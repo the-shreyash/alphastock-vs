@@ -1,0 +1,53 @@
+{
+  "summary": "Phase 2 testing complete. Backend: 40/40 pytest tests PASS (13 new Phase 2 + 27 previous). Verified GET /api/data-sources, GET/POST Zerodha endpoints (status/login-url/holdings/positions/order in simulated mode), GET /api/stocks/{sym}/live and /intraday (return source field), POST /api/auth/google/session (rejects missing session_id with 400, rejects invalid session_id), and WebSocket /api/ws (ping->pong and subscribe_prices->price_tick work). Frontend UI testing FAILED CRITICALLY: the React app does not render — page is fully black (empty body) and the browser issues an UNBOUNDED loop of /api/auth/me 401 requests (hundreds within 20s) so networkidle never resolves and login form never appears.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "/api/auth/google/session", "issue": "Sets cookie session_token with samesite='none' & secure=True while access/refresh cookies use samesite='lax' & secure=False — inconsistent; if backend served over http in preview, secure=true cookie will be dropped silently."},
+      {"endpoint": "WebSocket /api/ws", "issue": "user_id is taken from query params unauthenticated; any client can impersonate by passing arbitrary user_id. Should require JWT (cookie/Bearer) to authenticate the WS handshake."},
+      {"endpoint": "POST /api/zerodha/order", "issue": "Stores no audit record in DB (orders not persisted). For mocked mode it's fine, but in live mode every placed order should be logged for traceability."},
+      {"endpoint": "/api/zerodha/session", "issue": "Awaits kite_session(request_token, db) — if kite is not configured, simulated impl should still update users.zerodha_connected only on success; verify mock returns success consistently."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [
+      {"component": "App root (AuthContext or useWebSocket)", "issue": "Page renders BLACK with no visible UI. Browser logs show hundreds of 'Failed to load resource: 401' from /api/auth/me in <20s — clear infinite-loop / unthrottled re-fetch on the public /login route. networkidle never reaches.", "selector": "body (empty)", "priority": "CRITICAL"}
+    ],
+    "integration_issues": [
+      {"flow": "Login page initial render", "issue": "Either AuthContext calls /api/auth/me on every render without guard, or axios 401 interceptor retries /auth/refresh which 401s again without break, or useWebSocket reconnects rapidly. Need to: (a) call /me only once on mount, (b) on /auth/refresh failure clear tokens and stop loop, (c) ensure useWebSocket has exponential backoff and does not trigger AuthContext re-renders.", "affected_selectors": ["[data-testid='login-email-input']", "[data-testid='login-submit-button']", "all UI"]}
+    ],
+    "design_issues": [
+      {"screen": "Login (when rendered)", "issues": ["Cannot evaluate visual design - page never paints due to JS loop / blocked render."]}
+    ]
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_phase2.py",
+    "/app/backend/tests/test_backend.py",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [
+    "URGENT: Debug Login page infinite 401 loop. Check src/context/AuthContext.jsx (useEffect dep array calling /auth/me on every render?), src/services/api.js 401 interceptor (must not retry /auth/me itself nor loop /auth/refresh), and src/hooks/useWebSocket.js (must not reconnect aggressively on auth pages or fire AuthContext state updates).",
+    "On /login and /register, AuthContext should NOT call /api/auth/me (or should short-circuit on 401 with isAuth=false and stop). Currently it appears to keep hammering /me.",
+    "Secure WebSocket: authenticate /api/ws using JWT cookie or token query, do not trust client-supplied user_id.",
+    "Reconcile cookie security flags across access_token / refresh_token / session_token (all should use samesite='none' + secure=True when frontend uses HTTPS).",
+    "Persist Zerodha orders in DB collection (orders) including user_id, timestamp, status for live mode."
+  ],
+  "critical_code_review_comments": [
+    "server.py is now ~1140 lines mixing routers, AI service, WebSocket manager, scheduler bootstrap, OAuth — should split into routers/auth.py, routers/zerodha.py, routers/ws.py, services/ai.py.",
+    "WebSocket endpoint accepts any user_id via query string without auth — security hole.",
+    "Many endpoints return raw mongo dicts; response_model is defined (UserResponse, TradeResponse) but unused — wire them up for OpenAPI docs and ObjectId safety.",
+    "Google OAuth handler unconditionally sets session_token cookie with secure=True+samesite=none even though access/refresh cookies use secure=False — inconsistent and may fail in mixed env.",
+    "Scheduler started at startup with no idempotency guard if app restarts on hot-reload — may schedule duplicate jobs.",
+    "/api/auth/refresh sets only access cookie but does not rotate refresh_token — minor security concern."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_phase2.py"
+  ],
+  "success_rate": {"backend": "100% (40/40)", "frontend": "0% — page never paints; cannot verify any UI flow"},
+  "test_credentials": "admin@alphapartner.com / admin123 (verified via backend login API).",
+  "seed_data_creation": "Backend seeds admin on startup (verified). Tests created a TEST_ trade and a TCS open trade for admin during lifecycle tests.",
+  "retest_needed": true,
+  "should_main_agent_self_test": false,
+  "context_for_next_testing_agent": "Backend is fully green (40/40). Frontend UI is BROKEN at runtime: hitting /login produces a black page and an infinite stream of 401 responses from /api/auth/me. Previous iteration suspected Cloudflare; this iteration confirms it is NOT Cloudflare (the page is reachable and React clearly mounts since it makes 401 calls) — it is a client-side loop. After main agent fixes the loop in AuthContext / api.js interceptor / useWebSocket, re-run playwright login -> dashboard -> settings -> register flows to validate Google buttons, WebSocket indicator, Zerodha status panel, Data Sources panel.",
+  "rca of the issue": "RCA — Frontend infinite 401 loop: On the unauthenticated /login route, the React app issues continuous GET /api/auth/me requests at a rate of ~10/sec (200+ requests captured in 20s). All return 401, which itself is correct backend behavior (test_me_requires_auth passes). The bug is client-side. Three likely causes (in priority order): (1) AuthContext useEffect that calls /me has a state setter inside the effect with that state in its dependency array, causing re-fire each time setUser(null) is called; (2) axios response interceptor on 401 triggers /api/auth/refresh which returns 401 (no refresh cookie on first load) and then retries /me unconditionally — classic refresh-retry loop without a 'isRefreshing' flag or attempted flag on the original request; (3) useWebSocket attempts to connect, gets 'anonymous', updates state, which re-mounts AuthContext consumers and re-calls /me. Mitigation: in api.js 401 interceptor, mark originalRequest._retry=true before calling /refresh, and on refresh failure: do NOT retry, just resolve setUser(null) once. In AuthContext, fetch /me only inside a useEffect with empty deps [], and on 401 set loading=false and user=null without re-triggering. In useWebSocket, only connect when authenticated user exists. Reproduction: open https://alpha-trading-3.preview.emergentagent.com/login, open devtools Network tab — observe continuous /api/auth/me 401 requests; page body stays black."
+}

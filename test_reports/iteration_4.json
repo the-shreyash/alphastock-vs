@@ -1,0 +1,48 @@
+{
+  "summary": "Phase 4 testing complete. Backend: 54/54 pytest PASS (40 prior + 14 new Phase 4 cases). Frontend: All new Phase 4 panels working: AI Portfolio Monitor (100/100 health, alerts list, manual refresh button), WhatsApp Alerts panel (SETUP NEEDED status, instructions, phone save input), TradingView candlestick chart on /stock/RELIANCE with volume bars + 1D/1W/1M period switcher, technical indicators (RSI/MACD/Volume Ratio) and market data (Market Cap/PE/Day Range/52W). New endpoints: /api/monitor/health, /api/monitor/run, /api/monitor/alerts, /api/whatsapp/status, /api/whatsapp/test, /api/whatsapp/configure, /api/zerodha/urls, /api/zerodha/callback (302 redirect to /settings?zerodha=cancelled), /api/zerodha/postback. /api/data-sources now includes whatsapp block with mode=simulated. WhatsApp send returns success+source=simulated (MOCKED – no Twilio keys).",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "/api/zerodha/callback", "issue": "On cancelled/failed it redirects to '/settings?...' (relative) because CORS_ORIGINS may not be a full URL. The route should use REACT_APP frontend URL env var; current fallback works but produces relative redirects."},
+      {"endpoint": "/api/zerodha/postback", "issue": "No HMAC signature verification on incoming postback — anyone with the URL can inject fake order events into zerodha_postbacks collection."},
+      {"endpoint": "WebSocket /api/ws", "issue": "Carry-over: still accepts unauthenticated user_id via query string."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [
+      {"flow": "WebSocket reconnect", "issue": "Console still shows 'WebSocket is closed before the connection is established' on first dashboard load. Carry-over from iteration 3, non-blocking.", "affected_selectors": ["[data-testid='ws-live-indicator']"]}
+    ],
+    "design_issues": [
+      {"screen": "Stock detail (RELIANCE)", "issues": ["TradingView lightweight-charts v5 renders cleanly with candlesticks + volume bars + price scale. Period switcher (1D/1W/1M) works. Layout responsive."]},
+      {"screen": "Dashboard", "issues": ["Portfolio Monitor + WhatsApp panels added below FII/DII row look clean in both themes. Health-score green bar at 100/100 in current seed-data state."]}
+    ]
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_backend.py",
+    "/app/backend/tests/test_phase2.py",
+    "/app/backend/tests/test_phase4.py",
+    "/app/test_reports/pytest/pytest_results.xml",
+    "/app/test_reports/pytest/phase4_results.xml"
+  ],
+  "action_items": [
+    "(Security) Add HMAC signature verification to /api/zerodha/postback before persisting to DB.",
+    "(Optional polish) /api/zerodha/callback should redirect to frontend URL from env (not CORS_ORIGINS first entry) so success/fail UI is consistent across deployments.",
+    "(Carry-over) Authenticate WebSocket handshake with JWT and silence reconnect-on-route-change warning in useWebSocket hook."
+  ],
+  "critical_code_review_comments": [
+    "server.py is now ~1260 lines — split monitor, whatsapp, zerodha routers into their own files for maintainability.",
+    "portfolio_monitor.analyze_portfolio_health accepts market_func but never uses it — remove the unused parameter or wire it into a market-context bullish/bearish factor.",
+    "/api/whatsapp/test does not respect the per-user 'whatsapp_number' saved via /configure — it just sends from TWILIO_WHATSAPP_FROM to USER_WHATSAPP_TO (single global recipient). In live mode this means every user's test message goes to the same admin phone.",
+    "TradingChart.jsx mounts with hard-coded width from container.clientWidth — verify ResizeObserver is attached so it re-renders on sidebar collapse / window resize.",
+    "Zerodha postback writes raw body to DB without schema validation — add Pydantic model to filter junk fields."
+  ],
+  "updated_files": ["/app/backend/tests/test_phase4.py"],
+  "success_rate": {"backend": "100% (54/54)", "frontend": "100% on Phase 4 critical flows"},
+  "test_credentials": "admin@alphapartner.com / admin123 (verified login → /dashboard, monitor + whatsapp panels render).",
+  "seed_data_creation": "Backend auto-seeds admin on startup. Existing TEST_ trades from earlier iterations provide 4 open positions which drive the AI Portfolio Monitor display.",
+  "retest_needed": false,
+  "should_main_agent_self_test": true,
+  "context_for_next_testing_agent": "Phase 4 is fully green: 14 new backend tests in /app/backend/tests/test_phase4.py + 40 carry-over tests all pass. WhatsApp is in SIMULATED mode (no Twilio env keys set) — send/status/configure all behave correctly. TradingView chart uses lightweight-charts v5 addSeries(CandlestickSeries) and renders for /stock/<SYMBOL>. Known minor: zerodha postback has no signature verification; whatsapp/test ignores per-user phone. data-testid map for Phase 4: portfolio-monitor, monitor-refresh-btn, monitor-alert-<i>, whatsapp-panel, whatsapp-test-btn, whatsapp-phone-input, trading-chart-<symbol>, stock-detail-page, chart-period-<1D|1W|1M>, back-btn.",
+  "rca_of_the_issue": "No bugs found. All Phase 4 features (portfolio monitor health + alerts, WhatsApp simulated send/configure, Zerodha URLs/callback/postback, TradingView candlestick chart, dashboard panels) function as specified. Only carry-over minor issues remain (WebSocket auth, postback signature, WS reconnect console noise)."
+}

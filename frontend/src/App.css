@@ -1,0 +1,222 @@
+/* AlphaPartner - Global App Styles */
+
+/* Utility classes using CSS vars */
+.bg-app { background-color: var(--bg); }
+.bg-surface { background-color: var(--bg-surface); }
+.bg-elevated { background-color: var(--bg-elevated); }
+.text-primary { color: var(--text-primary); }
+.text-secondary { color: var(--text-secondary); }
+.text-muted { color: var(--text-muted); }
+.border-main { border-color: var(--border); }
+.border-subtle { border-color: var(--border-subtle); }
+.text-gain { color: var(--gain); }
+.text-loss { color: var(--loss); }
+.text-ai { color: var(--ai-accent); }
+.bg-ai-soft { background-color: var(--ai-accent-soft); }
+.bg-hover:hover { background-color: var(--hover); }
+.shadow-card { box-shadow: var(--card-shadow); }
+
+/* Premium card style */
+.card-premium {
+  background-color: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 1rem;
+  transition: all 0.2s ease;
+}
+.card-premium:hover {
+  box-shadow: var(--card-shadow);
+}
+
+/* =============================================
+   GLASSMORPHISM (Crystal Variant)
+   ============================================= */
+.glass {
+  backdrop-filter: blur(20px) saturate(1.6);
+  -webkit-backdrop-filter: blur(20px) saturate(1.6);
+  border: 1px solid rgba(255,255,255,0.15);
+}
+[data-theme="light"] .glass {
+  background: rgba(255,255,255,0.7);
+  border-color: rgba(255,255,255,0.6);
+}
+[data-theme="dark"] .glass {
+  background: rgba(9,9,11,0.7);
+  border-color: rgba(255,255,255,0.08);
+}
+
+/* =============================================
+   TRACING BEAM — AI Card Glow Effect
+   ============================================= */
+.tracing-beam {
+  position: relative;
+  overflow: hidden;
+}
+.tracing-beam::before {
+  content: '';
+  position: absolute;
+  top: -50%;
+  left: -50%;
+  width: 200%;
+  height: 200%;
+  background: conic-gradient(
+    from 0deg,
+    transparent 0deg,
+    var(--ai-accent) 60deg,
+    transparent 120deg
+  );
+  animation: tracing-spin 4s linear infinite;
+  opacity: 0;
+  transition: opacity 0.4s ease;
+  z-index: 0;
+}
+.tracing-beam:hover::before {
+  opacity: 0.12;
+}
+.tracing-beam::after {
+  content: '';
+  position: absolute;
+  inset: 1px;
+  background: var(--bg-elevated);
+  border-radius: calc(1rem - 1px);
+  z-index: 1;
+}
+.tracing-beam > * {
+  position: relative;
+  z-index: 2;
+}
+
+@keyframes tracing-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+/* =============================================
+   BUTTON LIFT EFFECT
+   ============================================= */
+.btn-lift {
+  transition: all 0.2s ease;
+}
+.btn-lift:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px rgba(0,0,0,0.08);
+}
+.btn-lift:active {
+  transform: translateY(0);
+}
+[data-theme="dark"] .btn-lift:hover {
+  box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+}
+
+/* =============================================
+   SMOOTH PAGE TRANSITIONS (CSS fallback)
+   ============================================= */
+.page-enter {
+  opacity: 0;
+  transform: translateY(8px);
+}
+.page-enter-active {
+  opacity: 1;
+  transform: translateY(0);
+  transition: opacity 0.3s ease, transform 0.3s ease;
+}
+
+/* =============================================
+   SKELETON LOADING
+   ============================================= */
+@keyframes skeleton-shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+.skeleton {
+  background: linear-gradient(90deg, var(--bg-surface) 25%, var(--bg-elevated) 50%, var(--bg-surface) 75%);
+  background-size: 200% 100%;
+  animation: skeleton-shimmer 1.8s ease-in-out infinite;
+  border-radius: 0.5rem;
+}
+
+/* =============================================
+   MICRO-ANIMATIONS
+   ============================================= */
+@keyframes fade-in-up {
+  from { opacity: 0; transform: translateY(12px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.animate-fade-in-up {
+  animation: fade-in-up 0.4s ease-out forwards;
+}
+
+@keyframes scale-in {
+  from { opacity: 0; transform: scale(0.95); }
+  to { opacity: 1; transform: scale(1); }
+}
+.animate-scale-in {
+  animation: scale-in 0.3s ease-out forwards;
+}
+
+/* Stagger children animation */
+.stagger-children > * {
+  animation: fade-in-up 0.4s ease-out forwards;
+  opacity: 0;
+}
+.stagger-children > *:nth-child(1) { animation-delay: 0.05s; }
+.stagger-children > *:nth-child(2) { animation-delay: 0.1s; }
+.stagger-children > *:nth-child(3) { animation-delay: 0.15s; }
+.stagger-children > *:nth-child(4) { animation-delay: 0.2s; }
+.stagger-children > *:nth-child(5) { animation-delay: 0.25s; }
+.stagger-children > *:nth-child(6) { animation-delay: 0.3s; }
+.stagger-children > *:nth-child(7) { animation-delay: 0.35s; }
+.stagger-children > *:nth-child(8) { animation-delay: 0.4s; }
+
+/* =============================================
+   SEGMENT CONTROL (kept for potential reuse)
+   ============================================= */
+.segment-control {
+  display: inline-flex;
+  padding: 3px;
+  background-color: var(--bg-surface);
+  border-radius: 10px;
+  border: 1px solid var(--border);
+}
+.segment-btn {
+  padding: 6px 16px;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 500;
+  transition: all 0.2s ease;
+  color: var(--text-secondary);
+  cursor: pointer;
+  border: none;
+  background: transparent;
+}
+.segment-btn.active {
+  background-color: var(--bg-elevated);
+  color: var(--text-primary);
+  box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+}
+
+/* =============================================
+   THEME TOGGLE (used in Settings)
+   ============================================= */
+.theme-toggle {
+  width: 40px;
+  height: 22px;
+  border-radius: 11px;
+  background-color: var(--bg-surface);
+  border: 1px solid var(--border);
+  position: relative;
+  cursor: pointer;
+  transition: all 0.3s ease;
+}
+.theme-toggle .knob {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background-color: var(--text-primary);
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  transition: transform 0.3s ease;
+}
+[data-theme="dark"] .theme-toggle .knob {
+  transform: translateX(18px);
+}

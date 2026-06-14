@@ -1,0 +1,55 @@
+{
+  "summary": "Phase 7 testing complete. Backend: 17/17 new Phase 7 pytests PASS (in /app/backend/tests/test_phase7.py) covering real Yahoo Finance market overview (Nifty=23,123 / BankNifty=54,063.75 / Sensex=73,524.26 — source=yahoo_finance), real stock quote /api/stocks/RELIANCE returning live price 1263.30 INR with rsi/vwap from Alpha Vantage, WhatsApp Twilio LIVE (configured=true, mode=live, has_sid/token/from/to all true), POST /api/whatsapp/test successfully delivered a Twilio WhatsApp message (success=true, source=twilio, sid=SM...), plus regression on auto-login, top-picks, news feed, trades, journal, zerodha/status, zerodha/account, stocks/search. Frontend: Dashboard renders the exact real Yahoo values (NIFTY 50 23,123.00 -1.04%, BANK NIFTY 54,063.75 -0.79%, SENSEX 73,524.26 -0.97%, INDIA VIX 13.9). News page opens articles in an in-app modal (URL stays at /news, Close button + 'Read Full Article' external link with target=_blank work as designed). AI Picks (route /picks) still shows Trade Now / Full AI Report buttons. Portfolio still shows ZERODHA ACCOUNT panel with margins and Zerodha Holdings tab.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "/api/stocks/{symbol}", "issue": "day_range is built from raw Yahoo high/low without rounding, producing strings like '1259.199951171875 - 1282.5999755859375'. Should round to 2 decimals."},
+      {"endpoint": "/api/stocks/{symbol}", "issue": "Real path returns macd=0 and macd_signal=0 as hard-coded placeholders (not real)."},
+      {"endpoint": "/api/stocks/{symbol}", "issue": "volume_ratio is always 1.0 (placeholder) and avg_volume is the latest-day volume, not a true average."},
+      {"endpoint": "/api/market/overview", "issue": "india_vix, market_sentiment, advance_decline are merged from simulated data while top-level source='yahoo_finance' — could mislead clients into believing all fields are real."},
+      {"endpoint": "/api/whatsapp/configure", "issue": "Carry-over: stores user-provided phone number with no E.164 validation."},
+      {"endpoint": "Carry-over from iteration 6", "issue": "/api/zerodha/quick-trade still returns 500 (KeyError) on missing fields (no Pydantic); /api/journal `days` param still ignored; /api/zerodha/postback no HMAC; WebSocket /api/ws still accepts unauth user_id."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": [
+      {"screen": "Dashboard", "issues": ["Header chip shows 'LIVE' (AlphaPartner system status) regardless of market state. Backend correctly returns market_status=CLOSED but dashboard never surfaces a 'Market Closed' indicator next to the indices — only Nifty card shows the -1.04% change. Adding a small CLOSED/OPEN badge near Nifty 50 would match the new real-data behavior."]},
+      {"screen": "Dashboard AI Activity Feed", "issues": ["Last row reads '09:15 • Market opened — monitoring live' as a static simulated entry even when the live market is CLOSED. Activity feed should reflect real market_status."]},
+      {"screen": "Dashboard ticker bar", "issues": ["Carry-over: left-most ticker still partially hidden behind sidebar (e.g., '815.29 +5.54%' visible without symbol on the left edge)."]},
+      {"screen": "News /news", "issues": ["Modal summary still shows HTML entities like '&amp;' (e.g., 'wealth creation themes &amp;'). Need to decode entities before rendering. Carry-over: some MoneyControl summaries still contain escaped <img> HTML."]},
+      {"screen": "Stock detail / day_range field", "issues": ["When wired into UI, day_range string will display raw floats like '1259.199951171875 - 1282.5999755859375'. Round in backend or format on frontend."]}
+    ]
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_phase7.py",
+    "/app/test_reports/pytest/phase7_results.xml",
+    "/app/test_reports/pytest/phase6_results.xml"
+  ],
+  "action_items": [
+    "Round Yahoo high/low/vwap to 2 decimals before exposing via /api/stocks/{symbol} (and rebuild day_range from rounded values).",
+    "Decode HTML entities (e.g., &amp;, &nbsp;, <img>) in news article titles & summaries server-side or in News.jsx before rendering.",
+    "Surface market_status (OPEN/CLOSED) on Dashboard near the indices and gate AI Activity Feed 'Market opened — monitoring live' line on real status.",
+    "(Optional) Replace hard-coded macd/macd_signal=0 and volume_ratio=1.0 with real values or remove them from the real path response to avoid misleading metrics.",
+    "Carry-over: Pydantic validation on /api/zerodha/quick-trade; apply `days` cutoff in /api/journal; HMAC verify Zerodha postback; auth WebSocket; data-testid on Trade Now / Place Order / autocomplete / portfolio tabs."
+  ],
+  "critical_code_review_comments": [
+    "server.py now ~1524 lines — should be split into routers/ package (auth, market, stocks, analysis, trades, portfolio, zerodha, journal, news, monitor, whatsapp, real-market).",
+    "services/real_market.py uses a module-level _cache dict — no eviction, will grow unboundedly across symbols. Consider lru_cache with TTL wrapper or capped size.",
+    "real_market.fetch_real_stock_quote still falls back to RSI=50 silently when Alpha Vantage rate-limits — UI displays a fake neutral RSI as if real. Should return rsi=None and let UI render 'N/A' instead.",
+    "WhatsApp credentials in backend/.env (Twilio SID, Auth Token, From/To numbers) — make sure these are scoped to a dev/test Twilio sub-account, otherwise a leaked .env would let attackers send messages on the production account.",
+    "/api/whatsapp/test endpoint has no rate limiting — a malicious authenticated user could spam Twilio and burn credits."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_phase7.py",
+    "/app/test_reports/pytest/phase7_results.xml"
+  ],
+  "success_rate": {"backend": "100% (17/17 Phase 7; cumulative 99/99 across phases)", "frontend": "100% on Phase 7 scope — real values render on Dashboard, News in-app modal works, regression intact"},
+  "test_credentials": "admin@alphapartner.com / admin123 (auto-login active). Twilio creds configured in backend/.env (SID ACb226...e3, From whatsapp:+14155238886, To +918400881203). REAL WhatsApp message delivered during test run — confirm Twilio billing/quota.",
+  "seed_data_creation": "test_phase7.py is read-mostly. It triggers exactly ONE Twilio WhatsApp send per run via POST /api/whatsapp/test (consumes a Twilio sandbox/credit unit each time). No new trades/journal entries created.",
+  "retest_needed": false,
+  "should_main_agent_self_test": true,
+  "context_for_next_testing_agent": "Phase 7 GREEN. Real data source is Yahoo Finance via query1.finance.yahoo.com/v8/finance/chart/<TICKER>.NS (or ^NSEI/^NSEBANK/^BSESN for indices). Indices observed during test: NIFTY 23,123.00 (-1.04%), BANK NIFTY 54,063.75 (-0.79%), SENSEX 73,524.26 (-0.97%). RELIANCE.NS price 1263.30 (-2.15%). Market is currently CLOSED. Frontend URL = https://alpha-trading-3.preview.emergentagent.com (review_request URL b8b6c8bd-... is a stale preview slug; use frontend/.env REACT_APP_BACKEND_URL). AI Picks route is /picks (NOT /stock-picks). News modal: clicking a news-article-N card sets selectedArticle in component state and renders an overlay with title/summary/source/published + 'Read Full Article' (external target=_blank) and 'Close'. Background click also closes modal. Each Phase 7 pytest run sends ONE real WhatsApp via Twilio — keep budget in mind.",
+  "rca_of_the_issue": "No bugs blocking Phase 7 acceptance. Backend correctly returns real Yahoo Finance index values and stock quotes with source='yahoo_finance'. WhatsApp is verified live (Twilio SID returned, message accepted). News modal works in-app without redirect. Minor data-hygiene improvements: round Yahoo floats, decode HTML entities in news, surface market_status on dashboard, and either compute or drop placeholder macd/volume_ratio fields."
+}

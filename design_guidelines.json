@@ -1,0 +1,106 @@
+{
+  "theme": {
+    "domain": "Finance, Fintech, AI Trading",
+    "archetype": "4 (Swiss & High-Contrast with Premium Apple-like twists)",
+    "mode": "light and dark toggle",
+    "emotional_tone": "Premium, trustworthy, intelligent, clean, and completely un-intimidating for beginners while robust for experts."
+  },
+  "typography": {
+    "font_family": {
+      "heading": "Outfit",
+      "body": "Manrope",
+      "mono": "JetBrains Mono"
+    },
+    "scale": {
+      "h1": "text-4xl sm:text-5xl lg:text-6xl tracking-tight leading-none font-medium",
+      "h2": "text-3xl sm:text-4xl tracking-tight font-medium",
+      "h3": "text-xl sm:text-2xl tracking-tight font-medium",
+      "h4": "text-lg sm:text-xl font-medium",
+      "body": "text-base leading-relaxed",
+      "small": "text-sm",
+      "overline": "text-xs uppercase tracking-[0.2em] font-bold"
+    },
+    "notes": "Outfit provides a perfectly clean, geometric Apple-like structure. Manrope ensures ultimate legibility for financial data. Use JetBrains Mono for exact stock tickers and numbers to ensure tabula lining."
+  },
+  "colors": {
+    "light": {
+      "background": "#FFFFFF",
+      "surface": "#F4F5F7",
+      "surface_elevated": "#FFFFFF",
+      "text_primary": "#09090B",
+      "text_secondary": "#71717A",
+      "border": "#E4E4E7",
+      "brand_primary": "#000000",
+      "brand_secondary": "#A1A1AA",
+      "gain": "#10B981",
+      "loss": "#F43F5E",
+      "ai_accent": "#6366F1"
+    },
+    "dark": {
+      "background": "#09090B",
+      "surface": "#18181B",
+      "surface_elevated": "#27272A",
+      "text_primary": "#FAFAFA",
+      "text_secondary": "#A1A1AA",
+      "border": "#27272A",
+      "brand_primary": "#FFFFFF",
+      "brand_secondary": "#52525B",
+      "gain": "#10B981",
+      "loss": "#F43F5E",
+      "ai_accent": "#818CF8"
+    },
+    "notes": "Follow the 'Tinted Grey' rule: The background shouldn't be stark #000 but rather a deep #09090B. Gains and losses must stand out immediately against these monochrome backgrounds."
+  },
+  "spacing_and_layout": {
+    "philosophy": "Generous Spacing Philosophy. Use negative space to imply premium status.",
+    "dashboard_grid": "MODE B: The 'Control Room' Grid for dashboard. Tight gaps (gap-6) but immense internal padding in widgets (p-6 or p-8).",
+    "marketing_grid": "MODE A: The 'Tetris' Grid for the landing page. Wide gaps (gap-12), high asymmetry.",
+    "borders_and_radius": "Rounded corners with restrained radius. Use rounded-xl or rounded-2xl maximum. Avoid pure square edges except for very dense data tables.",
+    "surfaces": "Glassmorphism (The 'Crystal' Variant) for sticky headers and bottom nav overlays. Heavy blur (backdrop-blur-xl), slight saturation boost, 1px delicate inner stroke (border-white/20 in light mode)."
+  },
+  "components": {
+    "buttons": "Flat, sharp text, slight rounded-lg. Hover state must lift (-translate-y-px) with a soft diffuse shadow. Primary buttons in light mode are black with white text; dark mode are white with black text.",
+    "cards": "Subtle 1px border. Cardless look is preferred where possible to maintain the clean Apple-like style. When using cards, use shadow-sm with no heavy drop-shadows.",
+    "inputs": "Shadcn UI base, customized with subtle borders. Focus state must have a crisp 2px ring of the primary brand color.",
+    "tables": "Clean, generous row heights. Remove vertical borders. Subtly alternate row colors or use border-b only.",
+    "tabs": "Pill-style or minimal underline. For Beginner/Advanced toggle, use a premium segment-control style (like iOS)."
+  },
+  "key_features_design_strategy": {
+    "beginner_advanced_toggle": "A prominent but elegant segmented control. 'Beginner' mode triggers UI changes to show plain-english tooltips, larger text explanations, and hides complex Greek indicators. 'Advanced' shows raw candlestick charts, depth, and dense data tables.",
+    "ai_stock_picks": "Use the 'Tracing Beam' surface strategy around AI recommendation cards to make them feel active and intelligent. AI explanations should use a subtle colored background (e.g., bg-indigo-50/50 in light mode) to separate them from raw market data.",
+    "dual_ai_debate": "Visual separation: Two side-by-side or stacked message bubbles. Use distinct but complementary subtle avatars/colors for Claude (Anthropic peach/coral hint) and Gemini (Google blue/purple hint).",
+    "live_ticker_bar": "The 'Editorial Ribbon' Marquee strategy. Slow, smooth drift at the top of the dashboard or landing page. Monospace font for the ticker values.",
+    "marketing_landing_page": "Hero section must use the generated 'hero_landing_background' with a max overlay of bg-white/30 or bg-black/40. High visual impact. Clean typography. Mandatory disclaimer must be styled elegantly, not hidden, but not alarming (use text_secondary color with a delicate shield icon)."
+  },
+  "motion_and_interaction": {
+    "page_transitions": "Smooth fade and slight slide-up.",
+    "hover_states": "Crisp and immediate. Buttons lift slightly. Data rows get a very subtle background tint change.",
+    "chart_animations": "Use recharts with activeDot expanding on hover, and smooth line stroke drawing on mount."
+  },
+  "icons_and_assets": {
+    "icon_library": "lucide-react",
+    "image_urls": {
+      "hero_landing_background": {
+        "url": "https://static.prod-images.emergentagent.com/jobs/ca772020-c10b-4e53-8da2-687556d4f18a/images/a45661918686b329e2a5f146d26745e30232a110e0003dbf6092fbe50b6363be.png",
+        "description": "Modern minimalist Indian financial district glass building reflection. Perfect for Landing page Hero."
+      },
+      "premium_wealth_abstract": {
+        "url": "https://static.prod-images.emergentagent.com/jobs/ca772020-c10b-4e53-8da2-687556d4f18a/images/e19ad349bc9d5d599d04fc18dd24f268c2559efe37fce42c0fa8a5168087116a.png",
+        "description": "Sleek marble and glass composition representing wealth and stability. Great for AI features or Portfolio sections."
+      },
+      "stock_chart_minimal": {
+        "url": "https://images.pexels.com/photos/7172774/pexels-photo-7172774.jpeg",
+        "description": "Clean line chart showing data trends. Good for feature blocks on the landing page."
+      }
+    }
+  },
+  "instructions_to_main_agent": [
+    "Strictly follow the color palette, using the brand neutral/monochrome combinations with green/red for stock movements.",
+    "Implement the layout with full mobile responsiveness. Use grid layout extensively.",
+    "For the Beginner/Advanced mode, ensure state management controls the conditional rendering of data density.",
+    "Build the dashboard leveraging Shadcn UI components but heavily override them to match the Apple-like clean aesthetics (e.g., removing heavy shadows, softening borders, using rounded-xl/2xl).",
+    "Ensure the Light/Dark mode toggle correctly maps all Tailwind classes.",
+    "Use 'lucide-react' for all icons.",
+    "Add 'data-testid' to all interactive elements for robust testing."
+  ]
+}

@@ -1,0 +1,78 @@
+import { useState, useEffect, useRef, useCallback } from "react";
+
+const WS_URL = process.env.REACT_APP_BACKEND_URL?.replace("https://", "wss://").replace("http://", "ws://");
+
+export function useWebSocket(userId = "anonymous") {
+  const [connected, setConnected] = useState(false);
+  const [marketData, setMarketData] = useState(null);
+  const [priceTicks, setPriceTicks] = useState({});
+  const [tradeUpdates, setTradeUpdates] = useState([]);
+  const [activityUpdates, setActivityUpdates] = useState(null);
+  const wsRef = useRef(null);
+  const reconnectRef = useRef(null);
+
+  const connect = useCallback(() => {
+    if (!WS_URL || userId === "anonymous" || userId === "anon") return;
+    try {
+      const ws = new WebSocket(`${WS_URL}/api/ws?user_id=${userId}`);
+      wsRef.current = ws;
+
+      ws.onopen = () => {
+        setConnected(true);
+        if (reconnectRef.current) {
+          clearTimeout(reconnectRef.current);
+          reconnectRef.current = null;
+        }
+      };
+
+      ws.onmessage = (event) => {
+        try {
+          const msg = JSON.parse(event.data);
+          if (msg.type === "market_update") {
+            setMarketData(msg.data);
+          } else if (msg.type === "price_tick") {
+            setPriceTicks((prev) => ({ ...prev, [msg.data.symbol]: msg.data }));
+          } else if (msg.type === "trade_update") {
+            setTradeUpdates((prev) => [msg.data, ...prev.slice(0, 49)]);
+          } else if (msg.type === "activity_feed") {
+            setActivityUpdates(msg.data);
+          }
+        } catch {}
+      };
+
+      ws.onclose = () => {
+        setConnected(false);
+        // Reconnect after 5 seconds
+        reconnectRef.current = setTimeout(connect, 5000);
+      };
+
+      ws.onerror = () => {
+        ws.close();
+      };
+    } catch (err) {
+      console.error("WebSocket error:", err);
+    }
+  }, [userId]);
+
+  useEffect(() => {
+    connect();
+    return () => {
+      if (wsRef.current) wsRef.current.close();
+      if (reconnectRef.current) clearTimeout(reconnectRef.current);
+    };
+  }, [connect]);
+
+  const subscribePrices = useCallback((symbols) => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: "subscribe_prices", symbols }));
+    }
+  }, []);
+
+  const sendPing = useCallback(() => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: "ping" }));
+    }
+  }, []);
+
+  return { connected, marketData, priceTicks, tradeUpdates, activityUpdates, subscribePrices, sendPing };
+}

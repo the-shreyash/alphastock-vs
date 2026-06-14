@@ -1,0 +1,51 @@
+{
+  "summary": "Phase 5 testing complete. Backend: 68/68 pytest PASS (54 carry-over + 14 new Phase 5 cases). All Phase 5 features verified end-to-end: (1) Auto-login redirects / -> /dashboard with cookies + bearer token, (2) Real RSS news from MoneyControl/ET Markets/LiveMint/ET Stocks aggregated in /api/news (37 articles seen), (3) News search filter functional on /news, (4) Trade Journal /journal renders Total P&L, Win Rate, All-Time Performance, AI Performance Review (Generate Review button), and Trade History rows, (5) /api/analysis/full-report returns confidence_score, full scoring_breakdown (RSI/Volume/Price Action/VWAP/News Sentiment), dual AI debate (Claude+Gemini+verdict) and related_news, (6) Zerodha keys configured – /api/zerodha/status and /api/data-sources both report configured=true, (7) Sidebar contains News + Journal links alongside Dashboard/Picks/Trades/Portfolio/AI Chat/SIP/Settings, (8) Stock detail page /stock/RELIANCE renders TradingView candlestick + volume chart with 1D/1W/1M switcher, RSI/MACD/Volume Ratio indicators and Market Cap/PE/Day Range/52W. Portfolio Monitor present on dashboard.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "/api/auth/auto-login", "issue": "Auto-login is a GET with no auth/role check — anyone hitting the URL is granted an admin JWT+cookies. Acceptable for dev-mode flag, but must be gated behind an env flag (e.g., ENABLE_AUTO_LOGIN) before production."},
+      {"endpoint": "/api/journal", "issue": "Trade journal cutoff variable is computed but not applied to the Mongo filter — days param has no effect on the returned list (only the .to_list(200) cap matters)."},
+      {"endpoint": "/api/zerodha/postback", "issue": "Carry-over: no HMAC signature verification — anyone can POST fake order events."},
+      {"endpoint": "WebSocket /api/ws", "issue": "Carry-over: still accepts unauthenticated user_id via query string."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [
+      {"flow": "AI Picks page initial load", "issue": "Picks page body text is sparse (~840 chars) and no 'Full Report' / 'Confidence' visible immediately. Likely renders a loading placeholder while POST /api/analysis/top-picks runs (AI heavy). Backend full-report API itself returns scoring breakdown correctly (verified in pytest). Suggest adding a clear loading skeleton + data-testid='full-report-btn' so it can be reliably exercised.", "affected_selectors": ["[data-testid='full-report-btn']"]}
+    ],
+    "design_issues": [
+      {"screen": "News /news", "issues": ["MoneyControl Markets entries include raw <img> HTML in summary preview (visible escaped tags). Should strip HTML from RSS summary before render."]},
+      {"screen": "Dashboard ticker bar", "issues": ["Ticker bar text overflows behind sidebar on first symbol (left-most ticker partially hidden)."]}
+    ]
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_backend.py",
+    "/app/backend/tests/test_phase2.py",
+    "/app/backend/tests/test_phase4.py",
+    "/app/backend/tests/test_phase5.py",
+    "/app/test_reports/pytest/pytest_results.xml",
+    "/app/test_reports/pytest/phase5_results.xml"
+  ],
+  "action_items": [
+    "Gate /api/auth/auto-login behind ENABLE_AUTO_LOGIN env flag before production. Currently any unauthenticated visitor receives an admin JWT.",
+    "Fix /api/journal: apply the computed `cutoff` to the Mongo query (`exit_time: {$gte: cutoff}`) so the `days` query param actually limits results.",
+    "Sanitize RSS article['summary'] (strip <img> / HTML) in services/news_service.py before returning to frontend so /news doesn't show raw HTML tags.",
+    "Add data-testid='full-report-btn' on AI Picks card and a visible loading skeleton until top-picks resolves.",
+    "Carry-over: HMAC verification on /api/zerodha/postback; JWT auth on WebSocket handshake."
+  ],
+  "critical_code_review_comments": [
+    "server.py is ~1420 lines; split into routers/ package (auth, market, stocks, analysis, trades, portfolio, news, journal, zerodha, monitor, whatsapp).",
+    "Auto-login route returns a JWT cookie without any role/env guard — significant security risk if pushed to prod without flagging.",
+    "services/trade_journal.get_trade_journal computes `cutoff` but never uses it in the find() filter; days param is dead code.",
+    "services/news_service caches RSS responses at module scope without lock — concurrent requests may double-fetch on cache expiry (minor)."
+  ],
+  "updated_files": ["/app/backend/tests/test_phase5.py"],
+  "success_rate": {"backend": "100% (68/68)", "frontend": "~95% (News + Journal + Stock detail + Auto-login + Dashboard + Sidebar all OK; Picks Full-Report button not visually located but backend API works)"},
+  "test_credentials": "admin@alphapartner.com / admin123 (auto-login active — credentials only needed as fallback).",
+  "seed_data_creation": "Backend auto-seeds admin on startup. Existing TEST_ trades from prior iterations provide journal/portfolio data (5 closed RELIANCE trades, Total P&L INR 625, win-rate 100%).",
+  "retest_needed": false,
+  "should_main_agent_self_test": true,
+  "context_for_next_testing_agent": "Phase 5 GREEN. 14 new tests in /app/backend/tests/test_phase5.py (auto-login, news RSS, journal CRUD+stats, full-report scoring, zerodha-configured, dashboard composite). All previously added tests still pass. Frontend URL is https://alpha-trading-3.preview.emergentagent.com (frontend/.env). Auto-login fires on landing page — there is NO login form. Selector tips: News search box is the first input on /news (no data-testid yet), Journal 'Generate Review' button calls /api/journal/weekly-review (slow ~10s, AI). Picks page Full-Report trigger has no data-testid yet — main agent should add one. Stock chart uses lightweight-charts v5 inside /stock/<SYMBOL>.",
+  "rca_of_the_issue": "No critical bugs. Phase 5 features all work as specified. Minor functional gap: /api/journal `days` param is ignored (dead cutoff variable). Minor security concern: /api/auth/auto-login is unrestricted — must be guarded by an env flag before production deployment."
+}

@@ -1,0 +1,46 @@
+{
+  "summary": "Tested AlphaPartner MVP. Backend: 27/27 pytest tests PASS covering auth (login/register/me/duplicate/invalid), market endpoints (overview/gainers/losers/sectors/global/commodities/fii-dii/activity-feed), stocks (universe/search/detail/chart/404), analysis top-picks, trades full lifecycle (create/list/active/pnl/update->close), portfolio + summary, notifications list + mark-all-read, SIP calculator, settings get+update, and AI chat with Emergent LLM key (live response received). Frontend UI automation could NOT be executed because the preview URL is fronted by Cloudflare bot-challenge that blocks Playwright (returns 'Performing security verification' page). Code review of pages confirmed all required data-testid attributes are present on Login, Register, Dashboard, StockPicks, TradeMonitor, Portfolio, AIAssistant, SIPAdvisor, Settings, Sidebar, Navbar and NotificationPanel, and api.js correctly uses REACT_APP_BACKEND_URL with cookies+Bearer fallback and /auth/refresh interceptor.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "CORS", "issue": "CORS_ORIGINS='*' combined with allow_credentials=True is invalid per spec; browsers may reject cookies. Bearer token fallback still works. Recommend setting explicit origin (REACT_APP_BACKEND_URL host)."},
+      {"endpoint": "Brute-force lockout", "issue": "Each failed login resets locked_until to now+15min on every attempt (using $set), so the lockout window keeps sliding. Functionally locks user out but not the exact intended behaviour."},
+      {"endpoint": "/api/notifications/read-all", "issue": "Route defined after /{notif_id}/read; FastAPI matches correctly here because methods differ-paths, but ordering is fragile."},
+      {"endpoint": "/api/trades PUT", "issue": "exit_price status logic uses entry trade's stop_loss/target1 from initial doc; for SELL trades the SL/Target comparison logic is not inverted -> status classification may be wrong for short trades."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [
+      {"flow": "Playwright UI testing", "issue": "Preview URL gated by Cloudflare Turnstile/challenge; Playwright headless cannot pass. API/backend integration verified via direct HTTP and confirmed working. Real user browsers will pass the challenge once and proceed.", "affected_selectors": ["all"]}
+    ],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_backend.py",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [
+    "Restrict CORS_ORIGINS in backend/.env to explicit frontend origin (https://alpha-trading-3.preview.emergentagent.com) since allow_credentials=True is set; '*' is non-compliant.",
+    "Fix sliding lockout: only set locked_until when count crosses 5; do not reset on every failure.",
+    "Invert SL/Target classification when trade type=='SELL' in trades PUT handler.",
+    "(Optional) Whitelist Playwright/automation user-agent in Cloudflare for preview, or use a non-CDN internal URL for E2E tests so UI flows can be auto-verified."
+  ],
+  "critical_code_review_comments": [
+    "server.py is ~830 lines combining routes, AI service, auth helpers - should split into routers/auth.py, routers/trades.py, services/ai.py for maintainability.",
+    "UserResponse model defined but unused in endpoints - responses return raw dicts; consider response_model=... for OpenAPI clarity and ObjectId safety.",
+    "Login error message returns 'Invalid email or password' generically (good), but rate-limit on failed register is missing - register endpoint can be abused.",
+    "ai_chat / ai_dual_debate import emergentintegrations inside try/except per call - move to module-level import for performance.",
+    "No pagination on /api/trades, /api/notifications, /api/chat/history (capped at 100/50 silently)."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_backend.py"
+  ],
+  "success_rate": {"backend": "100% (27/27)", "frontend": "UI not auto-testable (Cloudflare block); code review of testids passes"},
+  "test_credentials": "admin@alphapartner.com / admin123 (verified working). Also created throw-away test_*@example.com users during register tests.",
+  "seed_data_creation": "Backend startup seeds admin user idempotently and writes /app/memory/test_credentials.md. Tests created a few RELIANCE/TCS/INFY trades for admin during lifecycle tests.",
+  "retest_needed": true,
+  "should_main_agent_self_test": true,
+  "context_for_next_testing_agent": "Backend is fully green. UI automation hits Cloudflare 'Performing security verification' page (Turnstile) before the React app loads, so Playwright cannot proceed. Either (a) ask user to manually verify UI in real browser, (b) request a CF-bypass token for preview URL, or (c) run Playwright with persistent context + slow human-like flow. All data-testid selectors exist as expected in pages and components. AI integrations (Emergent LLM) confirmed working through /api/chat which returned a real LLM response within ~5s.",
+  "rca of the issue": "Frontend UI auto-test failure RCA: the deployed preview URL (alpha-trading-3.preview.emergentagent.com) is fronted by Cloudflare with bot-challenge enabled. The initial page response is the Cloudflare 'Verify you are human' Turnstile interstitial (HTML containing 'Performing security verification'), so React never mounts under Playwright. Confirmed by screenshot. Mitigation: bypass via CF allowlist for the test runner IP/user-agent, or test against an internal port-forwarded URL. The application itself is functional (verified via authenticated REST flow end-to-end)."
+}
