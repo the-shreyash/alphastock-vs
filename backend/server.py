@@ -1,9 +1,9 @@
-# pyrefly: ignore [missing-import]
+# pyrefly: ignore [missing-import] - force uvicorn reload
 from dotenv import load_dotenv
 from pathlib import Path
 
 ROOT_DIR = Path(__file__).parent
-load_dotenv(ROOT_DIR / '.env')
+load_dotenv(ROOT_DIR / '.env', override=True)
 
 from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Depends, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
@@ -340,23 +340,28 @@ async def market_overview():
 
 @market_router.get("/gainers")
 async def top_gainers():
-    return get_top_gainers()
+    from services.real_market import fetch_real_gainers
+    return await fetch_real_gainers()
 
 @market_router.get("/losers")
 async def top_losers():
-    return get_top_losers()
+    from services.real_market import fetch_real_losers
+    return await fetch_real_losers()
 
 @market_router.get("/sectors")
 async def sector_performance():
-    return get_sector_performance()
+    from services.real_market import fetch_real_sectors
+    return await fetch_real_sectors()
 
 @market_router.get("/global")
 async def global_markets():
-    return get_global_markets()
+    from services.real_market import fetch_real_global_markets
+    return await fetch_real_global_markets()
 
 @market_router.get("/commodities")
 async def commodities():
-    return get_commodities()
+    from services.real_market import fetch_real_commodities
+    return await fetch_real_commodities()
 
 @market_router.get("/fii-dii")
 async def fii_dii():
@@ -405,7 +410,8 @@ async def stock_detail(symbol: str):
 
 @stocks_router.get("/{symbol}/chart")
 async def stock_chart(symbol: str, period: str = "1D"):
-    return get_chart_data(symbol, period)
+    from services.real_market import fetch_real_chart_data
+    return await fetch_real_chart_data(symbol, period)
 
 
 @stocks_router.get("/{symbol}/patterns")
@@ -427,7 +433,9 @@ async def top_picks():
     if cached and cached.get("top_picks"):
         picks = cached["top_picks"]
     else:
-        picks = generate_top_picks(3)
+        from services.real_market import fetch_real_top_picks
+        res = await fetch_real_top_picks(3)
+        picks = res.get("picks", [])
         await db.market_analysis.update_one(
             {"date": today},
             {"$set": {"top_picks": picks, "generated_at": datetime.now(timezone.utc).isoformat()}},
@@ -437,10 +445,13 @@ async def top_picks():
 
 @analysis_router.post("/explain")
 async def explain_stock(data: StockAnalysisRequest):
-    quote = get_stock_quote(data.symbol)
+    from services.real_market import fetch_real_stock_quote
+    quote = await fetch_real_stock_quote(data.symbol)
+    if not quote:
+        quote = get_stock_quote(data.symbol)
     if not quote:
         raise HTTPException(status_code=404, detail="Stock not found")
-    name = data.name or quote["name"]
+    name = data.name or quote.get("name", data.symbol)
     prompt = f"""Analyze this NSE stock for intraday trading:
 Stock: {name} ({data.symbol})
 Price: INR {quote['price']}
@@ -457,9 +468,17 @@ Explain: WHY this stock could be a good trade, momentum factors, entry reasoning
 
 @analysis_router.get("/morning-report")
 async def morning_report():
-    picks = generate_top_picks(3)
-    overview = get_market_overview()
-    sectors = get_sector_performance()
+    from services.real_market import fetch_real_top_picks, fetch_real_market_overview, fetch_real_sectors
+    picks_res = await fetch_real_top_picks(3)
+    picks = picks_res.get("picks", [])
+    
+    overview = await fetch_real_market_overview()
+    if not overview:
+        overview = get_market_overview()
+        
+    sectors = await fetch_real_sectors()
+    if not sectors:
+        sectors = get_sector_performance()
 
     report = ""
     if claude_configured() or gemini_configured():
@@ -493,12 +512,15 @@ async def morning_report_full(user: dict = Depends(get_current_user)):
         return cached
 
     # Generate fresh report
-    from services.real_market import fetch_real_market_overview
+    from services.real_market import fetch_real_market_overview, fetch_real_top_picks, fetch_real_sectors
     real_overview = await fetch_real_market_overview()
     overview = get_market_overview()
-    picks = generate_top_picks(3)
+    picks_res = await fetch_real_top_picks(3)
+    picks = picks_res.get("picks", [])
     fii_dii = get_fii_dii()
-    sectors = get_sector_performance()
+    sectors = await fetch_real_sectors()
+    if not sectors:
+        sectors = get_sector_performance()
 
     nifty_chg = (real_overview or {}).get("nifty", {}).get("change_pct", overview["nifty"]["change_pct"])
     banknifty_chg = (real_overview or {}).get("bank_nifty", {}).get("change_pct", overview["bank_nifty"]["change_pct"])
@@ -1373,14 +1395,16 @@ async def zerodha_emergency_stop(user: dict = Depends(get_current_user)):
 
 @stocks_router.get("/{symbol}/live")
 async def stock_live_quote(symbol: str):
-    """Get live quote - Alpha Vantage if configured, else simulated."""
+    """Get live quote - Alpha Vantage if configured, else real Yahoo Finance."""
     if av_configured():
         av_quote = await av_get_quote(symbol)
         if av_quote:
             av_quote["source"] = "alpha_vantage"
             return av_quote
-    # Fallback to simulated
-    quote = get_stock_quote(symbol)
+    from services.real_market import fetch_real_stock_quote
+    quote = await fetch_real_stock_quote(symbol)
+    if not quote:
+        quote = get_stock_quote(symbol)
     if not quote:
         raise HTTPException(status_code=404, detail="Stock not found")
     quote["source"] = "simulated"
@@ -1388,12 +1412,14 @@ async def stock_live_quote(symbol: str):
 
 @stocks_router.get("/{symbol}/intraday")
 async def stock_intraday(symbol: str, interval: str = "5min"):
-    """Get intraday data - Alpha Vantage if configured, else simulated."""
+    """Get intraday data - Alpha Vantage if configured, else real Yahoo Finance."""
     if av_configured():
         av_data = await av_intraday(symbol, interval)
         if av_data:
             return {"data": av_data, "source": "alpha_vantage"}
-    return {"data": get_chart_data(symbol, "1D"), "source": "simulated"}
+    from services.real_market import fetch_real_chart_data
+    chart = await fetch_real_chart_data(symbol, "1D")
+    return {"data": chart, "source": "simulated"}
 
 
 # ============ DATA SOURCE STATUS ============
