@@ -12,8 +12,8 @@ from services.ai_provider import AIProvider, AIMessage, AIResponse
 logger = logging.getLogger(__name__)
 
 # Default model — override via model parameter
-CLAUDE_DEFAULT_MODEL = "claude-3-5-sonnet-20241022"
-CLAUDE_FAST_MODEL = "claude-3-5-haiku-20241022"
+CLAUDE_DEFAULT_MODEL = "claude-3-haiku-20240307"
+CLAUDE_FAST_MODEL = "claude-3-haiku-20240307"
 
 
 def _get_key() -> str:

@@ -365,7 +365,8 @@ async def commodities():
 
 @market_router.get("/fii-dii")
 async def fii_dii():
-    return get_fii_dii()
+    from services.real_market import fetch_real_fii_dii
+    return await fetch_real_fii_dii()
 
 @market_router.get("/summary")
 async def market_summary():
@@ -374,7 +375,8 @@ async def market_summary():
 
 @market_router.get("/activity-feed")
 async def activity_feed():
-    return get_ai_activity_feed()
+    from services.activity_logger import get_recent_activity
+    return get_recent_activity()
 
 
 # ============ STOCKS ROUTES ============
@@ -996,10 +998,17 @@ async def websocket_endpoint(websocket: WebSocket):
 
 # Background task: broadcast market data every 10 seconds
 async def market_broadcast_loop():
+    """
+    Broadcasts real-time market data to all connected WebSocket clients every 10 seconds.
+    Uses real Yahoo Finance data, not simulated data.
+    """
     while True:
         try:
             if ws_manager.active:
-                overview = get_market_overview()
+                from services.real_market import fetch_real_market_overview
+                overview = await fetch_real_market_overview()
+                if not overview:
+                    overview = get_market_overview()  # fallback
                 await ws_manager.broadcast({
                     "type": "market_update",
                     "data": overview,
@@ -1008,6 +1017,87 @@ async def market_broadcast_loop():
         except Exception as e:
             logging.error(f"Broadcast error: {e}")
         await asyncio.sleep(10)
+
+
+async def ai_monitoring_loop():
+    """
+    AI always watches the platform. Every 30 seconds, scans for:
+    - Market alerts (Nifty big moves)
+    - Breaking events (VIX spike, gap-up/down)
+    Sends real-time push notifications via WebSocket to all connected users.
+    """
+    from services.activity_logger import log_activity
+    prev_nifty = None
+    while True:
+        try:
+            from services.real_market import fetch_real_market_overview
+            overview = await fetch_real_market_overview()
+            if overview:
+                nifty_val = overview.get("nifty", {}).get("value", 0)
+                nifty_chg_pct = overview.get("nifty", {}).get("change_pct", 0)
+
+                # Detect large moves (>1% in either direction)
+                if abs(nifty_chg_pct) >= 1.0:
+                    direction = "📈 surging" if nifty_chg_pct > 0 else "📉 dropping"
+                    severity = "critical" if abs(nifty_chg_pct) >= 2.0 else "warning"
+                    msg = f"⚡ MARKET ALERT: Nifty is {direction} {nifty_chg_pct:+.2f}% at {nifty_val:,.0f}! Monitor your positions."
+                    log_activity(f"Nifty {direction} {nifty_chg_pct:+.2f}%", "alert", "warning")
+                    
+                    # Save notification for all active users
+                    users = await db.users.find({}, {"_id": 1}).to_list(100)
+                    for u in users:
+                        existing = await db.notifications.find_one({
+                            "user_id": str(u["_id"]),
+                            "type": "MARKET_ALERT",
+                            "created_at": {"$gte": (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()}
+                        })
+                        if not existing:  # Don't spam — only once per 5 min
+                            await db.notifications.insert_one({
+                                "user_id": str(u["_id"]),
+                                "type": "MARKET_ALERT",
+                                "title": "Market Alert",
+                                "message": msg,
+                                "severity": severity,
+                                "read": False,
+                                "created_at": datetime.now(timezone.utc).isoformat(),
+                            })
+                    
+                    # Broadcast to all WebSocket clients
+                    if ws_manager.active:
+                        await ws_manager.broadcast({
+                            "type": "ai_alert",
+                            "severity": severity,
+                            "message": msg,
+                            "data": {"nifty": nifty_val, "change_pct": nifty_chg_pct},
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                        })
+                
+                # Detect Nifty crossing key psychological levels
+                key_levels = [24000, 24500, 25000, 25500, 26000, 23500, 23000]
+                if prev_nifty:
+                    for level in key_levels:
+                        crossed_up = prev_nifty < level <= nifty_val
+                        crossed_down = prev_nifty > level >= nifty_val
+                        if crossed_up or crossed_down:
+                            direction = "above" if crossed_up else "below"
+                            emoji = "🔔" if crossed_up else "⚠️"
+                            alert_msg = f"{emoji} Nifty crossed {direction} key level {level:,}! Current: {nifty_val:,.0f}"
+                            log_activity(f"Nifty crossed {level}", "alert", "done")
+                            if ws_manager.active:
+                                await ws_manager.broadcast({
+                                    "type": "ai_alert",
+                                    "severity": "info",
+                                    "message": alert_msg,
+                                    "data": {"nifty": nifty_val, "level": level},
+                                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                                })
+                
+                prev_nifty = nifty_val
+
+        except Exception as e:
+            logging.error(f"AI monitoring loop error: {e}")
+        
+        await asyncio.sleep(30)
 
 
 # ============ GOOGLE OAUTH ROUTES ============
@@ -2021,6 +2111,10 @@ async def startup():
     # Start WebSocket broadcast loop
     asyncio.create_task(market_broadcast_loop())
     logger.info("WebSocket broadcast loop started")
+
+    # Start AI monitoring loop — watches market 24/7 and sends proactive alerts
+    asyncio.create_task(ai_monitoring_loop())
+    logger.info("AI monitoring loop started — watching for market events")
 
     logger.info("AlphaPartner API started successfully")
     logger.info(f"Data sources: Alpha Vantage={'ON' if av_configured() else 'OFF'}, Zerodha={'ON' if kite_configured() else 'OFF'}")

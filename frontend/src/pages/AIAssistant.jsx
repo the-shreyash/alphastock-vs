@@ -78,8 +78,8 @@ export default function AIAssistant() {
               </div>
             )}
             <div className={`max-w-[80%] p-3 rounded-xl text-sm leading-relaxed whitespace-pre-wrap ${msg.role === "user"
-                ? "bg-white/5 border border-main text-secondary"
-                : "bg-surface border border-main text-secondary"
+              ? "bg-white/5 border border-main text-secondary"
+              : "bg-surface border border-main text-secondary"
               }`}>
               {msg.content}
             </div>

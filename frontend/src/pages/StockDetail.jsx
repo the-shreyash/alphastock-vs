@@ -4,8 +4,9 @@ import api from "../services/api";
 import { formatCurrency, formatNumber, formatPercent } from "../utils/formatters";
 import {
   ArrowLeft, TrendingUp, TrendingDown, BarChart3, Activity, Info,
-  Zap, ShieldCheck, ShieldAlert, Minus, Eye, RefreshCw,
+  Zap, ShieldCheck, ShieldAlert, Minus, Eye, RefreshCw, HelpCircle
 } from "lucide-react";
+import { useTheme } from "../context/ThemeContext";
 import TradingChart from "../components/charts/TradingChart";
 
 // ─── Pattern Signal Colours ───────────────────────────────────
@@ -97,6 +98,7 @@ function PatternBiasBar({ bullish, bearish, total }) {
 export default function StockDetail() {
   const { symbol } = useParams();
   const navigate = useNavigate();
+  const { displayMode } = useTheme();
 
   const [quote, setQuote] = useState(null);
   const [chartData, setChartData] = useState([]);
@@ -112,6 +114,7 @@ export default function StockDetail() {
     if (!symbol) return;
     fetchData();
     fetchPatterns();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [symbol, period]);
 
   const fetchData = async () => {
@@ -347,44 +350,120 @@ export default function StockDetail() {
 
       {/* Technical Indicators + Market Data */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-        <div className="card-premium p-5">
-          <h3 className="text-xs font-bold uppercase tracking-widest mb-3" style={{ color: "var(--text-muted)" }}>Technical Indicators</h3>
-          <p className="text-xs mb-3 p-2 rounded-lg flex items-start gap-2" style={{ background: "var(--ai-accent-soft)", color: "var(--ai-accent)" }}>
-            <Info size={12} className="shrink-0 mt-0.5" /> RSI above 70 = overbought (may fall). Below 30 = oversold (may rise). MACD crossing signal line = trend change.
-          </p>
-          <div className="space-y-3">
-            {[
-              { label: "RSI (14)", value: quote.rsi, hint: quote.rsi > 70 ? "Overbought" : quote.rsi < 30 ? "Oversold" : "Neutral" },
-              { label: "MACD", value: quote.macd },
-              { label: "MACD Signal", value: quote.macd_signal },
-              { label: "Volume Ratio", value: `${quote.volume_ratio}x avg` },
-            ].map((ind) => (
-              <div key={ind.label} className="flex items-center justify-between py-1 border-b" style={{ borderColor: "var(--border)" }}>
-                <span className="text-sm" style={{ color: "var(--text-secondary)" }}>{ind.label}</span>
-                <div className="text-right">
-                  <span className="text-sm font-mono font-medium" style={{ color: "var(--text-primary)" }}>{ind.value}</span>
-                  {ind.hint && <span className="text-[10px] ml-2" style={{ color: "var(--text-muted)" }}>{ind.hint}</span>}
+        {displayMode === "beginner" ? (
+          <div className="card-premium p-5">
+            <h3 className="text-xs font-bold uppercase tracking-widest mb-3 flex items-center gap-1.5" style={{ color: "var(--ai-accent)" }}>
+              <Brain size={14} /> Simplified AI Indicators
+            </h3>
+            <p className="text-xs mb-4 p-2 rounded-lg flex items-start gap-2" style={{ background: "var(--ai-accent-soft)", color: "var(--ai-accent)" }}>
+              <Info size={12} className="shrink-0 mt-0.5" />
+              We have simplified the technical charts to show easy-to-understand metrics. Switch to <strong>Advanced</strong> mode at the top for raw stats.
+            </p>
+            
+            <div className="space-y-4">
+              <div className="py-2 border-b" style={{ borderColor: "var(--border)" }}>
+                <div className="flex justify-between items-center mb-1">
+                  <span className="text-sm font-semibold flex items-center gap-1" style={{ color: "var(--text-primary)" }}>
+                    Buyer Activity Status <HelpCircle size={12} className="text-slate-400" title="RSI (Relative Strength Index) tracks current demand." />
+                  </span>
+                  <span className="text-xs font-mono font-bold" style={{ color: quote.rsi > 70 ? "var(--loss)" : quote.rsi < 30 ? "var(--gain)" : "var(--text-secondary)" }}>
+                    {quote.rsi > 70 ? "Extremely High (Overbought)" : quote.rsi < 30 ? "Extremely Low (Oversold)" : "Healthy (Balanced)"}
+                  </span>
                 </div>
+                <p className="text-xs" style={{ color: "var(--text-secondary)" }}>
+                  {quote.rsi > 70 
+                    ? "Many people have bought this stock recently. Prices could undergo a short-term pullback." 
+                    : quote.rsi < 30 
+                    ? "Very few people are buying this stock right now. It could be due for a potential reversal upward." 
+                    : "Trading demand is stable. Price is moving within standard parameters."}
+                </p>
               </div>
-            ))}
+
+              <div className="py-2 border-b" style={{ borderColor: "var(--border)" }}>
+                <div className="flex justify-between items-center mb-1">
+                  <span className="text-sm font-semibold flex items-center gap-1" style={{ color: "var(--text-primary)" }}>
+                    Volume Expansion <HelpCircle size={12} className="text-slate-400" title="Tracks how many shares are traded compared to the daily average." />
+                  </span>
+                  <span className="text-xs font-mono font-bold" style={{ color: quote.volume_ratio > 1.5 ? "var(--gain)" : "var(--text-secondary)" }}>
+                    {quote.volume_ratio > 2.0 ? "Massive Activity" : quote.volume_ratio > 1.2 ? "Elevated Activity" : "Normal Activity"} ({quote.volume_ratio}x usual)
+                  </span>
+                </div>
+                <p className="text-xs" style={{ color: "var(--text-secondary)" }}>
+                  {quote.volume_ratio > 1.5 
+                    ? "A large amount of money is moving into this stock today. This indicates heavy institution block deal action." 
+                    : "Standard trading volume. Retail and long-term investors are active at usual rates."}
+                </p>
+              </div>
+
+              <div className="py-2">
+                <div className="flex justify-between items-center mb-1">
+                  <span className="text-sm font-semibold flex items-center gap-1" style={{ color: "var(--text-primary)" }}>
+                    Price vs Average Price <HelpCircle size={12} className="text-slate-400" title="VWAP (Volume Weighted Average Price) is the average price paid today." />
+                  </span>
+                  <span className="text-xs font-mono font-bold" style={{ color: "var(--text-primary)" }}>
+                    {Math.abs(quote.price - quote.vwap) / quote.price < 0.015 ? "Buying Near Average" : "Paying Above Average"}
+                  </span>
+                </div>
+                <p className="text-xs" style={{ color: "var(--text-secondary)" }}>
+                  The average buyer today paid ₹{quote.vwap.toFixed(2)}. The stock is currently trading at ₹{quote.price.toFixed(2)}.
+                </p>
+              </div>
+            </div>
           </div>
-        </div>
+        ) : (
+          <div className="card-premium p-5">
+            <h3 className="text-xs font-bold uppercase tracking-widest mb-3" style={{ color: "var(--text-muted)" }}>Technical Indicators</h3>
+            <p className="text-xs mb-3 p-2 rounded-lg flex items-start gap-2" style={{ background: "var(--ai-accent-soft)", color: "var(--ai-accent)" }}>
+              <Info size={12} className="shrink-0 mt-0.5" /> RSI above 70 = overbought (may fall). Below 30 = oversold (may rise). MACD crossing signal line = trend change.
+            </p>
+            <div className="space-y-3">
+              {[
+                { label: "RSI (14)", value: quote.rsi, hint: quote.rsi > 70 ? "Overbought" : quote.rsi < 30 ? "Oversold" : "Neutral" },
+                { label: "MACD", value: quote.macd },
+                { label: "MACD Signal", value: quote.macd_signal },
+                { label: "Volume Ratio", value: `${quote.volume_ratio}x avg` },
+              ].map((ind) => (
+                <div key={ind.label} className="flex items-center justify-between py-1 border-b" style={{ borderColor: "var(--border)" }}>
+                  <span className="text-sm" style={{ color: "var(--text-secondary)" }}>{ind.label}</span>
+                  <div className="text-right">
+                    <span className="text-sm font-mono font-medium" style={{ color: "var(--text-primary)" }}>{ind.value}</span>
+                    {ind.hint && <span className="text-[10px] ml-2" style={{ color: "var(--text-muted)" }}>{ind.hint}</span>}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
 
         <div className="card-premium p-5">
-          <h3 className="text-xs font-bold uppercase tracking-widest mb-3" style={{ color: "var(--text-muted)" }}>Market Data</h3>
+          <h3 className="text-xs font-bold uppercase tracking-widest mb-3" style={{ color: "var(--text-muted)" }}>{displayMode === "beginner" ? "Company Context" : "Market Data"}</h3>
           <div className="space-y-3">
-            {[
-              { label: "Market Cap", value: `${(quote.market_cap_cr / 100).toFixed(0)}K Cr` },
-              { label: "P/E Ratio", value: quote.pe_ratio },
-              { label: "Day Range", value: quote.day_range },
-              { label: "52W High", value: formatCurrency(quote.week_52_high) },
-              { label: "52W Low", value: formatCurrency(quote.week_52_low) },
-            ].map((d) => (
-              <div key={d.label} className="flex items-center justify-between py-1 border-b" style={{ borderColor: "var(--border)" }}>
-                <span className="text-sm" style={{ color: "var(--text-secondary)" }}>{d.label}</span>
-                <span className="text-sm font-mono font-medium" style={{ color: "var(--text-primary)" }}>{d.value}</span>
-              </div>
-            ))}
+            {displayMode === "beginner" ? (
+              [
+                { label: "Company Size", value: quote.market_cap_cr > 100000 ? "Mega Cap Enterprise" : quote.market_cap_cr > 25000 ? "Large Cap Enterprise" : "Mid Cap Enterprise" },
+                { label: "Price Range Today", value: quote.day_range },
+                { label: "52-Week High Point", value: formatCurrency(quote.week_52_high) },
+                { label: "52-Week Low Point", value: formatCurrency(quote.week_52_low) },
+              ].map((d) => (
+                <div key={d.label} className="flex items-center justify-between py-1 border-b" style={{ borderColor: "var(--border)" }}>
+                  <span className="text-sm" style={{ color: "var(--text-secondary)" }}>{d.label}</span>
+                  <span className="text-sm font-semibold" style={{ color: "var(--text-primary)" }}>{d.value}</span>
+                </div>
+              ))
+            ) : (
+              [
+                { label: "Market Cap", value: `${(quote.market_cap_cr / 100).toFixed(0)}K Cr` },
+                { label: "P/E Ratio", value: quote.pe_ratio },
+                { label: "Day Range", value: quote.day_range },
+                { label: "52W High", value: formatCurrency(quote.week_52_high) },
+                { label: "52W Low", value: formatCurrency(quote.week_52_low) },
+              ].map((d) => (
+                <div key={d.label} className="flex items-center justify-between py-1 border-b" style={{ borderColor: "var(--border)" }}>
+                  <span className="text-sm" style={{ color: "var(--text-secondary)" }}>{d.label}</span>
+                  <span className="text-sm font-mono font-medium" style={{ color: "var(--text-primary)" }}>{d.value}</span>
+                </div>
+              ))
+            )}
           </div>
         </div>
       </div>

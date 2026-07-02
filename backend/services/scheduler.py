@@ -14,9 +14,13 @@ async def morning_analysis_job(db, ai_func, market_func, pick_func):
     logger.info("Running morning analysis job...")
     try:
         from services.activity_logger import log_activity
+        from services.real_market import fetch_real_top_picks, fetch_real_market_overview
         log_activity("Scanning NSE top gainers", "scan", "done")
 
-        picks = pick_func(3)
+        # Use real live picks from Yahoo Finance + technical scoring
+        real_picks_result = await fetch_real_top_picks(3)
+        picks = real_picks_result.get("picks", [])
+
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         await db.market_analysis.update_one(
             {"date": today},
@@ -24,10 +28,12 @@ async def morning_analysis_job(db, ai_func, market_func, pick_func):
             upsert=True
         )
 
+        # Real market overview for morning report
+        overview = await fetch_real_market_overview()
         report = await ai_func()
         await db.market_analysis.update_one(
             {"date": today},
-            {"$set": {"morning_report": report, "overview_snapshot": market_func()}},
+            {"$set": {"morning_report": report, "overview_snapshot": overview}},
         )
 
         # Only notify users who have open trades or recently traded (personal relevance)
@@ -64,12 +70,12 @@ async def morning_analysis_job(db, ai_func, market_func, pick_func):
 
 
 async def market_scanner_job(db, ws_broadcast):
-    """Every 5 min during market hours: Scan for breakouts."""
+    """Every 5 min during market hours: Scan for breakouts using real data."""
     logger.info("Running market scanner...")
     try:
-        from market_data import get_market_overview, get_top_gainers
-        overview = get_market_overview()
-        gainers = get_top_gainers(3)
+        from services.real_market import fetch_real_market_overview, fetch_real_gainers
+        overview = await fetch_real_market_overview()
+        gainers = await fetch_real_gainers(3)
 
         # Broadcast market update via WebSocket
         if ws_broadcast:
@@ -85,19 +91,44 @@ async def market_scanner_job(db, ws_broadcast):
 
 
 async def trade_monitor_job(db, ws_broadcast):
-    """Every 60 sec during market hours: Monitor active trades with AI."""
+    """Every 60 sec during market hours: Monitor active trades with real live prices."""
     try:
-        from market_data import get_stock_quote
+        from services.real_market import fetch_real_stock_quote
         from services.portfolio_monitor import run_monitoring_cycle
         from services.whatsapp_service import send_whatsapp, is_configured as wa_configured
+        from services.activity_logger import log_activity
+
+        # Use real stock quote function with async wrapper
+        async def real_quote_func(symbol: str):
+            return await fetch_real_stock_quote(symbol)
+
+        # Sync wrapper for portfolio_monitor which expects sync function
+        import asyncio
+        quote_cache = {}
+
+        async def prefetch_quotes(symbols):
+            tasks = [fetch_real_stock_quote(s) for s in symbols]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for sym, res in zip(symbols, results):
+                if not isinstance(res, Exception) and res:
+                    quote_cache[sym] = res
+
+        # Pre-fetch all quotes for open trades
+        open_trades = await db.trades.find({"status": "OPEN"}).to_list(100)
+        symbols_needed = list({t["symbol"] for t in open_trades})
+        if symbols_needed:
+            await prefetch_quotes(symbols_needed)
+            log_activity(f"Live price check for {len(symbols_needed)} open positions", "monitor", "done")
+
+        def sync_quote_func(symbol: str):
+            return quote_cache.get(symbol)
 
         wa_func = send_whatsapp if wa_configured() else None
-        alert_count = await run_monitoring_cycle(db, get_stock_quote, wa_func)
+        alert_count = await run_monitoring_cycle(db, sync_quote_func, wa_func)
 
         # Also broadcast updates via WebSocket
-        active_trades = await db.trades.find({"status": "OPEN"}).to_list(100)
-        for trade in active_trades:
-            quote = get_stock_quote(trade["symbol"])
+        for trade in open_trades:
+            quote = quote_cache.get(trade["symbol"])
             if not quote:
                 continue
             if ws_broadcast:

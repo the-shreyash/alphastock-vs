@@ -6,7 +6,7 @@ import api from "../../services/api";
 
 export default function Navbar({ onNotificationClick, onMenuClick }) {
   const { user } = useAuth();
-  const { theme, toggleTheme } = useTheme();
+  const { theme, toggleTheme, displayMode, toggleDisplayMode } = useTheme();
   const [unreadCount, setUnreadCount] = useState(0);
 
   useEffect(() => {
@@ -42,6 +42,25 @@ export default function Navbar({ onNotificationClick, onMenuClick }) {
           <div className="w-2 h-2 rounded-full animate-pulse" style={{ background: "var(--gain)" }} />
           <span className="text-xs font-mono" style={{ color: "var(--gain)" }}>LIVE</span>
         </div>
+        
+        {/* iOS-style Segmented Mode Control */}
+        <div className="segment-control ml-2 hidden xs:inline-flex">
+          <button 
+            data-testid="mode-toggle-beginner" 
+            onClick={() => displayMode !== "beginner" && toggleDisplayMode()}
+            className={`segment-btn ${displayMode === "beginner" ? "active" : ""}`}
+          >
+            Beginner
+          </button>
+          <button 
+            data-testid="mode-toggle-advanced" 
+            onClick={() => displayMode !== "advanced" && toggleDisplayMode()}
+            className={`segment-btn ${displayMode === "advanced" ? "active" : ""}`}
+          >
+            Advanced
+          </button>
+        </div>
+
         <span className="text-xs font-mono hidden sm:block" style={{ color: "var(--text-muted)" }}>
           {new Date().toLocaleDateString("en-IN", { weekday: "short", day: "numeric", month: "short", year: "numeric" })}
         </span>
