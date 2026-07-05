@@ -35,6 +35,7 @@ from services.scheduler import setup_scheduler
 from models import (
     UserCreate, UserLogin, UserResponse, UserSettingsUpdate,
     TradeCreate, TradeResponse,
+    WatchlistAdd,
     ChatMessage, ChatResponse,
     StockAnalysisRequest, SIPRequest,
 )
@@ -227,6 +228,7 @@ sip_router = APIRouter(prefix="/api/sip", tags=["SIP"])
 chat_router = APIRouter(prefix="/api/chat", tags=["Chat"])
 paper_router = APIRouter(prefix="/api/paper", tags=["Paper Trading"])
 backtest_router = APIRouter(prefix="/api/backtest", tags=["Backtesting"])
+watchlist_router = APIRouter(prefix="/api/watchlist", tags=["Watchlist"])
 
 
 
@@ -1741,6 +1743,66 @@ async def weekly_review(user: dict = Depends(get_current_user)):
     return await generate_weekly_review(db, user["_id"], ai_review)
 
 
+# ============ WATCHLIST ROUTES ============
+
+@watchlist_router.get("")
+async def get_watchlist(user: dict = Depends(get_current_user)):
+    """Get user's watchlist enriched with live quotes."""
+    from services.real_market import fetch_all_universe_quotes
+    items = await db.watchlist.find({"user_id": user["_id"]}).sort("added_at", -1).to_list(100)
+    quotes = await fetch_all_universe_quotes()
+    quote_map = {q["symbol"]: q for q in quotes if q}
+    for item in items:
+        item["_id"] = str(item["_id"])
+        quote = quote_map.get(item["symbol"]) or get_stock_quote(item["symbol"])
+        if quote:
+            item["quote"] = {
+                "price": quote.get("price"),
+                "change_pct": quote.get("change_pct"),
+                "volume_ratio": quote.get("volume_ratio"),
+                "rsi": quote.get("rsi"),
+                "sector": quote.get("sector"),
+                "name": quote.get("name", item["symbol"]),
+            }
+            if item.get("added_price") and quote.get("price"):
+                item["since_added_pct"] = round(
+                    (quote["price"] - item["added_price"]) / item["added_price"] * 100, 2
+                )
+    return items
+
+@watchlist_router.post("")
+async def add_to_watchlist(data: WatchlistAdd, user: dict = Depends(get_current_user)):
+    """Add a stock to the watchlist. Idempotent per user+symbol."""
+    symbol = data.symbol.upper().strip()
+    if not any(s["symbol"] == symbol for s in STOCK_UNIVERSE):
+        raise HTTPException(status_code=404, detail=f"Unknown symbol: {symbol}")
+    existing = await db.watchlist.find_one({"user_id": user["_id"], "symbol": symbol})
+    if existing:
+        existing["_id"] = str(existing["_id"])
+        return existing
+    # Real quote first so added_price matches the live prices used for since-added P&L
+    from services.real_market import fetch_real_stock_quote
+    quote = await fetch_real_stock_quote(symbol) or get_stock_quote(symbol) or {}
+    doc = {
+        "user_id": user["_id"],
+        "symbol": symbol,
+        "note": data.note,
+        "added_price": quote.get("price"),
+        "added_at": datetime.now(timezone.utc).isoformat(),
+    }
+    result = await db.watchlist.insert_one(doc)
+    doc["_id"] = str(result.inserted_id)
+    return doc
+
+@watchlist_router.delete("/{symbol}")
+async def remove_from_watchlist(symbol: str, user: dict = Depends(get_current_user)):
+    """Remove a stock from the watchlist."""
+    result = await db.watchlist.delete_one({"user_id": user["_id"], "symbol": symbol.upper().strip()})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Not in watchlist")
+    return {"message": f"{symbol.upper()} removed from watchlist"}
+
+
 # ============ ENHANCED AI EXPLAIN ============
 
 @analysis_router.post("/full-report")
@@ -2012,6 +2074,7 @@ app.include_router(whatsapp_router)
 app.include_router(email_router)
 app.include_router(news_router)
 app.include_router(journal_router)
+app.include_router(watchlist_router)
 app.include_router(gemini_router)
 
 # Health check

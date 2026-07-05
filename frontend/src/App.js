@@ -20,6 +20,7 @@ import PaperTrading from "./pages/PaperTrading";
 import Backtesting from "./pages/Backtesting";
 import MorningReport from "./pages/MorningReport";
 import Markets from "./pages/Markets";
+import Watchlist from "./pages/Watchlist";
 import "./App.css";
 
 function ProtectedRoute({ children }) {
@@ -59,6 +60,7 @@ function AppRouter() {
       <Route path="/" element={<ProtectedRoute><Layout /></ProtectedRoute>}>
         <Route path="dashboard" element={<Dashboard />} />
         <Route path="markets" element={<Markets />} />
+        <Route path="watchlist" element={<Watchlist />} />
         <Route path="picks" element={<StockPicks />} />
         <Route path="stock/:symbol" element={<StockDetail />} />
         <Route path="trades" element={<TradeMonitor />} />

@@ -101,3 +101,71 @@
 #====================================================================================================
 # Testing Data - Main Agent and testing sub agent both should log testing data below this section
 #====================================================================================================
+user_problem_statement: "Build StockAssist AI — an AI-powered trading operating system per .claude/project.md. Current phase: complete missing core pages (Markets, Watchlist) on top of the platform-wide UI redesign."
+
+backend:
+  - task: "Market data endpoints (overview, gainers, losers, sectors, global, fii-dii)"
+    implemented: true
+    working: true
+    file: "backend/server.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+        - working: true
+          agent: "main"
+          comment: "Pre-existing endpoints verified against new Markets page; all six routes present."
+  - task: "Watchlist CRUD endpoints with live quote enrichment"
+    implemented: true
+    working: "NA"
+    file: "backend/server.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: true
+    status_history:
+        - working: "NA"
+          agent: "main"
+          comment: "Added GET/POST /api/watchlist and DELETE /api/watchlist/{symbol}. Per-user, idempotent add, validates symbol against STOCK_UNIVERSE, enriches with cached universe quotes and since-added performance. Routes verified to register via app import."
+
+frontend:
+  - task: "Markets page (index strip, heatmap, movers, breadth, sectors, FII/DII, global)"
+    implemented: true
+    working: "NA"
+    file: "frontend/src/pages/Markets.jsx"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: true
+    status_history:
+        - working: "NA"
+          agent: "main"
+          comment: "New page wired at /markets with sidebar link; 30s auto-refresh; production build passes."
+  - task: "Watchlist page (search-to-add, live rows, RSI, since-added, remove)"
+    implemented: true
+    working: "NA"
+    file: "frontend/src/pages/Watchlist.jsx"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: true
+    status_history:
+        - working: "NA"
+          agent: "main"
+          comment: "New page wired at /watchlist with sidebar link; debounced search over /stocks/search; empty state; production build passes."
+
+metadata:
+  created_by: "main_agent"
+  version: "1.0"
+  test_sequence: 1
+  run_ui: false
+
+test_plan:
+  current_focus:
+    - "Watchlist CRUD endpoints with live quote enrichment"
+    - "Watchlist page (search-to-add, live rows, RSI, since-added, remove)"
+    - "Markets page (index strip, heatmap, movers, breadth, sectors, FII/DII, global)"
+  stuck_tasks: []
+  test_all: false
+  test_priority: "high_first"
+
+agent_communication:
+    - agent: "main"
+      message: "Added Markets and Watchlist features end-to-end. Backend watchlist routes need integration testing with a running MongoDB; frontend pages need UI smoke testing."

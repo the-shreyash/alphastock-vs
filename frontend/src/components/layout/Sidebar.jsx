@@ -1,5 +1,5 @@
 import { NavLink, useLocation } from "react-router-dom";
-import { LayoutDashboard, Target, TrendingUp, Briefcase, MessageSquare, Calculator, Settings, LogOut, ChevronLeft, ChevronRight, Newspaper, BookOpen, X, FlaskConical, BarChart2, Sun, Search, Globe, Bell, Brain, LineChart } from "lucide-react";
+import { LayoutDashboard, Target, TrendingUp, Briefcase, MessageSquare, Calculator, Settings, LogOut, ChevronLeft, ChevronRight, Newspaper, BookOpen, X, FlaskConical, BarChart2, Sun, Search, Globe, Bell, Brain, LineChart, Eye } from "lucide-react";
 import { useAuth } from "../../context/AuthContext";
 import APLogo from "../APLogo";
 
@@ -7,6 +7,7 @@ const NAV_ITEMS = [
   { to: "/dashboard", icon: LayoutDashboard, label: "Home" },
   { to: "/picks", icon: Target, label: "Stock Scanner" },
   { to: "/markets", icon: Globe, label: "Markets" },
+  { to: "/watchlist", icon: Eye, label: "Watchlist" },
   { to: "/portfolio", icon: Briefcase, label: "Portfolio" },
   { to: "/trades", icon: TrendingUp, label: "Trading" },
   { type: "divider" },

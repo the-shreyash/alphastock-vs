@@ -97,6 +97,12 @@ class TradeResponse(BaseDocument):
     is_paper: bool = False
 
 
+# --- Watchlist Models ---
+class WatchlistAdd(BaseModel):
+    symbol: str
+    note: Optional[str] = None
+
+
 # --- Chat Models ---
 class ChatMessage(BaseModel):
     message: str
