@@ -5,7 +5,7 @@ from pathlib import Path
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env', override=True)
 
-from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Depends, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Depends, Header, WebSocket, WebSocketDisconnect, BackgroundTasks
 from pydantic import BaseModel
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -666,13 +666,43 @@ async def trade_pnl(user: dict = Depends(get_current_user)):
         "losses": losses,
     }
 
+async def _generate_coaching_background(trade_id: str):
+    """Background task: generate and cache AI coaching for a just-closed trade.
+
+    Runs *after* the close response is returned so the user is never blocked
+    waiting on the AI (see CLAUDE.md: never block a FastAPI response on AI).
+    No-op if the trade is still open or coaching was already cached.
+    """
+    try:
+        trade = await db.trades.find_one({"_id": ObjectId(trade_id)})
+        if not trade or trade.get("status") == "OPEN" or trade.get("coaching"):
+            return
+        from services.trade_journal import generate_trade_coaching
+        engine = get_debate_engine()
+
+        async def _ai(prompt):
+            return await engine.simple_chat(
+                "You are an expert trading coach for Indian stock market traders.",
+                prompt, prefer="claude", max_tokens=400,
+            )
+
+        ai_func = _ai if (claude_configured() or gemini_configured()) else None
+        coaching = await generate_trade_coaching(trade, ai_func=ai_func)
+        await db.trades.update_one({"_id": ObjectId(trade_id)}, {"$set": {"coaching": coaching}})
+        from services.activity_logger import log_activity
+        log_activity(f"AI coaching generated for {trade['symbol']} trade", "monitor", "done")
+    except Exception as e:
+        logger.error(f"Background coaching generation failed for {trade_id}: {e}")
+
+
 @trades_router.put("/{trade_id}")
-async def update_trade(trade_id: str, request: Request, user: dict = Depends(get_current_user)):
+async def update_trade(trade_id: str, request: Request, background_tasks: BackgroundTasks, user: dict = Depends(get_current_user)):
     body = await request.json()
     trade = await db.trades.find_one({"_id": ObjectId(trade_id), "user_id": user["_id"]})
     if not trade:
         raise HTTPException(status_code=404, detail="Trade not found")
 
+    was_open = trade.get("status") == "OPEN"
     update = {}
     if "exit_price" in body:
         update["exit_price"] = body["exit_price"]
@@ -704,6 +734,12 @@ async def update_trade(trade_id: str, request: Request, user: dict = Depends(get
     await db.trades.update_one({"_id": ObjectId(trade_id)}, {"$set": update})
     updated = await db.trades.find_one({"_id": ObjectId(trade_id)})
     updated["_id"] = str(updated["_id"])
+
+    # If this update just closed the trade, generate AI coaching in the
+    # background so the close response returns immediately (never block on AI).
+    if was_open and updated.get("status") != "OPEN":
+        background_tasks.add_task(_generate_coaching_background, trade_id)
+
     return updated
 
 # ─── Trade Coaching ─────────────────────────────────
@@ -752,6 +788,55 @@ async def get_trade_coaching(trade_id: str, user: dict = Depends(get_current_use
     from services.activity_logger import log_activity
     log_activity(f"AI coaching generated for {trade['symbol']} trade", "monitor", "done")
     return coaching
+
+@trades_router.get("/{trade_id}/live-tip")
+async def get_trade_live_tip(trade_id: str, user: dict = Depends(get_current_user)):
+    """Short (~40 word) live AI coaching tip for an OPEN position.
+
+    Lightweight and generated on demand — the frontend polls this every 5 min.
+    Not cached (the tip depends on the live price and should stay fresh).
+    """
+    trade = await db.trades.find_one({"_id": ObjectId(trade_id), "user_id": user["_id"]})
+    if not trade:
+        raise HTTPException(status_code=404, detail="Trade not found")
+    if trade.get("status") != "OPEN":
+        raise HTTPException(status_code=400, detail="Live tips are only available for open trades")
+
+    symbol = trade["symbol"]
+    entry = trade.get("entry_price", 0)
+    sl = trade.get("stop_loss", 0)
+    target = trade.get("target1", 0)
+    ttype = trade.get("type", "BUY")
+    current = entry
+    quote = get_stock_quote(symbol)
+    if quote:
+        current = quote["price"]
+    pnl_pct = round(((current - entry) / entry) * 100, 2) if entry else 0
+    if ttype == "SELL":
+        pnl_pct = -pnl_pct
+
+    if not (claude_configured() or gemini_configured()):
+        return {"trade_id": trade_id, "symbol": symbol, "tip": (
+            f"{symbol} is {pnl_pct:+.2f}% vs entry. Stick to the plan: respect your "
+            f"₹{sl} stop and let it work toward ₹{target}. Don't move the stop on emotion."
+        )}
+
+    prompt = (
+        f"Open NSE {ttype} position in {symbol}. Entry ₹{entry}, current ₹{current} "
+        f"({pnl_pct:+.2f}%), stop loss ₹{sl}, target ₹{target}. "
+        f"Give ONE actionable coaching tip in about 40 words on managing this trade right "
+        f"now — focus on risk, stop discipline, or booking partial profit. No preamble."
+    )
+    engine = get_debate_engine()
+    try:
+        tip = await engine.simple_chat(
+            "You are a concise, disciplined trading coach for Indian markets.",
+            prompt, prefer="claude", max_tokens=120,
+        )
+    except Exception as e:
+        logger.error(f"Live tip generation failed for {trade_id}: {e}")
+        tip = f"Stay disciplined on {symbol}: honour the ₹{sl} stop and aim for ₹{target}."
+    return {"trade_id": trade_id, "symbol": symbol, "tip": tip.strip()}
 
 
 # ============ PORTFOLIO ROUTES ============
@@ -1742,6 +1827,132 @@ async def weekly_review(user: dict = Depends(get_current_user)):
         return await ai_chat(prompt, "weekly-review", user)
     return await generate_weekly_review(db, user["_id"], ai_review)
 
+@journal_router.get("/setup-stats")
+async def setup_stats(user: dict = Depends(get_current_user)):
+    """Historical success rate per trade setup type."""
+    from services.trade_journal import get_setup_success_rates
+    return await get_setup_success_rates(db, user["_id"])
+
+
+# ============ WEBHOOK ROUTES (n8n automation) ============
+# These endpoints are called by the n8n automation service (Feature 8), NOT by
+# browser clients — so they are gated by a shared secret header instead of JWT.
+# n8n workflows (see /n8n) trigger these on a cron schedule to run the same
+# analysis jobs the in-process APScheduler runs, and each call is recorded in
+# the `webhook_logs` collection so the frontend can surface "last run" times.
+
+webhooks_router = APIRouter(prefix="/api/webhooks", tags=["Webhooks"])
+
+
+async def verify_webhook_key(x_webhook_key: Optional[str] = Header(None)) -> bool:
+    """Reject webhook calls without a valid X-Webhook-Key header.
+
+    Fails closed: if WEBHOOK_API_KEY is unset on the server, all calls are denied.
+    """
+    expected = os.environ.get("WEBHOOK_API_KEY")
+    if not expected or not x_webhook_key or not secrets.compare_digest(x_webhook_key, expected):
+        raise HTTPException(status_code=403, detail="Invalid or missing webhook API key")
+    return True
+
+
+async def _log_webhook(workflow_name: str, status: str):
+    """Record a webhook invocation for the Settings "last run" display."""
+    try:
+        await db.webhook_logs.insert_one({
+            "workflow_name": workflow_name,
+            "triggered_at": datetime.now(timezone.utc).isoformat(),
+            "status": status,
+        })
+    except Exception as e:
+        logging.error(f"Failed to log webhook '{workflow_name}': {e}")
+
+
+@webhooks_router.post("/morning-scan")
+async def webhook_morning_scan(_: bool = Depends(verify_webhook_key)):
+    """Run the morning analysis job (scan stocks, generate picks, morning report)."""
+    from services.scheduler import morning_analysis_job
+    try:
+        await morning_analysis_job(db, ai_market_summary, get_market_overview, generate_top_picks)
+        await _log_webhook("morning_scan", "success")
+        return {"status": "success", "workflow": "morning_scan"}
+    except Exception as e:
+        await _log_webhook("morning_scan", "error")
+        logging.error(f"morning-scan webhook error: {e}")
+        raise HTTPException(status_code=500, detail=f"Morning scan failed: {e}")
+
+
+@webhooks_router.post("/evening-summary")
+async def webhook_evening_summary(_: bool = Depends(verify_webhook_key)):
+    """Run the end-of-day report job (P&L, wins/losses, user notifications)."""
+    from services.scheduler import eod_report_job
+    try:
+        await eod_report_job(db)
+        await _log_webhook("evening_summary", "success")
+        return {"status": "success", "workflow": "evening_summary"}
+    except Exception as e:
+        await _log_webhook("evening_summary", "error")
+        logging.error(f"evening-summary webhook error: {e}")
+        raise HTTPException(status_code=500, detail=f"Evening summary failed: {e}")
+
+
+@webhooks_router.post("/weekly-review")
+async def webhook_weekly_review(_: bool = Depends(verify_webhook_key)):
+    """Generate an AI weekly performance review for every user and notify them."""
+    from services.trade_journal import generate_weekly_review
+    try:
+        users = await db.users.find({}, {"_id": 1, "capital": 1, "risk_level": 1}).to_list(1000)
+        reviewed = 0
+        for u in users:
+            uid = str(u["_id"])
+            async def ai_review(prompt, _ctx=u):
+                return await ai_chat(prompt, "weekly-review", _ctx)
+            result = await generate_weekly_review(db, uid, ai_review)
+            await db.notifications.insert_one({
+                "user_id": uid,
+                "type": "WEEKLY_REVIEW",
+                "title": "Weekly Performance Review",
+                "message": result.get("review", "Your weekly trading review is ready."),
+                "read": False,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            })
+            reviewed += 1
+        await _log_webhook("weekly_review", "success")
+        return {"status": "success", "workflow": "weekly_review", "users_reviewed": reviewed}
+    except Exception as e:
+        await _log_webhook("weekly_review", "error")
+        logging.error(f"weekly-review webhook error: {e}")
+        raise HTTPException(status_code=500, detail=f"Weekly review failed: {e}")
+
+
+@webhooks_router.post("/news-digest")
+async def webhook_news_digest(_: bool = Depends(verify_webhook_key)):
+    """Force-refresh the market news cache to build a fresh digest."""
+    from services.news_service import fetch_news
+    try:
+        articles = await fetch_news(force=True)
+        await _log_webhook("news_digest", "success")
+        return {"status": "success", "workflow": "news_digest", "articles": len(articles)}
+    except Exception as e:
+        await _log_webhook("news_digest", "error")
+        logging.error(f"news-digest webhook error: {e}")
+        raise HTTPException(status_code=500, detail=f"News digest failed: {e}")
+
+
+@webhooks_router.get("/logs")
+async def webhook_logs(user: dict = Depends(get_current_user)):
+    """Most recent run per workflow — powers the n8n Automation panel in Settings."""
+    pipeline = [
+        {"$sort": {"triggered_at": -1}},
+        {"$group": {
+            "_id": "$workflow_name",
+            "workflow_name": {"$first": "$workflow_name"},
+            "triggered_at": {"$first": "$triggered_at"},
+            "status": {"$first": "$status"},
+        }},
+    ]
+    logs = await db.webhook_logs.aggregate(pipeline).to_list(50)
+    return {log["workflow_name"]: {"triggered_at": log["triggered_at"], "status": log["status"]} for log in logs}
+
 
 # ============ WATCHLIST ROUTES ============
 
@@ -2074,6 +2285,7 @@ app.include_router(whatsapp_router)
 app.include_router(email_router)
 app.include_router(news_router)
 app.include_router(journal_router)
+app.include_router(webhooks_router)
 app.include_router(watchlist_router)
 app.include_router(gemini_router)
 

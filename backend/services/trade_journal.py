@@ -69,6 +69,69 @@ async def get_performance_stats(db, user_id, days=7):
     }
 
 
+def _demo_setup_success_rates():
+    """Realistic demo/fallback data for users with no closed-trade history yet.
+
+    Deterministic so the chart stays stable across refreshes. Covers the full
+    win-rate colour range (green >60, amber 40-60, red <40) for a good preview.
+    """
+    setups = [
+        {"setup_type": "Bull Flag Breakout", "total_trades": 14, "winning_trades": 10,
+         "avg_pnl_percent": 3.4, "best_trade_pnl": 8420.0, "worst_trade_pnl": -1950.0},
+        {"setup_type": "Cup & Handle", "total_trades": 9, "winning_trades": 6,
+         "avg_pnl_percent": 2.1, "best_trade_pnl": 5100.0, "worst_trade_pnl": -2300.0},
+        {"setup_type": "VWAP Crossover", "total_trades": 11, "winning_trades": 5,
+         "avg_pnl_percent": 0.4, "best_trade_pnl": 3600.0, "worst_trade_pnl": -3100.0},
+        {"setup_type": "Reversal / Double Bottom", "total_trades": 7, "winning_trades": 2,
+         "avg_pnl_percent": -1.2, "best_trade_pnl": 2400.0, "worst_trade_pnl": -4200.0},
+    ]
+    for s in setups:
+        s["win_rate"] = round(s["winning_trades"] / s["total_trades"] * 100, 1)
+    return {"setups": setups, "is_demo": True}
+
+
+async def get_setup_success_rates(db, user_id):
+    """Historical success rate grouped by trade setup type.
+
+    Returns per-setup stats (total_trades, winning_trades, win_rate %,
+    avg_pnl_percent, best_trade_pnl, worst_trade_pnl). Falls back to demo
+    data when the user has no closed trades or no setup_type tagging yet.
+    """
+    all_trades = await db.trades.find({"user_id": user_id}).to_list(500)
+    closed = [t for t in all_trades if t.get("status") != "OPEN"]
+
+    # Group closed trades by setup_type (skip trades without a setup tag).
+    groups = {}
+    for t in closed:
+        setup = t.get("setup_type")
+        if not setup:
+            continue
+        groups.setdefault(setup, []).append(t)
+
+    if not groups:
+        return _demo_setup_success_rates()
+
+    setups = []
+    for setup_type, trades_list in groups.items():
+        pnls = [t.get("pnl") if t.get("pnl") is not None else 0 for t in trades_list]
+        pnl_pcts = [t.get("pnl_percent") if t.get("pnl_percent") is not None else 0 for t in trades_list]
+        wins = [p for p in pnls if p > 0]
+        total = len(trades_list)
+        setups.append({
+            "setup_type": setup_type,
+            "total_trades": total,
+            "winning_trades": len(wins),
+            "win_rate": round(len(wins) / total * 100, 1) if total else 0,
+            "avg_pnl_percent": round(sum(pnl_pcts) / total, 2) if total else 0,
+            "best_trade_pnl": round(max(pnls), 2) if pnls else 0,
+            "worst_trade_pnl": round(min(pnls), 2) if pnls else 0,
+        })
+
+    # Most-traded setups first.
+    setups.sort(key=lambda s: s["total_trades"], reverse=True)
+    return {"setups": setups, "is_demo": False}
+
+
 async def generate_weekly_review(db, user_id, ai_func=None):
     """Generate AI weekly performance review."""
     stats = await get_performance_stats(db, user_id, days=7)

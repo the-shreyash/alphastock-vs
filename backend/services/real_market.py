@@ -103,6 +103,7 @@ async def fetch_yahoo_quote(symbol: str, range_str: str = "2d"):
             highs = [h for h in indicators.get("high", []) if h is not None]
             lows = [l for l in indicators.get("low", []) if l is not None]
             volumes = [v for v in indicators.get("volume", []) if v is not None]
+            raw_timestamps = result[0].get("timestamp", []) or []
 
             quote = {
                 "price": round(price, 2),
@@ -121,6 +122,8 @@ async def fetch_yahoo_quote(symbol: str, range_str: str = "2d"):
                 "historical_volumes": volumes,
                 "historical_highs": highs,
                 "historical_lows": lows,
+                "historical_opens": opens,
+                "historical_timestamps": raw_timestamps,
             }
             _set_cache(cache_key, quote)
             return quote
@@ -277,6 +280,17 @@ def _lower_wick(o, c, l):
     return min(o, c) - l
 
 
+def _timestamp_for_index(idx, timestamps):
+    """Map a candle_index to an ISO date string using the aligned Yahoo timestamp list.
+    Returns '' if the index is out of range or conversion fails."""
+    if not isinstance(idx, int) or idx < 0 or idx >= len(timestamps):
+        return ""
+    try:
+        return datetime.fromtimestamp(timestamps[idx], tz=timezone.utc).strftime("%Y-%m-%d")
+    except (ValueError, OSError, TypeError, OverflowError):
+        return ""
+
+
 def detect_bullish_engulfing(opens, highs, lows, closes):
     """Detect Bullish Engulfing: small red candle followed by large green candle."""
     detected = []
@@ -286,11 +300,10 @@ def detect_bullish_engulfing(opens, highs, lows, closes):
         if prev_c < prev_o and curr_c > curr_o:        # prev red, curr green
             if curr_o <= prev_c and curr_c >= prev_o:  # body engulfs
                 detected.append({
-                    "index": i,
                     "pattern": "Bullish Engulfing",
+                    "candle_index": i,
                     "signal": "bullish",
-                    "strength": "strong",
-                    "price": closes[i],
+                    "confidence": 0.85,
                     "description": "A small bearish candle is completely engulfed by a larger bullish candle — buyers have taken control.",
                 })
     return detected[-1:] if detected else []
@@ -305,11 +318,10 @@ def detect_bearish_engulfing(opens, highs, lows, closes):
         if prev_c > prev_o and curr_c < curr_o:        # prev green, curr red
             if curr_o >= prev_c and curr_c <= prev_o:  # body engulfs
                 detected.append({
-                    "index": i,
                     "pattern": "Bearish Engulfing",
+                    "candle_index": i,
                     "signal": "bearish",
-                    "strength": "strong",
-                    "price": closes[i],
+                    "confidence": 0.85,
                     "description": "A small bullish candle is completely engulfed by a larger bearish candle — sellers have taken control.",
                 })
     return detected[-1:] if detected else []
@@ -324,12 +336,61 @@ def detect_doji(opens, highs, lows, closes):
         total_range = h - l
         if total_range > 0 and body / total_range < 0.1:
             detected.append({
-                "index": i,
                 "pattern": "Doji",
+                "candle_index": i,
                 "signal": "neutral",
-                "strength": "moderate",
-                "price": closes[i],
+                "confidence": 0.6,
                 "description": "Open and close are nearly equal, signalling indecision. Watch the next candle for direction.",
+            })
+    return detected[-1:] if detected else []
+
+
+def detect_hammer(opens, highs, lows, closes):
+    """Detect Hammer: small body near the top of the range with a long lower wick
+    (>= 2x the body) appearing after a downtrend — bullish reversal signal."""
+    detected = []
+    for i in range(3, len(closes)):
+        o, h, l, c = opens[i], highs[i], lows[i], closes[i]
+        body = _body_size(o, c)
+        total_range = h - l
+        if body == 0 or total_range == 0:
+            continue
+        lower = _lower_wick(o, c, l)
+        upper = _upper_wick(o, c, h)
+        prior_downtrend = closes[i-1] < closes[i-3]        # price fell into the candle
+        if lower >= 2 * body and upper <= body and prior_downtrend:
+            confidence = round(min(0.9, 0.5 + 0.1 * (lower / body)), 2)
+            detected.append({
+                "pattern": "Hammer",
+                "candle_index": i,
+                "signal": "bullish",
+                "confidence": confidence,
+                "description": "A small body near the top of the range with a long lower wick after a downtrend — buyers rejected lower prices, hinting at a bullish reversal.",
+            })
+    return detected[-1:] if detected else []
+
+
+def detect_shooting_star(opens, highs, lows, closes):
+    """Detect Shooting Star: small body near the bottom of the range with a long upper wick
+    (>= 2x the body) appearing after an uptrend — bearish reversal signal."""
+    detected = []
+    for i in range(3, len(closes)):
+        o, h, l, c = opens[i], highs[i], lows[i], closes[i]
+        body = _body_size(o, c)
+        total_range = h - l
+        if body == 0 or total_range == 0:
+            continue
+        upper = _upper_wick(o, c, h)
+        lower = _lower_wick(o, c, l)
+        prior_uptrend = closes[i-1] > closes[i-3]          # price rose into the candle
+        if upper >= 2 * body and lower <= body and prior_uptrend:
+            confidence = round(min(0.9, 0.5 + 0.1 * (upper / body)), 2)
+            detected.append({
+                "pattern": "Shooting Star",
+                "candle_index": i,
+                "signal": "bearish",
+                "confidence": confidence,
+                "description": "A small body near the bottom of the range with a long upper wick after an uptrend — sellers rejected higher prices, hinting at a bearish reversal.",
             })
     return detected[-1:] if detected else []
 
@@ -345,11 +406,10 @@ def detect_double_top(closes, window=20):
     trough = min(recent[peak1_idx:peak2_idx+1]) if peak1_idx < peak2_idx else 0
     if abs(peak1 - peak2) / ((peak1 + peak2) / 2) < 0.03 and (peak1 - trough) / peak1 > 0.02:
         return [{
-            "index": len(closes) - 1,
             "pattern": "Double Top",
+            "candle_index": len(closes) - 1,
             "signal": "bearish",
-            "strength": "strong",
-            "price": closes[-1],
+            "confidence": 0.8,
             "description": "Two peaks at similar price level — strong reversal pattern indicating potential downtrend.",
         }]
     return []
@@ -366,11 +426,10 @@ def detect_double_bottom(closes, window=20):
     peak = max(recent[low1_idx:low2_idx+1]) if low1_idx < low2_idx else 0
     if abs(low1 - low2) / ((low1 + low2) / 2) < 0.03 and (peak - low1) / peak > 0.02:
         return [{
-            "index": len(closes) - 1,
             "pattern": "Double Bottom",
+            "candle_index": len(closes) - 1,
             "signal": "bullish",
-            "strength": "strong",
-            "price": closes[-1],
+            "confidence": 0.8,
             "description": "Two troughs at similar price level — strong reversal pattern indicating potential uptrend.",
         }]
     return []
@@ -387,11 +446,10 @@ def detect_head_and_shoulders(closes, window=30):
     right = max(seg[3*q:])
     if head > left and head > right and abs(left - right) / head < 0.05:
         return [{
-            "index": len(closes) - 1,
             "pattern": "Head & Shoulders",
+            "candle_index": len(closes) - 1,
             "signal": "bearish",
-            "strength": "strong",
-            "price": closes[-1],
+            "confidence": 0.85,
             "description": "Classic reversal pattern: left shoulder, head, right shoulder. Signals potential end of uptrend.",
         }]
     return []
@@ -413,20 +471,18 @@ def detect_triangle_breakout(closes, highs, lows, window=15):
         breakout_dn = last_close < recent_l[-2]
         if breakout_up:
             return [{
-                "index": len(closes) - 1,
                 "pattern": "Triangle Breakout ↑",
+                "candle_index": len(closes) - 1,
                 "signal": "bullish",
-                "strength": "moderate",
-                "price": closes[-1],
+                "confidence": 0.65,
                 "description": "Price broke above a converging triangle — bullish breakout with potential upward momentum.",
             }]
         if breakout_dn:
             return [{
-                "index": len(closes) - 1,
                 "pattern": "Triangle Breakout ↓",
+                "candle_index": len(closes) - 1,
                 "signal": "bearish",
-                "strength": "moderate",
-                "price": closes[-1],
+                "confidence": 0.65,
                 "description": "Price broke below a converging triangle — bearish breakout with potential downward momentum.",
             }]
     return []
@@ -450,6 +506,7 @@ async def detect_chart_patterns(symbol: str) -> dict:
     highs  = data.get("historical_highs",  [])
     lows   = data.get("historical_lows",   [])
     closes = data.get("historical_closes", [])
+    timestamps = data.get("historical_timestamps", []) or []
 
     # Yahoo Finance doesn't always return opens in basic quote — fallback gracefully
     if not opens:
@@ -461,12 +518,17 @@ async def detect_chart_patterns(symbol: str) -> dict:
     highs  = highs[-min_len:]
     lows   = lows[-min_len:]
     closes = closes[-min_len:]
+    # Align timestamps to the same trimmed window so candle_index maps correctly
+    timestamps = timestamps[-min_len:] if len(timestamps) >= min_len else timestamps
 
     all_patterns = []
     if min_len >= 2:
         all_patterns += detect_bullish_engulfing(opens, highs, lows, closes)
         all_patterns += detect_bearish_engulfing(opens, highs, lows, closes)
         all_patterns += detect_doji(opens, highs, lows, closes)
+    if min_len >= 4:
+        all_patterns += detect_hammer(opens, highs, lows, closes)
+        all_patterns += detect_shooting_star(opens, highs, lows, closes)
     if min_len >= 20:
         all_patterns += detect_double_top(closes)
         all_patterns += detect_double_bottom(closes)
@@ -482,6 +544,11 @@ async def detect_chart_patterns(symbol: str) -> dict:
         if p["pattern"] not in seen:
             seen.add(p["pattern"])
             unique.insert(0, p)
+
+    # Resolve a human-readable timestamp for each pattern by its candle_index
+    for p in unique:
+        idx = p.get("candle_index")
+        p["timestamp"] = _timestamp_for_index(idx, timestamps)
 
     bullish_count = sum(1 for p in unique if p["signal"] == "bullish")
     bearish_count = sum(1 for p in unique if p["signal"] == "bearish")
@@ -807,6 +874,10 @@ async def fetch_real_top_picks(count=3):
             "rsi": rsi,
             "volume_ratio": volume_ratio,
             "pattern": patterns_list[0]["pattern"] if patterns_list else "Momentum Play",
+            "patterns": [
+                {"pattern": p["pattern"], "signal": p["signal"]}
+                for p in patterns_list[:2]
+            ],
             "sector_change": 1.2, # approximate placeholder
             "risk_level": "LOW" if confidence > 82 else ("MEDIUM" if confidence > 72 else "HIGH"),
             "reasons": reasons if len(reasons) >= 2 else reasons + [f"Price action is above key support level", f"Consolidating near recent highs"],

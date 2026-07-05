@@ -2,7 +2,7 @@ import { useState, useEffect } from "react";
 import { useSearchParams } from "react-router-dom";
 import api from "../services/api";
 import { useAuth } from "../context/AuthContext";
-import { Save, User, Shield, ShieldAlert, Bell, Link2, ExternalLink, Database, Check, X, Wifi, MessageSquare, Mail } from "lucide-react";
+import { Save, User, Shield, ShieldAlert, Bell, Link2, ExternalLink, Database, Check, X, Wifi, MessageSquare, Mail, Workflow, Clock } from "lucide-react";
 
 export default function SettingsPage() {
   const { user, checkAuth } = useAuth();
@@ -16,6 +16,7 @@ export default function SettingsPage() {
   const [zerodhaStatus, setZerodhaStatus] = useState(null);
   const [dataSources, setDataSources] = useState(null);
   const [zerodhaMessage, setZerodhaMessage] = useState(null);
+  const [webhookLogs, setWebhookLogs] = useState(null);
 
   useEffect(() => {
     if (user) {
@@ -33,6 +34,7 @@ export default function SettingsPage() {
     }
     api.get("/zerodha/status").then(({ data }) => setZerodhaStatus(data)).catch(() => {});
     api.get("/data-sources").then(({ data }) => setDataSources(data)).catch(() => {});
+    api.get("/webhooks/logs").then(({ data }) => setWebhookLogs(data)).catch(() => {});
 
     // Handle Zerodha redirect callback
     const zerodhaParam = searchParams.get("zerodha");
@@ -257,6 +259,48 @@ export default function SettingsPage() {
             ))}
           </div>
         )}
+      </div>
+
+      {/* n8n Automation */}
+      <div data-testid="n8n-automation-panel" className="glass-card p-5">
+        <h3 className="text-xs font-bold uppercase tracking-[0.15em] flex items-center gap-2 mb-1" style={{ color: "var(--text-muted)" }}>
+          <Workflow size={12} /> n8n Automation
+        </h3>
+        <p className="text-xs mb-3" style={{ color: "var(--text-secondary)" }}>
+          Scheduled workflows that trigger market scans, summaries, and digests via n8n. Shows the last run of each webhook.
+        </p>
+        <div className="space-y-2">
+          {[
+            { key: "morning_scan", label: "Morning Scan", schedule: "08:55 IST · Mon–Fri" },
+            { key: "evening_summary", label: "Evening Summary", schedule: "15:35 IST · Mon–Fri" },
+            { key: "weekly_review", label: "Weekly Review", schedule: "Sun 10:00 IST" },
+            { key: "news_digest", label: "News Digest", schedule: "09:30 & 13:00 IST · Mon–Fri" },
+          ].map((wf) => {
+            const log = webhookLogs?.[wf.key];
+            const lastRun = log ? new Date(log.triggered_at).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" }) : null;
+            const ok = log?.status === "success";
+            return (
+              <div key={wf.key} data-testid={`n8n-workflow-${wf.key}`} className="flex items-center justify-between gap-3 py-1.5 border-b last:border-0" style={{ borderColor: "var(--border)" }}>
+                <div className="min-w-0">
+                  <span className="text-sm block" style={{ color: "var(--text-secondary)" }}>{wf.label}</span>
+                  <span className="text-[10px]" style={{ color: "var(--text-muted)" }}>{wf.schedule}</span>
+                </div>
+                <div className="flex items-center gap-2 shrink-0">
+                  <span className="text-[10px] font-mono flex items-center gap-1" style={{ color: "var(--text-muted)" }}>
+                    <Clock size={10} /> {lastRun || "Never run"}
+                  </span>
+                  <span className="text-[10px] font-mono px-2 py-0.5 rounded-lg"
+                    style={{
+                      background: log ? (ok ? "rgba(16,185,129,0.08)" : "rgba(244,63,94,0.08)") : "var(--bg-surface)",
+                      color: log ? (ok ? "var(--gain)" : "var(--loss)") : "var(--text-muted)",
+                    }}>
+                    {log ? (ok ? "OK" : "ERROR") : "IDLE"}
+                  </span>
+                </div>
+              </div>
+            );
+          })}
+        </div>
       </div>
 
       {/* Emergency Controls */}

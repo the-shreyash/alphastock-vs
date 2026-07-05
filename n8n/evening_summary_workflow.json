@@ -1,0 +1,74 @@
+{
+  "name": "AlphaPartner — Evening Summary",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "35 15 * * 1-5"
+            }
+          ]
+        }
+      },
+      "id": "a1b2c3d4-0002-4a00-8000-000000000001",
+      "name": "Schedule 15:35 IST Mon-Fri",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        400,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://backend:8000/api/webhooks/evening-summary",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Webhook-Key",
+              "value": "={{ $env.WEBHOOK_API_KEY }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "a1b2c3d4-0002-4a00-8000-000000000002",
+      "name": "POST /api/webhooks/evening-summary",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        680,
+        300
+      ]
+    }
+  ],
+  "connections": {
+    "Schedule 15:35 IST Mon-Fri": {
+      "main": [
+        [
+          {
+            "node": "POST /api/webhooks/evening-summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Kolkata"
+  },
+  "pinData": {},
+  "meta": {},
+  "tags": [
+    {
+      "name": "alphapartner"
+    }
+  ]
+}

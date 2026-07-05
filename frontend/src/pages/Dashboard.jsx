@@ -3,7 +3,7 @@ import { Link } from "react-router-dom";
 import api from "../services/api";
 import { formatCurrency, formatNumber, formatPercent } from "../utils/formatters";
 import { useWebSocket } from "../hooks/useWebSocket";
-import { TrendingUp, TrendingDown, Activity, BarChart3, ArrowUpRight, ArrowDownRight, Zap, Brain, RefreshCw, Wifi, WifiOff, ChevronRight, Eye } from "lucide-react";
+import { TrendingUp, TrendingDown, Activity, BarChart3, ArrowUpRight, ArrowDownRight, Zap, Brain, RefreshCw, Wifi, WifiOff, ChevronRight, Eye, GraduationCap } from "lucide-react";
 import { useAuth } from "../context/AuthContext";
 import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer } from "recharts";
 
@@ -26,9 +26,21 @@ function StatCard({ label, value, change, changePct, testId }) {
 }
 
 /* ====== AI Activity Feed ====== */
+// Never-empty fallback: shown only until the first fetch/websocket message resolves.
+const AI_ACTIVITY_PLACEHOLDERS = [
+  { category: "scan", action: "Scanning NSE universe for momentum setups", time: "now", status: "running" },
+  { category: "news", action: "Parsing latest market headlines", time: "1m", status: "done" },
+  { category: "rank", action: "Ranking today's high-conviction picks", time: "3m", status: "done" },
+  { category: "monitor", action: "Monitoring open positions for P&L shifts", time: "5m", status: "done" },
+  { category: "alert", action: "Watching for breakout & stop-loss triggers", time: "8m", status: "done" },
+];
+
 function AIActivityFeed({ activities }) {
   const containerRef = useRef(null);
   useEffect(() => { if (containerRef.current) containerRef.current.scrollTop = 0; }, [activities]);
+
+  // Fall back to placeholders so the panel is never blank before data arrives.
+  const items = (activities && activities.length > 0) ? activities : AI_ACTIVITY_PLACEHOLDERS;
 
   const getCatColor = (cat) => {
     switch (cat?.toLowerCase()) {
@@ -50,7 +62,7 @@ function AIActivityFeed({ activities }) {
         <span className="badge-live text-[9px]">LIVE</span>
       </div>
       <div ref={containerRef} className="space-y-1 max-h-52 overflow-y-auto pr-1">
-        {activities?.slice(0, 8).map((a, i) => (
+        {items.slice(0, 20).map((a, i) => (
           <div key={i} className="flex items-center gap-2.5 px-2 py-2 rounded-lg transition-all" style={{ borderBottom: "1px solid var(--border-subtle)" }}>
             <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${a.status === "running" ? "animate-pulse" : ""}`}
               style={{ background: getCatColor(a.category) }} />
@@ -62,6 +74,56 @@ function AIActivityFeed({ activities }) {
       <Link to="/assistant" className="flex items-center justify-center gap-1 mt-3 text-[11px] font-semibold transition-all hover:opacity-80" style={{ color: "var(--ai-accent)" }}>
         View all <ChevronRight size={12} />
       </Link>
+    </div>
+  );
+}
+
+/* ====== Latest AI Lessons ====== */
+function LatestLessonsCard({ lessons, loading: lLoading }) {
+  const gradeStyle = (g) => {
+    const grade = (g || "").toUpperCase();
+    if (grade === "A" || grade === "B") return { color: "var(--gain)", bg: "var(--gain-bg)" };
+    if (grade === "C") return { color: "#F59E0B", bg: "rgba(245, 158, 11, 0.1)" };
+    return { color: "var(--loss)", bg: "var(--loss-bg)" };
+  };
+  return (
+    <div data-testid="latest-lessons-card" className="glass-card p-5">
+      <div className="flex items-center justify-between mb-4">
+        <h3 className="text-[11px] font-bold uppercase tracking-[0.12em] flex items-center gap-2" style={{ color: "var(--text-muted)" }}>
+          <GraduationCap size={13} /> Latest AI Lessons
+        </h3>
+      </div>
+      {lLoading ? (
+        <div className="space-y-2">
+          {[1, 2, 3].map((i) => <div key={i} className="h-12 rounded-xl skeleton" />)}
+        </div>
+      ) : !lessons?.length ? (
+        <p className="text-[12px] py-6 text-center" style={{ color: "var(--text-muted)" }}>
+          Close a trade to earn your first AI coaching lesson.
+        </p>
+      ) : (
+        <>
+          <div className="space-y-2">
+            {lessons.slice(0, 3).map((l, i) => {
+              const gs = gradeStyle(l.grade);
+              return (
+                <div key={l.trade_id || i} data-testid="lesson-item" className="flex items-center gap-3 p-2.5 rounded-xl" style={{ background: "var(--hover)" }}>
+                  <div className="w-8 h-8 rounded-lg flex items-center justify-center text-sm font-bold font-mono shrink-0" style={{ background: gs.bg, color: gs.color }}>
+                    {(l.grade || "–").toUpperCase()}
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <span className="text-[13px] font-semibold block truncate" style={{ color: "var(--text-primary)" }}>{l.lesson_title || "Trade lesson"}</span>
+                    <span className="text-[10px] font-mono" style={{ color: "var(--text-muted)" }}>{l.symbol}</span>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+          <Link to="/journal" className="flex items-center justify-center gap-1 mt-3 text-[11px] font-semibold transition-all hover:opacity-80" style={{ color: "var(--ai-accent)" }}>
+            View trade journal <ChevronRight size={12} />
+          </Link>
+        </>
+      )}
     </div>
   );
 }
@@ -231,9 +293,11 @@ export default function Dashboard() {
   const [picks, setPicks] = useState([]);
   const [morningReport, setMorningReport] = useState(null);
   const [portfolioSummary, setPortfolioSummary] = useState(null);
+  const [lessons, setLessons] = useState([]);
   const [loading, setLoading] = useState(true);
   const [reportLoading, setReportLoading] = useState(true);
   const [picksLoading, setPicksLoading] = useState(true);
+  const [lessonsLoading, setLessonsLoading] = useState(true);
 
   useEffect(() => { if (marketData) setOverview(marketData); }, [marketData]);
 
@@ -281,7 +345,12 @@ export default function Dashboard() {
       try { const { data } = await api.get("/portfolio/summary"); setPortfolioSummary(data); }
       catch { setPortfolioSummary(null); }
     };
-    fetchAll(); fetchReport(); fetchPicks(); fetchPortfolio();
+    const fetchLessons = async () => {
+      try { const { data } = await api.get("/trades/coaching/summary"); setLessons(data || []); }
+      catch { setLessons([]); }
+      finally { setLessonsLoading(false); }
+    };
+    fetchAll(); fetchReport(); fetchPicks(); fetchPortfolio(); fetchLessons();
     const i = setInterval(() => fetchAll(), 30000);
     return () => clearInterval(i);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -341,11 +410,14 @@ export default function Dashboard() {
       {/* Portfolio Summary */}
       <PortfolioSummaryCard summary={portfolioSummary} />
 
-      {/* Two Column: AI Activity + Market Breadth */}
+      {/* Two Column: AI Activity + Latest AI Lessons */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         <AIActivityFeed activities={activities} />
-        <MarketBreadth overview={overview} />
+        <LatestLessonsCard lessons={lessons} loading={lessonsLoading} />
       </div>
+
+      {/* Market Breadth */}
+      <MarketBreadth overview={overview} />
 
       {/* Sector Performance */}
       <SectorPerformance sectors={sectors} />

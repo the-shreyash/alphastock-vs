@@ -3,7 +3,8 @@ import { useNavigate } from "react-router-dom";
 import api from "../services/api";
 import { formatCurrency, formatPercent } from "../utils/formatters";
 
-import { Target, Shield, TrendingUp, AlertTriangle, Brain, RefreshCw, ChevronDown, ChevronUp, Info } from "lucide-react";
+import { Target, Shield, TrendingUp, AlertTriangle, Brain, RefreshCw, ChevronDown, ChevronUp, Info, BarChart3 } from "lucide-react";
+import { BarChart, Bar, Cell, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts";
 
 function ConfidenceBadge({ value }) {
   const color = value >= 80 ? "var(--gain)" : value >= 70 ? "#F59E0B" : "var(--loss)";
@@ -13,6 +14,133 @@ function ConfidenceBadge({ value }) {
 function RiskBadge({ level }) {
   const c = level === "LOW" ? "var(--gain)" : level === "MEDIUM" ? "#F59E0B" : "var(--loss)";
   return <span className="px-2 py-0.5 rounded-lg text-[10px] font-mono font-semibold uppercase" style={{ background: `${c}15`, color: c }}>{level}</span>;
+}
+
+// ─── Pattern badges (green=bullish, red=bearish, gray=neutral) ───
+const PATTERN_SIGNAL_STYLE = {
+  bullish: { color: "var(--gain)", bg: "rgba(52,211,153,0.12)" },
+  bearish: { color: "var(--loss)", bg: "rgba(248,113,113,0.12)" },
+  neutral: { color: "var(--text-secondary)", bg: "rgba(148,163,184,0.12)" },
+};
+
+function inferPatternSignal(name = "") {
+  const n = name.toLowerCase();
+  if (/bear|shooting star|double top|head\s*&\s*shoulders|breakdown|↓/.test(n)) return "bearish";
+  if (/doji|indecision|neutral/.test(n)) return "neutral";
+  return "bullish";
+}
+
+function PatternBadges({ pick }) {
+  // Prefer the server-provided pattern list (carries an explicit signal);
+  // fall back to the single `pattern` string with an inferred signal.
+  let items = [];
+  if (Array.isArray(pick.patterns) && pick.patterns.length > 0) {
+    items = pick.patterns.slice(0, 2).map((p) => ({
+      pattern: p.pattern,
+      signal: p.signal || inferPatternSignal(p.pattern),
+    }));
+  } else if (pick.pattern) {
+    items = [{ pattern: pick.pattern, signal: inferPatternSignal(pick.pattern) }];
+  }
+  if (items.length === 0) return null;
+  return (
+    <div className="flex items-center gap-1.5 flex-wrap">
+      {items.map((it, i) => {
+        const s = PATTERN_SIGNAL_STYLE[it.signal] || PATTERN_SIGNAL_STYLE.neutral;
+        return (
+          <span
+            key={`${it.pattern}-${i}`}
+            data-testid={`pick-pattern-${pick.symbol}-${i}`}
+            className="text-[10px] font-semibold font-mono px-2 py-0.5 rounded-full"
+            style={{ background: s.bg, color: s.color }}
+          >
+            {it.pattern}
+          </span>
+        );
+      })}
+    </div>
+  );
+}
+
+// ─── Setup Performance History ───
+// Win-rate colour bands: green >60%, amber 40-60%, red <40% (matches ConfidenceBadge convention)
+function setupWinRateColor(rate) {
+  if (rate > 60) return "var(--gain)";
+  if (rate >= 40) return "#F59E0B";
+  return "var(--loss)";
+}
+
+function SetupTooltip({ active, payload }) {
+  if (!active || !payload?.length) return null;
+  const d = payload[0].payload;
+  const avg = d.avg_pnl_percent ?? 0;
+  return (
+    <div className="px-3 py-2 rounded-xl text-xs shadow-xl" style={{ background: "var(--bg-surface)", border: "1px solid var(--border)" }}>
+      <p className="font-semibold mb-0.5" style={{ color: "var(--text-primary)" }}>{d.setup_type}</p>
+      <p className="font-mono" style={{ color: "var(--text-secondary)" }}>
+        {d.total_trades} trades | {d.win_rate}% win | avg {avg >= 0 ? "+" : ""}{avg}%
+      </p>
+    </div>
+  );
+}
+
+function SetupPerformanceHistory() {
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      try {
+        const { data } = await api.get("/journal/setup-stats");
+        if (alive) setData(data);
+      } catch (err) {
+        console.error("Setup stats error:", err);
+      } finally {
+        if (alive) setLoading(false);
+      }
+    })();
+    return () => { alive = false; };
+  }, []);
+
+  const setups = data?.setups || [];
+
+  return (
+    <div data-testid="setup-performance-history" className="glass-card p-5">
+      <div className="flex items-center justify-between mb-4">
+        <h3 className="text-xs font-bold uppercase tracking-widest flex items-center gap-1.5" style={{ color: "var(--text-muted)" }}>
+          <BarChart3 size={12} /> Setup Performance History
+        </h3>
+        {data?.is_demo && (
+          <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full" style={{ background: "var(--ai-accent-soft)", color: "var(--ai-accent)" }}>
+            Sample Data
+          </span>
+        )}
+      </div>
+
+      {loading ? (
+        <div className="h-56 rounded-xl skeleton" />
+      ) : setups.length === 0 ? (
+        <p className="text-xs py-8 text-center" style={{ color: "var(--text-muted)" }}>No setup history yet — close some tagged trades to see win rates.</p>
+      ) : (
+        <ResponsiveContainer width="100%" height={240}>
+          <BarChart data={setups} margin={{ top: 8, right: 10, left: 0, bottom: 5 }}>
+            <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" vertical={false} />
+            <XAxis dataKey="setup_type" tick={{ fontSize: 10, fill: "var(--text-muted)" }} tickLine={false}
+              axisLine={{ stroke: "var(--border)" }} interval={0} height={50} angle={-15} textAnchor="end" />
+            <YAxis tick={{ fontSize: 10, fill: "var(--text-muted)" }} tickLine={false} axisLine={false}
+              domain={[0, 100]} tickFormatter={v => `${v}%`} />
+            <Tooltip content={<SetupTooltip />} cursor={{ fill: "var(--hover)" }} />
+            <Bar dataKey="win_rate" radius={[4, 4, 0, 0]} maxBarSize={56}>
+              {setups.map((s, i) => (
+                <Cell key={i} fill={setupWinRateColor(s.win_rate)} />
+              ))}
+            </Bar>
+          </BarChart>
+        </ResponsiveContainer>
+      )}
+    </div>
+  );
 }
 
 function PickCard({ pick, onExplain, explaining, onTrade }) {
@@ -61,7 +189,7 @@ function PickCard({ pick, onExplain, explaining, onTrade }) {
         <div className="flex items-center gap-4 mt-3">
           <RiskBadge level={pick.risk_level} />
           <span className="text-xs text-muted font-mono">R:R {pick.risk_reward}</span>
-          <span className="text-xs text-muted font-mono">{pick.pattern}</span>
+          <PatternBadges pick={pick} />
           <span className="text-xs text-muted font-mono">Win: {pick.historical_success}</span>
         </div>
       </div>
@@ -309,6 +437,8 @@ export default function StockPicks() {
           ))}
         </div>
       )}
+
+      <SetupPerformanceHistory />
 
       <AIDebateModal data={debateData} onClose={() => setDebateData(null)} />
 

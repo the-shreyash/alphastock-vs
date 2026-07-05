@@ -14,10 +14,14 @@ import TradingChart from "../components/charts/TradingChart";
 const SIGNAL_STYLE = {
   bullish: { color: "var(--gain)", bg: "rgba(52,211,153,0.12)", label: "Bullish" },
   bearish: { color: "var(--loss)", bg: "rgba(248,113,113,0.12)", label: "Bearish" },
-  neutral: { color: "var(--ai-accent)", bg: "var(--ai-accent-soft)", label: "Neutral" },
+  neutral: { color: "var(--text-secondary)", bg: "rgba(148,163,184,0.12)", label: "Neutral" },
 };
 
-const STRENGTH_DOTS = { strong: 3, moderate: 2, weak: 1 };
+function confidenceDots(confidence) {
+  if (confidence >= 0.75) return 3;
+  if (confidence >= 0.5) return 2;
+  return 1;
+}
 
 function SignalIcon({ signal, size = 14 }) {
   if (signal === "bullish") return <TrendingUp size={size} />;
@@ -26,22 +30,29 @@ function SignalIcon({ signal, size = 14 }) {
 }
 
 function PatternCard({ pattern }) {
+  const [expanded, setExpanded] = useState(false);
   const s = SIGNAL_STYLE[pattern.signal] || SIGNAL_STYLE.neutral;
-  const dots = STRENGTH_DOTS[pattern.strength] || 1;
+  const conf = typeof pattern.confidence === "number" ? pattern.confidence : 0.5;
+  const dots = confidenceDots(conf);
   return (
     <div
       className="rounded-xl p-4 border transition-all hover:scale-[1.01]"
       style={{ background: s.bg, borderColor: s.color + "33" }}
     >
       <div className="flex items-start justify-between gap-2 mb-2">
-        {/* Pattern name + signal badge */}
+        {/* Pattern name + clickable signal badge */}
         <div className="flex items-center gap-2 flex-wrap">
-          <span
-            className="text-xs font-bold uppercase tracking-widest px-2 py-0.5 rounded-full"
+          <button
+            type="button"
+            data-testid={`pattern-badge-${pattern.pattern}`}
+            onClick={() => setExpanded((v) => !v)}
+            aria-expanded={expanded}
+            title="Click for pattern details"
+            className="text-xs font-bold uppercase tracking-widest px-2 py-0.5 rounded-full cursor-pointer transition-transform hover:scale-105"
             style={{ background: s.color + "22", color: s.color }}
           >
             {s.label}
-          </span>
+          </button>
           <span className="text-sm font-semibold" style={{ color: "var(--text-primary)" }}>
             {pattern.pattern}
           </span>
@@ -52,10 +63,10 @@ function PatternCard({ pattern }) {
         </span>
       </div>
 
-      {/* Strength dots */}
+      {/* Confidence dots */}
       <div className="flex items-center gap-1 mb-2">
         <span className="text-[10px] uppercase tracking-widest mr-1" style={{ color: "var(--text-muted)" }}>
-          Strength
+          Confidence {Math.round(conf * 100)}%
         </span>
         {[1, 2, 3].map((d) => (
           <span
@@ -66,15 +77,21 @@ function PatternCard({ pattern }) {
         ))}
       </div>
 
-      {/* Description */}
-      <p className="text-xs leading-relaxed" style={{ color: "var(--text-secondary)" }}>
-        {pattern.description}
-      </p>
+      {/* Description — hidden until the badge is clicked */}
+      {expanded ? (
+        <p className="text-xs leading-relaxed" style={{ color: "var(--text-secondary)" }}>
+          {pattern.description}
+        </p>
+      ) : (
+        <p className="text-[10px] italic" style={{ color: "var(--text-muted)" }}>
+          Tap the badge for details
+        </p>
+      )}
 
-      {/* Detected at price */}
-      {pattern.price && (
+      {/* Detected timestamp */}
+      {pattern.timestamp && (
         <div className="mt-2 text-[10px] font-mono" style={{ color: "var(--text-muted)" }}>
-          Detected at ₹{pattern.price.toFixed(2)}
+          Detected {pattern.timestamp}
         </div>
       )}
     </div>

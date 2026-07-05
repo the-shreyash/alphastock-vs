@@ -88,6 +88,30 @@ services:
       REACT_APP_BACKEND_URL: http://localhost:8000
       REACT_APP_GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
 
+  # ── n8n (Automation Workflows) ───────────────────────────────────
+  n8n:
+    image: n8nio/n8n:1.70.0
+    container_name: alphapartner_n8n
+    restart: unless-stopped
+    ports:
+      - "5678:5678"
+    depends_on:
+      - backend
+    environment:
+      # Basic auth for the n8n editor UI
+      N8N_BASIC_AUTH_ACTIVE: "true"
+      N8N_BASIC_AUTH_USER: admin
+      N8N_BASIC_AUTH_PASSWORD: alphapartner123
+      # Run workflow crons in IST so schedules match NSE market hours
+      GENERIC_TIMEZONE: Asia/Kolkata
+      TZ: Asia/Kolkata
+      # Reach the backend over the compose network
+      WEBHOOK_API_KEY: ${WEBHOOK_API_KEY:-}
+    volumes:
+      - n8n_data:/home/node/.n8n
+
 volumes:
   mongo_data:
+    driver: local
+  n8n_data:
     driver: local

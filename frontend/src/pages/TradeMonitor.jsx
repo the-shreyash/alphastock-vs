@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from "react";
 import api from "../services/api";
 import { formatCurrency, formatPercent, formatNumber } from "../utils/formatters";
-import { Plus, X, TrendingUp, TrendingDown, AlertTriangle, Target, Clock, Search } from "lucide-react";
+import { Plus, X, TrendingUp, TrendingDown, AlertTriangle, Target, Clock, Search, Sparkles } from "lucide-react";
 
 export default function TradeMonitor() {
   const [activeTrades, setActiveTrades] = useState([]);
@@ -12,6 +12,7 @@ export default function TradeMonitor() {
   const [tab, setTab] = useState("active");
   const [suggestions, setSuggestions] = useState([]);
   const [showSuggestions, setShowSuggestions] = useState(false);
+  const [tips, setTips] = useState({}); // { [tradeId]: "live coaching tip" }
 
   // New trade form
   const [form, setForm] = useState({ symbol: "", stock_name: "", entry_price: "", quantity: "", stop_loss: "", target1: "", target2: "", notes: "" });
@@ -42,6 +43,30 @@ export default function TradeMonitor() {
     const interval = setInterval(fetchActive, 15000);
     return () => clearInterval(interval);
   }, []);
+
+  // Live AI coaching tip per open trade, refreshed every 5 minutes.
+  const activeIds = activeTrades.map((t) => t._id).join(",");
+  useEffect(() => {
+    if (!activeIds) return;
+    fetchTips();
+    const tipInterval = setInterval(fetchTips, 5 * 60 * 1000);
+    return () => clearInterval(tipInterval);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeIds]);
+
+  const fetchTips = async () => {
+    const entries = await Promise.all(
+      activeTrades.map(async (t) => {
+        try {
+          const { data } = await api.get(`/trades/${t._id}/live-tip`);
+          return [t._id, data.tip];
+        } catch {
+          return [t._id, null];
+        }
+      })
+    );
+    setTips((prev) => ({ ...prev, ...Object.fromEntries(entries) }));
+  };
 
   const fetchAll = async () => {
     setLoading(true);
@@ -206,6 +231,15 @@ export default function TradeMonitor() {
                   <div><span className="text-muted">SL</span><div className="font-mono text-loss">{formatCurrency(trade.stop_loss)}</div></div>
                   <div><span className="text-muted">Target</span><div className="font-mono text-gain">{formatCurrency(trade.target1)}</div></div>
                 </div>
+                {tips[trade._id] && (
+                  <div data-testid={`live-tip-${trade.symbol}`} className="flex items-start gap-2 mt-3 p-2.5 rounded-xl" style={{ background: "var(--ai-accent-soft)", border: "1px solid var(--ai-accent-glow)" }}>
+                    <Sparkles size={13} className="shrink-0 mt-0.5" style={{ color: "var(--ai-accent)" }} />
+                    <div className="min-w-0">
+                      <span className="text-[9px] font-bold uppercase tracking-[0.12em] block mb-0.5" style={{ color: "var(--ai-accent)" }}>Live Coaching Tip</span>
+                      <p className="text-[11px] leading-relaxed" style={{ color: "var(--text-secondary)" }}>{tips[trade._id]}</p>
+                    </div>
+                  </div>
+                )}
                 <div className="flex gap-2 mt-3">
                   <button
                     data-testid={`close-trade-${trade.symbol}`}
