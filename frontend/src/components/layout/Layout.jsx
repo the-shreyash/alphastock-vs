@@ -69,7 +69,7 @@ export default function Layout() {
           onNotificationClick={() => setShowNotifs(!showNotifs)}
           onMenuClick={() => setMobileOpen(true)}
         />
-        <main className="p-4 sm:p-6 min-h-[calc(100vh-64px)]">
+        <main className="p-5 sm:p-6 lg:p-8 min-h-[calc(100vh-64px)]">
           <AnimatePresence mode="wait">
             <motion.div
               key={location.pathname}

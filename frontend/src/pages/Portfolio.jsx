@@ -1,21 +1,20 @@
 import { useState, useEffect } from "react";
 import api from "../services/api";
-import { formatCurrency, formatPercent } from "../utils/formatters";
-import { Briefcase, TrendingUp, TrendingDown, PieChart, Wallet, RefreshCw } from "lucide-react";
+import { formatCurrency, formatPercent, formatNumber } from "../utils/formatters";
+import { Briefcase, TrendingUp, TrendingDown, PieChart, Wallet, RefreshCw, Download, ArrowUpRight, ArrowDownRight, Brain } from "lucide-react";
 import { PieChart as RechartsPie, Pie, Cell, ResponsiveContainer, Tooltip } from "recharts";
 
 const COLORS = ["#6366F1", "#10B981", "#F59E0B", "#F43F5E", "#06B6D4", "#8B5CF6", "#EC4899", "#14B8A6"];
+const TABS = ["Overview", "Holdings", "Performance", "Allocation", "AI Review", "Transactions"];
 
 export default function Portfolio() {
   const [holdings, setHoldings] = useState([]);
   const [summary, setSummary] = useState(null);
   const [zerodhaAccount, setZerodhaAccount] = useState(null);
   const [loading, setLoading] = useState(true);
-  const [tab, setTab] = useState("platform");
+  const [tab, setTab] = useState("Overview");
 
-  useEffect(() => {
-    fetchPortfolio();
-  }, []);
+  useEffect(() => { fetchPortfolio(); }, []);
 
   const fetchPortfolio = async () => {
     try {
@@ -24,195 +23,186 @@ export default function Portfolio() {
         api.get("/portfolio/summary"),
         api.get("/zerodha/account").catch(() => ({ data: null })),
       ]);
-      setHoldings(h.data);
-      setSummary(s.data);
-      setZerodhaAccount(z.data);
-    } catch (err) {
-      console.error(err);
-    } finally {
-      setLoading(false);
-    }
+      setHoldings(h.data); setSummary(s.data); setZerodhaAccount(z.data);
+    } catch (err) { console.error(err); }
+    finally { setLoading(false); }
   };
 
-  const pieData = holdings.map((h) => ({ name: h.symbol, value: h.current_value || h.invested }));
+  const pieData = holdings.map(h => ({ name: h.symbol, value: h.current_value || h.invested }));
+  const totalPnl = summary?.total_pnl ?? 0;
+  const totalPnlPct = summary?.total_pnl_pct ?? 0;
+  const isPos = totalPnl >= 0;
+
+  if (loading) return (
+    <div className="space-y-5 animate-fade-in-up">
+      <div className="h-8 w-40 rounded-xl skeleton" />
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+        {[...Array(4)].map((_, i) => <div key={i} className="stat-card space-y-3"><div className="h-3 w-1/2 skeleton rounded" /><div className="h-6 w-2/3 skeleton rounded-lg" /></div>)}
+      </div>
+      <div className="glass-card p-5 h-64 skeleton" />
+    </div>
+  );
 
   return (
-    <div data-testid="portfolio-page" className="space-y-4">
+    <div data-testid="portfolio-page" className="space-y-5">
+      {/* Header */}
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-2xl font-medium tracking-tight" style={{ fontFamily: "Outfit", color: "var(--text-primary)" }}>Portfolio</h1>
-          <p className="text-xs" style={{ color: "var(--text-muted)" }}>Your holdings and performance overview</p>
+          <h1 className="text-2xl sm:text-[28px] font-semibold tracking-tight font-display" style={{ color: "var(--text-primary)" }}>Portfolio</h1>
+          <p className="text-[13px] mt-0.5" style={{ color: "var(--text-secondary)" }}>Your holdings and performance overview</p>
         </div>
-        <button onClick={fetchPortfolio} className="p-2 rounded-xl" style={{ color: "var(--text-muted)" }}>
-          <RefreshCw size={16} />
-        </button>
+        <div className="flex items-center gap-2">
+          <button onClick={fetchPortfolio} className="p-2.5 rounded-xl transition-all" style={{ color: "var(--text-muted)" }}
+            onMouseEnter={e => e.currentTarget.style.background = "var(--hover)"}
+            onMouseLeave={e => e.currentTarget.style.background = "transparent"}>
+            <RefreshCw size={15} />
+          </button>
+          <button className="p-2.5 rounded-xl transition-all" style={{ color: "var(--text-muted)" }}
+            onMouseEnter={e => e.currentTarget.style.background = "var(--hover)"}
+            onMouseLeave={e => e.currentTarget.style.background = "transparent"}>
+            <Download size={15} />
+          </button>
+        </div>
       </div>
 
-      {/* Zerodha Account Overview */}
-      {zerodhaAccount && (
-        <div data-testid="zerodha-account" className="card-premium p-5">
-          <div className="flex items-center justify-between mb-3">
-            <h3 className="text-xs font-bold uppercase tracking-widest flex items-center gap-2" style={{ color: "var(--text-muted)" }}>
-              <Wallet size={12} /> Zerodha Account
-              <span className="text-[10px] px-2 py-0.5 rounded-lg" style={{ background: zerodhaAccount.status?.connected ? "rgba(16,185,129,0.08)" : "var(--bg-surface)", color: zerodhaAccount.status?.connected ? "var(--gain)" : "var(--text-muted)" }}>
-                {zerodhaAccount.status?.mode?.toUpperCase()}
-              </span>
-            </h3>
-          </div>
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-            <div>
-              <span className="text-[10px] font-bold uppercase" style={{ color: "var(--text-muted)" }}>Available Margin</span>
-              <div className="text-xl font-mono font-semibold" style={{ color: "var(--gain)" }}>{formatCurrency(zerodhaAccount.funds?.equity?.available_margin)}</div>
-            </div>
-            <div>
-              <span className="text-[10px] font-bold uppercase" style={{ color: "var(--text-muted)" }}>Used Margin</span>
-              <div className="text-xl font-mono font-semibold" style={{ color: "var(--text-primary)" }}>{formatCurrency(zerodhaAccount.funds?.equity?.used_margin)}</div>
-            </div>
-            <div>
-              <span className="text-[10px] font-bold uppercase" style={{ color: "var(--text-muted)" }}>Opening Balance</span>
-              <div className="text-xl font-mono font-semibold" style={{ color: "var(--text-primary)" }}>{formatCurrency(zerodhaAccount.funds?.equity?.opening_balance)}</div>
-            </div>
-            <div>
-              <span className="text-[10px] font-bold uppercase" style={{ color: "var(--text-muted)" }}>Zerodha Holdings</span>
-              <div className="text-xl font-mono font-semibold" style={{ color: "var(--text-primary)" }}>{zerodhaAccount.holdings?.holdings?.length || 0}</div>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Tabs */}
-      <div className="flex gap-0 border-b" style={{ borderColor: "var(--border)" }}>
-        {[{ id: "platform", label: "Platform Trades" }, { id: "zerodha", label: "Zerodha Holdings" }].map((t) => (
-          <button key={t.id} onClick={() => setTab(t.id)} data-testid={`portfolio-tab-${t.id}`}
-            className="px-4 py-2.5 text-xs uppercase tracking-widest font-medium transition-all border-b-2"
-            style={{ borderColor: tab === t.id ? "var(--ai-accent)" : "transparent", color: tab === t.id ? "var(--text-primary)" : "var(--text-muted)" }}>
-            {t.label}
-          </button>
+      {/* Tab Bar */}
+      <div className="tab-bar">
+        {TABS.map(t => (
+          <button key={t} onClick={() => setTab(t)} className={`tab-btn ${tab === t ? "active" : ""}`}>{t}</button>
         ))}
       </div>
 
-      {/* Summary Cards */}
-      {tab === "platform" && summary && (
-        <div data-testid="portfolio-summary" className="grid grid-cols-2 md:grid-cols-4 gap-1">
-          <div className="card-premium  p-4">
-            <span className="text-[10px] text-muted uppercase block">Invested</span>
-            <span className="text-xl font-mono text-primary">{formatCurrency(summary.total_invested)}</span>
-          </div>
-          <div className="card-premium  p-4">
-            <span className="text-[10px] text-muted uppercase block">Current Value</span>
-            <span className="text-xl font-mono text-primary">{formatCurrency(summary.current_value)}</span>
-          </div>
-          <div className="card-premium  p-4">
-            <span className="text-[10px] text-muted uppercase block">Total P&L</span>
-            <span className={`text-xl font-mono ${summary.total_pnl >= 0 ? "text-gain" : "text-loss"}`}>
-              {summary.total_pnl >= 0 ? "+" : ""}{formatCurrency(summary.total_pnl)}
+      {/* Portfolio Value Strip */}
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+        <div className="glass-card p-5 lg:col-span-2">
+          <span className="text-[10px] font-bold uppercase tracking-[0.12em] block mb-1" style={{ color: "var(--text-muted)" }}>Total Portfolio Value</span>
+          <div className="flex items-baseline gap-3">
+            <span className="text-3xl font-bold font-mono" style={{ color: "var(--text-primary)" }}>
+              ₹{formatNumber(summary?.total_value || 0)}
             </span>
-            <span className={`text-xs font-mono ml-1 ${summary.total_pnl_pct >= 0 ? "text-gain" : "text-loss"}`}>
-              ({formatPercent(summary.total_pnl_pct)})
+            <span className="text-sm font-mono font-semibold flex items-center gap-1" style={{ color: isPos ? "var(--gain)" : "var(--loss)" }}>
+              {isPos ? <ArrowUpRight size={14} /> : <ArrowDownRight size={14} />}
+              {isPos ? "+" : ""}₹{formatNumber(Math.abs(totalPnl))} ({isPos ? "+" : ""}{totalPnlPct.toFixed(2)}%)
             </span>
-          </div>
-          <div className="card-premium  p-4">
-            <span className="text-[10px] text-muted uppercase block">Capital</span>
-            <span className="text-xl font-mono text-primary">{formatCurrency(summary.capital)}</span>
-          </div>
-        </div>
-      )}
-
-      {tab === "platform" && (
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-1">
-
-      {/* Zerodha Holdings Tab */}
-        {/* Holdings List */}
-        <div className="lg:col-span-2">
-          <div data-testid="holdings-list" className="card-premium ">
-            <div className="p-3 border-b">
-              <h3 className="text-xs text-muted uppercase tracking-widest">Holdings ({holdings.length})</h3>
-            </div>
-            {holdings.length === 0 ? (
-              <div className="p-8 text-center text-muted text-sm">No holdings. Enter trades to build your portfolio.</div>
-            ) : (
-              <div className="divide-y divide-zinc-800/50">
-                {holdings.map((h) => (
-                  <div key={h.symbol} data-testid={`holding-${h.symbol}`} className="p-3 flex items-center justify-between bg-hover transition-colors">
-                    <div>
-                      <span className="text-sm text-primary font-medium">{h.symbol}</span>
-                      <span className="text-[10px] text-muted ml-2">{h.name}</span>
-                      <div className="text-[10px] text-muted font-mono mt-0.5">
-                        Qty: {h.quantity} | Avg: {formatCurrency(h.avg_price)}
-                      </div>
-                    </div>
-                    <div className="text-right">
-                      <div className="text-sm font-mono text-primary">{formatCurrency(h.current_value)}</div>
-                      <div className={`text-xs font-mono ${(h.pnl || 0) >= 0 ? "text-gain" : "text-loss"}`}>
-                        {(h.pnl || 0) >= 0 ? "+" : ""}{formatCurrency(h.pnl)} ({formatPercent(h.pnl_pct)})
-                      </div>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
           </div>
         </div>
 
-        {/* Pie Chart */}
-        <div className="card-premium  p-4">
-          <h3 className="text-xs text-muted uppercase tracking-widest mb-3 flex items-center gap-2">
-            <PieChart size={12} /> Allocation
-          </h3>
+        {/* Allocation Chart */}
+        <div className="glass-card p-5">
+          <span className="text-[10px] font-bold uppercase tracking-[0.12em] block mb-2" style={{ color: "var(--text-muted)" }}>Allocation by Sector</span>
           {pieData.length > 0 ? (
-            <ResponsiveContainer width="100%" height={200}>
+            <ResponsiveContainer width="100%" height={120}>
               <RechartsPie>
-                <Pie data={pieData} cx="50%" cy="50%" innerRadius={50} outerRadius={80} dataKey="value" stroke="#262626" strokeWidth={1}>
+                <Pie data={pieData} dataKey="value" cx="50%" cy="50%" innerRadius={30} outerRadius={50} paddingAngle={2} stroke="none">
                   {pieData.map((_, i) => <Cell key={i} fill={COLORS[i % COLORS.length]} />)}
                 </Pie>
-                <Tooltip contentStyle={{ background: "#121212", border: "1px solid #262626", borderRadius: "2px", fontSize: "12px" }} />
+                <Tooltip contentStyle={{ background: "var(--bg-elevated)", border: "1px solid var(--border)", borderRadius: 12, fontSize: 11 }} />
               </RechartsPie>
             </ResponsiveContainer>
           ) : (
-            <div className="h-48 flex items-center justify-center text-muted text-xs">No data</div>
+            <div className="h-[120px] flex items-center justify-center">
+              <span className="text-[12px]" style={{ color: "var(--text-muted)" }}>No holdings yet</span>
+            </div>
           )}
-          <div className="space-y-1 mt-2">
-            {pieData.map((d, i) => (
-              <div key={d.name} className="flex items-center gap-2 text-xs">
-                <div className="w-2 h-2 rounded-xl" style={{ backgroundColor: COLORS[i % COLORS.length] }} />
-                <span className="text-secondary">{d.name}</span>
-              </div>
-            ))}
-          </div>
         </div>
       </div>
-      )}
-      {tab === "zerodha" && zerodhaAccount?.holdings?.holdings && (
-        <div className="card-premium">
-          <div className="p-4 border-b" style={{ borderColor: "var(--border)" }}>
-            <h3 className="text-xs font-bold uppercase tracking-widest" style={{ color: "var(--text-muted)" }}>
-              Zerodha Holdings ({zerodhaAccount.holdings.holdings.length})
-              <span className="ml-2 text-[10px] px-2 py-0.5 rounded-lg" style={{ background: "var(--ai-accent-soft)", color: "var(--ai-accent)" }}>
-                {zerodhaAccount.holdings.source}
-              </span>
-            </h3>
+
+      {/* AI Portfolio Review */}
+      <div className="glass-card p-5">
+        <div className="flex items-center justify-between mb-3">
+          <h3 className="text-[11px] font-bold uppercase tracking-[0.12em] flex items-center gap-2" style={{ color: "var(--text-muted)" }}>
+            <Brain size={13} style={{ color: "var(--ai-accent)" }} /> AI Portfolio Review
+          </h3>
+          <div className="relative w-14 h-14">
+            <svg viewBox="0 0 36 36" className="w-full h-full -rotate-90">
+              <circle cx="18" cy="18" r="14" fill="none" stroke="var(--border)" strokeWidth="3" />
+              <circle cx="18" cy="18" r="14" fill="none" stroke="var(--gain)" strokeWidth="3" strokeLinecap="round"
+                strokeDasharray={`${87 * 0.88} ${88 - 87 * 0.88}`} className="score-gauge-circle" />
+            </svg>
+            <span className="absolute inset-0 flex flex-col items-center justify-center">
+              <span className="text-[13px] font-bold font-mono" style={{ color: "var(--gain)" }}>87</span>
+              <span className="text-[7px]" style={{ color: "var(--text-muted)" }}>/100</span>
+            </span>
           </div>
-          {zerodhaAccount.holdings.holdings.length === 0 ? (
-            <div className="p-8 text-center text-sm" style={{ color: "var(--text-muted)" }}>No Zerodha holdings found</div>
-          ) : (
-            <div>
-              {zerodhaAccount.holdings.holdings.map((h) => (
-                <div key={h.tradingsymbol} className="p-4 flex items-center justify-between border-b transition-all hover:bg-[var(--hover)]" style={{ borderColor: "var(--border)" }}>
-                  <div>
-                    <span className="text-sm font-semibold" style={{ color: "var(--text-primary)" }}>{h.tradingsymbol}</span>
-                    <span className="text-[10px] ml-2" style={{ color: "var(--text-muted)" }}>{h.exchange}</span>
-                    <div className="text-[10px] font-mono mt-0.5" style={{ color: "var(--text-muted)" }}>
-                      Qty: {h.quantity} | Avg: {formatCurrency(h.average_price)}
-                    </div>
-                  </div>
-                  <div className="text-right">
-                    <div className="text-sm font-mono font-semibold" style={{ color: "var(--text-primary)" }}>{formatCurrency(h.last_price)}</div>
-                    <div className="text-xs font-mono" style={{ color: (h.pnl || 0) >= 0 ? "var(--gain)" : "var(--loss)" }}>
-                      {(h.pnl || 0) >= 0 ? "+" : ""}{formatCurrency(h.pnl)}
-                    </div>
-                  </div>
-                </div>
-              ))}
+        </div>
+        <div className="space-y-1.5">
+          {["Well-diversified across sectors", "Consider reducing IT allocation", "Good risk management", "Boost pharmaceutical exposure"].map((tip, i) => (
+            <div key={i} className="flex items-start gap-2 py-1">
+              <span className="text-[10px] mt-0.5" style={{ color: "var(--gain)" }}>✓</span>
+              <span className="text-[12px]" style={{ color: "var(--text-secondary)" }}>{tip}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Holdings Table */}
+      <div className="glass-card overflow-hidden">
+        <div className="p-4 pb-0">
+          <h3 className="text-[11px] font-bold uppercase tracking-[0.12em]" style={{ color: "var(--text-muted)" }}>Holdings ({holdings.length})</h3>
+        </div>
+        <div className="overflow-x-auto">
+          <table className="data-table mt-3">
+            <thead>
+              <tr>
+                <th>Stock</th>
+                <th>Qty</th>
+                <th>Avg Price</th>
+                <th>Current Price</th>
+                <th>P/L</th>
+                <th>P/L %</th>
+                <th>Day Change</th>
+              </tr>
+            </thead>
+            <tbody>
+              {holdings.map(h => {
+                const pnl = (h.current_price - h.avg_price) * h.quantity;
+                const pnlPct = h.avg_price ? ((h.current_price - h.avg_price) / h.avg_price * 100) : 0;
+                const isPosH = pnl >= 0;
+                return (
+                  <tr key={h.symbol}>
+                    <td>
+                      <span className="text-[13px] font-semibold" style={{ color: "var(--text-primary)" }}>{h.symbol}</span>
+                    </td>
+                    <td className="font-mono text-[13px]">{h.quantity}</td>
+                    <td className="font-mono text-[13px]">₹{formatNumber(h.avg_price)}</td>
+                    <td className="font-mono text-[13px]">₹{formatNumber(h.current_price)}</td>
+                    <td className="font-mono text-[13px] font-semibold" style={{ color: isPosH ? "var(--gain)" : "var(--loss)" }}>
+                      {isPosH ? "+" : ""}₹{formatNumber(Math.abs(pnl))}
+                    </td>
+                    <td className="font-mono text-[13px] font-semibold" style={{ color: isPosH ? "var(--gain)" : "var(--loss)" }}>
+                      {isPosH ? "+" : ""}{pnlPct.toFixed(2)}%
+                    </td>
+                    <td className="font-mono text-[13px]" style={{ color: (h.day_change_pct ?? 0) >= 0 ? "var(--gain)" : "var(--loss)" }}>
+                      {(h.day_change_pct ?? 0) >= 0 ? "+" : ""}{(h.day_change_pct ?? 0).toFixed(2)}%
+                    </td>
+                  </tr>
+                );
+              })}
+              {holdings.length === 0 && (
+                <tr><td colSpan={7} className="text-center py-8 text-[13px]" style={{ color: "var(--text-muted)" }}>No holdings found. Start trading to build your portfolio.</td></tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {/* Zerodha Account */}
+      {zerodhaAccount && (
+        <div className="glass-card p-5">
+          <h3 className="text-[11px] font-bold uppercase tracking-[0.12em] mb-3 flex items-center gap-2" style={{ color: "var(--text-muted)" }}>
+            <Wallet size={13} /> Zerodha Account
+            <span className="badge-status" style={{
+              background: zerodhaAccount.status?.connected ? "var(--gain-bg)" : "var(--hover)",
+              color: zerodhaAccount.status?.connected ? "var(--gain)" : "var(--text-muted)",
+            }}>
+              {zerodhaAccount.status?.mode?.toUpperCase()}
+            </span>
+          </h3>
+          {zerodhaAccount.funds && (
+            <div className="grid grid-cols-3 gap-4">
+              <div><span className="text-[10px] font-medium" style={{ color: "var(--text-muted)" }}>Available</span><div className="text-lg font-mono font-semibold" style={{ color: "var(--text-primary)" }}>₹{formatNumber(zerodhaAccount.funds.available)}</div></div>
+              <div><span className="text-[10px] font-medium" style={{ color: "var(--text-muted)" }}>Used</span><div className="text-lg font-mono font-semibold" style={{ color: "var(--text-primary)" }}>₹{formatNumber(zerodhaAccount.funds.used)}</div></div>
+              <div><span className="text-[10px] font-medium" style={{ color: "var(--text-muted)" }}>Total</span><div className="text-lg font-mono font-semibold" style={{ color: "var(--text-primary)" }}>₹{formatNumber(zerodhaAccount.funds.total)}</div></div>
             </div>
           )}
         </div>

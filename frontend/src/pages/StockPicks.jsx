@@ -20,7 +20,7 @@ function PickCard({ pick, onExplain, explaining, onTrade }) {
   const navigate = useNavigate();
 
   return (
-    <div data-testid={`pick-card-${pick.symbol}`} className="card-premium tracing-beam overflow-hidden">
+    <div data-testid={`pick-card-${pick.symbol}`} className="glass-card tracing-beam overflow-hidden">
       {/* Header */}
       <div className="p-5 border-b" style={{ borderColor: "var(--border)" }}>
         <div className="flex items-center justify-between mb-2">
@@ -126,7 +126,7 @@ function AIDebateModal({ data, onClose }) {
   if (!data) return null;
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: "rgba(0,0,0,0.6)", backdropFilter: "blur(4px)" }} onClick={onClose}>
-      <div className="card-premium max-w-4xl w-full max-h-[85vh] overflow-y-auto" style={{ background: "var(--bg)" }} onClick={(e) => e.stopPropagation()}>
+      <div className="glass-card max-w-4xl w-full max-h-[85vh] overflow-y-auto" style={{ background: "var(--bg)" }} onClick={(e) => e.stopPropagation()}>
         {/* Header */}
         <div className="p-5 border-b" style={{ borderColor: "var(--border)" }}>
           <h3 className="text-xl font-semibold" style={{ fontFamily: "Outfit", color: "var(--text-primary)" }}>
@@ -315,7 +315,7 @@ export default function StockPicks() {
       {/* Trade Confirmation Modal */}
       {tradingPick && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: "rgba(0,0,0,0.5)", backdropFilter: "blur(4px)" }} onClick={() => { setTradingPick(null); setTradeResult(null); }}>
-          <div className="card-premium max-w-md w-full p-6" style={{ background: "var(--bg)" }} onClick={(e) => e.stopPropagation()}>
+          <div className="glass-card max-w-md w-full p-6" style={{ background: "var(--bg)" }} onClick={(e) => e.stopPropagation()}>
             <h3 className="text-lg font-semibold mb-4" style={{ fontFamily: "Outfit", color: "var(--text-primary)" }}>
               Confirm Trade: {tradingPick.name}
             </h3>

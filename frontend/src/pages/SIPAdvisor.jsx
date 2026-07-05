@@ -44,7 +44,7 @@ export default function SIPAdvisor() {
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         {/* Form */}
-        <div className="card-premium  p-4 space-y-4">
+        <div className="glass-card  p-4 space-y-4">
           <h3 className="text-xs text-muted uppercase tracking-widest">Your Investment Profile</h3>
           <div className="grid grid-cols-2 gap-3">
             <div>
@@ -93,7 +93,7 @@ export default function SIPAdvisor() {
         {/* Calculator Result */}
         <div className="space-y-4">
           {calcResult && (
-            <div data-testid="sip-calc-result" className="card-premium  p-4">
+            <div data-testid="sip-calc-result" className="glass-card  p-4">
               <h3 className="text-xs text-muted uppercase tracking-widest mb-3 flex items-center gap-2">
                 <Calculator size={12} /> SIP Projection
               </h3>
@@ -125,7 +125,7 @@ export default function SIPAdvisor() {
 
       {/* AI Recommendation */}
       {aiResult && (
-        <div data-testid="sip-ai-result" className="card-premium  p-4">
+        <div data-testid="sip-ai-result" className="glass-card  p-4">
           <h3 className="text-xs text-muted uppercase tracking-widest mb-3 flex items-center gap-2">
             <Brain size={12} className="text-ai" /> AI Fund Recommendations
           </h3>

@@ -71,6 +71,8 @@ class TradeCreate(BaseModel):
     target1: float
     target2: Optional[float] = None
     notes: Optional[str] = None
+    setup_type: Optional[str] = None
+    is_paper: bool = False
 
 class TradeResponse(BaseDocument):
     user_id: Optional[str] = None
@@ -91,6 +93,8 @@ class TradeResponse(BaseDocument):
     ai_confidence: Optional[float] = None
     ai_explanation: Optional[str] = None
     notes: Optional[str] = None
+    setup_type: Optional[str] = None
+    is_paper: bool = False
 
 
 # --- Chat Models ---

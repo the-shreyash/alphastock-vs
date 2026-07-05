@@ -1,6 +1,11 @@
-/* AlphaPartner - Global App Styles */
+/* =============================================
+   StockAssist AI — Global Component Styles
+   Premium Financial Operating System Design
+   ============================================= */
 
-/* Utility classes using CSS vars */
+/* =============================================
+   UTILITY CLASSES (CSS Variable shortcuts)
+   ============================================= */
 .bg-app { background-color: var(--bg); }
 .bg-surface { background-color: var(--bg-surface); }
 .bg-elevated { background-color: var(--bg-elevated); }
@@ -16,40 +21,197 @@
 .bg-hover:hover { background-color: var(--hover); }
 .shadow-card { box-shadow: var(--card-shadow); }
 
-/* Premium card style */
-.card-premium {
-  background-color: var(--bg-elevated);
+/* =============================================
+   GLASS CARD — Primary Container
+   Premium glassmorphic card used everywhere
+   ============================================= */
+.glass-card {
+  background: var(--bg-card-glass);
+  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
   border: 1px solid var(--border);
-  border-radius: 1.25rem;
-  padding: 1.75rem;
-  box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.05), 0 1px 2px -1px rgba(0, 0, 0, 0.05);
+  border-radius: var(--card-radius);
+  box-shadow: var(--card-shadow);
+  transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+}
+.glass-card:hover {
+  background: var(--bg-card-glass-hover);
+  box-shadow: var(--card-shadow-hover);
+  border-color: var(--ai-accent-glow);
+}
+
+/* card-premium — backward compat alias */
+.card-premium {
+  background: var(--bg-card-glass);
+  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+  border: 1px solid var(--border);
+  border-radius: var(--card-radius);
+  box-shadow: var(--card-shadow);
   transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
 }
 .card-premium:hover {
-  transform: translateY(-2px);
-  box-shadow: 0 12px 24px -10px rgba(0, 0, 0, 0.12), 0 4px 12px -5px rgba(0, 0, 0, 0.05);
-  border-color: rgba(99, 102, 241, 0.15);
-}
-[data-theme="dark"] .card-premium:hover {
-  border-color: rgba(129, 140, 248, 0.25);
-  box-shadow: 0 12px 24px -10px rgba(0, 0, 0, 0.5);
+  background: var(--bg-card-glass-hover);
+  box-shadow: var(--card-shadow-hover);
 }
 
 /* =============================================
-   GLASSMORPHISM (Crystal Variant)
+   STAT CARD — Index / Metric Cards
+   Used for Nifty, Sensex, VIX strip
    ============================================= */
+.stat-card {
+  background: var(--bg-card-glass);
+  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+  border: 1px solid var(--border);
+  border-radius: var(--card-radius);
+  padding: 1.25rem 1.5rem;
+  box-shadow: var(--card-shadow);
+  transition: all 0.25s ease;
+}
+.stat-card:hover {
+  transform: translateY(-1px);
+  box-shadow: var(--card-shadow-hover);
+}
+
+/* =============================================
+   GLASSMORPHISM (Sidebar, Navbar, Panels)
+   ============================================= */
+.glass-nav {
+  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+  border: 1px solid var(--border);
+}
+[data-theme="light"] .glass-nav {
+  background: var(--nav-bg);
+}
+[data-theme="dark"] .glass-nav {
+  background: var(--nav-bg);
+}
+
 .glass {
   backdrop-filter: blur(20px) saturate(1.6);
   -webkit-backdrop-filter: blur(20px) saturate(1.6);
-  border: 1px solid rgba(255,255,255,0.15);
+  border: 1px solid var(--border);
 }
 [data-theme="light"] .glass {
   background: rgba(255,255,255,0.7);
-  border-color: rgba(255,255,255,0.6);
 }
 [data-theme="dark"] .glass {
-  background: rgba(9,9,11,0.7);
-  border-color: rgba(255,255,255,0.08);
+  background: rgba(11,13,20,0.7);
+}
+
+/* =============================================
+   BADGES
+   ============================================= */
+.badge-live {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 700;
+  font-family: 'JetBrains Mono', monospace;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  background: var(--gain-bg);
+  color: var(--gain);
+}
+.badge-live::before {
+  content: '';
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--gain);
+  animation: pulse-dot 2s ease-in-out infinite;
+}
+
+.badge-ai {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 12px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  background: var(--ai-accent-soft);
+  color: var(--ai-accent);
+}
+
+.badge-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: 6px;
+  font-size: 10px;
+  font-weight: 700;
+  font-family: 'JetBrains Mono', monospace;
+  text-transform: uppercase;
+}
+
+/* =============================================
+   BUTTONS
+   ============================================= */
+.btn-primary {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 10px 24px;
+  border-radius: 12px;
+  font-size: 14px;
+  font-weight: 600;
+  background: var(--ai-accent);
+  color: #FFFFFF;
+  border: none;
+  cursor: pointer;
+  transition: all 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+  box-shadow: 0 1px 3px rgba(99, 102, 241, 0.3);
+}
+.btn-primary:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 16px rgba(99, 102, 241, 0.35);
+  filter: brightness(1.08);
+}
+.btn-primary:active {
+  transform: translateY(0);
+}
+
+.btn-ghost {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 10px 24px;
+  border-radius: 12px;
+  font-size: 14px;
+  font-weight: 600;
+  background: transparent;
+  color: var(--text-primary);
+  border: 1px solid var(--border);
+  cursor: pointer;
+  transition: all 0.25s ease;
+}
+.btn-ghost:hover {
+  background: var(--hover);
+  border-color: var(--text-muted);
+  transform: translateY(-1px);
+}
+
+.btn-lift {
+  transition: all 0.2s ease;
+}
+.btn-lift:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px rgba(0,0,0,0.08);
+}
+.btn-lift:active {
+  transform: translateY(0);
+}
+[data-theme="dark"] .btn-lift:hover {
+  box-shadow: 0 4px 12px rgba(0,0,0,0.3);
 }
 
 /* =============================================
@@ -85,7 +247,7 @@
   position: absolute;
   inset: 1px;
   background: var(--bg-elevated);
-  border-radius: calc(1rem - 1px);
+  border-radius: calc(var(--card-radius) - 1px);
   z-index: 1;
 }
 .tracing-beam > * {
@@ -99,24 +261,7 @@
 }
 
 /* =============================================
-   BUTTON LIFT EFFECT
-   ============================================= */
-.btn-lift {
-  transition: all 0.2s ease;
-}
-.btn-lift:hover {
-  transform: translateY(-1px);
-  box-shadow: 0 4px 12px rgba(0,0,0,0.08);
-}
-.btn-lift:active {
-  transform: translateY(0);
-}
-[data-theme="dark"] .btn-lift:hover {
-  box-shadow: 0 4px 12px rgba(0,0,0,0.3);
-}
-
-/* =============================================
-   SMOOTH PAGE TRANSITIONS (CSS fallback)
+   PAGE TRANSITIONS
    ============================================= */
 .page-enter {
   opacity: 0;
@@ -136,10 +281,14 @@
   100% { background-position: 200% 0; }
 }
 .skeleton {
-  background: linear-gradient(90deg, var(--bg-surface) 25%, var(--bg-elevated) 50%, var(--bg-surface) 75%);
+  background: linear-gradient(90deg,
+    var(--bg-surface) 25%,
+    var(--bg-elevated) 50%,
+    var(--bg-surface) 75%
+  );
   background-size: 200% 100%;
   animation: skeleton-shimmer 1.8s ease-in-out infinite;
-  border-radius: 0.5rem;
+  border-radius: 8px;
 }
 
 /* =============================================
@@ -161,6 +310,19 @@
   animation: scale-in 0.3s ease-out forwards;
 }
 
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.5; transform: scale(0.8); }
+}
+
+@keyframes float {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-6px); }
+}
+.animate-float {
+  animation: float 3s ease-in-out infinite;
+}
+
 /* Stagger children animation */
 .stagger-children > * {
   animation: fade-in-up 0.4s ease-out forwards;
@@ -176,7 +338,7 @@
 .stagger-children > *:nth-child(8) { animation-delay: 0.4s; }
 
 /* =============================================
-   SEGMENT CONTROL (kept for potential reuse)
+   SEGMENT CONTROL
    ============================================= */
 .segment-control {
   display: inline-flex;
@@ -188,27 +350,28 @@
 .segment-btn {
   padding: 6px 16px;
   border-radius: 8px;
-  font-size: 13px;
-  font-weight: 500;
+  font-size: 12px;
+  font-weight: 600;
   transition: all 0.2s ease;
-  color: var(--text-secondary);
+  color: var(--text-muted);
   cursor: pointer;
   border: none;
   background: transparent;
+  letter-spacing: 0.01em;
 }
 .segment-btn.active {
-  background-color: var(--bg-elevated);
-  color: var(--text-primary);
-  box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+  background: var(--ai-accent);
+  color: #FFFFFF;
+  box-shadow: 0 2px 8px rgba(99, 102, 241, 0.25);
 }
 
 /* =============================================
    THEME TOGGLE (used in Settings)
    ============================================= */
 .theme-toggle {
-  width: 40px;
-  height: 22px;
-  border-radius: 11px;
+  width: 44px;
+  height: 24px;
+  border-radius: 12px;
   background-color: var(--bg-surface);
   border: 1px solid var(--border);
   position: relative;
@@ -216,15 +379,135 @@
   transition: all 0.3s ease;
 }
 .theme-toggle .knob {
-  width: 16px;
-  height: 16px;
+  width: 18px;
+  height: 18px;
   border-radius: 50%;
-  background-color: var(--text-primary);
+  background-color: var(--ai-accent);
   position: absolute;
   top: 2px;
   left: 2px;
-  transition: transform 0.3s ease;
+  transition: transform 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+  box-shadow: 0 2px 4px rgba(0,0,0,0.15);
 }
 [data-theme="dark"] .theme-toggle .knob {
-  transform: translateX(18px);
+  transform: translateX(20px);
+}
+
+/* =============================================
+   TAB BAR — Page navigation tabs
+   ============================================= */
+.tab-bar {
+  display: flex;
+  gap: 2px;
+  padding: 3px;
+  background: var(--bg-surface);
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  overflow-x: auto;
+}
+.tab-btn {
+  padding: 8px 18px;
+  border-radius: 9px;
+  font-size: 13px;
+  font-weight: 500;
+  transition: all 0.2s ease;
+  color: var(--text-muted);
+  cursor: pointer;
+  border: none;
+  background: transparent;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.tab-btn:hover {
+  color: var(--text-secondary);
+  background: var(--hover);
+}
+.tab-btn.active {
+  background: var(--bg-card-glass);
+  color: var(--text-primary);
+  font-weight: 600;
+  box-shadow: var(--card-shadow);
+}
+
+/* =============================================
+   TABLE — Premium data tables
+   ============================================= */
+.data-table {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+}
+.data-table th {
+  padding: 10px 16px;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--text-muted);
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  white-space: nowrap;
+}
+.data-table td {
+  padding: 12px 16px;
+  font-size: 13px;
+  color: var(--text-secondary);
+  border-bottom: 1px solid var(--border-subtle);
+  transition: background 0.15s ease;
+}
+.data-table tbody tr:hover td {
+  background: var(--hover);
+}
+.data-table tbody tr:last-child td {
+  border-bottom: none;
+}
+
+/* =============================================
+   SEARCH INPUT
+   ============================================= */
+.search-input {
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 8px 16px 8px 40px;
+  font-size: 13px;
+  color: var(--text-primary);
+  width: 100%;
+  transition: all 0.25s ease;
+  outline: none;
+}
+.search-input::placeholder {
+  color: var(--text-muted);
+}
+.search-input:focus {
+  border-color: var(--ai-accent);
+  box-shadow: 0 0 0 3px var(--ai-accent-soft);
+}
+
+/* =============================================
+   HEATMAP CELL
+   ============================================= */
+.heatmap-cell {
+  border-radius: 10px;
+  padding: 10px 8px;
+  text-align: center;
+  transition: all 0.2s ease;
+  cursor: pointer;
+}
+.heatmap-cell:hover {
+  transform: scale(1.03);
+  z-index: 1;
+}
+
+/* =============================================
+   SCORE GAUGE (Sentiment / AI Score)
+   ============================================= */
+.score-gauge {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.score-gauge-circle {
+  transition: stroke-dashoffset 1s cubic-bezier(0.16, 1, 0.3, 1);
 }

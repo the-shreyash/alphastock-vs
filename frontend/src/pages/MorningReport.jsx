@@ -17,13 +17,13 @@ const MOOD_CONFIG = {
 function IndexCard({ label, value, change_pct }) {
   const isPos = change_pct >= 0;
   return (
-    <div className="card-premium p-5 flex flex-col gap-1">
-      <span className="text-[10px] font-bold uppercase tracking-widest" style={{ color: "var(--text-muted)" }}>{label}</span>
-      <span className="text-2xl font-mono font-semibold" style={{ color: "var(--text-primary)" }}>
+    <div className="stat-card flex flex-col gap-1">
+      <span className="text-[10px] font-bold uppercase tracking-[0.12em]" style={{ color: "var(--text-muted)" }}>{label}</span>
+      <span className="text-xl font-mono font-semibold" style={{ color: "var(--text-primary)" }}>
         {value?.toLocaleString("en-IN")}
       </span>
-      <span className="text-sm font-mono font-medium flex items-center gap-1" style={{ color: isPos ? "var(--gain)" : "var(--loss)" }}>
-        {isPos ? <ArrowUpRight size={14} /> : <ArrowDownRight size={14} />}
+      <span className="text-[12px] font-mono font-medium flex items-center gap-1" style={{ color: isPos ? "var(--gain)" : "var(--loss)" }}>
+        {isPos ? <ArrowUpRight size={12} /> : <ArrowDownRight size={12} />}
         {isPos ? "+" : ""}{change_pct?.toFixed(2)}%
       </span>
     </div>
@@ -109,7 +109,7 @@ export default function MorningReport() {
         <div>
           <div className="flex items-center gap-2 mb-1">
             <Sun size={20} style={{ color: "#f59e0b" }} />
-            <h1 className="text-xl font-semibold" style={{ fontFamily: "Outfit", color: "var(--text-primary)" }}>
+            <h1 className="text-2xl sm:text-[28px] font-semibold tracking-tight font-display" style={{ color: "var(--text-primary)" }}>
               Morning Briefing
             </h1>
           </div>
@@ -161,7 +161,7 @@ export default function MorningReport() {
       </div>
 
       {/* AI Briefing */}
-      <div className="card-premium p-5">
+      <div className="glass-card p-5">
         <h3 className="text-xs font-bold uppercase tracking-widest mb-3 flex items-center gap-2" style={{ color: "var(--ai-accent)" }}>
           <BarChart3 size={12} /> AI Market Briefing
         </h3>
@@ -181,7 +181,7 @@ export default function MorningReport() {
             {report.top_picks.map((p, i) => <PickCard key={i} pick={p} />)}
           </div>
         ) : (
-          <div className="card-premium p-5 text-center text-sm" style={{ color: "var(--text-muted)" }}>
+          <div className="glass-card p-5 text-center text-sm" style={{ color: "var(--text-muted)" }}>
             Picks generating — check back in a moment.
           </div>
         )}
@@ -212,7 +212,7 @@ export default function MorningReport() {
             <p className="text-xs leading-relaxed" style={{ color: "var(--text-secondary)" }}>{report.global_cues}</p>
           </div>
 
-          <div className="card-premium p-4">
+          <div className="glass-card p-4">
             <h3 className="text-xs font-bold uppercase tracking-widest mb-3" style={{ color: "var(--text-muted)" }}>FII / DII Flow</h3>
             <div className="grid grid-cols-2 gap-3">
               {[

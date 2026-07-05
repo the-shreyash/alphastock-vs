@@ -38,7 +38,7 @@ export default function WhatsAppPanel() {
   const configured = status?.configured;
 
   return (
-    <div data-testid="whatsapp-panel" className="card-premium p-5">
+    <div data-testid="whatsapp-panel" className="glass-card p-5">
       <div className="flex items-center justify-between mb-4">
         <h3 className="text-xs font-bold uppercase tracking-[0.15em] flex items-center gap-2" style={{ color: "var(--text-muted)" }}>
           <MessageSquare size={12} style={{ color: configured ? "var(--gain)" : "var(--text-muted)" }} />

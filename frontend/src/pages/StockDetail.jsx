@@ -4,8 +4,9 @@ import api from "../services/api";
 import { formatCurrency, formatNumber, formatPercent } from "../utils/formatters";
 import {
   ArrowLeft, TrendingUp, TrendingDown, BarChart3, Activity, Info,
-  Zap, ShieldCheck, ShieldAlert, Minus, Eye, RefreshCw, HelpCircle
+  Zap, ShieldCheck, ShieldAlert, Minus, Eye, RefreshCw, HelpCircle, Brain, ChevronRight, Star, Plus
 } from "lucide-react";
+import { Link } from "react-router-dom";
 import { useTheme } from "../context/ThemeContext";
 import TradingChart from "../components/charts/TradingChart";
 
@@ -148,9 +149,11 @@ export default function StockDetail() {
   };
 
   if (loading) return (
-    <div className="space-y-4">
-      <div className="h-10 w-48 rounded-xl animate-pulse" style={{ background: "var(--bg-surface)" }} />
-      <div className="h-96 rounded-xl animate-pulse" style={{ background: "var(--bg-surface)" }} />
+    <div className="space-y-5 animate-fade-in-up">
+      <div className="h-4 w-64 rounded-lg skeleton" />
+      <div className="flex items-center gap-4"><div className="h-8 w-48 rounded-xl skeleton" /><div className="ml-auto h-10 w-32 rounded-xl skeleton" /></div>
+      <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-6 gap-3">{[...Array(6)].map((_, i) => <div key={i} className="stat-card space-y-2"><div className="h-3 w-1/2 skeleton rounded" /><div className="h-5 w-2/3 skeleton rounded" /></div>)}</div>
+      <div className="glass-card p-5 h-96 skeleton" />
     </div>
   );
 
@@ -165,29 +168,50 @@ export default function StockDetail() {
   const totalPatterns = patterns?.patterns?.length || 0;
 
   return (
-    <div data-testid="stock-detail-page" className="space-y-4">
+    <div data-testid="stock-detail-page" className="space-y-5">
+      {/* Breadcrumb */}
+      <div className="flex items-center gap-1.5 text-[11px]" style={{ color: "var(--text-muted)" }}>
+        <Link to="/dashboard" className="hover:opacity-80 transition-opacity">StockAssist AI</Link>
+        <ChevronRight size={10} />
+        <Link to="/markets" className="hover:opacity-80 transition-opacity">Markets</Link>
+        <ChevronRight size={10} />
+        <span>Stocks</span>
+        <ChevronRight size={10} />
+        <span style={{ color: "var(--text-primary)" }}>{quote.symbol}</span>
+      </div>
+
       {/* Header */}
       <div className="flex items-center gap-4">
-        <button data-testid="back-btn" onClick={() => navigate(-1)} className="p-2 rounded-xl" style={{ color: "var(--text-muted)" }}>
-          <ArrowLeft size={20} />
+        <button data-testid="back-btn" onClick={() => navigate(-1)} className="p-2 rounded-xl transition-all" style={{ color: "var(--text-muted)" }}
+          onMouseEnter={e => e.currentTarget.style.background = "var(--hover)"}
+          onMouseLeave={e => e.currentTarget.style.background = "transparent"}>
+          <ArrowLeft size={18} />
         </button>
         <div>
-          <h1 className="text-2xl font-medium tracking-tight" style={{ fontFamily: "Outfit", color: "var(--text-primary)" }}>
+          <h1 className="text-2xl sm:text-[28px] font-semibold tracking-tight font-display" style={{ color: "var(--text-primary)" }}>
             {quote.name}
           </h1>
-          <span className="text-sm font-mono" style={{ color: "var(--text-muted)" }}>{quote.symbol} | {quote.sector}</span>
+          <span className="text-[12px] font-mono" style={{ color: "var(--text-muted)" }}>{quote.symbol} · {quote.sector}</span>
         </div>
-        <div className="ml-auto text-right">
-          <div className="text-3xl font-semibold font-mono" style={{ color: "var(--text-primary)" }}>{formatCurrency(quote.price)}</div>
-          <div className="flex items-center gap-1 justify-end text-sm font-mono" style={{ color: isPos ? "var(--gain)" : "var(--loss)" }}>
-            {isPos ? <TrendingUp size={14} /> : <TrendingDown size={14} />}
-            {isPos ? "+" : ""}{formatNumber(quote.change)} ({formatPercent(quote.change_pct)})
+        <div className="ml-auto flex items-center gap-3">
+          <div className="text-right">
+            <div className="text-2xl sm:text-3xl font-semibold font-mono" style={{ color: "var(--text-primary)" }}>{formatCurrency(quote.price)}</div>
+            <div className="flex items-center gap-1.5 justify-end text-[13px] font-mono font-semibold" style={{ color: isPos ? "var(--gain)" : "var(--loss)" }}>
+              {isPos ? <TrendingUp size={13} /> : <TrendingDown size={13} />}
+              {isPos ? "+" : ""}₹{formatNumber(Math.abs(quote.change))} ({isPos ? "+" : ""}{quote.change_pct?.toFixed(2)}%)
+            </div>
           </div>
+          <button className="btn-ghost py-2 px-3 text-[11px] hidden sm:flex" title="Add to Watchlist">
+            <Star size={13} /> Watchlist
+          </button>
+          <button className="btn-primary py-2 px-3 text-[11px] hidden sm:flex">
+            <Brain size={13} /> AI Analysis
+          </button>
         </div>
       </div>
 
       {/* Quick Stats */}
-      <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-6 gap-3">
+      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3 stagger-children">
         {[
           { label: "Open",       value: formatCurrency(quote.open) },
           { label: "High",       value: formatCurrency(quote.high) },
@@ -196,22 +220,21 @@ export default function StockDetail() {
           { label: "Volume",     value: formatNumber(quote.volume, 0) },
           { label: "VWAP",       value: formatCurrency(quote.vwap) },
         ].map((s) => (
-          <div key={s.label} className="card-premium p-3">
-            <span className="text-[10px] font-bold uppercase tracking-widest block" style={{ color: "var(--text-muted)" }}>{s.label}</span>
-            <span className="text-sm font-mono font-semibold" style={{ color: "var(--text-primary)" }}>{s.value}</span>
+          <div key={s.label} className="stat-card !py-3 !px-4">
+            <span className="text-[10px] font-bold uppercase tracking-[0.12em] block" style={{ color: "var(--text-muted)" }}>{s.label}</span>
+            <span className="text-[14px] font-mono font-semibold" style={{ color: "var(--text-primary)" }}>{s.value}</span>
           </div>
         ))}
       </div>
 
       {/* Chart */}
-      <div className="card-premium p-4">
+      <div className="glass-card p-5">
         <div className="flex items-center justify-between mb-3">
-          <h3 className="text-xs font-bold uppercase tracking-widest" style={{ color: "var(--text-muted)" }}>Price Chart</h3>
-          <div className="flex gap-1">
+          <h3 className="text-[11px] font-bold uppercase tracking-[0.12em]" style={{ color: "var(--text-muted)" }}>Price Chart</h3>
+          <div className="segment-control">
             {["1D", "1W", "1M"].map((p) => (
               <button key={p} data-testid={`chart-period-${p}`} onClick={() => setPeriod(p)}
-                className="px-3 py-1 rounded-lg text-xs font-medium transition-all"
-                style={{ background: period === p ? "var(--ai-accent-soft)" : "transparent", color: period === p ? "var(--ai-accent)" : "var(--text-muted)" }}>
+                className={`segment-btn text-[11px] ${period === p ? "active" : ""}`}>
                 {p}
               </button>
             ))}
@@ -221,7 +244,7 @@ export default function StockDetail() {
       </div>
 
       {/* ─── Chart Pattern Detection Panel ─── */}
-      <div className="card-premium p-5" data-testid="pattern-detection-panel">
+      <div className="glass-card p-5" data-testid="pattern-detection-panel">
         <div className="flex items-center justify-between mb-4">
           <div className="flex items-center gap-2">
             <Eye size={16} style={{ color: "var(--ai-accent)" }} />
@@ -351,7 +374,7 @@ export default function StockDetail() {
       {/* Technical Indicators + Market Data */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
         {displayMode === "beginner" ? (
-          <div className="card-premium p-5">
+          <div className="glass-card p-5">
             <h3 className="text-xs font-bold uppercase tracking-widest mb-3 flex items-center gap-1.5" style={{ color: "var(--ai-accent)" }}>
               <Brain size={14} /> Simplified AI Indicators
             </h3>
@@ -411,7 +434,7 @@ export default function StockDetail() {
             </div>
           </div>
         ) : (
-          <div className="card-premium p-5">
+          <div className="glass-card p-5">
             <h3 className="text-xs font-bold uppercase tracking-widest mb-3" style={{ color: "var(--text-muted)" }}>Technical Indicators</h3>
             <p className="text-xs mb-3 p-2 rounded-lg flex items-start gap-2" style={{ background: "var(--ai-accent-soft)", color: "var(--ai-accent)" }}>
               <Info size={12} className="shrink-0 mt-0.5" /> RSI above 70 = overbought (may fall). Below 30 = oversold (may rise). MACD crossing signal line = trend change.
@@ -435,7 +458,7 @@ export default function StockDetail() {
           </div>
         )}
 
-        <div className="card-premium p-5">
+        <div className="glass-card p-5">
           <h3 className="text-xs font-bold uppercase tracking-widest mb-3" style={{ color: "var(--text-muted)" }}>{displayMode === "beginner" ? "Company Context" : "Market Data"}</h3>
           <div className="space-y-3">
             {displayMode === "beginner" ? (

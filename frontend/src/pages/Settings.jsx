@@ -92,14 +92,14 @@ export default function SettingsPage() {
   const inputStyle = { background: "var(--bg-surface)", border: "1px solid var(--border)", color: "var(--text-primary)" };
 
   return (
-    <div data-testid="settings-page" className="space-y-4 max-w-2xl">
+    <div data-testid="settings-page" className="space-y-5 max-w-3xl">
       <div>
-        <h1 className="text-2xl font-medium tracking-tight" style={{ fontFamily: "Outfit", color: "var(--text-primary)" }}>Settings</h1>
-        <p className="text-xs" style={{ color: "var(--text-muted)" }}>Configure your trading preferences and integrations</p>
+        <h1 className="text-2xl sm:text-[28px] font-semibold tracking-tight font-display" style={{ color: "var(--text-primary)" }}>Settings</h1>
+        <p className="text-[13px] mt-0.5" style={{ color: "var(--text-secondary)" }}>Configure your trading preferences and integrations</p>
       </div>
 
       {/* Zerodha Connection — Top Priority */}
-      <div className="card-premium p-5">
+      <div className="glass-card p-5">
         <h3 className="text-xs font-bold uppercase tracking-[0.15em] flex items-center gap-2 mb-4" style={{ color: "var(--text-muted)" }}>
           <Link2 size={12} /> Zerodha Kite Connect
         </h3>
@@ -149,7 +149,7 @@ export default function SettingsPage() {
       </div>
 
       {/* Profile */}
-      <div className="card-premium p-5 space-y-3">
+      <div className="glass-card p-5 space-y-3">
         <h3 className="text-xs font-bold uppercase tracking-[0.15em] flex items-center gap-2" style={{ color: "var(--text-muted)" }}><User size={12} /> Profile</h3>
         <div>
           <label className="text-[10px] font-bold uppercase tracking-widest block mb-1" style={{ color: "var(--text-muted)" }}>Name</label>
@@ -162,7 +162,7 @@ export default function SettingsPage() {
       </div>
 
       {/* Risk */}
-      <div className="card-premium p-5 space-y-3">
+      <div className="glass-card p-5 space-y-3">
         <h3 className="text-xs font-bold uppercase tracking-[0.15em] flex items-center gap-2" style={{ color: "var(--text-muted)" }}><Shield size={12} /> Risk Management</h3>
         <div className="grid grid-cols-2 gap-3">
           {[
@@ -189,7 +189,7 @@ export default function SettingsPage() {
       </div>
 
       {/* Notifications — Personal Only */}
-      <div className="card-premium p-5 space-y-3">
+      <div className="glass-card p-5 space-y-3">
         <h3 className="text-xs font-bold uppercase tracking-[0.15em] flex items-center gap-2" style={{ color: "var(--text-muted)" }}><Bell size={12} /> Notifications</h3>
         <p className="text-xs" style={{ color: "var(--text-secondary)" }}>Only alerts relevant to your trades and portfolio. No spam.</p>
         {[
@@ -233,7 +233,7 @@ export default function SettingsPage() {
       </div>
 
       {/* Data Sources */}
-      <div className="card-premium p-5">
+      <div className="glass-card p-5">
         <h3 className="text-xs font-bold uppercase tracking-[0.15em] flex items-center gap-2 mb-3" style={{ color: "var(--text-muted)" }}><Database size={12} /> Connected Services</h3>
         {dataSources && (
           <div className="space-y-2">
@@ -260,7 +260,7 @@ export default function SettingsPage() {
       </div>
 
       {/* Emergency Controls */}
-      <div className="card-premium p-5 border border-red-500/20 space-y-4">
+      <div className="glass-card p-5 border border-red-500/20 space-y-4">
         <h3 className="text-xs font-bold uppercase tracking-[0.15em] flex items-center gap-2 text-red-500" style={{ color: "var(--loss)" }}>
           <ShieldAlert size={14} /> Emergency Controls
         </h3>

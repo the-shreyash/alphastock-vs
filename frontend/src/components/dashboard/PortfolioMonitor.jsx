@@ -45,7 +45,7 @@ export default function PortfolioMonitor() {
 
   if (loading) {
     return (
-      <div className="card-premium p-5">
+      <div className="glass-card p-5">
         <div className="h-4 w-48 rounded-lg animate-pulse mb-3" style={{ background: "var(--bg-surface)" }} />
         <div className="h-20 rounded-lg animate-pulse" style={{ background: "var(--bg-surface)" }} />
       </div>
@@ -56,7 +56,7 @@ export default function PortfolioMonitor() {
   const scoreColor = score >= 75 ? "var(--gain)" : score >= 50 ? "#F59E0B" : "var(--loss)";
 
   return (
-    <div data-testid="portfolio-monitor" className="card-premium p-5">
+    <div data-testid="portfolio-monitor" className="glass-card p-5">
       <div className="flex items-center justify-between mb-4">
         <h3 className="text-xs font-bold uppercase tracking-[0.15em] flex items-center gap-2" style={{ color: "var(--text-muted)" }}>
           <Shield size={12} style={{ color: scoreColor }} /> AI Portfolio Monitor

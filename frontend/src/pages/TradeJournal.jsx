@@ -161,8 +161,10 @@ export default function TradeJournal() {
   };
 
   if (loading) return (
-    <div className="space-y-4">
-      {[1, 2, 3].map((i) => <div key={i} className="h-28 rounded-xl animate-pulse" style={{ background: "var(--bg-surface)" }} />)}
+    <div className="space-y-5 animate-fade-in-up">
+      <div className="h-8 w-40 rounded-xl skeleton" />
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">{[...Array(4)].map((_, i) => <div key={i} className="stat-card space-y-2"><div className="h-3 w-1/2 skeleton rounded" /><div className="h-6 w-2/3 skeleton rounded" /></div>)}</div>
+      <div className="glass-card p-5 h-40 skeleton" />
     </div>
   );
 
@@ -175,14 +177,13 @@ export default function TradeJournal() {
 
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-2xl sm:text-3xl font-medium tracking-tight" style={{ fontFamily: "Outfit", color: "var(--text-primary)" }}>Trade Journal</h1>
-          <p className="text-xs mt-1" style={{ color: "var(--text-muted)" }}>Performance tracking & AI coaching lessons</p>
+          <h1 className="text-2xl sm:text-[28px] font-semibold tracking-tight font-display" style={{ color: "var(--text-primary)" }}>Trade Journal</h1>
+          <p className="text-[13px] mt-0.5" style={{ color: "var(--text-secondary)" }}>Performance tracking & AI coaching</p>
         </div>
-        <div className="flex gap-1">
+        <div className="segment-control">
           {[7, 30, 90].map((p) => (
             <button key={p} data-testid={`period-${p}d`} onClick={() => setPeriod(p)}
-              className="px-3 py-1.5 rounded-lg text-xs font-medium transition-all"
-              style={{ background: period === p ? "var(--ai-accent-soft)" : "transparent", color: period === p ? "var(--ai-accent)" : "var(--text-muted)" }}>
+              className={`segment-btn text-[11px] ${period === p ? "active" : ""}`}>
               {p}D
             </button>
           ))}
@@ -190,22 +191,22 @@ export default function TradeJournal() {
       </div>
 
       {/* Stats Cards */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3 stagger-children">
         {[
           { label: "Total P&L", value: formatCurrency(recent.total_pnl), color: (recent.total_pnl || 0) >= 0 ? "var(--gain)" : "var(--loss)" },
           { label: "Win Rate", value: `${recent.win_rate || 0}%`, color: (recent.win_rate || 0) >= 50 ? "var(--gain)" : "var(--loss)" },
           { label: "Trades", value: recent.total || 0, color: "var(--text-primary)" },
           { label: "Best Trade", value: formatCurrency(recent.best), color: "var(--gain)" },
         ].map((s) => (
-          <div key={s.label} className="card-premium p-5">
-            <span className="text-[10px] font-bold uppercase tracking-widest block" style={{ color: "var(--text-muted)" }}>{s.label}</span>
-            <span className="text-2xl font-mono font-semibold" style={{ color: s.color }}>{s.value}</span>
+          <div key={s.label} className="stat-card">
+            <span className="text-[10px] font-bold uppercase tracking-[0.12em] block" style={{ color: "var(--text-muted)" }}>{s.label}</span>
+            <span className="text-xl font-mono font-semibold" style={{ color: s.color }}>{s.value}</span>
           </div>
         ))}
       </div>
 
       {/* All Time Stats */}
-      <div className="card-premium p-5">
+      <div className="glass-card p-5">
         <h3 className="text-xs font-bold uppercase tracking-widest mb-3 flex items-center gap-2" style={{ color: "var(--text-muted)" }}>
           <Award size={12} /> All-Time Performance
         </h3>
@@ -227,7 +228,7 @@ export default function TradeJournal() {
       </div>
 
       {/* AI Weekly Review */}
-      <div className="card-premium p-5">
+      <div className="glass-card p-5">
         <div className="flex items-center justify-between mb-3">
           <h3 className="text-xs font-bold uppercase tracking-widest flex items-center gap-2" style={{ color: "var(--ai-accent)" }}>
             <Brain size={12} /> AI Performance Review
@@ -247,7 +248,7 @@ export default function TradeJournal() {
       </div>
 
       {/* Trade History */}
-      <div className="card-premium">
+      <div className="glass-card">
         <div className="p-4 border-b" style={{ borderColor: "var(--border)" }}>
           <h3 className="text-xs font-bold uppercase tracking-widest" style={{ color: "var(--text-muted)" }}>Trade History ({journal.length})</h3>
         </div>

@@ -33,10 +33,10 @@ function Toast({ msg, type, onClose }) {
 
 function StatCard({ label, value, sub, color }) {
   return (
-    <div className="card-premium p-5 flex flex-col gap-1">
-      <span className="text-[10px] font-bold uppercase tracking-widest" style={{ color: "var(--text-muted)" }}>{label}</span>
-      <span className="text-2xl font-semibold font-mono" style={{ color: color || "var(--text-primary)" }}>{value}</span>
-      {sub && <span className="text-xs" style={{ color: "var(--text-muted)" }}>{sub}</span>}
+    <div className="stat-card flex flex-col gap-1">
+      <span className="text-[10px] font-bold uppercase tracking-[0.12em]" style={{ color: "var(--text-muted)" }}>{label}</span>
+      <span className="text-xl font-semibold font-mono" style={{ color: color || "var(--text-primary)" }}>{value}</span>
+      {sub && <span className="text-[11px]" style={{ color: "var(--text-muted)" }}>{sub}</span>}
     </div>
   );
 }
@@ -250,16 +250,13 @@ export default function PaperTrading() {
       {/* Header */}
       <div className="flex items-center justify-between flex-wrap gap-3">
         <div className="flex items-center gap-3">
-          <FlaskConical size={22} style={{ color: "#f59e0b" }} />
           <div>
-            <h1 className="text-xl font-semibold" style={{ fontFamily: "Outfit", color: "var(--text-primary)" }}>
-              Paper Trading Mode
+            <h1 className="text-2xl sm:text-[28px] font-semibold tracking-tight font-display flex items-center gap-2" style={{ color: "var(--text-primary)" }}>
+              <FlaskConical size={20} style={{ color: "#f59e0b" }} />Paper Trading
+              <span className="text-[10px] font-bold px-2 py-0.5 rounded-full" style={{ background: "#f59e0b22", color: "#f59e0b" }}>SIMULATED</span>
             </h1>
-            <p className="text-xs" style={{ color: "var(--text-muted)" }}>Practice trades with virtual ₹1,00,000 — no real money at risk</p>
+            <p className="text-[13px] mt-0.5" style={{ color: "var(--text-secondary)" }}>Practice trading with virtual money</p>
           </div>
-          <span className="text-xs font-bold px-3 py-1 rounded-full" style={{ background: "#f59e0b22", color: "#f59e0b", border: "1px solid #f59e0b44" }}>
-            SIMULATED
-          </span>
         </div>
         <div className="flex items-center gap-2">
           <button onClick={load} className="p-2 rounded-xl" style={{ color: "var(--text-muted)" }} title="Refresh">
@@ -299,13 +296,11 @@ export default function PaperTrading() {
       </div>
 
       {/* Trades Table */}
-      <div className="card-premium p-5">
+      <div className="glass-card p-5">
         {/* Tabs */}
-        <div className="flex gap-1 mb-4 p-1 rounded-xl w-fit" style={{ background: "var(--bg)" }}>
+        <div className="tab-bar mb-4 w-fit">
           {[{ key: "open", label: `Open (${openTrades.length})` }, { key: "closed", label: `Closed (${closedTrades.length})` }].map(t => (
-            <button key={t.key} onClick={() => setTab(t.key)}
-              className="px-4 py-1.5 rounded-lg text-xs font-medium transition-all"
-              style={{ background: tab === t.key ? "var(--ai-accent-soft)" : "transparent", color: tab === t.key ? "var(--ai-accent)" : "var(--text-muted)" }}>
+            <button key={t.key} onClick={() => setTab(t.key)} className={`tab-btn ${tab === t.key ? "active" : ""}`}>
               {t.label}
             </button>
           ))}

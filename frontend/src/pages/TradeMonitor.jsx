@@ -130,27 +130,27 @@ export default function TradeMonitor() {
       {/* PnL Summary */}
       {pnl && (
         <div data-testid="pnl-summary" className="grid grid-cols-2 md:grid-cols-5 gap-1">
-          <div className="card-premium  p-3">
+          <div className="glass-card  p-3">
             <span className="text-[10px] text-muted uppercase block">Total P&L</span>
             <span className={`text-lg font-mono ${pnl.total_pnl >= 0 ? "text-gain" : "text-loss"}`}>
               {pnl.total_pnl >= 0 ? "+" : ""}{formatCurrency(pnl.total_pnl)}
             </span>
           </div>
-          <div className="card-premium  p-3">
+          <div className="glass-card  p-3">
             <span className="text-[10px] text-muted uppercase block">Today P&L</span>
             <span className={`text-lg font-mono ${pnl.today_pnl >= 0 ? "text-gain" : "text-loss"}`}>
               {pnl.today_pnl >= 0 ? "+" : ""}{formatCurrency(pnl.today_pnl)}
             </span>
           </div>
-          <div className="card-premium  p-3">
+          <div className="glass-card  p-3">
             <span className="text-[10px] text-muted uppercase block">Win Rate</span>
             <span className="text-lg font-mono text-primary">{pnl.win_rate}%</span>
           </div>
-          <div className="card-premium  p-3">
+          <div className="glass-card  p-3">
             <span className="text-[10px] text-muted uppercase block">Open</span>
             <span className="text-lg font-mono text-primary">{pnl.open_trades}</span>
           </div>
-          <div className="card-premium  p-3">
+          <div className="glass-card  p-3">
             <span className="text-[10px] text-muted uppercase block">Total Trades</span>
             <span className="text-lg font-mono text-primary">{pnl.total_trades}</span>
           </div>
@@ -175,12 +175,12 @@ export default function TradeMonitor() {
       {tab === "active" && (
         <div className="space-y-1">
           {activeTrades.length === 0 ? (
-            <div className="card-premium  p-8 text-center">
+            <div className="glass-card  p-8 text-center">
               <p className="text-muted text-sm">No active trades. Click "New Trade" to get started.</p>
             </div>
           ) : (
             activeTrades.map((trade) => (
-              <div key={trade._id} data-testid={`active-trade-${trade.symbol}`} className="card-premium  p-4">
+              <div key={trade._id} data-testid={`active-trade-${trade.symbol}`} className="glass-card  p-4">
                 <div className="flex items-center justify-between mb-2">
                   <div className="flex items-center gap-3">
                     <span className={`px-1.5 py-0.5 text-[10px] font-mono rounded-xl ${trade.type === "BUY" ? "bg-gain/10 text-gain border border-gain/30" : "bg-loss/10 text-loss border border-loss/30"}`}>
@@ -228,12 +228,12 @@ export default function TradeMonitor() {
       {tab === "history" && (
         <div className="space-y-1">
           {history.length === 0 ? (
-            <div className="card-premium  p-8 text-center">
+            <div className="glass-card  p-8 text-center">
               <p className="text-muted text-sm">No trade history yet.</p>
             </div>
           ) : (
             history.map((trade) => (
-              <div key={trade._id} className="card-premium  p-3 flex items-center justify-between">
+              <div key={trade._id} className="glass-card  p-3 flex items-center justify-between">
                 <div className="flex items-center gap-3">
                   <span className={`px-1.5 py-0.5 text-[10px] font-mono rounded-xl ${trade.status === "TARGET_HIT" ? "bg-gain/10 text-gain" : trade.status === "SL_HIT" ? "bg-loss/10 text-loss" : "bg-zinc-800 text-secondary"}`}>
                     {trade.status}
@@ -258,7 +258,7 @@ export default function TradeMonitor() {
       {/* New Trade Modal */}
       {showNew && (
         <div className="fixed inset-0 bg-black/80 z-50 flex items-center justify-center p-4" onClick={() => setShowNew(false)}>
-          <div className="card-premium  w-full max-w-md" onClick={(e) => e.stopPropagation()}>
+          <div className="glass-card  w-full max-w-md" onClick={(e) => e.stopPropagation()}>
             <div className="flex items-center justify-between p-4 border-b">
               <h3 className="text-sm font-medium text-primary">New Trade Entry</h3>
               <button onClick={() => setShowNew(false)} className="text-muted hover:text-secondary"><X size={16} /></button>

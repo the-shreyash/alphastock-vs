@@ -20,13 +20,13 @@ const NSE_SYMBOLS = ["RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK", "SBIN",
 
 function MetricCard({ label, value, sub, color, icon: Icon }) {
   return (
-    <div className="card-premium p-5">
-      <div className="flex items-start justify-between mb-2">
-        <span className="text-[10px] font-bold uppercase tracking-widest" style={{ color: "var(--text-muted)" }}>{label}</span>
+    <div className="stat-card">
+      <div className="flex items-start justify-between mb-1">
+        <span className="text-[10px] font-bold uppercase tracking-[0.12em]" style={{ color: "var(--text-muted)" }}>{label}</span>
         {Icon && <Icon size={14} style={{ color: color || "var(--text-muted)" }} />}
       </div>
-      <div className="text-2xl font-semibold font-mono" style={{ color: color || "var(--text-primary)" }}>{value}</div>
-      {sub && <div className="text-xs mt-1" style={{ color: "var(--text-muted)" }}>{sub}</div>}
+      <div className="text-xl font-semibold font-mono" style={{ color: color || "var(--text-primary)" }}>{value}</div>
+      {sub && <div className="text-[11px] mt-1" style={{ color: "var(--text-muted)" }}>{sub}</div>}
     </div>
   );
 }
@@ -104,17 +104,16 @@ Is this strategy viable for live trading? What are the key risks? What improveme
     <div className="space-y-5" data-testid="backtesting-page">
       {/* Header */}
       <div>
-        <h1 className="text-xl font-semibold flex items-center gap-2" style={{ fontFamily: "Outfit", color: "var(--text-primary)" }}>
-          <BarChart3 size={20} style={{ color: "var(--ai-accent)" }} />
-          Backtesting Engine
+        <h1 className="text-2xl sm:text-[28px] font-semibold tracking-tight font-display" style={{ color: "var(--text-primary)" }}>
+          Backtesting
         </h1>
-        <p className="text-xs mt-0.5" style={{ color: "var(--text-muted)" }}>
-          Test trading strategies on historical NSE data before using them live
+        <p className="text-[13px] mt-0.5" style={{ color: "var(--text-secondary)" }}>
+          Test trading strategies on historical NSE data
         </p>
       </div>
 
       {/* Config Panel */}
-      <div className="card-premium p-6 space-y-5">
+      <div className="glass-card p-6 space-y-5">
         <h3 className="text-xs font-bold uppercase tracking-widest" style={{ color: "var(--text-muted)" }}>Strategy Configuration</h3>
 
         {/* Row 1: Symbol + Strategy */}
@@ -254,15 +253,15 @@ Is this strategy viable for live trading? What are the key risks? What improveme
 
           {/* Secondary metrics */}
           <div className="grid grid-cols-3 gap-3">
-            <div className="card-premium p-4 text-center">
+            <div className="glass-card p-4 text-center">
               <p className="text-[10px] uppercase tracking-widest mb-1" style={{ color: "var(--text-muted)" }}>Best Trade</p>
               <p className="text-lg font-mono font-semibold" style={{ color: "var(--gain)" }}>+{result.best_trade_pct}%</p>
             </div>
-            <div className="card-premium p-4 text-center">
+            <div className="glass-card p-4 text-center">
               <p className="text-[10px] uppercase tracking-widest mb-1" style={{ color: "var(--text-muted)" }}>Worst Trade</p>
               <p className="text-lg font-mono font-semibold" style={{ color: "var(--loss)" }}>{result.worst_trade_pct}%</p>
             </div>
-            <div className="card-premium p-4 text-center">
+            <div className="glass-card p-4 text-center">
               <p className="text-[10px] uppercase tracking-widest mb-1" style={{ color: "var(--text-muted)" }}>Avg Trade</p>
               <p className="text-lg font-mono font-semibold" style={{ color: pnlColor(result.avg_trade_pct) }}>
                 {result.avg_trade_pct >= 0 ? "+" : ""}{result.avg_trade_pct}%
@@ -272,7 +271,7 @@ Is this strategy viable for live trading? What are the key risks? What improveme
 
           {/* Equity Curve */}
           {result.equity_curve?.length > 1 && (
-            <div className="card-premium p-5">
+            <div className="glass-card p-5">
               <h3 className="text-xs font-bold uppercase tracking-widest mb-4" style={{ color: "var(--text-muted)" }}>
                 Equity Curve — {result.symbol} · {result.strategy.replace(/_/g, " ")}
               </h3>
@@ -294,7 +293,7 @@ Is this strategy viable for live trading? What are the key risks? What improveme
 
           {/* Trades Table */}
           {result.trades?.length > 0 && (
-            <div className="card-premium p-5">
+            <div className="glass-card p-5">
               <h3 className="text-xs font-bold uppercase tracking-widest mb-3" style={{ color: "var(--text-muted)" }}>
                 Trade Log ({result.trades.length} shown)
               </h3>
@@ -336,7 +335,7 @@ Is this strategy viable for live trading? What are the key risks? What improveme
           )}
 
           {/* AI Analysis */}
-          <div className="card-premium p-5">
+          <div className="glass-card p-5">
             <div className="flex items-center justify-between mb-3">
               <h3 className="text-xs font-bold uppercase tracking-widest" style={{ color: "var(--text-muted)" }}>AI Strategy Verdict</h3>
               <button onClick={getAiVerdict} disabled={aiLoading}
