@@ -1,16 +1,14 @@
-import { Bell, Sun, Moon, Menu, Search } from "lucide-react";
+import { Bell, Sun, Moon, Menu } from "lucide-react";
 import { useAuth } from "../../context/AuthContext";
 import { useTheme } from "../../context/ThemeContext";
 import { useState, useEffect } from "react";
-import { useNavigate } from "react-router-dom";
 import api from "../../services/api";
+import SearchBox from "./SearchBox";
 
 export default function Navbar({ onNotificationClick, onMenuClick }) {
   const { user } = useAuth();
-  const { theme, toggleTheme, displayMode, toggleDisplayMode } = useTheme();
+  const { theme, toggleTheme } = useTheme();
   const [unreadCount, setUnreadCount] = useState(0);
-  const [searchQuery, setSearchQuery] = useState("");
-  const navigate = useNavigate();
 
   useEffect(() => {
     if (!user) return;
@@ -19,13 +17,6 @@ export default function Navbar({ onNotificationClick, onMenuClick }) {
     const interval = setInterval(fetch, 30000);
     return () => clearInterval(interval);
   }, [user]);
-
-  const handleSearch = (e) => {
-    if (e.key === "Enter" && searchQuery.trim()) {
-      navigate(`/stock/${searchQuery.trim().toUpperCase()}`);
-      setSearchQuery("");
-    }
-  };
 
   return (
     <header
@@ -45,42 +36,12 @@ export default function Navbar({ onNotificationClick, onMenuClick }) {
           <Menu size={20} />
         </button>
 
-        {/* Search */}
-        <div className="relative hidden sm:block w-full max-w-md">
-          <Search size={15} className="absolute left-3.5 top-1/2 -translate-y-1/2" style={{ color: "var(--text-muted)" }} />
-          <input
-            data-testid="navbar-search"
-            type="text"
-            placeholder="Search stocks, news, reports..."
-            value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
-            onKeyDown={handleSearch}
-            className="search-input"
-            style={{ paddingLeft: "40px" }}
-          />
-        </div>
+        {/* Global stock search with autocomplete */}
+        <SearchBox />
       </div>
 
       {/* Right: Controls */}
-      <div className="flex items-center gap-2">
-        {/* Mode Toggle — Segmented Control */}
-        <div className="segment-control hidden md:inline-flex">
-          <button
-            data-testid="mode-toggle-beginner"
-            onClick={() => displayMode !== "beginner" && toggleDisplayMode()}
-            className={`segment-btn ${displayMode === "beginner" ? "active" : ""}`}
-          >
-            AI Beginner
-          </button>
-          <button
-            data-testid="mode-toggle-advanced"
-            onClick={() => displayMode !== "advanced" && toggleDisplayMode()}
-            className={`segment-btn ${displayMode === "advanced" ? "active" : ""}`}
-          >
-            AI Advanced
-          </button>
-        </div>
-
+      <div className="flex items-center gap-1.5">
         {/* Theme Toggle */}
         <button
           data-testid="theme-toggle-btn"
@@ -91,7 +52,7 @@ export default function Navbar({ onNotificationClick, onMenuClick }) {
           onMouseEnter={e => e.currentTarget.style.background = "var(--hover)"}
           onMouseLeave={e => e.currentTarget.style.background = "transparent"}
         >
-          {theme === "light" ? <Moon size={17} /> : <Sun size={17} />}
+          {theme === "light" ? <Moon size={18} /> : <Sun size={18} />}
         </button>
 
         {/* Notifications */}
@@ -103,7 +64,7 @@ export default function Navbar({ onNotificationClick, onMenuClick }) {
           onMouseEnter={e => e.currentTarget.style.background = "var(--hover)"}
           onMouseLeave={e => e.currentTarget.style.background = "transparent"}
         >
-          <Bell size={17} />
+          <Bell size={18} />
           {unreadCount > 0 && (
             <span
               className="absolute -top-0.5 -right-0.5 min-w-[16px] h-4 rounded-full flex items-center justify-center text-[9px] font-bold px-1"
@@ -116,9 +77,9 @@ export default function Navbar({ onNotificationClick, onMenuClick }) {
 
         {/* User Avatar */}
         {user && (
-          <div className="flex items-center gap-2.5 pl-2 ml-1" style={{ borderLeft: "1px solid var(--border)" }}>
+          <div className="flex items-center gap-2.5 pl-2.5 ml-1.5" style={{ borderLeft: "1px solid var(--border)" }}>
             <div
-              className="w-8 h-8 rounded-full flex items-center justify-center text-[11px] font-bold"
+              className="w-9 h-9 rounded-full flex items-center justify-center text-[13px] font-bold font-display"
               style={{
                 background: "linear-gradient(135deg, var(--ai-accent), #A78BFA)",
                 color: "#FFFFFF",
@@ -126,7 +87,7 @@ export default function Navbar({ onNotificationClick, onMenuClick }) {
             >
               {user.name?.[0]?.toUpperCase() || "U"}
             </div>
-            <span className="text-sm font-medium hidden lg:block" style={{ color: "var(--text-primary)" }}>
+            <span className="text-[15px] font-medium hidden lg:block" style={{ color: "var(--text-primary)" }}>
               {user.name}
             </span>
           </div>

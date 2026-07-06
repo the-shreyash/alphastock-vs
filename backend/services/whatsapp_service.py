@@ -36,9 +36,11 @@ def get_status():
 
 async def send_whatsapp(message: str, to_number: str = None):
     """Send WhatsApp message via Twilio. Returns result dict."""
-    from services.activity_logger import log_activity
-    log_activity("Sending alert via Telegram/WhatsApp", "alert", "done")
-
+    # NOTE: Delivery is intentionally NOT logged to the AI activity feed here —
+    # a single alert fans out to WhatsApp + Telegram + email, which flooded the
+    # feed with dozens of identical "Sending alert" rows per monitoring cycle.
+    # The heartbeat engine's "Monitored N positions — K alert(s) fired" summary
+    # reports alert activity truthfully and concisely instead.
     creds = _get_credentials()
 
     if not all([creds["sid"], creds["token"], creds["from_number"]]):

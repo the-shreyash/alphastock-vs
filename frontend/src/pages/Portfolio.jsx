@@ -3,9 +3,25 @@ import api from "../services/api";
 import { formatCurrency, formatPercent, formatNumber } from "../utils/formatters";
 import { Briefcase, TrendingUp, TrendingDown, PieChart, Wallet, RefreshCw, Download, ArrowUpRight, ArrowDownRight, Brain } from "lucide-react";
 import { PieChart as RechartsPie, Pie, Cell, ResponsiveContainer, Tooltip } from "recharts";
+import { motion } from "framer-motion";
 
 const COLORS = ["#6366F1", "#10B981", "#F59E0B", "#F43F5E", "#06B6D4", "#8B5CF6", "#EC4899", "#14B8A6"];
 const TABS = ["Overview", "Holdings", "Performance", "Allocation", "AI Review", "Transactions"];
+
+/* Scroll-reveal wrapper — fades/slides content in as it enters the viewport */
+function Reveal({ children, delay = 0, className }) {
+  return (
+    <motion.div
+      className={className}
+      initial={{ opacity: 0, y: 16 }}
+      whileInView={{ opacity: 1, y: 0 }}
+      viewport={{ once: true, margin: "-60px" }}
+      transition={{ duration: 0.4, delay, ease: [0.16, 1, 0.3, 1] }}
+    >
+      {children}
+    </motion.div>
+  );
+}
 
 export default function Portfolio() {
   const [holdings, setHoldings] = useState([]);
@@ -46,38 +62,39 @@ export default function Portfolio() {
   return (
     <div data-testid="portfolio-page" className="space-y-5">
       {/* Header */}
-      <div className="flex items-center justify-between">
-        <div>
-          <h1 className="text-2xl sm:text-[28px] font-semibold tracking-tight font-display" style={{ color: "var(--text-primary)" }}>Portfolio</h1>
-          <p className="text-[13px] mt-0.5" style={{ color: "var(--text-secondary)" }}>Your holdings and performance overview</p>
+      <Reveal>
+        <div className="flex items-center justify-between">
+          <div>
+            <h1 className="page-title">Portfolio</h1>
+            <p className="page-subtitle mt-1">Your holdings and performance overview</p>
+          </div>
+          <div className="flex items-center gap-2">
+            <button onClick={fetchPortfolio} className="btn-ghost btn-sm" style={{ padding: "10px" }}>
+              <RefreshCw size={15} />
+            </button>
+            <button className="btn-ghost btn-sm" style={{ padding: "10px" }}>
+              <Download size={15} />
+            </button>
+          </div>
         </div>
-        <div className="flex items-center gap-2">
-          <button onClick={fetchPortfolio} className="p-2.5 rounded-xl transition-all" style={{ color: "var(--text-muted)" }}
-            onMouseEnter={e => e.currentTarget.style.background = "var(--hover)"}
-            onMouseLeave={e => e.currentTarget.style.background = "transparent"}>
-            <RefreshCw size={15} />
-          </button>
-          <button className="p-2.5 rounded-xl transition-all" style={{ color: "var(--text-muted)" }}
-            onMouseEnter={e => e.currentTarget.style.background = "var(--hover)"}
-            onMouseLeave={e => e.currentTarget.style.background = "transparent"}>
-            <Download size={15} />
-          </button>
-        </div>
-      </div>
+      </Reveal>
 
       {/* Tab Bar */}
-      <div className="tab-bar">
-        {TABS.map(t => (
-          <button key={t} onClick={() => setTab(t)} className={`tab-btn ${tab === t ? "active" : ""}`}>{t}</button>
-        ))}
-      </div>
+      <Reveal>
+        <div className="tab-bar">
+          {TABS.map(t => (
+            <button key={t} onClick={() => setTab(t)} className={`tab-btn ${tab === t ? "active" : ""}`}>{t}</button>
+          ))}
+        </div>
+      </Reveal>
 
       {/* Portfolio Value Strip */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-        <div className="glass-card p-5 lg:col-span-2">
-          <span className="text-[10px] font-bold uppercase tracking-[0.12em] block mb-1" style={{ color: "var(--text-muted)" }}>Total Portfolio Value</span>
-          <div className="flex items-baseline gap-3">
-            <span className="text-3xl font-bold font-mono" style={{ color: "var(--text-primary)" }}>
+        <Reveal delay={0} className="lg:col-span-2">
+        <div className="glass-card p-5 h-full">
+          <span className="stat-label block mb-1.5">Total Portfolio Value</span>
+          <div className="flex items-baseline gap-3 flex-wrap">
+            <span className="stat-value">
               ₹{formatNumber(summary?.total_value || 0)}
             </span>
             <span className="text-sm font-mono font-semibold flex items-center gap-1" style={{ color: isPos ? "var(--gain)" : "var(--loss)" }}>
@@ -86,10 +103,12 @@ export default function Portfolio() {
             </span>
           </div>
         </div>
+        </Reveal>
 
         {/* Allocation Chart */}
-        <div className="glass-card p-5">
-          <span className="text-[10px] font-bold uppercase tracking-[0.12em] block mb-2" style={{ color: "var(--text-muted)" }}>Allocation by Sector</span>
+        <Reveal delay={0.06}>
+        <div className="glass-card p-5 h-full">
+          <span className="stat-label block mb-2">Allocation by Sector</span>
           {pieData.length > 0 ? (
             <ResponsiveContainer width="100%" height={120}>
               <RechartsPie>
@@ -101,16 +120,18 @@ export default function Portfolio() {
             </ResponsiveContainer>
           ) : (
             <div className="h-[120px] flex items-center justify-center">
-              <span className="text-[12px]" style={{ color: "var(--text-muted)" }}>No holdings yet</span>
+              <span className="body-text" style={{ color: "var(--text-muted)" }}>No holdings yet</span>
             </div>
           )}
         </div>
+        </Reveal>
       </div>
 
       {/* AI Portfolio Review */}
+      <Reveal>
       <div className="glass-card p-5">
         <div className="flex items-center justify-between mb-3">
-          <h3 className="text-[11px] font-bold uppercase tracking-[0.12em] flex items-center gap-2" style={{ color: "var(--text-muted)" }}>
+          <h3 className="eyebrow flex items-center gap-2">
             <Brain size={13} style={{ color: "var(--ai-accent)" }} /> AI Portfolio Review
           </h3>
           <div className="relative w-14 h-14">
@@ -134,11 +155,13 @@ export default function Portfolio() {
           ))}
         </div>
       </div>
+      </Reveal>
 
       {/* Holdings Table */}
+      <Reveal>
       <div className="glass-card overflow-hidden">
         <div className="p-4 pb-0">
-          <h3 className="text-[11px] font-bold uppercase tracking-[0.12em]" style={{ color: "var(--text-muted)" }}>Holdings ({holdings.length})</h3>
+          <h3 className="eyebrow">Holdings ({holdings.length})</h3>
         </div>
         <div className="overflow-x-auto">
           <table className="data-table mt-3">
@@ -185,11 +208,13 @@ export default function Portfolio() {
           </table>
         </div>
       </div>
+      </Reveal>
 
       {/* Zerodha Account */}
       {zerodhaAccount && (
+        <Reveal>
         <div className="glass-card p-5">
-          <h3 className="text-[11px] font-bold uppercase tracking-[0.12em] mb-3 flex items-center gap-2" style={{ color: "var(--text-muted)" }}>
+          <h3 className="eyebrow mb-3 flex items-center gap-2">
             <Wallet size={13} /> Zerodha Account
             <span className="badge-status" style={{
               background: zerodhaAccount.status?.connected ? "var(--gain-bg)" : "var(--hover)",
@@ -200,12 +225,13 @@ export default function Portfolio() {
           </h3>
           {zerodhaAccount.funds && (
             <div className="grid grid-cols-3 gap-4">
-              <div><span className="text-[10px] font-medium" style={{ color: "var(--text-muted)" }}>Available</span><div className="text-lg font-mono font-semibold" style={{ color: "var(--text-primary)" }}>₹{formatNumber(zerodhaAccount.funds.available)}</div></div>
-              <div><span className="text-[10px] font-medium" style={{ color: "var(--text-muted)" }}>Used</span><div className="text-lg font-mono font-semibold" style={{ color: "var(--text-primary)" }}>₹{formatNumber(zerodhaAccount.funds.used)}</div></div>
-              <div><span className="text-[10px] font-medium" style={{ color: "var(--text-muted)" }}>Total</span><div className="text-lg font-mono font-semibold" style={{ color: "var(--text-primary)" }}>₹{formatNumber(zerodhaAccount.funds.total)}</div></div>
+              <div><span className="stat-label">Available</span><div className="text-lg font-mono font-semibold" style={{ color: "var(--text-primary)" }}>₹{formatNumber(zerodhaAccount.funds.available)}</div></div>
+              <div><span className="stat-label">Used</span><div className="text-lg font-mono font-semibold" style={{ color: "var(--text-primary)" }}>₹{formatNumber(zerodhaAccount.funds.used)}</div></div>
+              <div><span className="stat-label">Total</span><div className="text-lg font-mono font-semibold" style={{ color: "var(--text-primary)" }}>₹{formatNumber(zerodhaAccount.funds.total)}</div></div>
             </div>
           )}
         </div>
+        </Reveal>
       )}
     </div>
   );

@@ -1,251 +1,852 @@
-# AlphaPartner — Testing Rules & Guidelines
+# StockAssist AI
+## Testing Documentation
 
-> Load this file for any task involving running tests, writing new tests,
-> debugging test failures, or understanding the test suite.
+Version: 1.0
 
----
-
-## Test Suite Overview
-
-| Category | Count | Location |
-|---|---|---|
-| Core backend tests | 99 | `backend/` (pytest) |
-| Advanced integration tests | 4 | `backend/` (pytest) |
-| **Total** | **103** | All must pass at all times |
-
-The 4 integration tests specifically cover:
-- Settings update flow
-- Emergency Stop execution
-- Chat debate response format (Claude + Gemini + synthesis)
-- SIP debate response format
+Status: Active Development
 
 ---
 
-## Running Tests
+# Purpose
 
-### Run all tests (standard)
-```bash
-cd backend
-./venv/bin/python -m pytest
-```
+This document defines the complete testing strategy for StockAssist AI.
 
-### Run with short traceback on failure
-```bash
-cd backend
-./venv/bin/python -m pytest --tb=short
-```
+Testing ensures that every feature, API, AI workflow, broker integration, payment flow, and user interaction works correctly before reaching production.
 
-### Run a specific test by name
-```bash
-cd backend
-./venv/bin/python -m pytest -k "test_name_here"
-```
+Quality is everyone's responsibility.
 
-### Run with verbose output
-```bash
-cd backend
-./venv/bin/python -m pytest -v
-```
-
-### Run and show only failures
-```bash
-cd backend
-./venv/bin/python -m pytest --tb=short -q
-```
+Testing is required before deployment.
 
 ---
 
-## Test Rules (Non-Negotiable)
+# Testing Goals
 
-1. **103 tests must always pass** — after ANY backend change, run tests and verify.
-2. **Never modify existing tests** to make them pass after a code change — fix the source code instead.
-3. **Exception**: if a test itself has a genuine bug (tests wrong behavior), document the bug clearly before modifying the test.
-4. **New features require new tests** — every new API endpoint needs at least one test.
-5. **Simulated/fallback behavior must be testable** — tests should not require real API keys to pass.
-6. **Frontend changes do not require backend test reruns** — only backend changes trigger test verification.
+Prevent Bugs
 
----
+Protect Users
 
-## Writing New Tests
+Ensure Reliability
 
-### File naming
-- Test files: `test_[feature_name].py` inside `backend/`
-- Example: `test_paper_trading.py`, `test_activity_feed.py`
+Verify AI Responses
 
-### Test function naming
-```python
-def test_[endpoint_or_function]_[scenario]():
-    ...
+Validate Market Data
 
-# Examples:
-def test_get_paper_trades_returns_empty_for_new_user():
-def test_execute_paper_trade_deducts_balance():
-def test_activity_feed_returns_list():
-def test_morning_report_generates_on_demand():
-```
+Secure Payments
 
-### Test structure (AAA pattern)
-```python
-def test_feature_behavior():
-    # ARRANGE — set up test data and state
-    user_id = "test_user_123"
-    trade_data = {"symbol": "RELIANCE", "quantity": 10, ...}
+Verify Broker Integrations
 
-    # ACT — call the function or endpoint being tested
-    response = client.post("/api/paper/trade", json=trade_data, headers=auth_headers)
+Maintain Performance
 
-    # ASSERT — verify the outcome
-    assert response.status_code == 200
-    assert response.json()["status"] == "ok"
-    assert response.json()["trade"]["is_paper"] == True
-```
-
-### FastAPI test client setup
-```python
-from fastapi.testclient import TestClient
-from server import app
-
-client = TestClient(app)
-
-# Auth header for protected endpoints
-def get_auth_headers(user_id="test_user"):
-    # Use the existing test JWT generation pattern from existing test files
-    token = create_test_token(user_id)
-    return {"Authorization": f"Bearer {token}"}
-```
-
-### Testing async functions directly
-```python
-import asyncio
-import pytest
-
-@pytest.mark.asyncio
-async def test_async_service_function():
-    result = await some_async_service_function("param")
-    assert result is not None
-```
-
-### Mocking external services
-```python
-from unittest.mock import patch, AsyncMock
-
-# Mock Zerodha API
-with patch("services.zerodha_service.get_holdings", new_callable=AsyncMock) as mock:
-    mock.return_value = [{"symbol": "RELIANCE", "quantity": 10}]
-    response = client.get("/api/zerodha/holdings", headers=auth_headers)
-
-# Mock AI debate engine
-with patch("services.ai_debate_engine.run_debate", new_callable=AsyncMock) as mock:
-    mock.return_value = {"verdict": "Bullish setup", "claude": "...", "gemini": "..."}
-    response = client.post("/api/chat", json={"message": "Analyze HDFC"}, headers=auth_headers)
-```
+Support Continuous Deployment
 
 ---
 
-## What to Test for Each New Feature
+# Testing Philosophy
 
-### Feature: AI Activity Feed
-```
-- GET /api/ai-activity returns a list (even if empty)
-- Each item has: time, action, category, status fields
-- WebSocket connection to activity_feed channel does not crash
-- log_activity() appends to deque correctly
-```
+Every feature must be tested before release.
 
-### Feature: Chart Pattern Detection
-```
-- detect_chart_patterns([]) returns empty list (not crash)
-- Bullish engulfing detected correctly with test OHLCV data
-- GET /api/stocks/{symbol}/patterns returns list
-- Each pattern has: pattern, signal, confidence, description fields
-```
+Testing should be:
 
-### Feature: Paper Trading
-```
-- GET /api/paper/balance returns default 100000 for new user
-- POST /api/paper/trade succeeds with valid data
-- POST /api/paper/trade deducts from paper_capital
-- Closed paper trades appear in GET /api/paper/trades
-- POST /api/paper/reset restores capital to 100000
-- Paper trades have is_paper=True in DB
-- Paper trades NEVER call zerodha_service functions
-```
+Automated
 
-### Feature: Historical Setup Success Rate
-```
-- GET /api/journal/setup-stats returns dict
-- Win rate calculation correct: 3 wins / 5 trades = 60%
-- Returns demo data (not crash) when no trades exist
-- setup_type field accepted in POST /api/trades
-```
+Repeatable
 
-### Feature: Backtesting Engine
-```
-- POST /api/backtest returns result with all expected fields
-- win_rate is between 0 and 100
-- equity_curve is a list of {date, capital} objects
-- Returns fallback data when yfinance unavailable (not crash)
-- Sharpe ratio is a float (can be negative)
-```
+Reliable
 
-### Feature: AI Trade Coaching
-```
-- GET /api/trades/{trade_id}/coaching returns coaching object
-- Coaching has: grade, lesson_title, what_went_right, what_went_wrong, next_time
-- Grade is one of: A, B, C, D
-- Coaching is cached — second call returns same result without re-generating
-- Returns 400 for open trades (coaching only for closed trades)
-```
+Fast
 
-### Feature: Morning Report
-```
-- GET /api/reports/morning returns report object
-- Report has: date, market_mood, nifty, banknifty, sensex, ai_briefing, top_picks
-- market_mood is one of: Bullish, Bearish, Neutral, Cautious
-- Report cached for same date — second call returns cached version
-- Returns report even when stock picks not yet generated (top_picks: [])
-```
+Independent
 
-### Feature: n8n Webhooks
-```
-- POST /api/webhooks/morning-scan returns {"status": "ok"}
-- POST /api/webhooks/evening-summary returns {"status": "ok"}
-- POST /api/webhooks/weekly-review returns {"status": "ok"}
-- POST /api/webhooks/news-digest returns {"status": "ok"}
-- Webhook without correct API key header returns 403
-```
+Documented
 
 ---
 
-## Debugging Failing Tests
+# Testing Pyramid
 
-When a test fails after a code change, follow this sequence:
+                End-to-End Tests
+                     ▲
+               Integration Tests
+                     ▲
+                 Unit Tests
 
-1. Read the full error message — identify which assertion failed.
-2. Check if the change altered a route path, response format, or field name.
-3. Check if a new required field was added to a Pydantic model that existing test data doesn't have.
-4. Check if an async function is not being awaited properly.
-5. Check if a MongoDB operation changed and the test mock needs updating.
+Most tests should be unit tests.
 
-### Common failure patterns
-
-**Pattern: `KeyError` or `assert 'field' in response`**
-→ Response format changed. Align new code response with what test expects.
-
-**Pattern: `422 Unprocessable Entity` in test**
-→ Pydantic validation failed. Check if request body in test matches updated model.
-
-**Pattern: `RuntimeWarning: coroutine was never awaited`**
-→ New async function called without `await`. Add `await` or use `AsyncMock` in test.
-
-**Pattern: `AssertionError: 103 != 99` (wrong count)**
-→ New tests added but some new tests failing. Fix new tests first, then verify 103+ pass.
+End-to-end tests should cover critical user journeys.
 
 ---
 
-## Test Environment Notes
+# Testing Levels
 
-- Tests run without real API keys — all external services use simulated fallbacks.
-- MongoDB: tests use the same database unless a test fixture creates isolated collections.
-- `REACT_APP_BACKEND_URL=http://localhost:8000` must be set when running tests.
-- `venv/bin/python` must be used — not system Python — to ensure correct packages.
+Unit Testing
+
+Integration Testing
+
+API Testing
+
+End-to-End Testing
+
+Performance Testing
+
+Security Testing
+
+Accessibility Testing
+
+AI Validation Testing
+
+Broker Testing
+
+Regression Testing
+
+User Acceptance Testing
+
+---
+
+# Unit Testing
+
+Purpose
+
+Test individual functions and components.
+
+Examples
+
+Utility Functions
+
+React Components
+
+Hooks
+
+Services
+
+Validators
+
+Business Logic
+
+Expected Coverage
+
+Minimum 80%
+
+Recommended 90%
+
+---
+
+# Frontend Testing
+
+Framework
+
+Vitest
+
+React Testing Library
+
+Test
+
+Pages
+
+Components
+
+Forms
+
+Buttons
+
+Charts
+
+Cards
+
+Navigation
+
+Theme
+
+Responsive Layout
+
+Loading States
+
+Error States
+
+Empty States
+
+---
+
+# Backend Testing
+
+Framework
+
+Vitest / Jest
+
+Test
+
+Controllers
+
+Services
+
+Middleware
+
+Routes
+
+Authentication
+
+Authorization
+
+Validation
+
+Database Layer
+
+Business Logic
+
+---
+
+# API Testing
+
+Test Every Endpoint
+
+Authentication
+
+Authorization
+
+Validation
+
+Success Responses
+
+Error Responses
+
+Pagination
+
+Filtering
+
+Sorting
+
+Rate Limiting
+
+Performance
+
+---
+
+# Integration Testing
+
+Purpose
+
+Verify communication between services.
+
+Examples
+
+Frontend ↔ Backend
+
+Backend ↔ MongoDB
+
+Backend ↔ Redis
+
+Backend ↔ AI
+
+Backend ↔ Broker
+
+Backend ↔ Payment
+
+---
+
+# End-to-End Testing
+
+Framework
+
+Playwright
+
+Critical User Flows
+
+User Registration
+
+Login
+
+Connect Broker
+
+Search Stock
+
+View Dashboard
+
+Generate Morning Report
+
+Chat with AI
+
+Paper Trade
+
+Backtest Strategy
+
+Upgrade Subscription
+
+Purchase Credits
+
+Logout
+
+Admin Login
+
+---
+
+# AI Testing
+
+Validate
+
+Response Quality
+
+Response Time
+
+Prompt Accuracy
+
+Context Retention
+
+Memory
+
+Portfolio Analysis
+
+Trade Suggestions
+
+Morning Reports
+
+AI Debate
+
+AI Reflection
+
+Verify
+
+No hallucinated portfolio data
+
+No invalid recommendations caused by missing data
+
+Proper error handling
+
+---
+
+# Broker Integration Testing
+
+Test
+
+OAuth Flow
+
+Portfolio Sync
+
+Holdings Sync
+
+Order Placement
+
+Order Modification
+
+Order Cancellation
+
+Trade History
+
+WebSocket
+
+Token Refresh
+
+Session Expiry
+
+API Failure
+
+Rate Limits
+
+---
+
+# Payment Testing
+
+Test
+
+Checkout
+
+Webhook Verification
+
+Subscription Activation
+
+Credit Purchase
+
+Invoice Generation
+
+Refund Flow
+
+Payment Failure
+
+Renewals
+
+Cancellation
+
+---
+
+# Market Engine Testing
+
+Verify
+
+Live Price Updates
+
+Market Scanner
+
+Ranking Engine
+
+Sector Analysis
+
+Morning Report Data
+
+News Processing
+
+Cache
+
+WebSocket Streams
+
+---
+
+# Performance Testing
+
+Targets
+
+Dashboard
+
+<2 Seconds
+
+Search
+
+<500ms
+
+API
+
+<500ms
+
+Scanner
+
+<10 Seconds
+
+Morning Report
+
+<60 Seconds
+
+Portfolio Load
+
+<2 Seconds
+
+---
+
+# Load Testing
+
+Simulate
+
+100 Users
+
+500 Users
+
+1000 Users
+
+5000 Users
+
+10000 Users
+
+Measure
+
+Response Time
+
+CPU
+
+Memory
+
+Database
+
+Redis
+
+Worker Queue
+
+WebSocket Stability
+
+---
+
+# Stress Testing
+
+Verify behavior during
+
+Traffic Spike
+
+Market Open
+
+Breaking News
+
+Large AI Usage
+
+Large Scanner Requests
+
+Mass Notifications
+
+---
+
+# Security Testing
+
+Authentication
+
+Authorization
+
+Rate Limiting
+
+JWT
+
+CSRF
+
+XSS
+
+Injection
+
+Session Management
+
+Secrets
+
+Broker Tokens
+
+Payment Security
+
+OWASP Top 10
+
+---
+
+# Accessibility Testing
+
+Verify
+
+Keyboard Navigation
+
+Focus States
+
+ARIA Labels
+
+Screen Reader
+
+Contrast Ratio
+
+Reduced Motion
+
+Responsive Text
+
+WCAG AA Compliance
+
+---
+
+# Mobile Testing
+
+Test
+
+Android
+
+iOS
+
+Tablets
+
+Responsive Layout
+
+Touch Gestures
+
+Navigation
+
+Charts
+
+Forms
+
+Performance
+
+---
+
+# Browser Testing
+
+Support
+
+Chrome
+
+Edge
+
+Firefox
+
+Safari
+
+Latest Stable Versions
+
+---
+
+# Database Testing
+
+Verify
+
+Indexes
+
+Relationships
+
+Validation
+
+Soft Delete
+
+Migration
+
+Backup
+
+Recovery
+
+Performance
+
+---
+
+# Redis Testing
+
+Verify
+
+Caching
+
+Expiration
+
+Invalidation
+
+Sessions
+
+Rate Limits
+
+Queue
+
+---
+
+# Notification Testing
+
+Email
+
+Browser Notifications
+
+Push Notifications (Future)
+
+Retry Logic
+
+Delivery Status
+
+---
+
+# Regression Testing
+
+Run before every release.
+
+Ensure previous functionality still works.
+
+Focus
+
+Authentication
+
+Dashboard
+
+Portfolio
+
+Trading
+
+AI
+
+Subscriptions
+
+Admin Portal
+
+---
+
+# Smoke Testing
+
+Verify
+
+Application Starts
+
+Database Connected
+
+Redis Connected
+
+API Healthy
+
+Frontend Loads
+
+Login Works
+
+---
+
+# User Acceptance Testing
+
+Verify
+
+Business Requirements
+
+User Experience
+
+Design Consistency
+
+Performance
+
+Accessibility
+
+Documentation
+
+---
+
+# Test Data
+
+Use
+
+Dedicated Test Database
+
+Sandbox Brokers
+
+Sandbox Payment Gateway
+
+Mock AI Responses
+
+Synthetic Users
+
+Never test on production user data.
+
+---
+
+# CI/CD Testing
+
+Every Pull Request
+
+↓
+
+Lint
+
+↓
+
+Type Check
+
+↓
+
+Unit Tests
+
+↓
+
+Integration Tests
+
+↓
+
+API Tests
+
+↓
+
+Build
+
+↓
+
+Security Scan
+
+↓
+
+Deploy Staging
+
+---
+
+# Coverage Goals
+
+Frontend
+
+90%
+
+Backend
+
+90%
+
+Business Logic
+
+95%
+
+Critical Services
+
+100%
+
+---
+
+# Bug Severity
+
+Critical
+
+System unusable
+
+High
+
+Major feature broken
+
+Medium
+
+Feature partially works
+
+Low
+
+Minor UI issue
+
+Trivial
+
+Cosmetic issue
+
+---
+
+# Release Quality Gates
+
+Before production verify
+
+✓ Unit Tests Passed
+
+✓ Integration Tests Passed
+
+✓ API Tests Passed
+
+✓ E2E Tests Passed
+
+✓ Security Scan Passed
+
+✓ Performance Targets Met
+
+✓ Accessibility Verified
+
+✓ Documentation Updated
+
+✓ Manual QA Approved
+
+✓ Product Owner Approval
+
+---
+
+# Monitoring After Release
+
+Monitor
+
+Error Rate
+
+Crash Rate
+
+API Failures
+
+Broker Failures
+
+Payment Failures
+
+AI Errors
+
+Latency
+
+User Feedback
+
+Rollback if required.
+
+---
+
+# Future Enhancements
+
+Visual Regression Testing
+
+AI Evaluation Framework
+
+Synthetic Monitoring
+
+Chaos Engineering
+
+Contract Testing
+
+Mutation Testing
+
+Cross-Region Testing
+
+Enterprise QA Dashboard
+
+---
+
+# Long-Term Vision
+
+Testing should become an automated quality assurance system that continuously validates every layer of StockAssist AI.
+
+Every deployment should be backed by automated tests, performance benchmarks, security checks, and user experience validation, ensuring confidence in every release while enabling rapid development.
+
+---
+
+# End of Testing Documentation

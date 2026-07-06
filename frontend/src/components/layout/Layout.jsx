@@ -1,12 +1,14 @@
 import { useState, useEffect } from "react";
 import { Outlet, useLocation } from "react-router-dom";
 import { motion, AnimatePresence } from "framer-motion";
-import Sidebar from "./Sidebar";
+import Sidebar, { SIDEBAR_COLLAPSED_W, SIDEBAR_EXPANDED_W, SIDEBAR_MOBILE_W } from "./Sidebar";
 import Navbar from "./Navbar";
 import NotificationPanel from "../notifications/NotificationPanel";
 
 export default function Layout() {
-  const [collapsed, setCollapsed] = useState(false);
+  // Hover-expand is the primary interaction: the sidebar starts collapsed
+  // (narrow) and widens on hover. Clicking the toggle pins it open.
+  const [collapsed, setCollapsed] = useState(true);
   const [showNotifs, setShowNotifs] = useState(false);
   const [mobileOpen, setMobileOpen] = useState(false);
   const [isDesktop, setIsDesktop] = useState(window.innerWidth >= 1024);
@@ -28,7 +30,7 @@ export default function Layout() {
     return () => window.removeEventListener("resize", handleResize);
   }, []);
 
-  const mainMargin = isDesktop ? (collapsed ? 68 : 240) : 0;
+  const mainMargin = isDesktop ? (collapsed ? SIDEBAR_COLLAPSED_W : SIDEBAR_EXPANDED_W) : 0;
 
   return (
     <div className="min-h-screen transition-colors duration-300" style={{ background: "var(--bg)" }} data-testid="app-layout">
@@ -51,9 +53,9 @@ export default function Layout() {
               data-testid="mobile-sidebar-backdrop"
             />
             <motion.div
-              initial={{ x: -280 }}
+              initial={{ x: -SIDEBAR_MOBILE_W }}
               animate={{ x: 0 }}
-              exit={{ x: -280 }}
+              exit={{ x: -SIDEBAR_MOBILE_W }}
               transition={{ type: "spring", damping: 28, stiffness: 320 }}
               className="fixed left-0 top-0 h-screen z-50"
             >
@@ -69,7 +71,7 @@ export default function Layout() {
           onNotificationClick={() => setShowNotifs(!showNotifs)}
           onMenuClick={() => setMobileOpen(true)}
         />
-        <main className="p-5 sm:p-6 lg:p-8 min-h-[calc(100vh-64px)]">
+        <main className="page-container min-h-[calc(100vh-64px)]">
           <AnimatePresence mode="wait">
             <motion.div
               key={location.pathname}

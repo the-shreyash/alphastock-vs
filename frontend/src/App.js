@@ -6,6 +6,7 @@ import Landing from "./pages/Landing";
 import Login from "./pages/Login";
 import Register from "./pages/Register";
 import AuthCallback from "./pages/AuthCallback";
+import BrokerCallback from "./pages/BrokerCallback";
 import Dashboard from "./pages/Dashboard";
 import StockPicks from "./pages/StockPicks";
 import StockDetail from "./pages/StockDetail";
@@ -57,6 +58,7 @@ function AppRouter() {
       <Route path="/" element={<PublicRoute><Landing /></PublicRoute>} />
       <Route path="/login" element={<PublicRoute><Login /></PublicRoute>} />
       <Route path="/register" element={<PublicRoute><Register /></PublicRoute>} />
+      <Route path="/broker/callback" element={<BrokerCallback />} />
       <Route path="/" element={<ProtectedRoute><Layout /></ProtectedRoute>}>
         <Route path="dashboard" element={<Dashboard />} />
         <Route path="markets" element={<Markets />} />

@@ -5,6 +5,22 @@ import { formatCurrency, formatPercent } from "../utils/formatters";
 
 import { Target, Shield, TrendingUp, AlertTriangle, Brain, RefreshCw, ChevronDown, ChevronUp, Info, BarChart3 } from "lucide-react";
 import { BarChart, Bar, Cell, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts";
+import { motion } from "framer-motion";
+
+/* Scroll-reveal wrapper — fades/slides content in as it enters the viewport */
+function Reveal({ children, delay = 0, className }) {
+  return (
+    <motion.div
+      className={className}
+      initial={{ opacity: 0, y: 16 }}
+      whileInView={{ opacity: 1, y: 0 }}
+      viewport={{ once: true, margin: "-60px" }}
+      transition={{ duration: 0.4, delay, ease: [0.16, 1, 0.3, 1] }}
+    >
+      {children}
+    </motion.div>
+  );
+}
 
 function ConfidenceBadge({ value }) {
   const color = value >= 80 ? "var(--gain)" : value >= 70 ? "#F59E0B" : "var(--loss)";
@@ -108,7 +124,7 @@ function SetupPerformanceHistory() {
   return (
     <div data-testid="setup-performance-history" className="glass-card p-5">
       <div className="flex items-center justify-between mb-4">
-        <h3 className="text-xs font-bold uppercase tracking-widest flex items-center gap-1.5" style={{ color: "var(--text-muted)" }}>
+        <h3 className="eyebrow flex items-center gap-1.5">
           <BarChart3 size={12} /> Setup Performance History
         </h3>
         {data?.is_demo && (
@@ -154,8 +170,8 @@ function PickCard({ pick, onExplain, explaining, onTrade }) {
         <div className="flex items-center justify-between mb-2">
           <div className="flex items-center gap-3">
             <div>
-              <h3 className="text-base font-semibold" style={{ fontFamily: "Outfit", color: "var(--text-primary)" }}>{pick.name}</h3>
-              <span className="text-xs font-mono" style={{ color: "var(--text-muted)" }}>{pick.symbol} | {pick.sector}</span>
+              <h3 className="card-title">{pick.name}</h3>
+              <span className="caption font-mono">{pick.symbol} | {pick.sector}</span>
             </div>
           </div>
           <div className="text-right">
@@ -222,8 +238,7 @@ function PickCard({ pick, onExplain, explaining, onTrade }) {
             data-testid={`explain-btn-${pick.symbol}`}
             onClick={() => onExplain(pick)}
             disabled={explaining}
-            className="text-xs flex items-center gap-1 px-3 py-1.5 rounded-lg disabled:opacity-50 transition-all"
-            style={{ background: "var(--ai-accent-soft)", color: "var(--ai-accent)" }}
+            className="btn-secondary btn-sm"
           >
             <Brain size={12} />
             {explaining ? "Analyzing..." : "Full AI Report"}
@@ -231,16 +246,14 @@ function PickCard({ pick, onExplain, explaining, onTrade }) {
           <button
             data-testid={`trade-btn-${pick.symbol}`}
             onClick={() => onTrade(pick)}
-            className="text-xs flex items-center gap-1 px-3 py-1.5 rounded-lg font-semibold transition-all hover:-translate-y-px"
-            style={{ background: "var(--gain)", color: "#fff" }}
+            className="btn-primary btn-sm"
           >
             <TrendingUp size={12} />
             Trade Now
           </button>
           <button
             onClick={() => navigate(`/stock/${pick.symbol}`)}
-            className="text-xs flex items-center gap-1 px-3 py-1.5 rounded-lg transition-all"
-            style={{ background: "var(--bg-surface)", color: "var(--text-secondary)" }}
+            className="btn-ghost btn-sm"
           >
             View Chart
           </button>
@@ -257,10 +270,10 @@ function AIDebateModal({ data, onClose }) {
       <div className="glass-card max-w-4xl w-full max-h-[85vh] overflow-y-auto" style={{ background: "var(--bg)" }} onClick={(e) => e.stopPropagation()}>
         {/* Header */}
         <div className="p-5 border-b" style={{ borderColor: "var(--border)" }}>
-          <h3 className="text-xl font-semibold" style={{ fontFamily: "Outfit", color: "var(--text-primary)" }}>
+          <h3 className="section-title">
             Full AI Analysis: {data.name || data.symbol}
           </h3>
-          <p className="text-xs mt-1" style={{ color: "var(--text-muted)" }}>Dual AI Debate + Scoring Breakdown + Related News</p>
+          <p className="caption mt-1">Dual AI Debate + Scoring Breakdown + Related News</p>
         </div>
 
         {/* Confidence Score */}
@@ -320,7 +333,7 @@ function AIDebateModal({ data, onClose }) {
 
         {/* Final Verdict */}
         <div className="p-5 border-t" style={{ borderColor: "var(--border)", background: "var(--bg-surface)" }}>
-          <h4 className="text-xs font-bold uppercase tracking-widest mb-2 flex items-center gap-1" style={{ color: "var(--ai-accent)" }}>
+          <h4 className="eyebrow mb-2 flex items-center gap-1" style={{ color: "var(--ai-accent)" }}>
             <Target size={12} /> Final Verdict
           </h4>
           <p className="text-sm leading-relaxed whitespace-pre-wrap" style={{ color: "var(--text-secondary)" }}>{data.final_verdict}</p>
@@ -329,7 +342,7 @@ function AIDebateModal({ data, onClose }) {
         {/* Related News */}
         {data.related_news?.length > 0 && (
           <div className="p-5 border-t" style={{ borderColor: "var(--border)" }}>
-            <h4 className="text-xs font-bold uppercase tracking-widest mb-3" style={{ color: "var(--text-muted)" }}>Related News</h4>
+            <h4 className="eyebrow mb-3">Related News</h4>
             <div className="space-y-2">
               {data.related_news.map((n, i) => (
                 <a key={i} href={n.link} target="_blank" rel="noopener noreferrer" className="block p-2 rounded-lg transition-all hover:bg-[var(--hover)]">
@@ -342,8 +355,7 @@ function AIDebateModal({ data, onClose }) {
         )}
 
         <div className="p-4 border-t flex justify-end" style={{ borderColor: "var(--border)" }}>
-          <button data-testid="close-debate-btn" onClick={onClose} className="px-5 py-2 rounded-xl text-xs font-medium"
-            style={{ background: "var(--brand)", color: "var(--bg)" }}>Close</button>
+          <button data-testid="close-debate-btn" onClick={onClose} className="btn-secondary btn-sm">Close</button>
         </div>
       </div>
     </div>
@@ -416,29 +428,33 @@ export default function StockPicks() {
 
   return (
     <div data-testid="stock-picks-page" className="space-y-4">
-      <div className="flex items-center justify-between">
-        <div>
-          <h1 className="text-2xl font-medium tracking-tight" style={{ fontFamily: "Outfit", color: "var(--text-primary)" }}>AI Stock Picks</h1>
-          <p className="text-xs" style={{ color: "var(--text-muted)" }}>Top 3 AI-selected stocks. Click "Full AI Report" for complete analysis or "Trade Now" to execute instantly.</p>
+      <Reveal>
+        <div className="flex items-center justify-between">
+          <div>
+            <h1 className="page-title">AI Stock Picks</h1>
+            <p className="page-subtitle mt-1">Top 3 AI-selected stocks. Click "Full AI Report" for complete analysis or "Trade Now" to execute instantly.</p>
+          </div>
+          <button data-testid="refresh-picks-btn" onClick={fetchPicks} className="btn-ghost btn-sm" style={{ padding: "10px" }}>
+            <RefreshCw size={16} className={loading ? "animate-spin" : ""} />
+          </button>
         </div>
-        <button data-testid="refresh-picks-btn" onClick={fetchPicks} className="p-2 transition-colors" style={{ color: "var(--text-muted)" }}>
-          <RefreshCw size={16} className={loading ? "animate-spin" : ""} />
-        </button>
-      </div>
+      </Reveal>
 
       {loading ? (
         <div className="space-y-4">
           {[1, 2, 3].map((i) => <div key={i} className="h-48 rounded-2xl skeleton" />)}
         </div>
       ) : (
-        <div className="space-y-3 stagger-children">
-          {picks.map((pick) => (
-            <PickCard key={pick.symbol} pick={pick} onExplain={handleExplain} explaining={explaining === pick.symbol} onTrade={handleTrade} />
+        <div className="space-y-3">
+          {picks.map((pick, i) => (
+            <Reveal key={pick.symbol} delay={i * 0.05}>
+              <PickCard pick={pick} onExplain={handleExplain} explaining={explaining === pick.symbol} onTrade={handleTrade} />
+            </Reveal>
           ))}
         </div>
       )}
 
-      <SetupPerformanceHistory />
+      <Reveal><SetupPerformanceHistory /></Reveal>
 
       <AIDebateModal data={debateData} onClose={() => setDebateData(null)} />
 
@@ -446,7 +462,7 @@ export default function StockPicks() {
       {tradingPick && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: "rgba(0,0,0,0.5)", backdropFilter: "blur(4px)" }} onClick={() => { setTradingPick(null); setTradeResult(null); }}>
           <div className="glass-card max-w-md w-full p-6" style={{ background: "var(--bg)" }} onClick={(e) => e.stopPropagation()}>
-            <h3 className="text-lg font-semibold mb-4" style={{ fontFamily: "Outfit", color: "var(--text-primary)" }}>
+            <h3 className="card-title mb-4">
               Confirm Trade: {tradingPick.name}
             </h3>
             <div className="grid grid-cols-2 gap-3 mb-4">
@@ -459,13 +475,13 @@ export default function StockPicks() {
                 { l: "Confidence", v: `${tradingPick.confidence}%` },
               ].map((s) => (
                 <div key={s.l}>
-                  <span className="text-[10px] font-bold uppercase tracking-widest block" style={{ color: "var(--text-muted)" }}>{s.l}</span>
+                  <span className="stat-label block">{s.l}</span>
                   <span className="text-sm font-mono font-semibold" style={{ color: s.c || "var(--text-primary)" }}>{s.v}</span>
                 </div>
               ))}
             </div>
             <div className="mb-4">
-              <label className="text-[10px] font-bold uppercase tracking-widest block mb-1" style={{ color: "var(--text-muted)" }}>Quantity</label>
+              <label className="stat-label block mb-1">Quantity</label>
               <input data-testid="trade-qty-modal" type="number" defaultValue={1} min={1}
                 onChange={(e) => setTradingPick({ ...tradingPick, qty: parseInt(e.target.value) || 1 })}
                 className="w-full rounded-xl px-3 py-2 text-sm font-mono focus:outline-none"
@@ -484,11 +500,9 @@ export default function StockPicks() {
 
             <div className="flex gap-2">
               <button onClick={() => { setTradingPick(null); setTradeResult(null); }}
-                className="flex-1 py-2.5 rounded-xl text-sm font-medium"
-                style={{ background: "var(--bg-surface)", color: "var(--text-secondary)" }}>Cancel</button>
+                className="btn-ghost flex-1">Cancel</button>
               <button data-testid="confirm-trade-btn" onClick={executeTrade} disabled={tradeLoading || tradeResult}
-                className="flex-1 py-2.5 rounded-xl text-sm font-semibold transition-all hover:-translate-y-px disabled:opacity-50"
-                style={{ background: "var(--gain)", color: "#fff" }}>
+                className="btn-primary flex-1">
                 {tradeLoading ? "Placing..." : tradeResult ? "Done" : "Place Order"}
               </button>
             </div>

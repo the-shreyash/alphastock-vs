@@ -1,4 +1,5 @@
 import { useState, useEffect } from "react";
+import { motion } from "framer-motion";
 import api from "../services/api";
 import { formatCurrency, formatPercent } from "../utils/formatters";
 import {
@@ -35,8 +36,8 @@ function CoachingDrawer({ trade, onClose }) {
         {/* Header */}
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2">
-            <GraduationCap size={18} style={{ color: "var(--ai-accent)" }} />
-            <span className="text-sm font-semibold" style={{ color: "var(--text-primary)" }}>AI Trade Coach</span>
+            <GraduationCap size={20} style={{ color: "var(--ai-accent)" }} />
+            <span className="card-title">AI Trade Coach</span>
           </div>
           <button onClick={onClose} style={{ color: "var(--text-muted)" }}><X size={16} /></button>
         </div>
@@ -177,8 +178,8 @@ export default function TradeJournal() {
 
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-2xl sm:text-[28px] font-semibold tracking-tight font-display" style={{ color: "var(--text-primary)" }}>Trade Journal</h1>
-          <p className="text-[13px] mt-0.5" style={{ color: "var(--text-secondary)" }}>Performance tracking & AI coaching</p>
+          <h1 className="page-title">Trade Journal</h1>
+          <p className="page-subtitle mt-0.5">Performance tracking & AI coaching</p>
         </div>
         <div className="segment-control">
           {[7, 30, 90].map((p) => (
@@ -191,24 +192,37 @@ export default function TradeJournal() {
       </div>
 
       {/* Stats Cards */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-3 stagger-children">
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
         {[
           { label: "Total P&L", value: formatCurrency(recent.total_pnl), color: (recent.total_pnl || 0) >= 0 ? "var(--gain)" : "var(--loss)" },
           { label: "Win Rate", value: `${recent.win_rate || 0}%`, color: (recent.win_rate || 0) >= 50 ? "var(--gain)" : "var(--loss)" },
           { label: "Trades", value: recent.total || 0, color: "var(--text-primary)" },
           { label: "Best Trade", value: formatCurrency(recent.best), color: "var(--gain)" },
-        ].map((s) => (
-          <div key={s.label} className="stat-card">
-            <span className="text-[10px] font-bold uppercase tracking-[0.12em] block" style={{ color: "var(--text-muted)" }}>{s.label}</span>
-            <span className="text-xl font-mono font-semibold" style={{ color: s.color }}>{s.value}</span>
-          </div>
+        ].map((s, i) => (
+          <motion.div
+            key={s.label}
+            className="stat-card"
+            initial={{ opacity: 0, y: 16 }}
+            whileInView={{ opacity: 1, y: 0 }}
+            viewport={{ once: true, margin: "-60px" }}
+            transition={{ duration: 0.4, delay: i * 0.05 }}
+          >
+            <span className="stat-label block">{s.label}</span>
+            <span className="stat-value" style={{ color: s.color }}>{s.value}</span>
+          </motion.div>
         ))}
       </div>
 
       {/* All Time Stats */}
-      <div className="glass-card p-5">
-        <h3 className="text-xs font-bold uppercase tracking-widest mb-3 flex items-center gap-2" style={{ color: "var(--text-muted)" }}>
-          <Award size={12} /> All-Time Performance
+      <motion.div
+        className="glass-card p-5"
+        initial={{ opacity: 0, y: 16 }}
+        whileInView={{ opacity: 1, y: 0 }}
+        viewport={{ once: true, margin: "-60px" }}
+        transition={{ duration: 0.4 }}
+      >
+        <h3 className="card-title mb-3 flex items-center gap-2">
+          <Award size={16} /> All-Time Performance
         </h3>
         <div className="grid grid-cols-3 sm:grid-cols-6 gap-4 text-center">
           {[
@@ -220,37 +234,48 @@ export default function TradeJournal() {
             { l: "Avg P&L", v: formatCurrency(allTime.avg_pnl) },
           ].map((s) => (
             <div key={s.l}>
-              <div className="text-[10px] font-bold uppercase" style={{ color: "var(--text-muted)" }}>{s.l}</div>
+              <div className="stat-label">{s.l}</div>
               <div className="text-sm font-mono font-semibold" style={{ color: "var(--text-primary)" }}>{s.v}</div>
             </div>
           ))}
         </div>
-      </div>
+      </motion.div>
 
       {/* AI Weekly Review */}
-      <div className="glass-card p-5">
+      <motion.div
+        className="glass-card p-5"
+        initial={{ opacity: 0, y: 16 }}
+        whileInView={{ opacity: 1, y: 0 }}
+        viewport={{ once: true, margin: "-60px" }}
+        transition={{ duration: 0.4 }}
+      >
         <div className="flex items-center justify-between mb-3">
-          <h3 className="text-xs font-bold uppercase tracking-widest flex items-center gap-2" style={{ color: "var(--ai-accent)" }}>
-            <Brain size={12} /> AI Performance Review
+          <h3 className="card-title flex items-center gap-2" style={{ color: "var(--ai-accent)" }}>
+            <Brain size={18} /> AI Performance Review
           </h3>
           <button data-testid="generate-review-btn" onClick={fetchReview} disabled={reviewLoading}
-            className="flex items-center gap-1 px-3 py-1.5 rounded-lg text-xs font-medium"
-            style={{ background: "var(--ai-accent-soft)", color: "var(--ai-accent)" }}>
-            {reviewLoading ? <RefreshCw size={12} className="animate-spin" /> : <Brain size={12} />}
+            className="btn-secondary btn-sm">
+            {reviewLoading ? <RefreshCw size={14} className="animate-spin" /> : <Brain size={14} />}
             {reviewLoading ? "Analyzing..." : "Generate Review"}
           </button>
         </div>
         {review ? (
-          <div className="text-sm leading-relaxed whitespace-pre-wrap" style={{ color: "var(--text-secondary)" }}>{review}</div>
+          <div className="body-text whitespace-pre-wrap">{review}</div>
         ) : (
-          <p className="text-sm" style={{ color: "var(--text-muted)" }}>Click "Generate Review" to get AI analysis of your trading performance.</p>
+          <p className="body-text" style={{ color: "var(--text-muted)" }}>Click "Generate Review" to get AI analysis of your trading performance.</p>
         )}
-      </div>
+      </motion.div>
 
       {/* Trade History */}
-      <div className="glass-card">
+      <motion.div
+        className="glass-card"
+        initial={{ opacity: 0, y: 16 }}
+        whileInView={{ opacity: 1, y: 0 }}
+        viewport={{ once: true, margin: "-60px" }}
+        transition={{ duration: 0.4 }}
+      >
         <div className="p-4 border-b" style={{ borderColor: "var(--border)" }}>
-          <h3 className="text-xs font-bold uppercase tracking-widest" style={{ color: "var(--text-muted)" }}>Trade History ({journal.length})</h3>
+          <h3 className="card-title">Trade History ({journal.length})</h3>
         </div>
         {journal.length === 0 ? (
           <div className="p-12 text-center">
@@ -259,8 +284,15 @@ export default function TradeJournal() {
           </div>
         ) : (
           <div className="divide-y" style={{ borderColor: "var(--border)" }}>
-            {journal.map((t) => (
-              <div key={t.id} className="p-4 flex items-center justify-between transition-all hover:bg-[var(--hover)]">
+            {journal.map((t, i) => (
+              <motion.div
+                key={t.id}
+                className="p-4 flex items-center justify-between transition-all hover:bg-[var(--hover)]"
+                initial={{ opacity: 0, y: 16 }}
+                whileInView={{ opacity: 1, y: 0 }}
+                viewport={{ once: true, margin: "-40px" }}
+                transition={{ duration: 0.35, delay: Math.min(i, 8) * 0.04 }}
+              >
                 <div className="flex items-center gap-3">
                   <div className="w-8 h-8 rounded-xl flex items-center justify-center"
                     style={{ background: (t.pnl || 0) >= 0 ? "rgba(16,185,129,0.1)" : "rgba(244,63,94,0.1)" }}>
@@ -268,7 +300,7 @@ export default function TradeJournal() {
                   </div>
                   <div>
                     <div className="flex items-center gap-2">
-                      <span className="text-sm font-semibold" style={{ color: "var(--text-primary)" }}>{t.symbol}</span>
+                      <span className="card-subtitle font-semibold" style={{ color: "var(--text-primary)" }}>{t.symbol}</span>
                       <span className="text-[10px] font-mono px-1.5 py-0.5 rounded"
                         style={{
                           background: t.status === "TARGET_HIT" ? "rgba(16,185,129,0.1)" : t.status === "SL_HIT" ? "rgba(244,63,94,0.1)" : "var(--bg-surface)",
@@ -300,11 +332,11 @@ export default function TradeJournal() {
                     Coach
                   </button>
                 </div>
-              </div>
+              </motion.div>
             ))}
           </div>
         )}
-      </div>
+      </motion.div>
     </div>
   );
 }

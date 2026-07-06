@@ -32,9 +32,8 @@ def get_status():
 
 async def send_telegram(message: str, chat_id: str = None):
     """Send Telegram message via Bot API. Returns result dict."""
-    from services.activity_logger import log_activity
-    log_activity("Sending alert via Telegram/WhatsApp", "alert", "done")
-
+    # NOTE: See send_whatsapp — per-send alert logging removed to keep the AI
+    # activity feed a diverse, truthful trace instead of "Sending alert" spam.
     config = _get_config()
 
     if not config["bot_token"]:

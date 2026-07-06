@@ -2,8 +2,8 @@
 import collections
 import logging
 import asyncio
-from datetime import datetime, timezone, timedelta
-from typing import Optional, Callable
+from datetime import datetime, timezone
+from typing import Callable
 
 logger = logging.getLogger(__name__)
 
@@ -51,26 +51,7 @@ def get_recent_activity():
     return list(activity_deque)[::-1][:20]
 
 
-# Pre-populate with realistic startup messages
-def _prepopulate():
-    now = datetime.now(timezone.utc)
-    startup_events = [
-        ("Checking US market overnight movement", "scan", "done", 15),
-        ("Reading RBI and economic news", "news", "done", 12),
-        ("Analyzing Bank Nifty structure", "scan", "done", 10),
-        ("Scanning 50 NSE stocks for setups", "scan", "done", 8),
-        ("Detecting unusual volume patterns", "scan", "done", 5),
-        ("Ranking top 3 setups by confidence", "rank", "done", 3),
-        ("Monitoring active trades", "monitor", "running", 1),
-    ]
-    for action, category, status, min_ago in startup_events:
-        t_str = (now - timedelta(minutes=min_ago)).strftime("%H:%M:%S")
-        activity_deque.append({
-            "time": t_str,
-            "action": action,
-            "category": category,
-            "status": status
-        })
-
-
-_prepopulate()
+# NOTE: The feed intentionally starts EMPTY. It is filled within seconds of
+# startup by the AI heartbeat engine (services/heartbeat_engine.py), which logs
+# a truthful running -> done/warning trace of real background work (live market
+# fetches, news scans, trade monitoring). No fake pre-population.

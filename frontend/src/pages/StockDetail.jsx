@@ -1,13 +1,13 @@
 import { useState, useEffect } from "react";
 import { useParams, useNavigate } from "react-router-dom";
+import { motion } from "framer-motion";
 import api from "../services/api";
 import { formatCurrency, formatNumber, formatPercent } from "../utils/formatters";
 import {
   ArrowLeft, TrendingUp, TrendingDown, BarChart3, Activity, Info,
-  Zap, ShieldCheck, ShieldAlert, Minus, Eye, RefreshCw, HelpCircle, Brain, ChevronRight, Star, Plus
+  Zap, ShieldCheck, ShieldAlert, Minus, Eye, RefreshCw, Brain, ChevronRight, Star, Plus
 } from "lucide-react";
 import { Link } from "react-router-dom";
-import { useTheme } from "../context/ThemeContext";
 import TradingChart from "../components/charts/TradingChart";
 
 // ─── Pattern Signal Colours ───────────────────────────────────
@@ -29,13 +29,17 @@ function SignalIcon({ signal, size = 14 }) {
   return <Minus size={size} />;
 }
 
-function PatternCard({ pattern }) {
+function PatternCard({ pattern, index = 0 }) {
   const [expanded, setExpanded] = useState(false);
   const s = SIGNAL_STYLE[pattern.signal] || SIGNAL_STYLE.neutral;
   const conf = typeof pattern.confidence === "number" ? pattern.confidence : 0.5;
   const dots = confidenceDots(conf);
   return (
-    <div
+    <motion.div
+      initial={{ opacity: 0, y: 16 }}
+      whileInView={{ opacity: 1, y: 0 }}
+      viewport={{ once: true, margin: "-60px" }}
+      transition={{ duration: 0.4, delay: index * 0.05 }}
       className="rounded-xl p-4 border transition-all hover:scale-[1.01]"
       style={{ background: s.bg, borderColor: s.color + "33" }}
     >
@@ -53,7 +57,7 @@ function PatternCard({ pattern }) {
           >
             {s.label}
           </button>
-          <span className="text-sm font-semibold" style={{ color: "var(--text-primary)" }}>
+          <span className="card-subtitle font-semibold" style={{ color: "var(--text-primary)" }}>
             {pattern.pattern}
           </span>
         </div>
@@ -65,7 +69,7 @@ function PatternCard({ pattern }) {
 
       {/* Confidence dots */}
       <div className="flex items-center gap-1 mb-2">
-        <span className="text-[10px] uppercase tracking-widest mr-1" style={{ color: "var(--text-muted)" }}>
+        <span className="caption uppercase tracking-widest mr-1">
           Confidence {Math.round(conf * 100)}%
         </span>
         {[1, 2, 3].map((d) => (
@@ -94,7 +98,7 @@ function PatternCard({ pattern }) {
           Detected {pattern.timestamp}
         </div>
       )}
-    </div>
+    </motion.div>
   );
 }
 
@@ -116,7 +120,6 @@ function PatternBiasBar({ bullish, bearish, total }) {
 export default function StockDetail() {
   const { symbol } = useParams();
   const navigate = useNavigate();
-  const { displayMode } = useTheme();
 
   const [quote, setQuote] = useState(null);
   const [chartData, setChartData] = useState([]);
@@ -205,30 +208,30 @@ export default function StockDetail() {
           <ArrowLeft size={18} />
         </button>
         <div>
-          <h1 className="text-2xl sm:text-[28px] font-semibold tracking-tight font-display" style={{ color: "var(--text-primary)" }}>
+          <h1 className="page-title">
             {quote.name}
           </h1>
-          <span className="text-[12px] font-mono" style={{ color: "var(--text-muted)" }}>{quote.symbol} · {quote.sector}</span>
+          <span className="caption font-mono">{quote.symbol} · {quote.sector}</span>
         </div>
         <div className="ml-auto flex items-center gap-3">
           <div className="text-right">
-            <div className="text-2xl sm:text-3xl font-semibold font-mono" style={{ color: "var(--text-primary)" }}>{formatCurrency(quote.price)}</div>
+            <div className="stat-value">{formatCurrency(quote.price)}</div>
             <div className="flex items-center gap-1.5 justify-end text-[13px] font-mono font-semibold" style={{ color: isPos ? "var(--gain)" : "var(--loss)" }}>
               {isPos ? <TrendingUp size={13} /> : <TrendingDown size={13} />}
               {isPos ? "+" : ""}₹{formatNumber(Math.abs(quote.change))} ({isPos ? "+" : ""}{quote.change_pct?.toFixed(2)}%)
             </div>
           </div>
-          <button className="btn-ghost py-2 px-3 text-[11px] hidden sm:flex" title="Add to Watchlist">
+          <button className="btn-secondary btn-sm hidden sm:inline-flex" title="Add to Watchlist">
             <Star size={13} /> Watchlist
           </button>
-          <button className="btn-primary py-2 px-3 text-[11px] hidden sm:flex">
+          <button className="btn-primary btn-sm hidden sm:inline-flex">
             <Brain size={13} /> AI Analysis
           </button>
         </div>
       </div>
 
       {/* Quick Stats */}
-      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3 stagger-children">
+      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
         {[
           { label: "Open",       value: formatCurrency(quote.open) },
           { label: "High",       value: formatCurrency(quote.high) },
@@ -236,18 +239,31 @@ export default function StockDetail() {
           { label: "Prev Close", value: formatCurrency(quote.prev_close) },
           { label: "Volume",     value: formatNumber(quote.volume, 0) },
           { label: "VWAP",       value: formatCurrency(quote.vwap) },
-        ].map((s) => (
-          <div key={s.label} className="stat-card !py-3 !px-4">
-            <span className="text-[10px] font-bold uppercase tracking-[0.12em] block" style={{ color: "var(--text-muted)" }}>{s.label}</span>
-            <span className="text-[14px] font-mono font-semibold" style={{ color: "var(--text-primary)" }}>{s.value}</span>
-          </div>
+        ].map((s, i) => (
+          <motion.div
+            key={s.label}
+            className="stat-card !py-3 !px-4"
+            initial={{ opacity: 0, y: 16 }}
+            whileInView={{ opacity: 1, y: 0 }}
+            viewport={{ once: true, margin: "-60px" }}
+            transition={{ duration: 0.4, delay: i * 0.05 }}
+          >
+            <span className="stat-label block">{s.label}</span>
+            <span className="text-[15px] font-mono font-semibold" style={{ color: "var(--text-primary)" }}>{s.value}</span>
+          </motion.div>
         ))}
       </div>
 
       {/* Chart */}
-      <div className="glass-card p-5">
+      <motion.div
+        className="glass-card p-5"
+        initial={{ opacity: 0, y: 16 }}
+        whileInView={{ opacity: 1, y: 0 }}
+        viewport={{ once: true, margin: "-60px" }}
+        transition={{ duration: 0.4 }}
+      >
         <div className="flex items-center justify-between mb-3">
-          <h3 className="text-[11px] font-bold uppercase tracking-[0.12em]" style={{ color: "var(--text-muted)" }}>Price Chart</h3>
+          <h3 className="card-title">Price Chart</h3>
           <div className="segment-control">
             {["1D", "1W", "1M"].map((p) => (
               <button key={p} data-testid={`chart-period-${p}`} onClick={() => setPeriod(p)}
@@ -258,14 +274,21 @@ export default function StockDetail() {
           </div>
         </div>
         <TradingChart data={chartData} symbol={symbol} height={380} />
-      </div>
+      </motion.div>
 
       {/* ─── Chart Pattern Detection Panel ─── */}
-      <div className="glass-card p-5" data-testid="pattern-detection-panel">
+      <motion.div
+        className="glass-card p-5"
+        data-testid="pattern-detection-panel"
+        initial={{ opacity: 0, y: 16 }}
+        whileInView={{ opacity: 1, y: 0 }}
+        viewport={{ once: true, margin: "-60px" }}
+        transition={{ duration: 0.4 }}
+      >
         <div className="flex items-center justify-between mb-4">
           <div className="flex items-center gap-2">
-            <Eye size={16} style={{ color: "var(--ai-accent)" }} />
-            <h3 className="text-xs font-bold uppercase tracking-widest" style={{ color: "var(--text-muted)" }}>
+            <Eye size={18} style={{ color: "var(--ai-accent)" }} />
+            <h3 className="card-title">
               Chart Pattern Detection
             </h3>
             {totalPatterns > 0 && (
@@ -280,8 +303,7 @@ export default function StockDetail() {
           <button
             onClick={fetchPatterns}
             disabled={patternsLoading}
-            className="flex items-center gap-1 text-xs px-3 py-1.5 rounded-lg transition-all"
-            style={{ background: "var(--ai-accent-soft)", color: "var(--ai-accent)" }}
+            className="btn-ghost btn-sm"
             title="Refresh pattern scan"
           >
             <RefreshCw size={12} className={patternsLoading ? "animate-spin" : ""} />
@@ -377,7 +399,7 @@ export default function StockDetail() {
             {/* Pattern cards */}
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
               {patterns.patterns.map((p, i) => (
-                <PatternCard key={`${p.pattern}-${i}`} pattern={p} />
+                <PatternCard key={`${p.pattern}-${i}`} pattern={p} index={i} />
               ))}
             </div>
 
@@ -386,126 +408,62 @@ export default function StockDetail() {
             </p>
           </>
         )}
-      </div>
+      </motion.div>
 
       {/* Technical Indicators + Market Data */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-        {displayMode === "beginner" ? (
-          <div className="glass-card p-5">
-            <h3 className="text-xs font-bold uppercase tracking-widest mb-3 flex items-center gap-1.5" style={{ color: "var(--ai-accent)" }}>
-              <Brain size={14} /> Simplified AI Indicators
-            </h3>
-            <p className="text-xs mb-4 p-2 rounded-lg flex items-start gap-2" style={{ background: "var(--ai-accent-soft)", color: "var(--ai-accent)" }}>
-              <Info size={12} className="shrink-0 mt-0.5" />
-              We have simplified the technical charts to show easy-to-understand metrics. Switch to <strong>Advanced</strong> mode at the top for raw stats.
-            </p>
-            
-            <div className="space-y-4">
-              <div className="py-2 border-b" style={{ borderColor: "var(--border)" }}>
-                <div className="flex justify-between items-center mb-1">
-                  <span className="text-sm font-semibold flex items-center gap-1" style={{ color: "var(--text-primary)" }}>
-                    Buyer Activity Status <HelpCircle size={12} className="text-slate-400" title="RSI (Relative Strength Index) tracks current demand." />
-                  </span>
-                  <span className="text-xs font-mono font-bold" style={{ color: quote.rsi > 70 ? "var(--loss)" : quote.rsi < 30 ? "var(--gain)" : "var(--text-secondary)" }}>
-                    {quote.rsi > 70 ? "Extremely High (Overbought)" : quote.rsi < 30 ? "Extremely Low (Oversold)" : "Healthy (Balanced)"}
-                  </span>
-                </div>
-                <p className="text-xs" style={{ color: "var(--text-secondary)" }}>
-                  {quote.rsi > 70 
-                    ? "Many people have bought this stock recently. Prices could undergo a short-term pullback." 
-                    : quote.rsi < 30 
-                    ? "Very few people are buying this stock right now. It could be due for a potential reversal upward." 
-                    : "Trading demand is stable. Price is moving within standard parameters."}
-                </p>
-              </div>
-
-              <div className="py-2 border-b" style={{ borderColor: "var(--border)" }}>
-                <div className="flex justify-between items-center mb-1">
-                  <span className="text-sm font-semibold flex items-center gap-1" style={{ color: "var(--text-primary)" }}>
-                    Volume Expansion <HelpCircle size={12} className="text-slate-400" title="Tracks how many shares are traded compared to the daily average." />
-                  </span>
-                  <span className="text-xs font-mono font-bold" style={{ color: quote.volume_ratio > 1.5 ? "var(--gain)" : "var(--text-secondary)" }}>
-                    {quote.volume_ratio > 2.0 ? "Massive Activity" : quote.volume_ratio > 1.2 ? "Elevated Activity" : "Normal Activity"} ({quote.volume_ratio}x usual)
-                  </span>
-                </div>
-                <p className="text-xs" style={{ color: "var(--text-secondary)" }}>
-                  {quote.volume_ratio > 1.5 
-                    ? "A large amount of money is moving into this stock today. This indicates heavy institution block deal action." 
-                    : "Standard trading volume. Retail and long-term investors are active at usual rates."}
-                </p>
-              </div>
-
-              <div className="py-2">
-                <div className="flex justify-between items-center mb-1">
-                  <span className="text-sm font-semibold flex items-center gap-1" style={{ color: "var(--text-primary)" }}>
-                    Price vs Average Price <HelpCircle size={12} className="text-slate-400" title="VWAP (Volume Weighted Average Price) is the average price paid today." />
-                  </span>
-                  <span className="text-xs font-mono font-bold" style={{ color: "var(--text-primary)" }}>
-                    {Math.abs(quote.price - quote.vwap) / quote.price < 0.015 ? "Buying Near Average" : "Paying Above Average"}
-                  </span>
-                </div>
-                <p className="text-xs" style={{ color: "var(--text-secondary)" }}>
-                  The average buyer today paid ₹{quote.vwap.toFixed(2)}. The stock is currently trading at ₹{quote.price.toFixed(2)}.
-                </p>
-              </div>
-            </div>
-          </div>
-        ) : (
-          <div className="glass-card p-5">
-            <h3 className="text-xs font-bold uppercase tracking-widest mb-3" style={{ color: "var(--text-muted)" }}>Technical Indicators</h3>
-            <p className="text-xs mb-3 p-2 rounded-lg flex items-start gap-2" style={{ background: "var(--ai-accent-soft)", color: "var(--ai-accent)" }}>
-              <Info size={12} className="shrink-0 mt-0.5" /> RSI above 70 = overbought (may fall). Below 30 = oversold (may rise). MACD crossing signal line = trend change.
-            </p>
-            <div className="space-y-3">
-              {[
-                { label: "RSI (14)", value: quote.rsi, hint: quote.rsi > 70 ? "Overbought" : quote.rsi < 30 ? "Oversold" : "Neutral" },
-                { label: "MACD", value: quote.macd },
-                { label: "MACD Signal", value: quote.macd_signal },
-                { label: "Volume Ratio", value: `${quote.volume_ratio}x avg` },
-              ].map((ind) => (
-                <div key={ind.label} className="flex items-center justify-between py-1 border-b" style={{ borderColor: "var(--border)" }}>
-                  <span className="text-sm" style={{ color: "var(--text-secondary)" }}>{ind.label}</span>
-                  <div className="text-right">
-                    <span className="text-sm font-mono font-medium" style={{ color: "var(--text-primary)" }}>{ind.value}</span>
-                    {ind.hint && <span className="text-[10px] ml-2" style={{ color: "var(--text-muted)" }}>{ind.hint}</span>}
-                  </div>
-                </div>
-              ))}
-            </div>
-          </div>
-        )}
-
-        <div className="glass-card p-5">
-          <h3 className="text-xs font-bold uppercase tracking-widest mb-3" style={{ color: "var(--text-muted)" }}>{displayMode === "beginner" ? "Company Context" : "Market Data"}</h3>
+        <motion.div
+          className="glass-card p-5"
+          initial={{ opacity: 0, y: 16 }}
+          whileInView={{ opacity: 1, y: 0 }}
+          viewport={{ once: true, margin: "-60px" }}
+          transition={{ duration: 0.4 }}
+        >
+          <h3 className="card-title mb-3">Technical Indicators</h3>
+          <p className="text-xs mb-3 p-2 rounded-lg flex items-start gap-2" style={{ background: "var(--ai-accent-soft)", color: "var(--ai-accent)" }}>
+            <Info size={12} className="shrink-0 mt-0.5" /> RSI above 70 = overbought (may fall). Below 30 = oversold (may rise). MACD crossing signal line = trend change.
+          </p>
           <div className="space-y-3">
-            {displayMode === "beginner" ? (
-              [
-                { label: "Company Size", value: quote.market_cap_cr > 100000 ? "Mega Cap Enterprise" : quote.market_cap_cr > 25000 ? "Large Cap Enterprise" : "Mid Cap Enterprise" },
-                { label: "Price Range Today", value: quote.day_range },
-                { label: "52-Week High Point", value: formatCurrency(quote.week_52_high) },
-                { label: "52-Week Low Point", value: formatCurrency(quote.week_52_low) },
-              ].map((d) => (
-                <div key={d.label} className="flex items-center justify-between py-1 border-b" style={{ borderColor: "var(--border)" }}>
-                  <span className="text-sm" style={{ color: "var(--text-secondary)" }}>{d.label}</span>
-                  <span className="text-sm font-semibold" style={{ color: "var(--text-primary)" }}>{d.value}</span>
+            {[
+              { label: "RSI (14)", value: quote.rsi, hint: quote.rsi > 70 ? "Overbought" : quote.rsi < 30 ? "Oversold" : "Neutral" },
+              { label: "MACD", value: quote.macd },
+              { label: "MACD Signal", value: quote.macd_signal },
+              { label: "Volume Ratio", value: `${quote.volume_ratio}x avg` },
+            ].map((ind) => (
+              <div key={ind.label} className="flex items-center justify-between py-1 border-b" style={{ borderColor: "var(--border)" }}>
+                <span className="text-sm" style={{ color: "var(--text-secondary)" }}>{ind.label}</span>
+                <div className="text-right">
+                  <span className="text-sm font-mono font-medium" style={{ color: "var(--text-primary)" }}>{ind.value}</span>
+                  {ind.hint && <span className="text-[10px] ml-2" style={{ color: "var(--text-muted)" }}>{ind.hint}</span>}
                 </div>
-              ))
-            ) : (
-              [
-                { label: "Market Cap", value: `${(quote.market_cap_cr / 100).toFixed(0)}K Cr` },
-                { label: "P/E Ratio", value: quote.pe_ratio },
-                { label: "Day Range", value: quote.day_range },
-                { label: "52W High", value: formatCurrency(quote.week_52_high) },
-                { label: "52W Low", value: formatCurrency(quote.week_52_low) },
-              ].map((d) => (
-                <div key={d.label} className="flex items-center justify-between py-1 border-b" style={{ borderColor: "var(--border)" }}>
-                  <span className="text-sm" style={{ color: "var(--text-secondary)" }}>{d.label}</span>
-                  <span className="text-sm font-mono font-medium" style={{ color: "var(--text-primary)" }}>{d.value}</span>
-                </div>
-              ))
-            )}
+              </div>
+            ))}
           </div>
-        </div>
+        </motion.div>
+
+        <motion.div
+          className="glass-card p-5"
+          initial={{ opacity: 0, y: 16 }}
+          whileInView={{ opacity: 1, y: 0 }}
+          viewport={{ once: true, margin: "-60px" }}
+          transition={{ duration: 0.4, delay: 0.05 }}
+        >
+          <h3 className="card-title mb-3">Market Data</h3>
+          <div className="space-y-3">
+            {[
+              { label: "Market Cap", value: `${(quote.market_cap_cr / 100).toFixed(0)}K Cr` },
+              { label: "P/E Ratio", value: quote.pe_ratio },
+              { label: "Day Range", value: quote.day_range },
+              { label: "52W High", value: formatCurrency(quote.week_52_high) },
+              { label: "52W Low", value: formatCurrency(quote.week_52_low) },
+            ].map((d) => (
+              <div key={d.label} className="flex items-center justify-between py-1 border-b" style={{ borderColor: "var(--border)" }}>
+                <span className="text-sm" style={{ color: "var(--text-secondary)" }}>{d.label}</span>
+                <span className="text-sm font-mono font-medium" style={{ color: "var(--text-primary)" }}>{d.value}</span>
+              </div>
+            ))}
+          </div>
+        </motion.div>
       </div>
     </div>
   );

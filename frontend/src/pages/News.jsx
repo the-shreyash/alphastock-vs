@@ -1,4 +1,5 @@
 import { useState, useEffect } from "react";
+import { motion } from "framer-motion";
 import api from "../services/api";
 import { Newspaper, ExternalLink, RefreshCw, Search, TrendingUp, TrendingDown, Globe, AlertCircle } from "lucide-react";
 
@@ -46,20 +47,19 @@ export default function News() {
   const sources = [...new Set(articles.map(a => a.source))];
 
   return (
-    <div data-testid="news-page" className="space-y-5">
+    <div data-testid="news-page" className="space-y-6">
       {/* Header */}
-      <div className="flex items-center justify-between">
+      <motion.div className="flex items-center justify-between"
+        initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.4 }}>
         <div>
-          <h1 className="text-2xl sm:text-[28px] font-semibold tracking-tight font-display" style={{ color: "var(--text-primary)" }}>Market Intelligence</h1>
-          <p className="text-[13px] mt-0.5" style={{ color: "var(--text-secondary)" }}>Stay updated with real-time market events</p>
+          <h1 className="page-title">Market Intelligence</h1>
+          <p className="page-subtitle mt-1">Stay updated with real-time market events</p>
         </div>
         <button data-testid="refresh-news-btn" onClick={() => fetchNews(true)}
-          className="p-2.5 rounded-xl transition-all" style={{ color: "var(--text-muted)" }}
-          onMouseEnter={e => e.currentTarget.style.background = "var(--hover)"}
-          onMouseLeave={e => e.currentTarget.style.background = "transparent"}>
-          <RefreshCw size={15} className={loading ? "animate-spin" : ""} />
+          className="btn-ghost btn-sm" style={{ color: "var(--text-muted)" }}>
+          <RefreshCw size={15} className={loading ? "animate-spin" : ""} /> Refresh
         </button>
-      </div>
+      </motion.div>
 
       {/* Tab Bar */}
       <div className="tab-bar">
@@ -89,21 +89,23 @@ export default function News() {
               <p style={{ color: "var(--text-muted)" }}>No news found</p>
             </div>
           ) : (
-            <div className="space-y-2">
+            <div className="space-y-2.5">
               {filtered.map((article, i) => (
-                <div key={i} data-testid={`news-article-${i}`}
+                <motion.div key={i} data-testid={`news-article-${i}`}
                   className="glass-card p-4 cursor-pointer transition-all hover:-translate-y-px"
-                  onClick={() => setSelectedArticle(article)}>
-                  <div className="flex items-center gap-2 mb-1.5">
+                  onClick={() => setSelectedArticle(article)}
+                  initial={{ opacity: 0, y: 16 }} whileInView={{ opacity: 1, y: 0 }}
+                  viewport={{ once: true, margin: "-40px" }} transition={{ duration: 0.35, delay: Math.min(i, 8) * 0.04 }}>
+                  <div className="flex items-center gap-2 mb-2">
                     <span className="badge-status" style={{ background: "var(--ai-accent-soft)", color: "var(--ai-accent)" }}>{article.source}</span>
                     <span className="text-[10px] font-mono" style={{ color: "var(--text-muted)" }}>
                       {article.published ? new Date(article.published).toLocaleString("en-IN", { hour: "2-digit", minute: "2-digit", day: "numeric", month: "short" }) : ""}
                     </span>
                     {article.sentiment && <SentimentBadge sentiment={article.sentiment} />}
                   </div>
-                  <h3 className="text-[13px] font-semibold mb-1" style={{ color: "var(--text-primary)" }}>{article.title}</h3>
-                  {article.summary && <p className="text-[12px] leading-relaxed line-clamp-2" style={{ color: "var(--text-secondary)" }}>{article.summary}</p>}
-                </div>
+                  <h3 className="text-[15px] font-semibold mb-1 font-display" style={{ color: "var(--text-primary)" }}>{article.title}</h3>
+                  {article.summary && <p className="body-text line-clamp-2">{article.summary}</p>}
+                </motion.div>
               ))}
             </div>
           )}
@@ -111,8 +113,10 @@ export default function News() {
 
         {/* Right: Sentiment Panel */}
         <div className="space-y-4">
-          <div className="glass-card p-5">
-            <h3 className="text-[11px] font-bold uppercase tracking-[0.12em] mb-3" style={{ color: "var(--text-muted)" }}>Market Sentiment</h3>
+          <motion.div className="glass-card p-5"
+            initial={{ opacity: 0, y: 16 }} whileInView={{ opacity: 1, y: 0 }}
+            viewport={{ once: true, margin: "-60px" }} transition={{ duration: 0.4 }}>
+            <h3 className="eyebrow mb-3">Market Sentiment</h3>
             <div className="relative w-20 h-20 mx-auto mb-3">
               <svg viewBox="0 0 36 36" className="w-full h-full -rotate-90">
                 <circle cx="18" cy="18" r="14" fill="none" stroke="var(--border)" strokeWidth="3" />
@@ -124,20 +128,22 @@ export default function News() {
                 <span className="text-[7px]" style={{ color: "var(--text-muted)" }}>Bullish</span>
               </span>
             </div>
-            <p className="text-[11px] text-center" style={{ color: "var(--text-secondary)" }}>Overall market sentiment is positive with strong buying pressure.</p>
-          </div>
+            <p className="caption text-center" style={{ color: "var(--text-secondary)" }}>Overall market sentiment is positive with strong buying pressure.</p>
+          </motion.div>
 
-          <div className="glass-card p-5">
-            <h3 className="text-[11px] font-bold uppercase tracking-[0.12em] mb-3" style={{ color: "var(--text-muted)" }}>Sources</h3>
+          <motion.div className="glass-card p-5"
+            initial={{ opacity: 0, y: 16 }} whileInView={{ opacity: 1, y: 0 }}
+            viewport={{ once: true, margin: "-60px" }} transition={{ duration: 0.4, delay: 0.06 }}>
+            <h3 className="eyebrow mb-3">Sources</h3>
             <div className="space-y-1.5">
               {sources.slice(0, 6).map(src => (
-                <div key={src} className="flex items-center justify-between px-2 py-1.5 rounded-lg" style={{ background: "var(--hover)" }}>
-                  <span className="text-[11px] font-medium" style={{ color: "var(--text-secondary)" }}>{src}</span>
-                  <span className="text-[10px] font-mono" style={{ color: "var(--text-muted)" }}>{articles.filter(a => a.source === src).length}</span>
+                <div key={src} className="flex items-center justify-between px-2.5 py-2 rounded-lg" style={{ background: "var(--hover)" }}>
+                  <span className="text-[13px] font-medium" style={{ color: "var(--text-secondary)" }}>{src}</span>
+                  <span className="text-[11px] font-mono" style={{ color: "var(--text-muted)" }}>{articles.filter(a => a.source === src).length}</span>
                 </div>
               ))}
             </div>
-          </div>
+          </motion.div>
         </div>
       </div>
 
@@ -152,15 +158,15 @@ export default function News() {
                   {selectedArticle.published ? new Date(selectedArticle.published).toLocaleString("en-IN", { weekday: "short", day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" }) : ""}
                 </span>
               </div>
-              <h2 className="text-xl font-semibold mb-4 font-display" style={{ color: "var(--text-primary)" }}>{selectedArticle.title}</h2>
-              <div className="text-[13px] leading-relaxed mb-6" style={{ color: "var(--text-secondary)" }}>
+              <h2 className="card-title mb-4">{selectedArticle.title}</h2>
+              <div className="body-text mb-6">
                 {selectedArticle.summary || "Full article content loading..."}
               </div>
-              <div className="flex gap-2">
-                <a href={selectedArticle.link} target="_blank" rel="noopener noreferrer" className="btn-ghost text-[12px] py-2 px-4">
-                  <ExternalLink size={12} /> Read Full Article
+              <div className="flex gap-3">
+                <a href={selectedArticle.link} target="_blank" rel="noopener noreferrer" className="btn-ghost btn-sm">
+                  <ExternalLink size={14} /> Read Full Article
                 </a>
-                <button onClick={() => setSelectedArticle(null)} className="btn-primary text-[12px] py-2 px-4">Close</button>
+                <button onClick={() => setSelectedArticle(null)} className="btn-primary btn-sm">Close</button>
               </div>
             </div>
           </div>

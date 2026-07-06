@@ -6,14 +6,30 @@ import { useWebSocket } from "../hooks/useWebSocket";
 import { TrendingUp, TrendingDown, Activity, BarChart3, ArrowUpRight, ArrowDownRight, Zap, Brain, RefreshCw, Wifi, WifiOff, ChevronRight, Eye, GraduationCap } from "lucide-react";
 import { useAuth } from "../context/AuthContext";
 import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer } from "recharts";
+import { motion } from "framer-motion";
+
+/* Scroll-reveal wrapper — fades/slides content in as it enters the viewport */
+function Reveal({ children, delay = 0, className }) {
+  return (
+    <motion.div
+      className={className}
+      initial={{ opacity: 0, y: 16 }}
+      whileInView={{ opacity: 1, y: 0 }}
+      viewport={{ once: true, margin: "-60px" }}
+      transition={{ duration: 0.4, delay, ease: [0.16, 1, 0.3, 1] }}
+    >
+      {children}
+    </motion.div>
+  );
+}
 
 /* ====== Stat Card (Index strip) ====== */
 function StatCard({ label, value, change, changePct, testId }) {
   const isPos = (change ?? changePct ?? 0) >= 0;
   return (
     <div data-testid={testId} className="stat-card">
-      <span className="text-[10px] font-bold uppercase tracking-[0.12em] block mb-1" style={{ color: "var(--text-muted)" }}>{label}</span>
-      <div className="text-xl font-semibold font-mono tracking-tight" style={{ color: "var(--text-primary)" }}>{value || "—"}</div>
+      <span className="stat-label block mb-1.5">{label}</span>
+      <div className="stat-value">{value || "—"}</div>
       {changePct != null && (
         <div className="flex items-center gap-1 mt-1 text-[11px] font-mono font-semibold" style={{ color: isPos ? "var(--gain)" : "var(--loss)" }}>
           {isPos ? <ArrowUpRight size={11} /> : <ArrowDownRight size={11} />}
@@ -56,7 +72,7 @@ function AIActivityFeed({ activities }) {
   return (
     <div data-testid="ai-activity-feed" className="glass-card p-5">
       <div className="flex items-center justify-between mb-4">
-        <h3 className="text-[11px] font-bold uppercase tracking-[0.12em] flex items-center gap-2" style={{ color: "var(--text-muted)" }}>
+        <h3 className="eyebrow flex items-center gap-2">
           AI Activity
         </h3>
         <span className="badge-live text-[9px]">LIVE</span>
@@ -89,7 +105,7 @@ function LatestLessonsCard({ lessons, loading: lLoading }) {
   return (
     <div data-testid="latest-lessons-card" className="glass-card p-5">
       <div className="flex items-center justify-between mb-4">
-        <h3 className="text-[11px] font-bold uppercase tracking-[0.12em] flex items-center gap-2" style={{ color: "var(--text-muted)" }}>
+        <h3 className="eyebrow flex items-center gap-2">
           <GraduationCap size={13} /> Latest AI Lessons
         </h3>
       </div>
@@ -132,7 +148,7 @@ function LatestLessonsCard({ lessons, loading: lLoading }) {
 function MorningReportCard({ report, loading: rLoading }) {
   return (
     <div data-testid="morning-report-card" className="glass-card p-5">
-      <h3 className="text-[11px] font-bold uppercase tracking-[0.12em] mb-3" style={{ color: "var(--text-muted)" }}>
+      <h3 className="eyebrow mb-3">
         AI Morning Report
       </h3>
       {rLoading ? (
@@ -150,7 +166,7 @@ function MorningReportCard({ report, loading: rLoading }) {
               {report?.sentiment || "Neutral"} ☀
             </span>
           </div>
-          <p className="text-[13px] leading-relaxed mb-3" style={{ color: "var(--text-secondary)" }}>
+          <p className="body-text mb-3">
             {report?.summary || "Market sentiment is positive with strong global cues."}
           </p>
           {report?.top_sectors && (
@@ -179,7 +195,7 @@ function TopPicksCard({ picks, loading: pLoading }) {
   return (
     <div data-testid="top-picks-card" className="glass-card p-5">
       <div className="flex items-center justify-between mb-4">
-        <h3 className="text-[11px] font-bold uppercase tracking-[0.12em]" style={{ color: "var(--text-muted)" }}>Top AI Picks</h3>
+        <h3 className="eyebrow">Top AI Picks</h3>
       </div>
       {pLoading ? (
         <div className="space-y-3">
@@ -217,7 +233,7 @@ function TopPicksCard({ picks, loading: pLoading }) {
 function PortfolioSummaryCard({ summary }) {
   return (
     <div data-testid="portfolio-summary-card" className="glass-card p-5">
-      <h3 className="text-[11px] font-bold uppercase tracking-[0.12em] mb-4" style={{ color: "var(--text-muted)" }}>Portfolio</h3>
+      <h3 className="eyebrow mb-4">Portfolio</h3>
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
         {[
           { label: "Portfolio Value", value: summary?.total_value ? `₹${formatNumber(summary.total_value)}` : "—" },
@@ -226,7 +242,7 @@ function PortfolioSummaryCard({ summary }) {
           { label: "Holdings", value: summary?.holdings_count ?? "—" },
         ].map(item => (
           <div key={item.label}>
-            <span className="text-[10px] font-bold uppercase tracking-wider block mb-0.5" style={{ color: "var(--text-muted)" }}>{item.label}</span>
+            <span className="stat-label block mb-1">{item.label}</span>
             <span className="text-lg font-semibold font-mono" style={{ color: item.color || "var(--text-primary)" }}>{item.value}</span>
           </div>
         ))}
@@ -241,7 +257,7 @@ function SectorPerformance({ sectors }) {
   return (
     <div data-testid="sector-heatmap" className="glass-card p-5">
       <div className="flex items-center justify-between mb-4">
-        <h3 className="text-[11px] font-bold uppercase tracking-[0.12em]" style={{ color: "var(--text-muted)" }}>Sector Performance</h3>
+        <h3 className="eyebrow">Sector Performance</h3>
       </div>
       <div className="grid grid-cols-3 sm:grid-cols-4 lg:grid-cols-6 gap-2">
         {sectors.map(s => {
@@ -266,7 +282,7 @@ function MarketBreadth({ overview }) {
   const breadth = overview.breadth || { advances: 1042, declines: 842, unchanged: 176 };
   return (
     <div data-testid="market-breadth" className="glass-card p-5">
-      <h3 className="text-[11px] font-bold uppercase tracking-[0.12em] mb-3" style={{ color: "var(--text-muted)" }}>Market Breadth</h3>
+      <h3 className="eyebrow mb-3">Market Breadth</h3>
       <div className="grid grid-cols-3 gap-3">
         {[
           { label: "Advances", value: breadth.advances, color: "var(--gain)", bg: "var(--gain-bg)" },
@@ -286,7 +302,7 @@ function MarketBreadth({ overview }) {
 /* ====== MAIN DASHBOARD ====== */
 export default function Dashboard() {
   const { user } = useAuth();
-  const { connected, marketData, activityUpdates } = useWebSocket(user?._id || user?.id || "");
+  const { connected, marketData, activityUpdates, priceTicks, portfolioUpdate } = useWebSocket(user?._id || user?.id || "");
   const [overview, setOverview] = useState(null);
   const [sectors, setSectors] = useState([]);
   const [activities, setActivities] = useState([]);
@@ -300,6 +316,36 @@ export default function Dashboard() {
   const [lessonsLoading, setLessonsLoading] = useState(true);
 
   useEffect(() => { if (marketData) setOverview(marketData); }, [marketData]);
+
+  // Overlay live index prices (WS "prices" pushes) onto the overview so the
+  // index strip ticks between the slower full-overview refreshes.
+  useEffect(() => {
+    if (!priceTicks) return;
+    const idxMap = { nifty: "NIFTY", bank_nifty: "BANKNIFTY", sensex: "SENSEX" };
+    setOverview(prev => {
+      if (!prev) return prev;
+      let changed = false;
+      const next = { ...prev };
+      for (const [key, sym] of Object.entries(idxMap)) {
+        const tick = priceTicks[sym];
+        if (tick?.price != null) {
+          next[key] = { ...(prev[key] || {}), value: tick.price, change_pct: tick.change_pct };
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
+    });
+  }, [priceTicks]);
+
+  // Live open-position P&L from the AI heartbeat's portfolio_update push.
+  useEffect(() => {
+    if (!portfolioUpdate) return;
+    setPortfolioSummary(prev => ({
+      ...(prev || {}),
+      total_pnl: portfolioUpdate.total_pnl ?? portfolioUpdate.total_unrealized_pnl ?? prev?.total_pnl,
+      open_positions: portfolioUpdate.open_positions ?? prev?.open_positions,
+    }));
+  }, [portfolioUpdate]);
 
   useEffect(() => {
     if (activityUpdates) {
@@ -379,48 +425,50 @@ export default function Dashboard() {
   return (
     <div data-testid="dashboard-page" className="space-y-5">
       {/* Header */}
-      <div className="flex items-center justify-between">
-        <div>
-          <h1 className="text-2xl sm:text-[28px] font-semibold tracking-tight font-display" style={{ color: "var(--text-primary)" }}>
-            {greeting()}, {user?.name?.split(" ")[0]} 👋
-          </h1>
-          <p className="text-[13px] mt-0.5" style={{ color: "var(--text-secondary)" }}>Here's what the AI has prepared for you today.</p>
-        </div>
-        <div className="flex items-center gap-2">
-          <div data-testid="ws-status" className="badge-live text-[9px]">
-            {connected ? <><Wifi size={10} /> LIVE</> : <><WifiOff size={10} /> OFFLINE</>}
+      <Reveal>
+        <div className="flex items-center justify-between">
+          <div>
+            <h1 className="page-title">
+              {greeting()}, {user?.name?.split(" ")[0]} 👋
+            </h1>
+            <p className="page-subtitle mt-1">Here's what the AI has prepared for you today.</p>
+          </div>
+          <div className="flex items-center gap-2">
+            <div data-testid="ws-status" className="badge-live text-[9px]">
+              {connected ? <><Wifi size={10} /> LIVE</> : <><WifiOff size={10} /> OFFLINE</>}
+            </div>
           </div>
         </div>
-      </div>
+      </Reveal>
 
       {/* Index Strip */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-3 stagger-children">
-        <StatCard testId="nifty-card" label="Nifty 50" value={formatNumber(overview?.nifty?.value)} change={overview?.nifty?.change} changePct={overview?.nifty?.change_pct} />
-        <StatCard testId="banknifty-card" label="Bank Nifty" value={formatNumber(overview?.bank_nifty?.value)} change={overview?.bank_nifty?.change} changePct={overview?.bank_nifty?.change_pct} />
-        <StatCard testId="sensex-card" label="Sensex" value={formatNumber(overview?.sensex?.value)} change={overview?.sensex?.change} changePct={overview?.sensex?.change_pct} />
-        <StatCard testId="vix-card" label="India VIX" value={overview?.india_vix ?? "—"} />
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+        <Reveal delay={0}><StatCard testId="nifty-card" label="Nifty 50" value={formatNumber(overview?.nifty?.value)} change={overview?.nifty?.change} changePct={overview?.nifty?.change_pct} /></Reveal>
+        <Reveal delay={0.05}><StatCard testId="banknifty-card" label="Bank Nifty" value={formatNumber(overview?.bank_nifty?.value)} change={overview?.bank_nifty?.change} changePct={overview?.bank_nifty?.change_pct} /></Reveal>
+        <Reveal delay={0.1}><StatCard testId="sensex-card" label="Sensex" value={formatNumber(overview?.sensex?.value)} change={overview?.sensex?.change} changePct={overview?.sensex?.change_pct} /></Reveal>
+        <Reveal delay={0.15}><StatCard testId="vix-card" label="India VIX" value={overview?.india_vix ?? "—"} /></Reveal>
       </div>
 
       {/* Two Column: Morning Report + Top Picks */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        <MorningReportCard report={morningReport} loading={reportLoading} />
-        <TopPicksCard picks={picks} loading={picksLoading} />
+        <Reveal delay={0}><MorningReportCard report={morningReport} loading={reportLoading} /></Reveal>
+        <Reveal delay={0.06}><TopPicksCard picks={picks} loading={picksLoading} /></Reveal>
       </div>
 
       {/* Portfolio Summary */}
-      <PortfolioSummaryCard summary={portfolioSummary} />
+      <Reveal><PortfolioSummaryCard summary={portfolioSummary} /></Reveal>
 
       {/* Two Column: AI Activity + Latest AI Lessons */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        <AIActivityFeed activities={activities} />
-        <LatestLessonsCard lessons={lessons} loading={lessonsLoading} />
+        <Reveal delay={0}><AIActivityFeed activities={activities} /></Reveal>
+        <Reveal delay={0.06}><LatestLessonsCard lessons={lessons} loading={lessonsLoading} /></Reveal>
       </div>
 
       {/* Market Breadth */}
-      <MarketBreadth overview={overview} />
+      <Reveal><MarketBreadth overview={overview} /></Reveal>
 
       {/* Sector Performance */}
-      <SectorPerformance sectors={sectors} />
+      <Reveal><SectorPerformance sectors={sectors} /></Reveal>
     </div>
   );
 }

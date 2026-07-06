@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
+import { motion } from "framer-motion";
 import api from "../services/api";
 import { formatCurrency, formatNumber, formatPercent } from "../utils/formatters";
 import {
@@ -31,13 +32,19 @@ function Toast({ msg, type, onClose }) {
   );
 }
 
-function StatCard({ label, value, sub, color }) {
+function StatCard({ label, value, sub, color, index = 0 }) {
   return (
-    <div className="stat-card flex flex-col gap-1">
-      <span className="text-[10px] font-bold uppercase tracking-[0.12em]" style={{ color: "var(--text-muted)" }}>{label}</span>
-      <span className="text-xl font-semibold font-mono" style={{ color: color || "var(--text-primary)" }}>{value}</span>
-      {sub && <span className="text-[11px]" style={{ color: "var(--text-muted)" }}>{sub}</span>}
-    </div>
+    <motion.div
+      className="stat-card flex flex-col gap-1"
+      initial={{ opacity: 0, y: 16 }}
+      whileInView={{ opacity: 1, y: 0 }}
+      viewport={{ once: true, margin: "-60px" }}
+      transition={{ duration: 0.4, delay: index * 0.05 }}
+    >
+      <span className="stat-label">{label}</span>
+      <span className="stat-value" style={{ color: color || "var(--text-primary)" }}>{value}</span>
+      {sub && <span className="caption">{sub}</span>}
+    </motion.div>
   );
 }
 
@@ -73,11 +80,11 @@ function NewTradeModal({ onClose, onSubmit, loading }) {
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: "rgba(0,0,0,0.7)" }}>
-      <div className="w-full max-w-lg rounded-2xl p-6 shadow-2xl" style={{ background: "var(--bg-surface)", border: "1px solid var(--border)" }}>
+      <div className="glass-card w-full max-w-lg p-6 shadow-2xl">
         <div className="flex items-center justify-between mb-5">
           <div className="flex items-center gap-2">
-            <FlaskConical size={18} style={{ color: "var(--ai-accent)" }} />
-            <h2 className="text-base font-semibold" style={{ color: "var(--text-primary)" }}>New Paper Trade</h2>
+            <FlaskConical size={20} style={{ color: "var(--ai-accent)" }} />
+            <h2 className="card-title">New Paper Trade</h2>
             <span className="text-[10px] font-bold px-2 py-0.5 rounded-full" style={{ background: "#f59e0b22", color: "#f59e0b" }}>SIMULATED</span>
           </div>
           <button onClick={onClose} style={{ color: "var(--text-muted)" }}><X size={18} /></button>
@@ -87,7 +94,7 @@ function NewTradeModal({ onClose, onSubmit, loading }) {
           {/* Symbol row */}
           <div className="flex gap-2">
             <div className="flex-1">
-              <label className="text-[10px] font-bold uppercase tracking-widest mb-1 block" style={{ color: "var(--text-muted)" }}>NSE Symbol</label>
+              <label className="stat-label mb-1 block">NSE Symbol</label>
               <input
                 value={form.symbol} onChange={e => set("symbol", e.target.value.toUpperCase())}
                 onBlur={fetchPrice}
@@ -98,7 +105,7 @@ function NewTradeModal({ onClose, onSubmit, loading }) {
               />
             </div>
             <div>
-              <label className="text-[10px] font-bold uppercase tracking-widest mb-1 block" style={{ color: "var(--text-muted)" }}>Type</label>
+              <label className="stat-label mb-1 block">Type</label>
               <div className="flex rounded-xl overflow-hidden border" style={{ borderColor: "var(--border)" }}>
                 {["BUY", "SELL"].map(t => (
                   <button key={t} type="button" onClick={() => set("type", t)}
@@ -123,7 +130,7 @@ function NewTradeModal({ onClose, onSubmit, loading }) {
               { key: "target1", label: "Target (₹)", type: "number", step: "0.01" },
             ].map(f => (
               <div key={f.key}>
-                <label className="text-[10px] font-bold uppercase tracking-widest mb-1 block" style={{ color: "var(--text-muted)" }}>{f.label}</label>
+                <label className="stat-label mb-1 block">{f.label}</label>
                 <input
                   type={f.type} step={f.step} min={f.min}
                   value={form[f.key]} onChange={e => set(f.key, e.target.value)}
@@ -137,7 +144,7 @@ function NewTradeModal({ onClose, onSubmit, loading }) {
 
           {/* Setup type */}
           <div>
-            <label className="text-[10px] font-bold uppercase tracking-widest mb-1 block" style={{ color: "var(--text-muted)" }}>Setup Type</label>
+            <label className="stat-label mb-1 block">Setup Type</label>
             <div className="relative">
               <select
                 value={form.setup_type} onChange={e => set("setup_type", e.target.value)}
@@ -152,8 +159,8 @@ function NewTradeModal({ onClose, onSubmit, loading }) {
 
           <button
             type="submit" disabled={loading}
-            className="w-full py-2.5 rounded-xl text-sm font-semibold transition-all"
-            style={{ background: "var(--ai-accent)", color: "#fff", opacity: loading ? 0.7 : 1 }}
+            className="btn-primary btn-lg btn-block"
+            style={{ opacity: loading ? 0.7 : 1 }}
           >
             {loading ? "Placing..." : "Place Paper Trade"}
           </button>
@@ -251,27 +258,25 @@ export default function PaperTrading() {
       <div className="flex items-center justify-between flex-wrap gap-3">
         <div className="flex items-center gap-3">
           <div>
-            <h1 className="text-2xl sm:text-[28px] font-semibold tracking-tight font-display flex items-center gap-2" style={{ color: "var(--text-primary)" }}>
-              <FlaskConical size={20} style={{ color: "#f59e0b" }} />Paper Trading
+            <h1 className="page-title flex items-center gap-2">
+              <FlaskConical size={24} style={{ color: "#f59e0b" }} />Paper Trading
               <span className="text-[10px] font-bold px-2 py-0.5 rounded-full" style={{ background: "#f59e0b22", color: "#f59e0b" }}>SIMULATED</span>
             </h1>
-            <p className="text-[13px] mt-0.5" style={{ color: "var(--text-secondary)" }}>Practice trading with virtual money</p>
+            <p className="page-subtitle mt-0.5">Practice trading with virtual money</p>
           </div>
         </div>
         <div className="flex items-center gap-2">
-          <button onClick={load} className="p-2 rounded-xl" style={{ color: "var(--text-muted)" }} title="Refresh">
+          <button onClick={load} className="btn-ghost btn-sm" title="Refresh">
             <RefreshCw size={16} />
           </button>
           <button onClick={handleReset} disabled={resetting}
-            className="flex items-center gap-1.5 px-4 py-2 rounded-xl text-xs font-medium transition-all"
+            className="btn-secondary btn-sm"
             style={{ background: "rgba(248,113,113,0.12)", color: "var(--loss)", border: "1px solid rgba(248,113,113,0.2)" }}>
             <RotateCcw size={13} />
             Reset Capital
           </button>
-          <button onClick={() => setModalOpen(true)}
-            className="flex items-center gap-1.5 px-4 py-2 rounded-xl text-xs font-semibold"
-            style={{ background: "var(--ai-accent)", color: "#fff" }}>
-            <Plus size={14} />
+          <button onClick={() => setModalOpen(true)} className="btn-primary btn-lg">
+            <Plus size={16} />
             New Paper Trade
           </button>
         </div>
@@ -279,24 +284,32 @@ export default function PaperTrading() {
 
       {/* Stat Cards */}
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-        <StatCard label="Paper Capital" value={formatCurrency(balance?.balance)} sub="Starting: ₹1,00,000" />
+        <StatCard label="Paper Capital" value={formatCurrency(balance?.balance)} sub="Starting: ₹1,00,000" index={0} />
         <StatCard
           label="Total P&L"
           value={`${pnl?.total_pnl >= 0 ? "+" : ""}${formatCurrency(pnl?.total_pnl)}`}
           sub={`${pnl?.total_pnl_pct >= 0 ? "+" : ""}${pnl?.total_pnl_pct?.toFixed(2)}% return`}
           color={pnlColor(pnl?.total_pnl)}
+          index={1}
         />
-        <StatCard label="Open Trades" value={pnl?.open_trades ?? 0} sub={`${pnl?.closed_trades ?? 0} closed`} />
+        <StatCard label="Open Trades" value={pnl?.open_trades ?? 0} sub={`${pnl?.closed_trades ?? 0} closed`} index={2} />
         <StatCard
           label="Realized P&L"
           value={formatCurrency(pnl?.realized_pnl)}
           sub={`Unrealized: ${formatCurrency(pnl?.unrealized_pnl)}`}
           color={pnlColor(pnl?.realized_pnl)}
+          index={3}
         />
       </div>
 
       {/* Trades Table */}
-      <div className="glass-card p-5">
+      <motion.div
+        className="glass-card p-5"
+        initial={{ opacity: 0, y: 16 }}
+        whileInView={{ opacity: 1, y: 0 }}
+        viewport={{ once: true, margin: "-60px" }}
+        transition={{ duration: 0.4 }}
+      >
         {/* Tabs */}
         <div className="tab-bar mb-4 w-fit">
           {[{ key: "open", label: `Open (${openTrades.length})` }, { key: "closed", label: `Closed (${closedTrades.length})` }].map(t => (
@@ -346,8 +359,8 @@ export default function PaperTrading() {
                         <td className="py-3 px-2 text-[10px]" style={{ color: "var(--text-muted)" }}>{(t.setup_type || "—").replace(/_/g, " ")}</td>
                         <td className="py-3 px-2">
                           <button onClick={() => closeTrade(t._id)}
-                            className="text-[10px] font-bold px-3 py-1.5 rounded-lg transition-all hover:opacity-80"
-                            style={{ background: "rgba(248,113,113,0.15)", color: "var(--loss)" }}>
+                            className="btn-secondary btn-sm"
+                            style={{ background: "rgba(248,113,113,0.15)", color: "var(--loss)", border: "1px solid rgba(248,113,113,0.25)" }}>
                             Close
                           </button>
                         </td>
@@ -399,7 +412,7 @@ export default function PaperTrading() {
             </div>
           )
         )}
-      </div>
+      </motion.div>
     </div>
   );
 }

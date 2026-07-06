@@ -2,7 +2,25 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import { Link } from "react-router-dom";
 import api from "../services/api";
 import { formatNumber } from "../utils/formatters";
+import { useWebSocket } from "../hooks/useWebSocket";
+import { useAuth } from "../context/AuthContext";
 import { Eye, Search, Plus, Trash2, ArrowUpRight, ArrowDownRight, Activity } from "lucide-react";
+import { motion } from "framer-motion";
+
+/* Scroll-reveal wrapper — fades/slides content in as it enters the viewport */
+function Reveal({ children, delay = 0, className }) {
+  return (
+    <motion.div
+      className={className}
+      initial={{ opacity: 0, y: 16 }}
+      whileInView={{ opacity: 1, y: 0 }}
+      viewport={{ once: true, margin: "-60px" }}
+      transition={{ duration: 0.4, delay, ease: [0.16, 1, 0.3, 1] }}
+    >
+      {children}
+    </motion.div>
+  );
+}
 
 function AddStockSearch({ onAdd, existing }) {
   const [query, setQuery] = useState("");
@@ -122,8 +140,8 @@ function WatchlistRow({ item, onRemove }) {
       <button
         data-testid={`watchlist-remove-${item.symbol}`}
         onClick={() => onRemove(item.symbol)}
-        className="p-2 rounded-lg transition-all shrink-0"
-        style={{ color: "var(--text-muted)" }}
+        className="btn-ghost shrink-0"
+        style={{ padding: "8px", color: "var(--text-muted)" }}
         onMouseEnter={e => { e.currentTarget.style.color = "var(--loss)"; e.currentTarget.style.background = "var(--loss-bg)"; }}
         onMouseLeave={e => { e.currentTarget.style.color = "var(--text-muted)"; e.currentTarget.style.background = "transparent"; }}
         title={`Remove ${item.symbol}`}
@@ -135,6 +153,8 @@ function WatchlistRow({ item, onRemove }) {
 }
 
 export default function Watchlist() {
+  const { user } = useAuth();
+  const { priceTicks } = useWebSocket(user?._id || user?.id || "");
   const [items, setItems] = useState([]);
   const [loading, setLoading] = useState(true);
 
@@ -151,6 +171,17 @@ export default function Watchlist() {
     const i = setInterval(fetchWatchlist, 30000);
     return () => clearInterval(i);
   }, [fetchWatchlist]);
+
+  // Live-patch each row's price/change from the WS "prices" stream, keeping the
+  // 30s poll as a fallback for the fields (RSI, since-added) not streamed.
+  useEffect(() => {
+    if (!priceTicks) return;
+    setItems(prev => prev.map(it => {
+      const tick = priceTicks[it.symbol];
+      if (!tick || tick.price == null) return it;
+      return { ...it, quote: { ...(it.quote || {}), price: tick.price, change_pct: tick.change_pct } };
+    }));
+  }, [priceTicks]);
 
   const handleAdd = async (symbol) => {
     try {
@@ -178,37 +209,51 @@ export default function Watchlist() {
   return (
     <div data-testid="watchlist-page" className="space-y-5">
       {/* Header */}
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-        <div>
-          <h1 className="text-2xl sm:text-[28px] font-semibold tracking-tight font-display" style={{ color: "var(--text-primary)" }}>Watchlist</h1>
-          <p className="text-[13px] mt-0.5" style={{ color: "var(--text-secondary)" }}>
-            Stocks you're tracking — live prices refresh every 30 seconds
-          </p>
+      <Reveal>
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+          <div>
+            <h1 className="page-title">Watchlist</h1>
+            <p className="page-subtitle mt-1">
+              Stocks you're tracking — live prices refresh every 30 seconds
+            </p>
+          </div>
+          <AddStockSearch onAdd={handleAdd} existing={items.map(i => i.symbol)} />
         </div>
-        <AddStockSearch onAdd={handleAdd} existing={items.map(i => i.symbol)} />
-      </div>
+      </Reveal>
 
       {/* List */}
       {items.length === 0 ? (
-        <div className="glass-card p-12 text-center">
-          <Eye size={32} className="mx-auto mb-3" style={{ color: "var(--text-muted)" }} />
-          <h3 className="text-[15px] font-semibold mb-1" style={{ color: "var(--text-primary)" }}>Your watchlist is empty</h3>
-          <p className="text-[12px] max-w-sm mx-auto" style={{ color: "var(--text-secondary)" }}>
-            Search for a stock above to start tracking it. The AI keeps an eye on price, momentum, and volume for every stock you add.
-          </p>
-        </div>
-      ) : (
-        <div className="glass-card overflow-hidden">
-          <div className="flex items-center gap-2 px-4 py-3" style={{ borderBottom: "1px solid var(--border)" }}>
-            <Activity size={13} style={{ color: "var(--ai-accent)" }} />
-            <span className="text-[11px] font-bold uppercase tracking-[0.12em]" style={{ color: "var(--text-muted)" }}>
-              Tracking {items.length} {items.length === 1 ? "stock" : "stocks"}
-            </span>
+        <Reveal>
+          <div className="glass-card p-12 text-center">
+            <Eye size={32} className="mx-auto mb-3" style={{ color: "var(--text-muted)" }} />
+            <h3 className="card-title mb-1">Your watchlist is empty</h3>
+            <p className="body-text max-w-sm mx-auto">
+              Search for a stock above to start tracking it. The AI keeps an eye on price, momentum, and volume for every stock you add.
+            </p>
           </div>
-          {items.map(item => (
-            <WatchlistRow key={item.symbol} item={item} onRemove={handleRemove} />
-          ))}
-        </div>
+        </Reveal>
+      ) : (
+        <Reveal>
+          <div className="glass-card overflow-hidden">
+            <div className="flex items-center gap-2 px-4 py-3" style={{ borderBottom: "1px solid var(--border)" }}>
+              <Activity size={13} style={{ color: "var(--ai-accent)" }} />
+              <span className="eyebrow">
+                Tracking {items.length} {items.length === 1 ? "stock" : "stocks"}
+              </span>
+            </div>
+            {items.map((item, i) => (
+              <motion.div
+                key={item.symbol}
+                initial={{ opacity: 0, y: 12 }}
+                whileInView={{ opacity: 1, y: 0 }}
+                viewport={{ once: true, margin: "-40px" }}
+                transition={{ duration: 0.35, delay: Math.min(i, 8) * 0.04 }}
+              >
+                <WatchlistRow item={item} onRemove={handleRemove} />
+              </motion.div>
+            ))}
+          </div>
+        </Reveal>
       )}
     </div>
   );

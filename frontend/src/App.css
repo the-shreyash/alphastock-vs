@@ -22,6 +22,105 @@
 .shadow-card { box-shadow: var(--card-shadow); }
 
 /* =============================================
+   TYPOGRAPHY SCALE — reusable heading/body classes
+   Adopt these platform-wide for a consistent, larger
+   premium type rhythm. Numbers/tickers keep JetBrains
+   Mono via .font-mono / .stat-value.
+   ============================================= */
+.page-title {
+  font-family: 'Outfit', -apple-system, sans-serif;
+  font-size: var(--fs-h1);
+  font-weight: 700;
+  line-height: var(--lh-tight);
+  letter-spacing: var(--tracking-tight);
+  color: var(--text-primary);
+}
+.page-subtitle {
+  font-size: var(--fs-body-lg);
+  font-weight: 400;
+  line-height: var(--lh-snug);
+  color: var(--text-secondary);
+}
+.section-title {
+  font-family: 'Outfit', -apple-system, sans-serif;
+  font-size: var(--fs-h2);
+  font-weight: 700;
+  line-height: var(--lh-tight);
+  letter-spacing: -0.015em;
+  color: var(--text-primary);
+}
+.card-title {
+  font-family: 'Outfit', -apple-system, sans-serif;
+  font-size: var(--fs-h3);
+  font-weight: 600;
+  line-height: 1.25;
+  letter-spacing: -0.01em;
+  color: var(--text-primary);
+}
+.card-subtitle {
+  font-size: var(--fs-body-sm);
+  font-weight: 400;
+  color: var(--text-secondary);
+}
+.body-lg {
+  font-size: var(--fs-body-lg);
+  line-height: var(--lh-normal);
+  color: var(--text-secondary);
+}
+.body-text {
+  font-size: var(--fs-body);
+  line-height: var(--lh-normal);
+  color: var(--text-secondary);
+}
+.caption {
+  font-size: var(--fs-caption);
+  color: var(--text-muted);
+}
+/* Section eyebrow / overline label */
+.eyebrow {
+  font-size: var(--fs-caption);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--text-muted);
+}
+/* Big numeric metric (keeps mono) */
+.stat-value {
+  font-family: 'JetBrains Mono', 'SF Mono', monospace;
+  font-size: var(--fs-stat);
+  font-weight: 600;
+  line-height: 1.1;
+  letter-spacing: -0.01em;
+  color: var(--text-primary);
+}
+.stat-label {
+  font-size: var(--fs-caption);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-wide);
+  color: var(--text-muted);
+}
+
+/* =============================================
+   PAGE CONTAINER — consistent breathing room on
+   every page ("padding from every side"). Optional
+   helper Layout/pages can adopt in a later phase.
+   ============================================= */
+.page-container {
+  padding: var(--page-padding-sm);
+  max-width: var(--page-max-width);
+  margin-inline: auto;
+}
+@media (min-width: 640px) {
+  .page-container { padding: var(--page-padding-md); }
+}
+@media (min-width: 1024px) {
+  .page-container { padding: var(--page-padding); }
+}
+/* Stack helper for consistent vertical gaps between sections */
+.page-stack > * + * { margin-top: var(--page-gap); }
+
+/* =============================================
    GLASS CARD — Primary Container
    Premium glassmorphic card used everywhere
    ============================================= */
@@ -90,15 +189,10 @@
 }
 
 .glass {
-  backdrop-filter: blur(20px) saturate(1.6);
-  -webkit-backdrop-filter: blur(20px) saturate(1.6);
+  background: var(--bg-card-glass);
+  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
   border: 1px solid var(--border);
-}
-[data-theme="light"] .glass {
-  background: rgba(255,255,255,0.7);
-}
-[data-theme="dark"] .glass {
-  background: rgba(11,13,20,0.7);
 }
 
 /* =============================================
@@ -153,51 +247,109 @@
 
 /* =============================================
    BUTTONS
+   Bigger, consistent, clearly tappable. All three
+   variants share the same sizing so any button in
+   the app reads as one system. Use .btn-lg / .btn-sm
+   modifiers to resize.
    ============================================= */
-.btn-primary {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 8px;
-  padding: 10px 24px;
-  border-radius: 12px;
-  font-size: 14px;
-  font-weight: 600;
-  background: var(--ai-accent);
-  color: #FFFFFF;
-  border: none;
-  cursor: pointer;
-  transition: all 0.25s cubic-bezier(0.16, 1, 0.3, 1);
-  box-shadow: 0 1px 3px rgba(99, 102, 241, 0.3);
-}
-.btn-primary:hover {
-  transform: translateY(-1px);
-  box-shadow: 0 4px 16px rgba(99, 102, 241, 0.35);
-  filter: brightness(1.08);
-}
-.btn-primary:active {
-  transform: translateY(0);
-}
-
+.btn-primary,
+.btn-secondary,
 .btn-ghost {
   display: inline-flex;
   align-items: center;
   justify-content: center;
   gap: 8px;
-  padding: 10px 24px;
-  border-radius: 12px;
-  font-size: 14px;
+  padding: 12px 26px;
+  border-radius: 14px;
+  font-family: 'Outfit', -apple-system, sans-serif;
+  font-size: 15px;
   font-weight: 600;
+  line-height: 1;
+  letter-spacing: -0.005em;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+}
+.btn-primary:focus-visible,
+.btn-secondary:focus-visible,
+.btn-ghost:focus-visible {
+  outline: 2px solid var(--ai-accent);
+  outline-offset: 2px;
+}
+.btn-primary:disabled,
+.btn-secondary:disabled,
+.btn-ghost:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  transform: none;
+  filter: none;
+}
+
+/* Primary — filled accent */
+.btn-primary {
+  background: var(--ai-accent);
+  color: #FFFFFF;
+  border: 1px solid transparent;
+  box-shadow: 0 1px 3px rgba(99, 102, 241, 0.3);
+}
+.btn-primary:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 6px 18px rgba(99, 102, 241, 0.35);
+  filter: brightness(1.08);
+}
+.btn-primary:active {
+  transform: translateY(0) scale(0.985);
+}
+
+/* Secondary — subtle filled surface */
+.btn-secondary {
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  border: 1px solid var(--border);
+  box-shadow: var(--card-shadow);
+}
+.btn-secondary:hover {
+  background: var(--bg-card-glass-hover);
+  border-color: var(--ai-accent-glow);
+  transform: translateY(-1px);
+  box-shadow: var(--card-shadow-hover);
+}
+.btn-secondary:active {
+  transform: translateY(0) scale(0.985);
+}
+
+/* Ghost — transparent outline */
+.btn-ghost {
   background: transparent;
   color: var(--text-primary);
   border: 1px solid var(--border);
-  cursor: pointer;
-  transition: all 0.25s ease;
 }
 .btn-ghost:hover {
   background: var(--hover);
   border-color: var(--text-muted);
   transform: translateY(-1px);
+}
+.btn-ghost:active {
+  transform: translateY(0) scale(0.985);
+}
+
+/* Size modifiers */
+.btn-lg {
+  padding: 15px 32px;
+  font-size: 16px;
+  border-radius: 16px;
+  gap: 10px;
+}
+.btn-sm {
+  padding: 8px 16px;
+  font-size: 13px;
+  border-radius: 11px;
+  gap: 6px;
+}
+/* Full-width utility */
+.btn-block {
+  display: flex;
+  width: 100%;
 }
 
 .btn-lift {
@@ -348,9 +500,9 @@
   border: 1px solid var(--border);
 }
 .segment-btn {
-  padding: 6px 16px;
+  padding: 7px 18px;
   border-radius: 8px;
-  font-size: 12px;
+  font-size: 13px;
   font-weight: 600;
   transition: all 0.2s ease;
   color: var(--text-muted);
@@ -469,8 +621,8 @@
   background: var(--bg-surface);
   border: 1px solid var(--border);
   border-radius: 12px;
-  padding: 8px 16px 8px 40px;
-  font-size: 13px;
+  padding: 10px 16px 10px 40px;
+  font-size: 14px;
   color: var(--text-primary);
   width: 100%;
   transition: all 0.25s ease;
@@ -482,6 +634,23 @@
 .search-input:focus {
   border-color: var(--ai-accent);
   box-shadow: 0 0 0 3px var(--ai-accent-soft);
+}
+
+/* Small keycap hint used inside the global search dropdown footer */
+.kbd-hint {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  font-family: 'JetBrains Mono', 'SF Mono', monospace;
+  font-size: 10px;
+  line-height: 1;
+  color: var(--text-secondary);
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: 5px;
 }
 
 /* =============================================

@@ -1,9 +1,13 @@
 """Zerodha Kite Connect service with mock fallback."""
 import os
 import logging
-from datetime import datetime, timezone
+from urllib.parse import quote
+from datetime import datetime, timezone, timedelta
 
 logger = logging.getLogger(__name__)
+
+# Kite access tokens are invalidated daily around 06:00 IST.
+IST = timezone(timedelta(hours=5, minutes=30))
 
 
 def _get_credentials():
@@ -17,18 +21,38 @@ def is_configured():
     return bool(api_key and api_secret)
 
 
-# In-memory token store (in production, store in DB)
+# In-memory cache of the active token; source of truth is db.broker_accounts.
 _access_token = None
+_connected_at = None
+_profile = {}
 
 
-def get_login_url():
+def _session_is_fresh(connected_at_iso: str) -> bool:
+    """A Kite token is valid until ~06:00 IST the following day."""
+    try:
+        connected = datetime.fromisoformat(connected_at_iso).astimezone(IST)
+        now = datetime.now(IST)
+        expiry = connected.replace(hour=6, minute=0, second=0, microsecond=0)
+        if connected.hour >= 6:
+            expiry += timedelta(days=1)
+        return now < expiry
+    except Exception:
+        return False
+
+
+def get_login_url(user_id: str = None):
     api_key, _ = _get_credentials()
     if not api_key:
         return {"url": None, "configured": False, "message": "Kite API key not configured. Add KITE_API_KEY to .env"}
-    return {"url": f"https://kite.zerodha.com/connect/login?v=3&api_key={api_key}", "configured": True}
+    url = f"https://kite.zerodha.com/connect/login?v=3&api_key={api_key}"
+    if user_id:
+        # Kite echoes redirect_params back onto the registered redirect URL,
+        # letting the public callback identify which app user initiated login.
+        url += f"&redirect_params={quote(f'uid={user_id}')}"
+    return {"url": url, "configured": True}
 
 
-async def generate_session(request_token: str, db=None):
+async def generate_session(request_token: str, db=None, user_id: str = None):
     api_key, api_secret = _get_credentials()
     if not api_key or not api_secret:
         return {"success": False, "message": "Zerodha not configured"}
@@ -47,13 +71,53 @@ async def generate_session(request_token: str, db=None):
             })
             data = resp.json()
             if data.get("status") == "success":
-                global _access_token
+                global _access_token, _connected_at, _profile
                 _access_token = data["data"]["access_token"]
+                _connected_at = datetime.now(timezone.utc).isoformat()
+                _profile = {
+                    "user_id": data["data"].get("user_id"),
+                    "user_name": data["data"].get("user_name"),
+                    "email": data["data"].get("email"),
+                    "broker": data["data"].get("broker", "ZERODHA"),
+                }
+                if db is not None:
+                    await db.broker_accounts.update_one(
+                        {"user_id": user_id, "broker": "zerodha"},
+                        {"$set": {
+                            "user_id": user_id,
+                            "broker": "zerodha",
+                            "access_token": _access_token,
+                            "public_token": data["data"].get("public_token"),
+                            "profile": _profile,
+                            "connected_at": _connected_at,
+                        }},
+                        upsert=True,
+                    )
                 return {"success": True, "access_token": _access_token, "user": data["data"]}
             return {"success": False, "message": data.get("message", "Session generation failed")}
     except Exception as e:
         logger.error(f"Zerodha session error: {e}")
         return {"success": False, "message": str(e)}
+
+
+async def load_saved_session(db):
+    """Hydrate the in-memory token from Mongo on startup; drop stale sessions."""
+    global _access_token, _connected_at, _profile
+    try:
+        doc = await db.broker_accounts.find_one({"broker": "zerodha"}, sort=[("connected_at", -1)])
+        if not doc or not doc.get("access_token"):
+            return False
+        if not _session_is_fresh(doc.get("connected_at", "")):
+            logger.info("Saved Zerodha session has expired (daily 6 AM IST cutoff); reconnect required.")
+            return False
+        _access_token = doc["access_token"]
+        _connected_at = doc.get("connected_at")
+        _profile = doc.get("profile", {})
+        logger.info("Restored Zerodha session from database.")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to load saved Zerodha session: {e}")
+        return False
 
 
 async def get_holdings():
@@ -154,12 +218,24 @@ async def cancel_order(order_id: str):
 def get_status():
     """Get Zerodha connection status."""
     configured = is_configured()
-    connected = _access_token is not None
+    fresh = _access_token is not None and (_connected_at is None or _session_is_fresh(_connected_at))
+    expired = _access_token is not None and not fresh
+    if fresh:
+        message = f"Connected to Zerodha ({_profile.get('user_id', '')})".strip()
+    elif expired:
+        message = "Zerodha session expired (Kite tokens reset daily at 6 AM IST). Please login again."
+    elif configured:
+        message = "API keys configured. Login required."
+    else:
+        message = "Add KITE_API_KEY and KITE_API_SECRET to enable live trading."
     return {
         "configured": configured,
-        "connected": connected,
-        "mode": "live" if connected else ("ready" if configured else "disconnected"),
-        "message": "Connected to Zerodha" if connected else ("API keys configured. Login required." if configured else "Add KITE_API_KEY and KITE_API_SECRET to enable live trading."),
+        "connected": fresh,
+        "session_expired": expired,
+        "profile": _profile if fresh else {},
+        "connected_at": _connected_at if fresh else None,
+        "mode": "live" if fresh else ("ready" if configured else "disconnected"),
+        "message": message,
     }
 
 

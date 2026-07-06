@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { motion } from "framer-motion";
 import api from "../services/api";
 import {
   BarChart3, Play, TrendingUp, TrendingDown, Minus, Award,
@@ -18,16 +19,22 @@ const STRATEGIES = [
 
 const NSE_SYMBOLS = ["RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK", "SBIN", "BHARTIARTL", "AXISBANK", "MARUTI", "TATAMOTORS"];
 
-function MetricCard({ label, value, sub, color, icon: Icon }) {
+function MetricCard({ label, value, sub, color, icon: Icon, index = 0 }) {
   return (
-    <div className="stat-card">
+    <motion.div
+      className="stat-card"
+      initial={{ opacity: 0, y: 16 }}
+      whileInView={{ opacity: 1, y: 0 }}
+      viewport={{ once: true, margin: "-60px" }}
+      transition={{ duration: 0.4, delay: index * 0.05 }}
+    >
       <div className="flex items-start justify-between mb-1">
-        <span className="text-[10px] font-bold uppercase tracking-[0.12em]" style={{ color: "var(--text-muted)" }}>{label}</span>
+        <span className="stat-label">{label}</span>
         {Icon && <Icon size={14} style={{ color: color || "var(--text-muted)" }} />}
       </div>
-      <div className="text-xl font-semibold font-mono" style={{ color: color || "var(--text-primary)" }}>{value}</div>
-      {sub && <div className="text-[11px] mt-1" style={{ color: "var(--text-muted)" }}>{sub}</div>}
-    </div>
+      <div className="stat-value" style={{ fontSize: "1.25rem", color: color || "var(--text-primary)" }}>{value}</div>
+      {sub && <div className="caption mt-1">{sub}</div>}
+    </motion.div>
   );
 }
 
@@ -104,22 +111,28 @@ Is this strategy viable for live trading? What are the key risks? What improveme
     <div className="space-y-5" data-testid="backtesting-page">
       {/* Header */}
       <div>
-        <h1 className="text-2xl sm:text-[28px] font-semibold tracking-tight font-display" style={{ color: "var(--text-primary)" }}>
+        <h1 className="page-title">
           Backtesting
         </h1>
-        <p className="text-[13px] mt-0.5" style={{ color: "var(--text-secondary)" }}>
+        <p className="page-subtitle mt-0.5">
           Test trading strategies on historical NSE data
         </p>
       </div>
 
       {/* Config Panel */}
-      <div className="glass-card p-6 space-y-5">
-        <h3 className="text-xs font-bold uppercase tracking-widest" style={{ color: "var(--text-muted)" }}>Strategy Configuration</h3>
+      <motion.div
+        className="glass-card p-6 space-y-5"
+        initial={{ opacity: 0, y: 16 }}
+        whileInView={{ opacity: 1, y: 0 }}
+        viewport={{ once: true, margin: "-60px" }}
+        transition={{ duration: 0.4 }}
+      >
+        <h3 className="card-title">Strategy Configuration</h3>
 
         {/* Row 1: Symbol + Strategy */}
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
           <div>
-            <label className="text-[10px] font-bold uppercase tracking-widest mb-1.5 block" style={{ color: "var(--text-muted)" }}>NSE Symbol</label>
+            <label className="stat-label mb-1.5 block">NSE Symbol</label>
             <input
               value={form.symbol} onChange={e => set("symbol", e.target.value.toUpperCase())}
               placeholder="RELIANCE"
@@ -132,7 +145,7 @@ Is this strategy viable for live trading? What are the key risks? What improveme
             </datalist>
           </div>
           <div>
-            <label className="text-[10px] font-bold uppercase tracking-widest mb-1.5 block" style={{ color: "var(--text-muted)" }}>Strategy</label>
+            <label className="stat-label mb-1.5 block">Strategy</label>
             <div className="relative">
               <select value={form.strategy} onChange={e => set("strategy", e.target.value)}
                 className="w-full px-3 py-2.5 rounded-xl text-sm appearance-none"
@@ -142,7 +155,7 @@ Is this strategy viable for live trading? What are the key risks? What improveme
               <ChevronDown size={14} className="absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none" style={{ color: "var(--text-muted)" }} />
             </div>
             {strategyInfo && (
-              <p className="text-[10px] mt-1" style={{ color: "var(--text-muted)" }}>{strategyInfo.desc}</p>
+              <p className="caption mt-1">{strategyInfo.desc}</p>
             )}
           </div>
         </div>
@@ -151,7 +164,7 @@ Is this strategy viable for live trading? What are the key risks? What improveme
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
           {[{ key: "start_date", label: "Start Date" }, { key: "end_date", label: "End Date" }].map(f => (
             <div key={f.key}>
-              <label className="text-[10px] font-bold uppercase tracking-widest mb-1.5 block" style={{ color: "var(--text-muted)" }}>{f.label}</label>
+              <label className="stat-label mb-1.5 block">{f.label}</label>
               <input type="date" value={form[f.key]} onChange={e => set(f.key, e.target.value)}
                 className="w-full px-3 py-2.5 rounded-xl text-sm"
                 style={{ background: "var(--bg)", border: "1px solid var(--border)", color: "var(--text-primary)" }} />
@@ -162,7 +175,7 @@ Is this strategy viable for live trading? What are the key risks? What improveme
         {/* Row 3: Sliders + Capital */}
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
           <div>
-            <label className="text-[10px] font-bold uppercase tracking-widest mb-1.5 flex justify-between" style={{ color: "var(--text-muted)" }}>
+            <label className="stat-label mb-1.5 flex justify-between">
               Stop Loss % <span style={{ color: "var(--loss)" }}>{form.stop_loss_pct}%</span>
             </label>
             <input type="range" min="0.5" max="5" step="0.5" value={form.stop_loss_pct}
@@ -170,7 +183,7 @@ Is this strategy viable for live trading? What are the key risks? What improveme
               className="w-full accent-red-400" />
           </div>
           <div>
-            <label className="text-[10px] font-bold uppercase tracking-widest mb-1.5 flex justify-between" style={{ color: "var(--text-muted)" }}>
+            <label className="stat-label mb-1.5 flex justify-between">
               Target % <span style={{ color: "var(--gain)" }}>{form.target_pct}%</span>
             </label>
             <input type="range" min="1" max="10" step="0.5" value={form.target_pct}
@@ -178,17 +191,15 @@ Is this strategy viable for live trading? What are the key risks? What improveme
               className="w-full accent-green-400" />
           </div>
           <div>
-            <label className="text-[10px] font-bold uppercase tracking-widest mb-1.5 block" style={{ color: "var(--text-muted)" }}>Initial Capital (₹)</label>
+            <label className="stat-label mb-1.5 block">Initial Capital (₹)</label>
             <input type="number" value={form.initial_capital} onChange={e => set("initial_capital", e.target.value)}
               className="w-full px-3 py-2 rounded-xl text-sm font-mono"
               style={{ background: "var(--bg)", border: "1px solid var(--border)", color: "var(--text-primary)" }} />
           </div>
         </div>
 
-        <button onClick={runBacktest} disabled={loading}
-          className="flex items-center gap-2 px-6 py-3 rounded-xl text-sm font-semibold transition-all"
-          style={{ background: "var(--ai-accent)", color: "#fff", opacity: loading ? 0.75 : 1 }}>
-          {loading ? <RefreshCw size={16} className="animate-spin" /> : <Play size={16} />}
+        <button onClick={runBacktest} disabled={loading} className="btn-primary btn-lg">
+          {loading ? <RefreshCw size={18} className="animate-spin" /> : <Play size={18} />}
           {loading ? "Running Backtest..." : "Run Backtest"}
         </button>
 
@@ -197,7 +208,7 @@ Is this strategy viable for live trading? What are the key risks? What improveme
             <AlertTriangle size={14} /> {error}
           </div>
         )}
-      </div>
+      </motion.div>
 
       {/* Loading skeleton */}
       {loading && (
@@ -222,6 +233,7 @@ Is this strategy viable for live trading? What are the key risks? What improveme
           {/* Metric Cards */}
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
             <MetricCard
+              index={0}
               label="Win Rate"
               value={`${result.win_rate}%`}
               sub={`${result.winning_trades}W / ${result.losing_trades}L`}
@@ -229,6 +241,7 @@ Is this strategy viable for live trading? What are the key risks? What improveme
               icon={result.win_rate >= 50 ? TrendingUp : TrendingDown}
             />
             <MetricCard
+              index={1}
               label="Total Return"
               value={`${result.total_return_pct >= 0 ? "+" : ""}${result.total_return_pct}%`}
               sub={`₹${result.initial_capital?.toLocaleString("en-IN")} → ₹${result.final_capital?.toLocaleString("en-IN")}`}
@@ -236,6 +249,7 @@ Is this strategy viable for live trading? What are the key risks? What improveme
               icon={result.total_return_pct >= 0 ? TrendingUp : TrendingDown}
             />
             <MetricCard
+              index={2}
               label="Max Drawdown"
               value={`-${result.max_drawdown_pct}%`}
               sub="Peak to trough"
@@ -243,6 +257,7 @@ Is this strategy viable for live trading? What are the key risks? What improveme
               icon={AlertTriangle}
             />
             <MetricCard
+              index={3}
               label="Sharpe Ratio"
               value={result.sharpe_ratio}
               sub={result.sharpe_ratio > 1 ? "Good risk-adjusted returns" : result.sharpe_ratio > 0 ? "Acceptable" : "Poor"}
@@ -253,26 +268,35 @@ Is this strategy viable for live trading? What are the key risks? What improveme
 
           {/* Secondary metrics */}
           <div className="grid grid-cols-3 gap-3">
-            <div className="glass-card p-4 text-center">
-              <p className="text-[10px] uppercase tracking-widest mb-1" style={{ color: "var(--text-muted)" }}>Best Trade</p>
-              <p className="text-lg font-mono font-semibold" style={{ color: "var(--gain)" }}>+{result.best_trade_pct}%</p>
-            </div>
-            <div className="glass-card p-4 text-center">
-              <p className="text-[10px] uppercase tracking-widest mb-1" style={{ color: "var(--text-muted)" }}>Worst Trade</p>
-              <p className="text-lg font-mono font-semibold" style={{ color: "var(--loss)" }}>{result.worst_trade_pct}%</p>
-            </div>
-            <div className="glass-card p-4 text-center">
-              <p className="text-[10px] uppercase tracking-widest mb-1" style={{ color: "var(--text-muted)" }}>Avg Trade</p>
-              <p className="text-lg font-mono font-semibold" style={{ color: pnlColor(result.avg_trade_pct) }}>
-                {result.avg_trade_pct >= 0 ? "+" : ""}{result.avg_trade_pct}%
-              </p>
-            </div>
+            {[
+              { label: "Best Trade", value: `+${result.best_trade_pct}%`, color: "var(--gain)" },
+              { label: "Worst Trade", value: `${result.worst_trade_pct}%`, color: "var(--loss)" },
+              { label: "Avg Trade", value: `${result.avg_trade_pct >= 0 ? "+" : ""}${result.avg_trade_pct}%`, color: pnlColor(result.avg_trade_pct) },
+            ].map((m, i) => (
+              <motion.div
+                key={m.label}
+                className="glass-card p-4 text-center"
+                initial={{ opacity: 0, y: 16 }}
+                whileInView={{ opacity: 1, y: 0 }}
+                viewport={{ once: true, margin: "-60px" }}
+                transition={{ duration: 0.4, delay: i * 0.05 }}
+              >
+                <p className="caption mb-1">{m.label}</p>
+                <p className="text-lg font-mono font-semibold" style={{ color: m.color }}>{m.value}</p>
+              </motion.div>
+            ))}
           </div>
 
           {/* Equity Curve */}
           {result.equity_curve?.length > 1 && (
-            <div className="glass-card p-5">
-              <h3 className="text-xs font-bold uppercase tracking-widest mb-4" style={{ color: "var(--text-muted)" }}>
+            <motion.div
+              className="glass-card p-5"
+              initial={{ opacity: 0, y: 16 }}
+              whileInView={{ opacity: 1, y: 0 }}
+              viewport={{ once: true, margin: "-60px" }}
+              transition={{ duration: 0.4 }}
+            >
+              <h3 className="card-title mb-4">
                 Equity Curve — {result.symbol} · {result.strategy.replace(/_/g, " ")}
               </h3>
               <ResponsiveContainer width="100%" height={220}>
@@ -288,13 +312,19 @@ Is this strategy viable for live trading? What are the key risks? What improveme
                     dot={false} activeDot={{ r: 4, fill: "var(--ai-accent)" }} />
                 </LineChart>
               </ResponsiveContainer>
-            </div>
+            </motion.div>
           )}
 
           {/* Trades Table */}
           {result.trades?.length > 0 && (
-            <div className="glass-card p-5">
-              <h3 className="text-xs font-bold uppercase tracking-widest mb-3" style={{ color: "var(--text-muted)" }}>
+            <motion.div
+              className="glass-card p-5"
+              initial={{ opacity: 0, y: 16 }}
+              whileInView={{ opacity: 1, y: 0 }}
+              viewport={{ once: true, margin: "-60px" }}
+              transition={{ duration: 0.4 }}
+            >
+              <h3 className="card-title mb-3">
                 Trade Log ({result.trades.length} shown)
               </h3>
               <div className="overflow-x-auto max-h-72 overflow-y-auto">
@@ -331,28 +361,32 @@ Is this strategy viable for live trading? What are the key risks? What improveme
                   </tbody>
                 </table>
               </div>
-            </div>
+            </motion.div>
           )}
 
           {/* AI Analysis */}
-          <div className="glass-card p-5">
+          <motion.div
+            className="glass-card p-5"
+            initial={{ opacity: 0, y: 16 }}
+            whileInView={{ opacity: 1, y: 0 }}
+            viewport={{ once: true, margin: "-60px" }}
+            transition={{ duration: 0.4 }}
+          >
             <div className="flex items-center justify-between mb-3">
-              <h3 className="text-xs font-bold uppercase tracking-widest" style={{ color: "var(--text-muted)" }}>AI Strategy Verdict</h3>
-              <button onClick={getAiVerdict} disabled={aiLoading}
-                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-all"
-                style={{ background: "var(--ai-accent-soft)", color: "var(--ai-accent)" }}>
-                {aiLoading ? <RefreshCw size={12} className="animate-spin" /> : <BarChart3 size={12} />}
+              <h3 className="card-title">AI Strategy Verdict</h3>
+              <button onClick={getAiVerdict} disabled={aiLoading} className="btn-secondary btn-sm">
+                {aiLoading ? <RefreshCw size={14} className="animate-spin" /> : <BarChart3 size={14} />}
                 {aiLoading ? "Analyzing..." : "Get AI Verdict"}
               </button>
             </div>
             {aiVerdict ? (
-              <p className="text-sm leading-relaxed" style={{ color: "var(--text-secondary)" }}>{aiVerdict}</p>
+              <p className="body-text">{aiVerdict}</p>
             ) : (
-              <p className="text-xs" style={{ color: "var(--text-muted)" }}>
+              <p className="body-text" style={{ color: "var(--text-muted)" }}>
                 Click "Get AI Verdict" to have Claude/Gemini analyze whether this strategy is viable for live trading.
               </p>
             )}
-          </div>
+          </motion.div>
         </div>
       )}
     </div>

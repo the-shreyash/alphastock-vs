@@ -39,6 +39,36 @@
     --sidebar-bg: #FFFFFF;
     --nav-bg: rgba(248, 249, 252, 0.8);
 
+    /* =============================================
+       TYPOGRAPHY SCALE (theme-independent — defined
+       once here, inherited by dark theme)
+       Larger, confident premium-fintech scale.
+       ============================================= */
+    --fs-display: clamp(2.25rem, 1.85rem + 1.8vw, 2.75rem); /* hero */
+    --fs-h1: clamp(1.75rem, 1.5rem + 1.15vw, 2.125rem);     /* page title */
+    --fs-h2: 1.5rem;                                        /* section title */
+    --fs-h3: 1.25rem;                                       /* card title */
+    --fs-h4: 1.0625rem;                                     /* sub-heading */
+    --fs-body-lg: 1.0625rem;                                /* lead / intro body */
+    --fs-body: 0.9375rem;                                   /* base body (15px) */
+    --fs-body-sm: 0.875rem;                                 /* 14px */
+    --fs-caption: 0.75rem;                                  /* 12px labels/eyebrows */
+    --fs-stat: clamp(1.5rem, 1.2rem + 1vw, 2rem);           /* big numeric stat */
+    --lh-tight: 1.15;
+    --lh-snug: 1.35;
+    --lh-normal: 1.6;
+    --tracking-tight: -0.02em;
+    --tracking-wide: 0.08em;
+
+    /* =============================================
+       LAYOUT SPACING (page breathing room)
+       ============================================= */
+    --page-padding: 2rem;        /* desktop gutters (>=1024px) */
+    --page-padding-md: 1.5rem;   /* tablet */
+    --page-padding-sm: 1.25rem;  /* mobile */
+    --page-gap: 1.5rem;          /* gap between page sections */
+    --page-max-width: 1600px;
+
     /* shadcn compat */
     --background: 0 0% 100%;
     --foreground: 0 0% 3.9%;
@@ -66,16 +96,19 @@
      DARK THEME
      ============================================= */
   [data-theme="dark"] {
-    --bg: #0B0D14;
-    --bg-surface: #111420;
-    --bg-elevated: #161A28;
-    --bg-card-glass: rgba(22, 26, 40, 0.65);
-    --bg-card-glass-hover: rgba(22, 26, 40, 0.8);
+    /* Deep indigo/navy-tinted dark — deliberately NOT charcoal gray.
+       Surfaces carry a subtle cool undertone consistent with --ai-accent. */
+    --bg: #0A0C15;
+    --bg-surface: #12141F;
+    --bg-elevated: #181C2C;
+    --bg-card-glass: rgba(24, 28, 46, 0.65);
+    --bg-card-glass-hover: rgba(30, 35, 56, 0.82);
     --text-primary: #F0F2F5;
     --text-secondary: #8B8FA3;
     --text-muted: #4B5068;
-    --border: rgba(255, 255, 255, 0.06);
-    --border-subtle: rgba(255, 255, 255, 0.03);
+    /* Indigo-tinted edges & hovers (was neutral white-alpha => read as gray) */
+    --border: rgba(130, 141, 235, 0.11);
+    --border-subtle: rgba(130, 141, 235, 0.06);
     --brand: #FFFFFF;
     --brand-secondary: #4B5068;
     --gain: #00D68F;
@@ -85,15 +118,15 @@
     --ai-accent: #818CF8;
     --ai-accent-soft: rgba(129, 140, 248, 0.12);
     --ai-accent-glow: rgba(129, 140, 248, 0.2);
-    --hover: rgba(255, 255, 255, 0.04);
+    --hover: rgba(129, 140, 248, 0.07);
     --card-shadow: 0 1px 3px rgba(0, 0, 0, 0.2), 0 1px 2px -1px rgba(0, 0, 0, 0.15);
     --card-shadow-hover: 0 12px 30px -8px rgba(0, 0, 0, 0.4);
     --glass-blur: 24px;
     --glass-saturate: 1.8;
     --card-radius: 16px;
     --card-radius-lg: 20px;
-    --sidebar-bg: #0E1019;
-    --nav-bg: rgba(11, 13, 20, 0.8);
+    --sidebar-bg: #0D1019;
+    --nav-bg: rgba(10, 12, 21, 0.8);
 
     /* shadcn compat */
     --background: 230 28% 4%;
@@ -125,17 +158,27 @@
     background-color: var(--bg);
     color: var(--text-primary);
     font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: var(--fs-body);
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
     transition: background-color 0.3s ease, color 0.3s ease;
-    line-height: 1.6;
+    line-height: var(--lh-normal);
   }
 
   h1, h2, h3, h4, h5, h6 {
     font-family: 'Outfit', -apple-system, sans-serif;
-    line-height: 1.2;
-    letter-spacing: -0.02em;
+    line-height: var(--lh-tight);
+    letter-spacing: var(--tracking-tight);
   }
+  /* Sensible larger defaults for raw headings. Tailwind `text-*`
+     utilities live in a later layer and still override these, so
+     pages that set explicit sizes are unaffected. */
+  h1 { font-size: var(--fs-h1); font-weight: 700; }
+  h2 { font-size: var(--fs-h2); font-weight: 700; }
+  h3 { font-size: var(--fs-h3); font-weight: 600; }
+  h4 { font-size: var(--fs-h4); font-weight: 600; }
+  h5 { font-size: 1rem; font-weight: 600; }
+  h6 { font-size: var(--fs-body-sm); font-weight: 600; }
 
   .font-display {
     font-family: 'Outfit', -apple-system, sans-serif;

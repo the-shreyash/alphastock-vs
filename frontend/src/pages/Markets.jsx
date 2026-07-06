@@ -3,6 +3,22 @@ import { Link } from "react-router-dom";
 import api from "../services/api";
 import { formatNumber } from "../utils/formatters";
 import { TrendingUp, TrendingDown, Globe, ArrowUpRight, ArrowDownRight } from "lucide-react";
+import { motion } from "framer-motion";
+
+/* Scroll-reveal wrapper — fades/slides content in as it enters the viewport */
+function Reveal({ children, delay = 0, className }) {
+  return (
+    <motion.div
+      className={className}
+      initial={{ opacity: 0, y: 16 }}
+      whileInView={{ opacity: 1, y: 0 }}
+      viewport={{ once: true, margin: "-60px" }}
+      transition={{ duration: 0.4, delay, ease: [0.16, 1, 0.3, 1] }}
+    >
+      {children}
+    </motion.div>
+  );
+}
 
 function IndexStrip({ overview }) {
   if (!overview) return null;
@@ -13,22 +29,24 @@ function IndexStrip({ overview }) {
     { label: "India VIX", data: { value: overview.india_vix } },
   ];
   return (
-    <div className="grid grid-cols-2 md:grid-cols-4 gap-3 stagger-children">
-      {indices.map(idx => {
+    <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+      {indices.map((idx, i) => {
         const isPos = (idx.data?.change_pct ?? 0) >= 0;
         return (
-          <div key={idx.label} className="stat-card">
-            <span className="text-[10px] font-bold uppercase tracking-[0.12em] block mb-1" style={{ color: "var(--text-muted)" }}>{idx.label}</span>
-            <div className="text-xl font-semibold font-mono" style={{ color: "var(--text-primary)" }}>
-              {idx.data?.value ? formatNumber(idx.data.value) : "—"}
-            </div>
-            {idx.data?.change_pct != null && (
-              <div className="flex items-center gap-1 mt-1 text-[11px] font-mono font-semibold" style={{ color: isPos ? "var(--gain)" : "var(--loss)" }}>
-                {isPos ? <ArrowUpRight size={11} /> : <ArrowDownRight size={11} />}
-                {isPos ? "+" : ""}{idx.data.change_pct.toFixed(2)}%
+          <Reveal key={idx.label} delay={i * 0.05}>
+            <div className="stat-card">
+              <span className="stat-label block mb-1.5">{idx.label}</span>
+              <div className="text-xl font-semibold font-mono" style={{ color: "var(--text-primary)" }}>
+                {idx.data?.value ? formatNumber(idx.data.value) : "—"}
               </div>
-            )}
-          </div>
+              {idx.data?.change_pct != null && (
+                <div className="flex items-center gap-1 mt-1 text-[11px] font-mono font-semibold" style={{ color: isPos ? "var(--gain)" : "var(--loss)" }}>
+                  {isPos ? <ArrowUpRight size={11} /> : <ArrowDownRight size={11} />}
+                  {isPos ? "+" : ""}{idx.data.change_pct.toFixed(2)}%
+                </div>
+              )}
+            </div>
+          </Reveal>
         );
       })}
     </div>
@@ -41,7 +59,7 @@ function MarketHeatmap({ gainers, losers }) {
 
   return (
     <div className="glass-card p-5">
-      <h3 className="text-[11px] font-bold uppercase tracking-[0.12em] mb-4" style={{ color: "var(--text-muted)" }}>Market Heatmap</h3>
+      <h3 className="eyebrow mb-4">Market Heatmap</h3>
       <div className="grid grid-cols-4 sm:grid-cols-6 lg:grid-cols-8 gap-1.5">
         {allStocks.map(s => {
           const isPos = s.change_pct >= 0;
@@ -67,7 +85,7 @@ function MarketHeatmap({ gainers, losers }) {
 function TopMovers({ title, data, icon: Icon, color }) {
   return (
     <div className="glass-card p-5">
-      <h3 className="text-[11px] font-bold uppercase tracking-[0.12em] mb-3 flex items-center gap-2" style={{ color: `var(--${color})` }}>
+      <h3 className="eyebrow mb-3 flex items-center gap-2" style={{ color: `var(--${color})` }}>
         <Icon size={13} /> {title}
       </h3>
       <div className="space-y-1">
@@ -97,7 +115,7 @@ function MarketBreadth({ overview }) {
   const breadth = overview?.breadth || { advances: 1042, declines: 842, unchanged: 176 };
   return (
     <div className="glass-card p-5">
-      <h3 className="text-[11px] font-bold uppercase tracking-[0.12em] mb-3" style={{ color: "var(--text-muted)" }}>Market Breadth</h3>
+      <h3 className="eyebrow mb-3">Market Breadth</h3>
       <div className="grid grid-cols-3 gap-3">
         {[
           { label: "Advances", value: breadth.advances, color: "var(--gain)", bg: "var(--gain-bg)" },
@@ -118,7 +136,7 @@ function SectorPerformance({ sectors }) {
   if (!sectors?.length) return null;
   return (
     <div className="glass-card p-5">
-      <h3 className="text-[11px] font-bold uppercase tracking-[0.12em] mb-4" style={{ color: "var(--text-muted)" }}>Sector Performance</h3>
+      <h3 className="eyebrow mb-4">Sector Performance</h3>
       <div className="space-y-2">
         {sectors.map(s => {
           const isPos = s.change_pct >= 0;
@@ -148,7 +166,7 @@ function GlobalMarkets({ markets }) {
   if (!markets?.length) return null;
   return (
     <div className="glass-card p-5">
-      <h3 className="text-[11px] font-bold uppercase tracking-[0.12em] mb-3 flex items-center gap-2" style={{ color: "var(--text-muted)" }}>
+      <h3 className="eyebrow mb-3 flex items-center gap-2">
         <Globe size={13} /> Global Markets
       </h3>
       <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
@@ -205,63 +223,67 @@ export default function Markets() {
   return (
     <div data-testid="markets-page" className="space-y-5">
       {/* Header */}
-      <div className="flex items-center justify-between">
-        <div>
-          <h1 className="text-2xl sm:text-[28px] font-semibold tracking-tight font-display" style={{ color: "var(--text-primary)" }}>Markets</h1>
-          <p className="text-[13px] mt-0.5" style={{ color: "var(--text-secondary)" }}>Real-time market overview and insights</p>
+      <Reveal>
+        <div className="flex items-center justify-between">
+          <div>
+            <h1 className="page-title">Markets</h1>
+            <p className="page-subtitle mt-1">Real-time market overview and insights</p>
+          </div>
+          <div className="flex items-center gap-2">
+            {overview?.market_status && (
+              <span className="badge-status" style={{
+                background: overview.market_status === "OPEN" ? "var(--gain-bg)" : "var(--loss-bg)",
+                color: overview.market_status === "OPEN" ? "var(--gain)" : "var(--loss)",
+              }}>
+                Market {overview.market_status === "OPEN" ? "Open" : "Closed"}
+              </span>
+            )}
+            {overview?.source === "yahoo_finance" && (
+              <span className="badge-status" style={{ background: "var(--gain-bg)", color: "var(--gain)" }}>NSE</span>
+            )}
+          </div>
         </div>
-        <div className="flex items-center gap-2">
-          {overview?.market_status && (
-            <span className="badge-status" style={{
-              background: overview.market_status === "OPEN" ? "var(--gain-bg)" : "var(--loss-bg)",
-              color: overview.market_status === "OPEN" ? "var(--gain)" : "var(--loss)",
-            }}>
-              Market {overview.market_status === "OPEN" ? "Open" : "Closed"}
-            </span>
-          )}
-          {overview?.source === "yahoo_finance" && (
-            <span className="badge-status" style={{ background: "var(--gain-bg)", color: "var(--gain)" }}>NSE</span>
-          )}
-        </div>
-      </div>
+      </Reveal>
 
       {/* Index Strip */}
       <IndexStrip overview={overview} />
 
       {/* Heatmap */}
-      <MarketHeatmap gainers={gainers} losers={losers} />
+      <Reveal><MarketHeatmap gainers={gainers} losers={losers} /></Reveal>
 
       {/* Two Column: Gainers + Losers */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-        <TopMovers title="Top Gainers" data={gainers} icon={TrendingUp} color="gain" />
-        <TopMovers title="Top Losers" data={losers} icon={TrendingDown} color="loss" />
+        <Reveal delay={0}><TopMovers title="Top Gainers" data={gainers} icon={TrendingUp} color="gain" /></Reveal>
+        <Reveal delay={0.06}><TopMovers title="Top Losers" data={losers} icon={TrendingDown} color="loss" /></Reveal>
       </div>
 
       {/* Two Column: Breadth + Sectors */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        <MarketBreadth overview={overview} />
-        <SectorPerformance sectors={sectors} />
+        <Reveal delay={0}><MarketBreadth overview={overview} /></Reveal>
+        <Reveal delay={0.06}><SectorPerformance sectors={sectors} /></Reveal>
       </div>
 
       {/* FII/DII */}
       {fiiDii && (
-        <div className="glass-card p-5">
-          <h3 className="text-[11px] font-bold uppercase tracking-[0.12em] mb-3" style={{ color: "var(--text-muted)" }}>FII / DII Activity (₹ Cr)</h3>
-          <div className="grid grid-cols-2 gap-6">
-            {[{ label: "FII Net", val: fiiDii.fii?.net }, { label: "DII Net", val: fiiDii.dii?.net }].map(({ label, val }) => (
-              <div key={label}>
-                <span className="text-[10px] font-medium uppercase" style={{ color: "var(--text-muted)" }}>{label}</span>
-                <div className="text-xl font-mono font-bold" style={{ color: val >= 0 ? "var(--gain)" : "var(--loss)" }}>
-                  {val >= 0 ? "+" : ""}{formatNumber(val)}
+        <Reveal>
+          <div className="glass-card p-5">
+            <h3 className="eyebrow mb-3">FII / DII Activity (₹ Cr)</h3>
+            <div className="grid grid-cols-2 gap-6">
+              {[{ label: "FII Net", val: fiiDii.fii?.net }, { label: "DII Net", val: fiiDii.dii?.net }].map(({ label, val }) => (
+                <div key={label}>
+                  <span className="stat-label">{label}</span>
+                  <div className="text-xl font-mono font-bold" style={{ color: val >= 0 ? "var(--gain)" : "var(--loss)" }}>
+                    {val >= 0 ? "+" : ""}{formatNumber(val)}
+                  </div>
                 </div>
-              </div>
-            ))}
+              ))}
+            </div>
           </div>
-        </div>
+        </Reveal>
       )}
 
       {/* Global Markets */}
-      <GlobalMarkets markets={globalMkts} />
+      <Reveal><GlobalMarkets markets={globalMkts} /></Reveal>
     </div>
   );
 }

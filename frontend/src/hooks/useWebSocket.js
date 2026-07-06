@@ -8,6 +8,8 @@ export function useWebSocket(userId = "anonymous") {
   const [priceTicks, setPriceTicks] = useState({});
   const [tradeUpdates, setTradeUpdates] = useState([]);
   const [activityUpdates, setActivityUpdates] = useState(null);
+  const [portfolioUpdate, setPortfolioUpdate] = useState(null);
+  const [alerts, setAlerts] = useState([]);
   const wsRef = useRef(null);
   const reconnectRef = useRef(null);
 
@@ -32,8 +34,15 @@ export function useWebSocket(userId = "anonymous") {
             setMarketData(msg.data);
           } else if (msg.type === "price_tick") {
             setPriceTicks((prev) => ({ ...prev, [msg.data.symbol]: msg.data }));
+          } else if (msg.type === "prices") {
+            // Batched live prices: { SYMBOL: { price, change_pct }, ... }
+            setPriceTicks((prev) => ({ ...prev, ...msg.data }));
           } else if (msg.type === "trade_update") {
             setTradeUpdates((prev) => [msg.data, ...prev.slice(0, 49)]);
+          } else if (msg.type === "portfolio_update") {
+            setPortfolioUpdate(msg.data);
+          } else if (msg.type === "alert") {
+            setAlerts((prev) => [msg.data, ...prev.slice(0, 49)]);
           } else if (msg.type === "activity_feed") {
             setActivityUpdates(msg.data);
           }
@@ -74,5 +83,5 @@ export function useWebSocket(userId = "anonymous") {
     }
   }, []);
 
-  return { connected, marketData, priceTicks, tradeUpdates, activityUpdates, subscribePrices, sendPing };
+  return { connected, marketData, priceTicks, tradeUpdates, activityUpdates, portfolioUpdate, alerts, subscribePrices, sendPing };
 }

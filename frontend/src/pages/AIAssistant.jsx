@@ -1,7 +1,9 @@
 import { useState, useRef, useEffect } from "react";
 import { Link } from "react-router-dom";
+import { motion } from "framer-motion";
 import api from "../services/api";
 import { Send, Bot, User, Trash2, Brain, LineChart, Briefcase, Lightbulb, ChevronRight, Sparkles, TrendingUp, Target, BarChart3 } from "lucide-react";
+import Backtesting from "./Backtesting";
 
 const TABS = ["AI Chat", "Trade Analysis", "Portfolio Review", "Strategy Builder"];
 
@@ -69,12 +71,12 @@ export default function AIAssistant() {
   };
 
   return (
-    <div data-testid="ai-workspace-page" className="space-y-5">
+    <div data-testid="ai-workspace-page" className="space-y-6">
       {/* Header */}
-      <div>
-        <h1 className="text-2xl sm:text-[28px] font-semibold tracking-tight font-display" style={{ color: "var(--text-primary)" }}>AI Workspace</h1>
-        <p className="text-[13px] mt-0.5" style={{ color: "var(--text-secondary)" }}>Your AI-powered trading assistant</p>
-      </div>
+      <motion.div initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.4 }}>
+        <h1 className="page-title">AI Workspace</h1>
+        <p className="page-subtitle mt-1">Your AI-powered trading assistant</p>
+      </motion.div>
 
       {/* Tab Bar */}
       <div className="tab-bar">
@@ -170,8 +172,10 @@ export default function AIAssistant() {
 
           {/* Right Panel: Trade Ideas */}
           <div className="space-y-4">
-            <div className="glass-card p-5">
-              <h3 className="text-[11px] font-bold uppercase tracking-[0.12em] mb-3 flex items-center gap-2" style={{ color: "var(--text-muted)" }}>
+            <motion.div className="glass-card p-5"
+              initial={{ opacity: 0, y: 16 }} whileInView={{ opacity: 1, y: 0 }}
+              viewport={{ once: true, margin: "-60px" }} transition={{ duration: 0.4 }}>
+              <h3 className="eyebrow mb-3 flex items-center gap-2">
                 <Sparkles size={13} style={{ color: "var(--ai-accent)" }} /> AI Trade Ideas
               </h3>
               <div className="space-y-2">
@@ -194,11 +198,13 @@ export default function AIAssistant() {
                   </Link>
                 ))}
               </div>
-            </div>
+            </motion.div>
 
             {/* Quick Links */}
-            <div className="glass-card p-5">
-              <h3 className="text-[11px] font-bold uppercase tracking-[0.12em] mb-3" style={{ color: "var(--text-muted)" }}>Quick Actions</h3>
+            <motion.div className="glass-card p-5"
+              initial={{ opacity: 0, y: 16 }} whileInView={{ opacity: 1, y: 0 }}
+              viewport={{ once: true, margin: "-60px" }} transition={{ duration: 0.4, delay: 0.06 }}>
+              <h3 className="eyebrow mb-3">Quick Actions</h3>
               <div className="space-y-1.5">
                 {[
                   { label: "Analyze Stock", icon: Target, to: "/picks" },
@@ -216,36 +222,48 @@ export default function AIAssistant() {
                   </Link>
                 ))}
               </div>
-            </div>
+            </motion.div>
           </div>
         </div>
       )}
 
       {tab === "Trade Analysis" && (
-        <div className="glass-card p-6 text-center" style={{ minHeight: 300 }}>
-          <Brain size={40} className="mx-auto mb-4" style={{ color: "var(--ai-accent)", opacity: 0.5 }} />
-          <h3 className="text-lg font-semibold font-display mb-2" style={{ color: "var(--text-primary)" }}>Trade Analysis</h3>
-          <p className="text-[13px] mb-4" style={{ color: "var(--text-secondary)" }}>AI-powered trade analysis with entry/exit recommendations.</p>
-          <Link to="/picks" className="btn-primary px-6 py-2.5 text-[13px]">View AI Picks</Link>
-        </div>
+        <motion.div className="glass-card p-8 text-center" style={{ minHeight: 300 }}
+          initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.4 }}>
+          <Brain size={44} className="mx-auto mb-4" style={{ color: "var(--ai-accent)", opacity: 0.5 }} />
+          <h3 className="card-title mb-2">Trade Analysis</h3>
+          <p className="body-text mb-5 max-w-md mx-auto">AI-powered trade analysis with entry/exit recommendations.</p>
+          <Link to="/picks" className="btn-primary btn-lg">View AI Picks</Link>
+        </motion.div>
       )}
 
       {tab === "Portfolio Review" && (
-        <div className="glass-card p-6 text-center" style={{ minHeight: 300 }}>
-          <Briefcase size={40} className="mx-auto mb-4" style={{ color: "var(--ai-accent)", opacity: 0.5 }} />
-          <h3 className="text-lg font-semibold font-display mb-2" style={{ color: "var(--text-primary)" }}>Portfolio Review</h3>
-          <p className="text-[13px] mb-4" style={{ color: "var(--text-secondary)" }}>Get AI insights on your portfolio allocation and performance.</p>
-          <Link to="/portfolio" className="btn-primary px-6 py-2.5 text-[13px]">Go to Portfolio</Link>
-        </div>
+        <motion.div className="glass-card p-8 text-center" style={{ minHeight: 300 }}
+          initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.4 }}>
+          <Briefcase size={44} className="mx-auto mb-4" style={{ color: "var(--ai-accent)", opacity: 0.5 }} />
+          <h3 className="card-title mb-2">Portfolio Review</h3>
+          <p className="body-text mb-5 max-w-md mx-auto">Get AI insights on your portfolio allocation and performance.</p>
+          <Link to="/portfolio" className="btn-primary btn-lg">Go to Portfolio</Link>
+        </motion.div>
       )}
 
       {tab === "Strategy Builder" && (
-        <div className="glass-card p-6 text-center" style={{ minHeight: 300 }}>
-          <Lightbulb size={40} className="mx-auto mb-4" style={{ color: "var(--ai-accent)", opacity: 0.5 }} />
-          <h3 className="text-lg font-semibold font-display mb-2" style={{ color: "var(--text-primary)" }}>Strategy Builder</h3>
-          <p className="text-[13px] mb-4" style={{ color: "var(--text-secondary)" }}>Build and backtest trading strategies with AI assistance.</p>
-          <Link to="/backtesting" className="btn-primary px-6 py-2.5 text-[13px]">Go to Backtesting</Link>
-        </div>
+        <motion.div className="space-y-5"
+          initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.4 }}>
+          {/* Intro banner — frames the embedded backtesting engine as the Strategy Builder */}
+          <div className="glass-card p-5 flex items-start gap-3">
+            <div className="w-10 h-10 rounded-xl flex items-center justify-center shrink-0" style={{ background: "var(--ai-accent-soft)" }}>
+              <Lightbulb size={18} style={{ color: "var(--ai-accent)" }} />
+            </div>
+            <div>
+              <h3 className="card-title mb-1">Strategy Builder</h3>
+              <p className="body-text">Configure a strategy, backtest it against historical NSE data, and get an AI verdict on whether it is viable for live trading — all in one place.</p>
+            </div>
+          </div>
+
+          {/* Backtesting engine embedded directly (route /backtesting still works for deep links) */}
+          <Backtesting />
+        </motion.div>
       )}
     </div>
   );

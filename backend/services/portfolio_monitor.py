@@ -1,6 +1,11 @@
 """AI-powered portfolio monitoring service."""
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+
+# Suppress re-sending the same (user, type, symbol) alert within this window so
+# a monitoring cycle running every 60s doesn't flood notifications or burn
+# WhatsApp/Telegram/email provider daily quotas.
+ALERT_DEDUP_MINUTES = 30
 
 logger = logging.getLogger(__name__)
 
@@ -20,9 +25,9 @@ async def analyze_portfolio_health(db, user_id, market_func, quote_func, ai_func
         if not quote:
             continue
 
-        from services.activity_logger import log_activity
-        log_activity(f"Monitoring open trade: {trade['symbol']}", "monitor", "running")
-
+        # NOTE: No per-trade activity log here — with many open positions it
+        # flooded the AI activity feed and evicted the heartbeat's diverse work.
+        # The heartbeat engine logs a single "Monitored N positions" summary.
         current = quote["price"]
         entry = trade["entry_price"]
         sl = trade["stop_loss"]
@@ -157,10 +162,24 @@ async def run_monitoring_cycle(db, quote_func, whatsapp_func=None):
         prefs = user.get("notification_prefs", {})
 
         for alert in critical_alerts:
+            # Dedup: skip if the same alert (type + symbol) was already sent to
+            # this user within ALERT_DEDUP_MINUTES — otherwise every cycle would
+            # re-notify and re-send external messages, exhausting provider quotas.
+            cutoff = (datetime.now(timezone.utc) - timedelta(minutes=ALERT_DEDUP_MINUTES)).isoformat()
+            already_sent = await db.notifications.find_one({
+                "user_id": user_id,
+                "type": alert["type"],
+                "symbol": alert["symbol"],
+                "created_at": {"$gte": cutoff},
+            })
+            if already_sent:
+                continue
+
             # Save as notification
             await db.notifications.insert_one({
                 "user_id": user_id,
                 "type": alert["type"],
+                "symbol": alert["symbol"],
                 "title": f"AI Alert: {alert['symbol']}",
                 "message": alert["message"],
                 "severity": alert["severity"],

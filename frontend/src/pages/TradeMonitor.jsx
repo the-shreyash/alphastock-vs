@@ -1,9 +1,14 @@
 import { useState, useEffect, useCallback } from "react";
+import { motion } from "framer-motion";
 import api from "../services/api";
 import { formatCurrency, formatPercent, formatNumber } from "../utils/formatters";
+import { useWebSocket } from "../hooks/useWebSocket";
+import { useAuth } from "../context/AuthContext";
 import { Plus, X, TrendingUp, TrendingDown, AlertTriangle, Target, Clock, Search, Sparkles } from "lucide-react";
 
 export default function TradeMonitor() {
+  const { user } = useAuth();
+  const { tradeUpdates } = useWebSocket(user?._id || user?.id || "");
   const [activeTrades, setActiveTrades] = useState([]);
   const [history, setHistory] = useState([]);
   const [pnl, setPnl] = useState(null);
@@ -43,6 +48,23 @@ export default function TradeMonitor() {
     const interval = setInterval(fetchActive, 15000);
     return () => clearInterval(interval);
   }, []);
+
+  // Live-patch open positions from the AI heartbeat's trade_update pushes so
+  // current price / unrealized P&L tick between the 15s polling fallback.
+  useEffect(() => {
+    if (!tradeUpdates?.length) return;
+    const latest = tradeUpdates[0];
+    setActiveTrades(prev => prev.map(t =>
+      (t._id === latest.trade_id || t.symbol === latest.symbol)
+        ? {
+            ...t,
+            current_price: latest.current_price ?? t.current_price,
+            unrealized_pnl: latest.unrealized_pnl ?? t.unrealized_pnl,
+            unrealized_pnl_pct: latest.unrealized_pnl_pct ?? t.unrealized_pnl_pct,
+          }
+        : t
+    ));
+  }, [tradeUpdates]);
 
   // Live AI coaching tip per open trade, refreshed every 5 minutes.
   const activeIds = activeTrades.map((t) => t._id).join(",");
@@ -144,52 +166,47 @@ export default function TradeMonitor() {
     <div data-testid="trades-page" className="space-y-4">
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-2xl font-medium text-primary tracking-tight">Trade Monitor</h1>
-          <p className="text-xs text-muted">Track your active positions and trade history</p>
+          <h1 className="page-title">Trade Monitor</h1>
+          <p className="page-subtitle mt-0.5">Track your active positions and trade history</p>
         </div>
-        <button data-testid="new-trade-btn" onClick={() => setShowNew(true)} className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-xl transition-colors" style={{ background: "var(--brand)", color: "var(--bg)" }}>
-          <Plus size={14} /> New Trade
+        <button data-testid="new-trade-btn" onClick={() => setShowNew(true)} className="btn-primary btn-lg">
+          <Plus size={18} /> New Trade
         </button>
       </div>
 
       {/* PnL Summary */}
       {pnl && (
-        <div data-testid="pnl-summary" className="grid grid-cols-2 md:grid-cols-5 gap-1">
-          <div className="glass-card  p-3">
-            <span className="text-[10px] text-muted uppercase block">Total P&L</span>
-            <span className={`text-lg font-mono ${pnl.total_pnl >= 0 ? "text-gain" : "text-loss"}`}>
-              {pnl.total_pnl >= 0 ? "+" : ""}{formatCurrency(pnl.total_pnl)}
-            </span>
-          </div>
-          <div className="glass-card  p-3">
-            <span className="text-[10px] text-muted uppercase block">Today P&L</span>
-            <span className={`text-lg font-mono ${pnl.today_pnl >= 0 ? "text-gain" : "text-loss"}`}>
-              {pnl.today_pnl >= 0 ? "+" : ""}{formatCurrency(pnl.today_pnl)}
-            </span>
-          </div>
-          <div className="glass-card  p-3">
-            <span className="text-[10px] text-muted uppercase block">Win Rate</span>
-            <span className="text-lg font-mono text-primary">{pnl.win_rate}%</span>
-          </div>
-          <div className="glass-card  p-3">
-            <span className="text-[10px] text-muted uppercase block">Open</span>
-            <span className="text-lg font-mono text-primary">{pnl.open_trades}</span>
-          </div>
-          <div className="glass-card  p-3">
-            <span className="text-[10px] text-muted uppercase block">Total Trades</span>
-            <span className="text-lg font-mono text-primary">{pnl.total_trades}</span>
-          </div>
+        <div data-testid="pnl-summary" className="grid grid-cols-2 md:grid-cols-5 gap-3">
+          {[
+            { label: "Total P&L", value: `${pnl.total_pnl >= 0 ? "+" : ""}${formatCurrency(pnl.total_pnl)}`, color: pnl.total_pnl >= 0 ? "var(--gain)" : "var(--loss)" },
+            { label: "Today P&L", value: `${pnl.today_pnl >= 0 ? "+" : ""}${formatCurrency(pnl.today_pnl)}`, color: pnl.today_pnl >= 0 ? "var(--gain)" : "var(--loss)" },
+            { label: "Win Rate", value: `${pnl.win_rate}%`, color: "var(--text-primary)" },
+            { label: "Open", value: pnl.open_trades, color: "var(--text-primary)" },
+            { label: "Total Trades", value: pnl.total_trades, color: "var(--text-primary)" },
+          ].map((s, i) => (
+            <motion.div
+              key={s.label}
+              className="stat-card"
+              initial={{ opacity: 0, y: 16 }}
+              whileInView={{ opacity: 1, y: 0 }}
+              viewport={{ once: true, margin: "-60px" }}
+              transition={{ duration: 0.4, delay: i * 0.05 }}
+            >
+              <span className="stat-label block">{s.label}</span>
+              <span className="stat-value" style={{ color: s.color }}>{s.value}</span>
+            </motion.div>
+          ))}
         </div>
       )}
 
       {/* Tabs */}
-      <div className="flex gap-0 border-b">
+      <div className="tab-bar w-fit">
         {["active", "history"].map((t) => (
           <button
             key={t}
             data-testid={`tab-${t}`}
             onClick={() => setTab(t)}
-            className={`px-4 py-2 text-xs uppercase tracking-widest transition-colors border-b-2 ${tab === t ? "border-white text-primary" : "border-transparent text-muted hover:text-secondary"}`}
+            className={`tab-btn ${tab === t ? "active" : ""}`}
           >
             {t === "active" ? `Active (${activeTrades.length})` : `History (${history.length})`}
           </button>
@@ -200,19 +217,27 @@ export default function TradeMonitor() {
       {tab === "active" && (
         <div className="space-y-1">
           {activeTrades.length === 0 ? (
-            <div className="glass-card  p-8 text-center">
+            <div className="glass-card p-8 text-center">
               <p className="text-muted text-sm">No active trades. Click "New Trade" to get started.</p>
             </div>
           ) : (
-            activeTrades.map((trade) => (
-              <div key={trade._id} data-testid={`active-trade-${trade.symbol}`} className="glass-card  p-4">
+            activeTrades.map((trade, i) => (
+              <motion.div
+                key={trade._id}
+                data-testid={`active-trade-${trade.symbol}`}
+                className="glass-card p-4"
+                initial={{ opacity: 0, y: 16 }}
+                whileInView={{ opacity: 1, y: 0 }}
+                viewport={{ once: true, margin: "-40px" }}
+                transition={{ duration: 0.4, delay: Math.min(i, 8) * 0.05 }}
+              >
                 <div className="flex items-center justify-between mb-2">
                   <div className="flex items-center gap-3">
                     <span className={`px-1.5 py-0.5 text-[10px] font-mono rounded-xl ${trade.type === "BUY" ? "bg-gain/10 text-gain border border-gain/30" : "bg-loss/10 text-loss border border-loss/30"}`}>
                       {trade.type}
                     </span>
                     <div>
-                      <span className="text-sm text-primary font-medium">{trade.stock_name}</span>
+                      <span className="card-subtitle font-semibold" style={{ color: "var(--text-primary)" }}>{trade.stock_name}</span>
                       <span className="text-xs text-muted ml-2 font-mono">{trade.symbol}</span>
                     </div>
                   </div>
@@ -247,12 +272,12 @@ export default function TradeMonitor() {
                       const price = prompt("Exit price:");
                       if (price) closeTrade(trade._id, price);
                     }}
-                    className="px-3 py-1 bg-zinc-800 text-secondary text-xs rounded-xl bg-hover:hover transition-colors"
+                    className="btn-secondary btn-sm"
                   >
                     Close Trade
                   </button>
                 </div>
-              </div>
+              </motion.div>
             ))
           )}
         </div>
@@ -262,18 +287,25 @@ export default function TradeMonitor() {
       {tab === "history" && (
         <div className="space-y-1">
           {history.length === 0 ? (
-            <div className="glass-card  p-8 text-center">
+            <div className="glass-card p-8 text-center">
               <p className="text-muted text-sm">No trade history yet.</p>
             </div>
           ) : (
-            history.map((trade) => (
-              <div key={trade._id} className="glass-card  p-3 flex items-center justify-between">
+            history.map((trade, i) => (
+              <motion.div
+                key={trade._id}
+                className="glass-card p-3 flex items-center justify-between"
+                initial={{ opacity: 0, y: 16 }}
+                whileInView={{ opacity: 1, y: 0 }}
+                viewport={{ once: true, margin: "-40px" }}
+                transition={{ duration: 0.35, delay: Math.min(i, 8) * 0.04 }}
+              >
                 <div className="flex items-center gap-3">
                   <span className={`px-1.5 py-0.5 text-[10px] font-mono rounded-xl ${trade.status === "TARGET_HIT" ? "bg-gain/10 text-gain" : trade.status === "SL_HIT" ? "bg-loss/10 text-loss" : "bg-zinc-800 text-secondary"}`}>
                     {trade.status}
                   </span>
                   <div>
-                    <span className="text-sm text-primary">{trade.symbol}</span>
+                    <span className="card-subtitle font-semibold" style={{ color: "var(--text-primary)" }}>{trade.symbol}</span>
                     <span className="text-xs text-muted ml-2">Qty: {trade.quantity}</span>
                   </div>
                 </div>
@@ -283,7 +315,7 @@ export default function TradeMonitor() {
                   </div>
                   <div className="text-[10px] text-muted font-mono">{formatPercent(trade.pnl_percent)}</div>
                 </div>
-              </div>
+              </motion.div>
             ))
           )}
         </div>
@@ -292,15 +324,15 @@ export default function TradeMonitor() {
       {/* New Trade Modal */}
       {showNew && (
         <div className="fixed inset-0 bg-black/80 z-50 flex items-center justify-center p-4" onClick={() => setShowNew(false)}>
-          <div className="glass-card  w-full max-w-md" onClick={(e) => e.stopPropagation()}>
-            <div className="flex items-center justify-between p-4 border-b">
-              <h3 className="text-sm font-medium text-primary">New Trade Entry</h3>
-              <button onClick={() => setShowNew(false)} className="text-muted hover:text-secondary"><X size={16} /></button>
+          <div className="glass-card w-full max-w-md" onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center justify-between p-4 border-b" style={{ borderColor: "var(--border)" }}>
+              <h3 className="card-title">New Trade Entry</h3>
+              <button onClick={() => setShowNew(false)} style={{ color: "var(--text-muted)" }}><X size={18} /></button>
             </div>
             <form onSubmit={handleSubmit} className="p-4 space-y-3">
               <div className="grid grid-cols-2 gap-3">
                 <div>
-                  <label className="text-[10px] text-muted uppercase block mb-1">Symbol</label>
+                  <label className="stat-label block mb-1">Symbol</label>
                   <div className="relative">
                     <input data-testid="trade-symbol-input" value={form.symbol} onChange={(e) => handleSymbolChange(e.target.value)} required className="w-full rounded-xl px-3 py-2 text-sm font-mono focus:outline-none" style={{ background: "var(--bg-surface)", border: "1px solid var(--border)", color: "var(--text-primary)" }} placeholder="Type stock name..." autoComplete="off" />
                     {showSuggestions && suggestions.length > 0 && (
@@ -318,39 +350,39 @@ export default function TradeMonitor() {
                   </div>
                 </div>
                 <div>
-                  <label className="text-[10px] text-muted uppercase block mb-1">Stock Name</label>
-                  <input data-testid="trade-name-input" value={form.stock_name} onChange={(e) => setForm({ ...form, stock_name: e.target.value })} required className="w-full bg-surface  px-2 py-1.5 text-sm text-primary focus:outline-none focus:border-zinc-600" placeholder="Reliance Industries" />
+                  <label className="stat-label block mb-1">Stock Name</label>
+                  <input data-testid="trade-name-input" value={form.stock_name} onChange={(e) => setForm({ ...form, stock_name: e.target.value })} required className="w-full rounded-xl px-3 py-2 text-sm focus:outline-none" style={{ background: "var(--bg-surface)", border: "1px solid var(--border)", color: "var(--text-primary)" }} placeholder="Reliance Industries" />
                 </div>
               </div>
               <div className="grid grid-cols-2 gap-3">
                 <div>
-                  <label className="text-[10px] text-muted uppercase block mb-1">Entry Price</label>
-                  <input data-testid="trade-entry-input" type="number" step="0.01" value={form.entry_price} onChange={(e) => setForm({ ...form, entry_price: e.target.value })} required className="w-full bg-surface  px-2 py-1.5 text-sm text-primary font-mono focus:outline-none focus:border-zinc-600" />
+                  <label className="stat-label block mb-1">Entry Price</label>
+                  <input data-testid="trade-entry-input" type="number" step="0.01" value={form.entry_price} onChange={(e) => setForm({ ...form, entry_price: e.target.value })} required className="w-full rounded-xl px-3 py-2 text-sm font-mono focus:outline-none" style={{ background: "var(--bg-surface)", border: "1px solid var(--border)", color: "var(--text-primary)" }} />
                 </div>
                 <div>
-                  <label className="text-[10px] text-muted uppercase block mb-1">Quantity</label>
-                  <input data-testid="trade-qty-input" type="number" value={form.quantity} onChange={(e) => setForm({ ...form, quantity: e.target.value })} required className="w-full bg-surface  px-2 py-1.5 text-sm text-primary font-mono focus:outline-none focus:border-zinc-600" />
+                  <label className="stat-label block mb-1">Quantity</label>
+                  <input data-testid="trade-qty-input" type="number" value={form.quantity} onChange={(e) => setForm({ ...form, quantity: e.target.value })} required className="w-full rounded-xl px-3 py-2 text-sm font-mono focus:outline-none" style={{ background: "var(--bg-surface)", border: "1px solid var(--border)", color: "var(--text-primary)" }} />
                 </div>
               </div>
               <div className="grid grid-cols-3 gap-3">
                 <div>
-                  <label className="text-[10px] text-muted uppercase block mb-1">Stop Loss</label>
-                  <input data-testid="trade-sl-input" type="number" step="0.01" value={form.stop_loss} onChange={(e) => setForm({ ...form, stop_loss: e.target.value })} required className="w-full bg-surface  px-2 py-1.5 text-sm text-primary font-mono focus:outline-none focus:border-zinc-600" />
+                  <label className="stat-label block mb-1">Stop Loss</label>
+                  <input data-testid="trade-sl-input" type="number" step="0.01" value={form.stop_loss} onChange={(e) => setForm({ ...form, stop_loss: e.target.value })} required className="w-full rounded-xl px-3 py-2 text-sm font-mono focus:outline-none" style={{ background: "var(--bg-surface)", border: "1px solid var(--border)", color: "var(--text-primary)" }} />
                 </div>
                 <div>
-                  <label className="text-[10px] text-muted uppercase block mb-1">Target 1</label>
-                  <input data-testid="trade-t1-input" type="number" step="0.01" value={form.target1} onChange={(e) => setForm({ ...form, target1: e.target.value })} required className="w-full bg-surface  px-2 py-1.5 text-sm text-primary font-mono focus:outline-none focus:border-zinc-600" />
+                  <label className="stat-label block mb-1">Target 1</label>
+                  <input data-testid="trade-t1-input" type="number" step="0.01" value={form.target1} onChange={(e) => setForm({ ...form, target1: e.target.value })} required className="w-full rounded-xl px-3 py-2 text-sm font-mono focus:outline-none" style={{ background: "var(--bg-surface)", border: "1px solid var(--border)", color: "var(--text-primary)" }} />
                 </div>
                 <div>
-                  <label className="text-[10px] text-muted uppercase block mb-1">Target 2</label>
-                  <input data-testid="trade-t2-input" type="number" step="0.01" value={form.target2} onChange={(e) => setForm({ ...form, target2: e.target.value })} className="w-full bg-surface  px-2 py-1.5 text-sm text-primary font-mono focus:outline-none focus:border-zinc-600" />
+                  <label className="stat-label block mb-1">Target 2</label>
+                  <input data-testid="trade-t2-input" type="number" step="0.01" value={form.target2} onChange={(e) => setForm({ ...form, target2: e.target.value })} className="w-full rounded-xl px-3 py-2 text-sm font-mono focus:outline-none" style={{ background: "var(--bg-surface)", border: "1px solid var(--border)", color: "var(--text-primary)" }} />
                 </div>
               </div>
               <div>
-                <label className="text-[10px] text-muted uppercase block mb-1">Notes</label>
-                <textarea data-testid="trade-notes-input" value={form.notes} onChange={(e) => setForm({ ...form, notes: e.target.value })} rows={2} className="w-full bg-surface  px-2 py-1.5 text-sm text-primary focus:outline-none focus:border-zinc-600 resize-none" />
+                <label className="stat-label block mb-1">Notes</label>
+                <textarea data-testid="trade-notes-input" value={form.notes} onChange={(e) => setForm({ ...form, notes: e.target.value })} rows={2} className="w-full rounded-xl px-3 py-2 text-sm focus:outline-none resize-none" style={{ background: "var(--bg-surface)", border: "1px solid var(--border)", color: "var(--text-primary)" }} />
               </div>
-              <button data-testid="submit-trade-btn" type="submit" className="w-full py-3 rounded-xl text-xs font-semibold transition-colors" style={{ background: "var(--brand)", color: "var(--bg)" }}>
+              <button data-testid="submit-trade-btn" type="submit" className="btn-primary btn-lg btn-block">
                 Execute Trade
               </button>
             </form>

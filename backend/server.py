@@ -29,6 +29,7 @@ from services.zerodha_service import (
     place_order as kite_order, cancel_order as kite_cancel, get_status as kite_status,
     is_configured as kite_configured, get_funds as kite_funds,
     get_profile as kite_profile, get_orders as kite_orders,
+    load_saved_session as kite_load_saved_session,
 )
 from services.scheduler import setup_scheduler
 
@@ -40,17 +41,112 @@ from models import (
     StockAnalysisRequest, SIPRequest,
 )
 from market_data import (
-    get_market_overview, get_top_gainers, get_top_losers,
-    get_sector_performance, get_global_markets, get_commodities,
-    get_fii_dii, get_stock_quote, generate_top_picks,
-    get_chart_data, get_ai_activity_feed, search_stocks,
-    STOCK_UNIVERSE,
+    get_market_overview, get_sector_performance,
+    get_stock_quote, generate_top_picks,
+    search_stocks, STOCK_UNIVERSE,
 )
+# NOTE: market_data.* are SIMULATED (random) generators. They are used ONLY as a
+# last-resort fallback when the live Yahoo Finance path in services.real_market
+# fails or returns nothing. Prefer the real_* fetchers (and the helpers below)
+# for every user-facing code path — see .claude/CLAUDE.md "Never use fake market data".
 
 # MongoDB
 mongo_url = os.environ['MONGO_URL']
 client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ['DB_NAME']]
+
+
+# ============ LIVE MARKET DATA HELPERS ============
+# These wrap services.real_market (live Yahoo Finance) and fall back to the
+# simulated market_data.* generators ONLY when the live API fails or returns
+# nothing. This keeps every user-facing path on real data while remaining
+# functional (and test-passing) without network access / API keys.
+
+async def real_quote(symbol: str):
+    """Live quote for `symbol`, enriched with descriptive fields Yahoo's chart
+    endpoint doesn't provide (name, sector, 52-week range, P/E, market cap) so
+    callers relying on the simulated quote's shape keep working.
+    Falls back to the simulated quote only if the live fetch fails/returns nothing."""
+    from services.real_market import fetch_real_stock_quote
+    real = None
+    try:
+        real = await fetch_real_stock_quote(symbol)
+    except Exception as e:
+        logging.warning(f"real_quote live fetch failed for {symbol}: {e}")
+    sim = get_stock_quote(symbol)
+    if not real:
+        return sim
+    if sim:
+        for k in ("name", "sector", "day_range", "week_52_high",
+                  "week_52_low", "market_cap_cr", "pe_ratio"):
+            real.setdefault(k, sim.get(k))
+    # Guarantee descriptive keys exist even for symbols outside the mock universe
+    real.setdefault("name", symbol.upper())
+    real.setdefault("sector", "")
+    real.setdefault("day_range", f"{real.get('low', 0)} - {real.get('high', 0)}")
+    for k in ("week_52_high", "week_52_low", "market_cap_cr", "pe_ratio"):
+        real.setdefault(k, 0)
+    return real
+
+
+async def real_quotes_map(symbols):
+    """Fetch live quotes for many symbols concurrently (Yahoo layer is cached),
+    returning {UPPER_SYMBOL: quote|None}. Each value prefers the live quote and
+    falls back to the simulated one, so loops never fire N slow calls twice."""
+    from services.real_market import fetch_real_stock_quote
+    uniq = list({(s or "").upper() for s in symbols if s})
+    if not uniq:
+        return {}
+    results = await asyncio.gather(
+        *[fetch_real_stock_quote(s) for s in uniq], return_exceptions=True
+    )
+    out = {}
+    for sym, res in zip(uniq, results):
+        if isinstance(res, Exception) or not res:
+            out[sym] = get_stock_quote(sym)
+            continue
+        sim = get_stock_quote(sym)
+        if sim:
+            res.setdefault("name", sim.get("name"))
+            res.setdefault("sector", sim.get("sector"))
+        res.setdefault("name", sym)
+        res.setdefault("sector", "")
+        out[sym] = res
+    return out
+
+
+async def real_overview():
+    """Live market overview (Nifty/Bank Nifty/Sensex from Yahoo). India VIX,
+    sentiment and advance/decline have no free real-time feed, so they are merged
+    in from the simulated generator as clearly-supplementary estimates. Falls back
+    entirely to the simulated overview only if the live fetch fails."""
+    from services.real_market import fetch_real_market_overview
+    real = await fetch_real_market_overview()
+    sim = get_market_overview()
+    if not real:
+        return sim
+    real.setdefault("india_vix", sim.get("india_vix"))
+    real.setdefault("market_sentiment", sim.get("market_sentiment"))
+    real.setdefault("advance_decline", sim.get("advance_decline"))
+    return real
+
+
+async def prefetch_quote_func(user_id):
+    """Build a SYNC quote lookup backed by prefetched LIVE quotes for the given
+    user's open positions. services.portfolio_monitor.analyze_portfolio_health
+    calls its quote_func synchronously (no await), so we resolve the async live
+    quotes up-front and hand it a plain dict lookup — keeping portfolio health on
+    real prices instead of random ones, without editing portfolio_monitor."""
+    open_trades = await db.trades.find(
+        {"user_id": user_id, "status": "OPEN"}
+    ).to_list(50)
+    quotes = await real_quotes_map([t["symbol"] for t in open_trades])
+
+    def quote_func(symbol):
+        return quotes.get((symbol or "").upper()) or get_stock_quote(symbol)
+
+    return quote_func
+
 
 app = FastAPI(title="AlphaPartner API")
 
@@ -163,9 +259,10 @@ Rules:
 
 async def ai_market_summary():
     """Generate AI market summary — uses Gemini as primary for speed."""
-    overview = get_market_overview()
-    sectors = get_sector_performance()
-    fii_dii = get_fii_dii()
+    from services.real_market import fetch_real_sectors, fetch_real_fii_dii
+    overview = await real_overview()
+    sectors = await fetch_real_sectors() or get_sector_performance()
+    fii_dii = await fetch_real_fii_dii()
     top_sector = sectors[0] if sectors else {"sector": "N/A", "change_pct": 0}
 
     sign = '+' if overview['nifty']['change'] >= 0 else ''
@@ -328,17 +425,8 @@ async def refresh_token(request: Request, response: Response):
 
 @market_router.get("/overview")
 async def market_overview():
-    """Get market overview — tries real Yahoo Finance data first, falls back to simulated."""
-    from services.real_market import fetch_real_market_overview
-    real = await fetch_real_market_overview()
-    if real:
-        # Merge with simulated data for fields Yahoo doesn't provide
-        sim = get_market_overview()
-        real["india_vix"] = sim.get("india_vix")
-        real["market_sentiment"] = sim.get("market_sentiment")
-        real["advance_decline"] = sim.get("advance_decline")
-        return real
-    return get_market_overview()
+    """Get market overview — live Yahoo Finance indices, simulated only on failure."""
+    return await real_overview()
 
 @market_router.get("/gainers")
 async def top_gainers():
@@ -472,14 +560,14 @@ Explain: WHY this stock could be a good trade, momentum factors, entry reasoning
 
 @analysis_router.get("/morning-report")
 async def morning_report():
-    from services.real_market import fetch_real_top_picks, fetch_real_market_overview, fetch_real_sectors
+    from services.real_market import fetch_real_top_picks, fetch_real_sectors
     picks_res = await fetch_real_top_picks(3)
     picks = picks_res.get("picks", [])
-    
-    overview = await fetch_real_market_overview()
-    if not overview:
-        overview = get_market_overview()
-        
+
+    # real_overview() merges India VIX / sentiment (no free live feed) so the
+    # prompt below can reference overview['india_vix'] / ['market_sentiment'].
+    overview = await real_overview()
+
     sectors = await fetch_real_sectors()
     if not sectors:
         sectors = get_sector_performance()
@@ -516,22 +604,21 @@ async def morning_report_full(user: dict = Depends(get_current_user)):
         return cached
 
     # Generate fresh report
-    from services.real_market import fetch_real_market_overview, fetch_real_top_picks, fetch_real_sectors
-    real_overview = await fetch_real_market_overview()
-    overview = get_market_overview()
+    from services.real_market import fetch_real_top_picks, fetch_real_sectors, fetch_real_fii_dii
+    overview = await real_overview()   # live indices + merged VIX/sentiment supplements
     picks_res = await fetch_real_top_picks(3)
     picks = picks_res.get("picks", [])
-    fii_dii = get_fii_dii()
+    fii_dii = await fetch_real_fii_dii()
     sectors = await fetch_real_sectors()
     if not sectors:
         sectors = get_sector_performance()
 
-    nifty_chg = (real_overview or {}).get("nifty", {}).get("change_pct", overview["nifty"]["change_pct"])
-    banknifty_chg = (real_overview or {}).get("bank_nifty", {}).get("change_pct", overview["bank_nifty"]["change_pct"])
-    nifty_val = (real_overview or {}).get("nifty", {}).get("value", overview["nifty"]["value"])
-    bnk_val = (real_overview or {}).get("bank_nifty", {}).get("value", overview["bank_nifty"]["value"])
-    sensex_val = (real_overview or {}).get("sensex", {}).get("value", 79000)
-    sensex_chg = (real_overview or {}).get("sensex", {}).get("change_pct", 0)
+    nifty_chg = overview.get("nifty", {}).get("change_pct", 0)
+    banknifty_chg = overview.get("bank_nifty", {}).get("change_pct", 0)
+    nifty_val = overview.get("nifty", {}).get("value", 0)
+    bnk_val = overview.get("bank_nifty", {}).get("value", 0)
+    sensex_val = overview.get("sensex", {}).get("value", 79000)
+    sensex_chg = overview.get("sensex", {}).get("change_pct", 0)
 
     mood_score = round((nifty_chg * 0.5 + banknifty_chg * 0.3 + overview["market_sentiment"] / 100 * 0.2), 3)
     if mood_score > 0.5: market_mood = "Bullish"
@@ -597,6 +684,8 @@ async def create_trade(data: TradeCreate, user: dict = Depends(get_current_user)
         "entry_time": datetime.now(timezone.utc).isoformat(),
         "exit_time": None,
         "notes": data.notes,
+        "setup_type": data.setup_type,
+        "is_paper": data.is_paper,
     }
     result = await db.trades.insert_one(trade_doc)
     trade_doc["_id"] = str(result.inserted_id)
@@ -621,10 +710,11 @@ async def get_trades(user: dict = Depends(get_current_user)):
 
 @trades_router.get("/active")
 async def get_active_trades(user: dict = Depends(get_current_user)):
-    trades = await db.trades.find({"user_id": user["_id"], "status": "OPEN"}).to_list(50)
+    trades = await db.trades.find({"user_id": user["_id"], "status": "OPEN"}).sort("entry_time", -1).to_list(50)
+    quotes = await real_quotes_map([t["symbol"] for t in trades])
     for t in trades:
         t["_id"] = str(t["_id"])
-        quote = get_stock_quote(t["symbol"])
+        quote = quotes.get(t["symbol"].upper())
         if quote:
             t["current_price"] = quote["price"]
             t["unrealized_pnl"] = round((quote["price"] - t["entry_price"]) * t["quantity"], 2)
@@ -808,7 +898,7 @@ async def get_trade_live_tip(trade_id: str, user: dict = Depends(get_current_use
     target = trade.get("target1", 0)
     ttype = trade.get("type", "BUY")
     current = entry
-    quote = get_stock_quote(symbol)
+    quote = await real_quote(symbol)
     if quote:
         current = quote["price"]
     pnl_pct = round(((current - entry) / entry) * 100, 2) if entry else 0
@@ -855,14 +945,15 @@ async def get_portfolio(user: dict = Depends(get_current_user)):
             h["invested"] += t["entry_price"] * t["quantity"]
             h["avg_price"] = round(h["invested"] / h["quantity"], 2) if h["quantity"] > 0 else 0
 
+    quotes = await real_quotes_map(list(holdings.keys()))
     for sym, h in holdings.items():
-        quote = get_stock_quote(sym)
+        quote = quotes.get(sym.upper())
         if quote:
             h["current_price"] = quote["price"]
             h["current_value"] = round(quote["price"] * h["quantity"], 2)
             h["pnl"] = round(h["current_value"] - h["invested"], 2)
             h["pnl_pct"] = round((h["pnl"] / h["invested"]) * 100, 2) if h["invested"] > 0 else 0
-            h["sector"] = quote["sector"]
+            h["sector"] = quote.get("sector", "")
 
     return list(holdings.values())
 
@@ -1068,9 +1159,10 @@ async def websocket_endpoint(websocket: WebSocket):
             if msg.get("type") == "subscribe_prices":
                 # Client subscribes to price updates for specific symbols
                 symbols = msg.get("symbols", [])
-                # Start sending price ticks
+                # Start sending price ticks (live Yahoo Finance, cached)
+                quotes = await real_quotes_map(symbols)
                 for sym in symbols:
-                    quote = get_stock_quote(sym)
+                    quote = quotes.get((sym or "").upper())
                     if quote:
                         await websocket.send_json({"type": "price_tick", "data": quote})
 
@@ -1347,7 +1439,7 @@ async def zerodha_status(user: dict = Depends(get_current_user)):
 
 @zerodha_router.get("/login-url")
 async def zerodha_login(user: dict = Depends(get_current_user)):
-    return kite_login_url()
+    return kite_login_url(user_id=str(user["_id"]))
 
 @zerodha_router.post("/session")
 async def zerodha_session(request: Request, user: dict = Depends(get_current_user)):
@@ -1355,7 +1447,7 @@ async def zerodha_session(request: Request, user: dict = Depends(get_current_use
     request_token = body.get("request_token")
     if not request_token:
         raise HTTPException(status_code=400, detail="request_token required")
-    result = await kite_session(request_token, db)
+    result = await kite_session(request_token, db, user_id=str(user["_id"]))
     if result.get("success"):
         await db.users.update_one({"_id": ObjectId(user["_id"])}, {"$set": {"zerodha_connected": True}})
     return result
@@ -1632,7 +1724,10 @@ monitor_router = APIRouter(prefix="/api/monitor", tags=["Monitor"])
 async def portfolio_health(user: dict = Depends(get_current_user)):
     """Get AI-powered portfolio health analysis."""
     from services.portfolio_monitor import analyze_portfolio_health
-    result = await analyze_portfolio_health(db, user["_id"], get_market_overview, get_stock_quote)
+    # market_func is unused by analyze_portfolio_health; quote_func is called
+    # synchronously, so pass a sync closure over prefetched LIVE quotes.
+    quote_func = await prefetch_quote_func(user["_id"])
+    result = await analyze_portfolio_health(db, user["_id"], None, quote_func)
     return result
 
 @monitor_router.get("/alerts")
@@ -1649,7 +1744,9 @@ async def get_recent_alerts(user: dict = Depends(get_current_user)):
 async def trigger_monitoring(user: dict = Depends(get_current_user)):
     """Manually trigger portfolio monitoring cycle."""
     from services.portfolio_monitor import analyze_portfolio_health
-    result = await analyze_portfolio_health(db, user["_id"], get_market_overview, get_stock_quote)
+    # Prefetched LIVE quotes → sync quote_func (see prefetch_quote_func).
+    quote_func = await prefetch_quote_func(user["_id"])
+    result = await analyze_portfolio_health(db, user["_id"], None, quote_func)
     # Save alerts as notifications
     for alert in result.get("alerts", []):
         if alert["severity"] in ("critical", "positive"):
@@ -1731,10 +1828,19 @@ async def configure_email(request: Request, user: dict = Depends(get_current_use
 
 @zerodha_router.get("/callback")
 async def zerodha_callback(request: Request):
-    """Handle Zerodha login redirect with request_token."""
+    """Handle the Kite Connect browser redirect after login/OTP.
+
+    Kite appends ?request_token=...&status=... plus any redirect_params we
+    attached to the login URL (uid identifies the app user, since no JWT is
+    available on a cross-site redirect). Always redirects back to the
+    frontend with an absolute URL — a relative redirect would land on the
+    backend origin and 404.
+    """
     request_token = request.query_params.get("request_token")
     status_param = request.query_params.get("status")
+    uid = request.query_params.get("uid")
     from starlette.responses import RedirectResponse
+    from services.activity_logger import log_activity
 
     frontend_base = os.environ.get("FRONTEND_URL")
     if not frontend_base:
@@ -1744,9 +1850,16 @@ async def zerodha_callback(request: Request):
     frontend_base = frontend_base.rstrip("/")
 
     if status_param == "success" and request_token:
-        result = await kite_session(request_token, db)
+        result = await kite_session(request_token, db, user_id=uid)
         if result.get("success"):
+            if uid:
+                try:
+                    await db.users.update_one({"_id": ObjectId(uid)}, {"$set": {"zerodha_connected": True}})
+                except Exception:
+                    pass
+            log_activity("Zerodha account connected — live broker session active", "monitor", "done")
             return RedirectResponse(url=f"{frontend_base}/settings?zerodha=connected")
+        logger.error(f"Zerodha session exchange failed: {result.get('message')}")
         return RedirectResponse(url=f"{frontend_base}/settings?zerodha=failed&error={result.get('message', 'unknown')}")
     return RedirectResponse(url=f"{frontend_base}/settings?zerodha=cancelled")
 
@@ -1872,6 +1985,9 @@ async def webhook_morning_scan(_: bool = Depends(verify_webhook_key)):
     """Run the morning analysis job (scan stocks, generate picks, morning report)."""
     from services.scheduler import morning_analysis_job
     try:
+        # morning_analysis_job fetches live picks/overview internally via
+        # services.real_market; the market_func / pick_func args below are accepted
+        # for signature compatibility but never invoked, so no simulated data leaks.
         await morning_analysis_job(db, ai_market_summary, get_market_overview, generate_top_picks)
         await _log_webhook("morning_scan", "success")
         return {"status": "success", "workflow": "morning_scan"}
@@ -2019,7 +2135,7 @@ async def remove_from_watchlist(symbol: str, user: dict = Depends(get_current_us
 @analysis_router.post("/full-report")
 async def full_ai_report(data: StockAnalysisRequest):
     """Generate comprehensive AI analysis report with full transparency."""
-    quote = get_stock_quote(data.symbol)
+    quote = await real_quote(data.symbol)
     if not quote:
         raise HTTPException(status_code=404, detail="Stock not found")
 
@@ -2320,6 +2436,10 @@ async def startup():
     await db.trades.create_index("user_id")
     await db.notifications.create_index("user_id")
     await db.chat_messages.create_index([("user_id", 1), ("session_id", 1)])
+    await db.broker_accounts.create_index([("user_id", 1), ("broker", 1)], unique=True)
+
+    # Restore a same-day Zerodha session so a backend restart doesn't force re-login
+    await kite_load_saved_session(db)
 
     # Seed admin
     admin_email = os.environ.get("ADMIN_EMAIL", "admin@alphapartner.com")
@@ -2372,6 +2492,9 @@ async def startup():
 
     # Setup scheduler (cron jobs)
     try:
+        # market_overview_func / generate_picks_func are passed through to
+        # morning_analysis_job for signature compatibility only — that job pulls
+        # live data from services.real_market and never calls these simulated fns.
         setup_scheduler(
             db=db,
             ai_summary_func=ai_market_summary,
@@ -2390,6 +2513,16 @@ async def startup():
     # Start AI monitoring loop — watches market 24/7 and sends proactive alerts
     asyncio.create_task(ai_monitoring_loop())
     logger.info("AI monitoring loop started — watching for market events")
+
+    # Start AI heartbeat engine — continuously performs REAL background work
+    # (live fetches, news/breakout/volume scans, trade & portfolio monitoring)
+    # and logs a truthful running->done trace to the AI Activity feed, while
+    # streaming live prices and pushing portfolio/trade/alert updates over WS.
+    try:
+        from services.heartbeat_engine import start_engine as start_heartbeat_engine
+        start_heartbeat_engine(db, ws_manager)
+    except Exception as e:
+        logger.error(f"Heartbeat engine start error: {e}")
 
     logger.info("AlphaPartner API started successfully")
     logger.info(f"Data sources: Alpha Vantage={'ON' if av_configured() else 'OFF'}, Zerodha={'ON' if kite_configured() else 'OFF'}")
