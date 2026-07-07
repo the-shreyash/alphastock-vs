@@ -91,10 +91,12 @@ export default function MorningReport() {
     </div>
   );
 
-  if (!report) return (
+  if (!report || report.available === false) return (
     <div className="text-center py-20" style={{ color: "var(--text-muted)" }}>
       <Sun size={40} className="mx-auto mb-3 opacity-40" />
-      <p className="body-text mb-5">Unable to load morning report. Please try refreshing.</p>
+      <p className="body-text mb-5">
+        {report?.note || "Unable to load morning report. Please try refreshing."}
+      </p>
       <button onClick={() => load(true)} className="btn-primary">Retry</button>
     </div>
   );

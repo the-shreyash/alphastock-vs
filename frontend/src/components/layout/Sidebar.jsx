@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { NavLink, useLocation } from "react-router-dom";
 import { motion, AnimatePresence } from "framer-motion";
-import { LayoutDashboard, Target, TrendingUp, Briefcase, Settings, LogOut, Newspaper, BookOpen, X, FlaskConical, Sun, Search, Globe, Brain, LineChart, Eye, PanelLeftClose, PanelLeftOpen } from "lucide-react";
+import { LayoutDashboard, Target, TrendingUp, Briefcase, Settings, LogOut, Newspaper, BookOpen, X, FlaskConical, Sun, Search, Globe, Brain, LineChart, Eye, Sparkles, PanelLeftClose, PanelLeftOpen } from "lucide-react";
 import { useAuth } from "../../context/AuthContext";
 import APLogo from "../APLogo";
 
@@ -9,7 +9,8 @@ import APLogo from "../APLogo";
 // Home, Markets, Stock Scanner, Morning Report, AI Workspace, Portfolio,
 // Trading, Journal, News, Settings.
 // `sub: true` entries are secondary items grouped under the primary above them
-// (Watchlist → Markets, SIP Advisor → AI Workspace, Paper Trading → Trading).
+// (Watchlist → Markets, Investment Advisor + SIP Advisor → AI Workspace,
+// Paper Trading → Trading).
 // Backtesting is no longer a top-level entry — it lives inside AI Workspace →
 // Strategy Builder (its /backtesting route still works for deep links).
 const NAV_ITEMS = [
@@ -22,6 +23,7 @@ const NAV_ITEMS = [
   { type: "divider" },
   // — AI —
   { to: "/assistant", icon: Brain, label: "AI Workspace" },
+  { to: "/advisor", icon: Sparkles, label: "Investment Advisor", sub: true },
   { to: "/sip", icon: LineChart, label: "SIP Advisor", sub: true },
   { type: "divider" },
   // — Trade —

@@ -1,10 +1,13 @@
-"""Stock market news aggregator from RSS feeds."""
+"""Stock market news aggregator from RSS feeds, with deterministic
+keyword-based sentiment derived from real headlines (never random)."""
 # pyrefly: ignore [missing-import]
 import feedparser
 import logging
 import asyncio
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
+
+from services.cache import cache_get, cache_set, cache_delete
 
 logger = logging.getLogger(__name__)
 executor = ThreadPoolExecutor(max_workers=3)
@@ -17,9 +20,35 @@ RSS_FEEDS = [
     {"name": "ET Stocks", "url": "https://economictimes.indiatimes.com/markets/stocks/rssfeeds/2146842.cms", "category": "stocks"},
 ]
 
-# Cache
-_news_cache = {"data": [], "fetched_at": None}
+NEWS_CACHE_KEY = "news_articles"
 CACHE_TTL = 300  # 5 minutes
+
+# Deterministic sentiment keywords for Indian financial headlines
+_POSITIVE_TERMS = (
+    "surge", "surges", "rally", "rallies", "gain", "gains", "jump", "jumps",
+    "rise", "rises", "soar", "soars", "record high", "all-time high", "upgrade",
+    "upgraded", "bullish", "profit", "beats", "strong", "buy", "outperform",
+    "advance", "advances", "recovery", "rebound", "growth", "positive",
+)
+_NEGATIVE_TERMS = (
+    "fall", "falls", "drop", "drops", "decline", "declines", "crash", "crashes",
+    "plunge", "plunges", "slump", "slumps", "loss", "losses", "downgrade",
+    "downgraded", "bearish", "weak", "sell-off", "selloff", "misses", "concern",
+    "concerns", "fear", "fears", "pressure", "slide", "slides", "negative", "cut",
+)
+
+
+def _classify_sentiment(text: str) -> str:
+    """Keyword-based sentiment for a headline/summary. Deterministic — the same
+    text always yields the same label."""
+    t = (text or "").lower()
+    pos = sum(1 for w in _POSITIVE_TERMS if w in t)
+    neg = sum(1 for w in _NEGATIVE_TERMS if w in t)
+    if pos > neg:
+        return "positive"
+    if neg > pos:
+        return "negative"
+    return "neutral"
 
 
 def _strip_html(text):
@@ -43,13 +72,16 @@ def _parse_feed(feed_info):
                 except Exception:
                     published = entry.get("published", "")
 
+            title = _strip_html(entry.get("title", "")).strip()
+            summary = _strip_html(entry.get("summary", ""))[:200].strip()
             articles.append({
-                "title": _strip_html(entry.get("title", "")).strip(),
+                "title": title,
                 "link": entry.get("link", ""),
-                "summary": _strip_html(entry.get("summary", ""))[:200].strip(),
+                "summary": summary,
                 "published": published,
                 "source": feed_info["name"],
                 "category": feed_info["category"],
+                "sentiment": _classify_sentiment(f"{title} {summary}"),
             })
         return articles
     except Exception as e:
@@ -58,14 +90,13 @@ def _parse_feed(feed_info):
 
 
 async def fetch_news(force=False):
-    """Fetch news from all RSS feeds with caching."""
-    global _news_cache
-    now = datetime.now(timezone.utc)
-
-    if not force and _news_cache["fetched_at"]:
-        elapsed = (now - _news_cache["fetched_at"]).total_seconds()
-        if elapsed < CACHE_TTL and _news_cache["data"]:
-            return _news_cache["data"]
+    """Fetch news from all RSS feeds with caching (Redis when configured)."""
+    if force:
+        await cache_delete(NEWS_CACHE_KEY)
+    else:
+        cached = await cache_get(NEWS_CACHE_KEY)
+        if cached:
+            return cached
 
     loop = asyncio.get_event_loop()
     all_articles = []
@@ -87,8 +118,42 @@ async def fetch_news(force=False):
 
     unique.sort(key=lambda x: x.get("published", ""), reverse=True)
 
-    _news_cache = {"data": unique[:50], "fetched_at": now}
-    return _news_cache["data"]
+    articles = unique[:50]
+    if articles:
+        await cache_set(NEWS_CACHE_KEY, articles, CACHE_TTL)
+    return articles
+
+
+async def get_market_sentiment():
+    """Aggregate market sentiment derived from real news headlines.
+    Returns an explicit unavailable payload when no articles could be fetched."""
+    articles = await fetch_news()
+    if not articles:
+        return {
+            "available": False,
+            "score": None,
+            "label": None,
+            "note": "News feeds are temporarily unreachable — sentiment unavailable.",
+        }
+
+    positive = sum(1 for a in articles if a.get("sentiment") == "positive")
+    negative = sum(1 for a in articles if a.get("sentiment") == "negative")
+    neutral = len(articles) - positive - negative
+
+    # 50 = balanced; each net positive/negative headline shifts the score
+    score = int(max(0, min(100, round(50 + (positive - negative) / len(articles) * 50))))
+    label = "Bullish" if score >= 60 else ("Bearish" if score <= 40 else "Neutral")
+
+    return {
+        "available": True,
+        "score": score,
+        "label": label,
+        "positive": positive,
+        "negative": negative,
+        "neutral": neutral,
+        "articles_analyzed": len(articles),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 async def search_stock_news(symbol: str, stock_name: str = ""):

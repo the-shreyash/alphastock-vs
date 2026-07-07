@@ -9,8 +9,9 @@ logger = logging.getLogger(__name__)
 scheduler = AsyncIOScheduler(timezone="Asia/Kolkata")
 
 
-async def morning_analysis_job(db, ai_func, market_func, pick_func):
-    """8:30 AM weekdays: Scan stocks, generate picks, create morning report."""
+async def morning_analysis_job(db, ai_func):
+    """8:30 AM weekdays: Scan stocks, generate picks, create morning report.
+    All data comes live from services.real_market — no simulated fallbacks."""
     logger.info("Running morning analysis job...")
     try:
         from services.activity_logger import log_activity
@@ -22,11 +23,14 @@ async def morning_analysis_job(db, ai_func, market_func, pick_func):
         picks = real_picks_result.get("picks", [])
 
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        await db.market_analysis.update_one(
-            {"date": today},
-            {"$set": {"top_picks": picks, "generated_at": datetime.now(timezone.utc).isoformat(), "type": "morning"}},
-            upsert=True
-        )
+        if picks:
+            await db.market_analysis.update_one(
+                {"date": today},
+                {"$set": {"top_picks": picks, "generated_at": datetime.now(timezone.utc).isoformat(), "type": "morning"}},
+                upsert=True
+            )
+        else:
+            logger.warning("Morning analysis: live picks unavailable — skipping picks snapshot")
 
         # Real market overview for morning report
         overview = await fetch_real_market_overview()
@@ -37,6 +41,10 @@ async def morning_analysis_job(db, ai_func, market_func, pick_func):
         )
 
         # Only notify users who have open trades or recently traded (personal relevance)
+        pick_summary = (
+            f"{len(picks)} AI picks generated. Top: {picks[0]['name']} ({picks[0]['confidence']}% confidence). Check AI Picks."
+            if picks else "Morning report is ready. Live pick data was unavailable this morning."
+        )
         users_with_activity = await db.trades.distinct("user_id")
         for uid in users_with_activity:
             user_prefs = await db.users.find_one({"_id": uid if not isinstance(uid, str) else uid}, {"notification_prefs": 1})
@@ -46,7 +54,7 @@ async def morning_analysis_job(db, ai_func, market_func, pick_func):
                     "user_id": uid if isinstance(uid, str) else str(uid),
                     "type": "MORNING_REPORT",
                     "title": "Morning Analysis Ready",
-                    "message": f"{len(picks)} AI picks generated. Top: {picks[0]['name']} ({picks[0]['confidence']}% confidence). Check AI Picks.",
+                    "message": pick_summary,
                     "read": False,
                     "created_at": datetime.now(timezone.utc).isoformat(),
                 })
@@ -57,10 +65,7 @@ async def morning_analysis_job(db, ai_func, market_func, pick_func):
                         from services.email_service import send_notification as email_notify
                         user_email = (user_prefs or {}).get("email", "")
                         if user_email:
-                            await email_notify(
-                                "MORNING_REPORT", user_email,
-                                content=f"{len(picks)} AI picks generated. Top pick: {picks[0]['name']} ({picks[0]['confidence']}% confidence)."
-                            )
+                            await email_notify("MORNING_REPORT", user_email, content=pick_summary)
                     except Exception as e:
                         logger.error(f"Email notification failed for {uid}: {e}")
 
@@ -231,14 +236,14 @@ async def eod_report_job(db):
         logger.error(f"EOD report error: {e}")
 
 
-def setup_scheduler(db, ai_summary_func, market_overview_func, generate_picks_func, ws_broadcast=None):
+def setup_scheduler(db, ai_summary_func, ws_broadcast=None):
     """Set up all cron jobs."""
 
     # Morning Analysis — 8:30 AM IST weekdays
     scheduler.add_job(
         morning_analysis_job,
         CronTrigger(hour=8, minute=30, day_of_week="mon-fri"),
-        args=[db, ai_summary_func, market_overview_func, generate_picks_func],
+        args=[db, ai_summary_func],
         id="morning_analysis",
         replace_existing=True,
     )

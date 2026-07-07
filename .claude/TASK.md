@@ -114,19 +114,35 @@ COMPLETED
 
 Tasks
 
-- Dashboard Layout
-- Sidebar
-- Header
-- Cards
-- Search
-- Notifications
-- Quick Actions
-- Theme Switch
-- Responsive Layout
+- [x] Dashboard Layout
+- [x] Sidebar
+- [x] Header
+- [x] Cards — stat-card, glass-card, premium-card
+- [x] Search — global stock search in Navbar + SearchBox component
+- [x] Notifications — NotificationPanel + dashboard widget
+- [x] Quick Actions — quick-action bar (New Trade, AI Analysis, Morning Report, Portfolio, Stock Picks, Market News)
+- [x] Theme Switch — light/dark toggle in Navbar
+- [x] Responsive Layout
+- [x] Index Strip — Nifty, Bank Nifty, Sensex, India VIX with sparkline charts
+- [x] Commodities Strip — Gold, Crude Oil, Silver, USD/INR live prices
+- [x] Morning Report Card — AI morning briefing summary
+- [x] Top AI Picks Card — top 3 AI-scored stock picks
+- [x] Portfolio Summary Card — value, P/L, holdings count
+- [x] Watchlist Widget — top 5 watchlist items with live quotes
+- [x] Market News Widget — latest 5 headlines with sentiment
+- [x] AI Activity Feed — live WebSocket activity stream
+- [x] Notifications Widget — recent unread notifications
+- [x] Recent Stocks — localStorage-tracked recently viewed stocks
+- [x] Market Breadth — advances/declines/unchanged with breadth bar
+- [x] Global Markets Widget — international index prices
+- [x] Sector Performance — heatmap grid
+- [x] AI Lessons Card — latest trade coaching grades
+- [x] Market Status Badge — OPEN/CLOSED indicator
+- [x] WebSocket Status — LIVE/OFFLINE badge
 
 Status
 
-IN_PROGRESS
+COMPLETED
 
 ---
 
@@ -154,7 +170,7 @@ Market Intelligence
 
 Status
 
-NOT_STARTED
+IN_PROGRESS
 
 ---
 
@@ -164,12 +180,12 @@ Tasks
 
 - Market Gateway
 - Market Collectors
-- Data Normalization
-- Validation
-- Redis Cache
+- [x] Data Normalization — live Yahoo Finance quotes/indices normalized in services.real_market
+- [x] Validation — unavailable data surfaced explicitly (available:false), never simulated
+- [x] Redis Cache — services/cache.py (Redis when REDIS_URL set, in-memory fallback)
 - Event Publishing
-- Live WebSocket
-- Market Health
+- [x] Live WebSocket — market_broadcast_loop streams real overview only
+- [x] Market Health — India VIX (^INDIAVIX), breadth & sentiment derived from live quotes
 
 ---
 
@@ -177,14 +193,14 @@ Tasks
 
 Tasks
 
-- Nifty
-- Sensex
-- Bank Nifty
-- India VIX
-- Commodities
-- Global Markets
-- Heatmap
-- Sector Analysis
+- [x] Nifty — live (^NSEI)
+- [x] Sensex — live (^BSESN)
+- [x] Bank Nifty — live (^NSEBANK)
+- [x] India VIX — live (^INDIAVIX), null when unavailable
+- [x] Commodities — live (Yahoo futures/forex), available:false on failure
+- [x] Global Markets — live (Yahoo global indices), available:false on failure
+- [x] Heatmap — live gainers/losers from universe quotes
+- [x] Sector Analysis — live sector averages (fetch_real_sectors)
 
 ---
 
@@ -192,13 +208,13 @@ Tasks
 
 Tasks
 
-- Technical Scanner
-- Volume Scanner
-- Breakout Scanner
+- [x] Technical Scanner — real RSI/MACD/volume from Yahoo history
+- [x] Volume Scanner — real volume ratio vs 20-day average
+- [x] Breakout Scanner — real chart-pattern detection
 - Swing Scanner
 - Long-Term Scanner
-- Momentum Scanner
-- AI Ranking
+- [x] Momentum Scanner — live day-change + volume shortlist (advisor)
+- [x] AI Ranking — fetch_real_top_picks scores live technicals; unavailable when no live data
 
 ---
 
@@ -206,12 +222,12 @@ Tasks
 
 Tasks
 
-- News Collection
-- Deduplication
-- Sentiment Analysis
+- [x] News Collection — RSS aggregation (services.news_service)
+- [x] Deduplication — title-based dedupe
+- [x] Sentiment Analysis — deterministic keyword sentiment per article + /api/news/sentiment aggregate
 - Company Mapping
 - Sector Mapping
-- AI Summary
+- [x] AI Summary — ai_market_summary on live data
 
 ---
 
@@ -447,6 +463,114 @@ Developer Guides
 
 ---
 
+# Sprint 2 — Replace Mock Data
+
+Status
+
+COMPLETED
+
+Objective
+
+Replace every remaining mock dataset with real backend integration. Where live
+data is unavailable, return an explicit "unavailable" state — never silently
+fall back to random values.
+
+Delivered
+
+- Backend `market_data.py` reduced to factual reference metadata only
+  (symbols, names, sectors). ALL random price/indicator/pick/chart/activity
+  generators removed.
+- `services/real_market.py` (Yahoo Finance / NSE) is the single live source:
+  - Removed every simulated fallback (quotes, charts, top picks, global,
+    commodities). Failures now return empty / `available:false`, never random.
+  - Added live India VIX (`^INDIAVIX`), advance/decline breadth and market
+    sentiment derived from live universe quotes.
+  - Added live NSE/BSE stock search via Yahoo search API (`search_yahoo_stocks`),
+    static metadata search only as offline fallback.
+  - FII/DII already real (NSE); ultimate fallback now `available:false` with nulls.
+- `services/cache.py` — shared cache: Redis when `REDIS_URL` is set, in-memory
+  otherwise. Wired into real_market + news_service. `redis==5.0.8` added to
+  requirements.
+- `services/news_service.py` — deterministic keyword sentiment per article +
+  `get_market_sentiment()` aggregate. New endpoint `GET /api/news/sentiment`.
+- `server.py` — every user-facing path (overview, stock detail/live, explain,
+  gemini analyze, top-picks, morning report, advisor, watchlist) returns
+  explicit unavailable instead of simulated data. Removed `random.randint`
+  news-score in full-report (now real news-mention sentiment). Fixed
+  `source:"simulated"` mislabels. Scheduler/webhook signatures trimmed.
+- Frontend (no UI redesign): News sentiment gauge now fetches
+  `/news/sentiment`; Dashboard/Markets market-breadth read live
+  `overview.advance_decline` (was hardcoded 1042/842/176) with unavailable
+  states; Dashboard AI-activity placeholders removed (loading skeleton);
+  StockPicks / MorningReport / InvestmentAdvisor / AIAssistant handle
+  `available:false`; AIAssistant "Trade Ideas" now real top-picks (was
+  hardcoded RELIANCE/TCS/HDFCBANK).
+
+Verification
+
+- Backend in-process suites: 49 passed (advisor, morning_report, webhooks,
+  paper_trading, chart_patterns, activity_feed, backtesting, trade_coaching,
+  setup_stats). Live smoke test confirmed real overview + search.
+- Frontend: all changed JSX files parse; no stale identifiers.
+- The HTTP-integration suites (test_backend/phase*) require a running server
+  and are unaffected by these changes.
+
+---
+
+# Sprint 3 — Dashboard Completion
+
+Status
+
+COMPLETED
+
+Objective
+
+Complete the Dashboard with all planned widgets, live data integration,
+improved loading states, animations, and performance. No UI redesign — extend
+and improve the existing design language.
+
+Delivered
+
+- **Quick Actions Bar** — row of 6 quick-action buttons (New Trade, AI
+  Analysis, Morning Report, Portfolio, Stock Picks, Market News) with
+  navigation; responsive horizontal scroll on mobile.
+- **Index Sparkline** — Nifty 50 stat-card now shows a mini intraday sparkline
+  chart overlay (last 30 data points from `/stocks/^NSEI/chart?period=1D`).
+- **Commodities & Forex Strip** — new 4-column strip showing Gold, Crude Oil,
+  Silver, and USD/INR live prices from `/market/commodities`.
+- **Watchlist Widget** — shows top 5 watchlist items with live quotes from
+  `/watchlist`; empty state with "Add stocks" CTA.
+- **Market News Widget** — latest 5 headlines from `/news` with sentiment
+  indicators and source/time metadata.
+- **Notifications Widget** — recent unread notifications from `/notifications`
+  with severity color coding.
+- **Recent Stocks** — localStorage-based recently viewed stocks (tracked from
+  StockDetail page visits); horizontal scroll chip display.
+- **Global Markets Widget** — international index prices from `/market/global`
+  in a 2-column grid.
+- **Market Status Badge** — MARKET OPEN / MARKET CLOSED indicator in header
+  derived from `overview.market_status`.
+- **Breadth Bar** — visual bar showing advance/decline ratio below the numeric
+  breadth grid.
+- **Performance** — all 11 API fetches fire in parallel on mount; core market
+  data refreshes every 30s; greeting and action lists memoized; WebSocket
+  fallback polling preserved.
+- **Loading States** — improved skeleton loader includes quick-actions row and
+  content grid placeholders.
+- **Animations** — scroll-reveal staggering on every section; hover
+  micro-interactions on cards and quick-action buttons.
+- **StockDetail recent-stocks tracking** — viewing any stock detail page now
+  writes the symbol to `localStorage(sa_recent_stocks)`, keeping the last 6
+  entries for the Dashboard widget.
+
+Verification
+
+- Frontend production build passes (`craco build`).
+- No new dependencies added.
+- All existing JSX files unmodified except Dashboard.jsx and StockDetail.jsx.
+
+---
+
 # Technical Debt
 
 Every technical debt item must contain
@@ -464,6 +588,72 @@ Target Version
 Owner
 
 Status
+
+---
+
+## TD-1: Backtest engine uses simulated trades
+
+Description
+
+`services/backtest_engine.py` generates simulated win/loss trades
+(`random.seed`/`random.randint`) rather than replaying real historical OHLCV.
+
+Reason
+
+Historical backtesting over the full universe was out of scope for Sprint 2
+(which targeted live market data surfaces).
+
+Impact
+
+Backtest results are illustrative, not real historical performance.
+
+Priority
+
+Medium
+
+Target Version
+
+Milestone 3 (Trading)
+
+Owner
+
+Unassigned
+
+Status
+
+OPEN
+
+---
+
+## TD-2: Paper trading is intentionally simulated
+
+Description
+
+Paper-trade fills use live quotes but positions are virtual by design.
+
+Reason
+
+Educational feature — virtual money, not a data-integrity issue.
+
+Impact
+
+None (expected behavior).
+
+Priority
+
+Low
+
+Target Version
+
+N/A
+
+Owner
+
+Unassigned
+
+Status
+
+ACCEPTED
 
 ---
 
@@ -563,7 +753,13 @@ This section should always contain the next highest-priority work.
 
 Current Objective
 
-Replace all remaining mock data with live APIs and complete end-to-end integration of the dashboard, market engine, AI system, broker connectivity, and admin portal.
+Sprint 3 (Dashboard Completion) is COMPLETE — the Dashboard now has all planned
+widgets: Quick Actions, Index Sparklines, Commodities/Forex Strip, Watchlist,
+Market News, Notifications, Recent Stocks, Global Markets, Market Status Badge,
+and Breadth Bar. All data is live from backend APIs. Loading states, animations,
+and performance are improved.
+
+Next: broker connectivity depth, admin portal, and payments/subscriptions.
 
 ---
 

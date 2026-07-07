@@ -2,8 +2,13 @@ import { useState, useEffect } from "react";
 import { Link } from "react-router-dom";
 import api from "../services/api";
 import { formatNumber } from "../utils/formatters";
-import { TrendingUp, TrendingDown, Globe, ArrowUpRight, ArrowDownRight } from "lucide-react";
+import { TrendingUp, TrendingDown, Globe, ArrowUpRight, ArrowDownRight, SlidersHorizontal, Layers, Calendar, Trophy } from "lucide-react";
 import { motion } from "framer-motion";
+import MarketScanner from "../components/market/MarketScanner";
+import EconomicCalendar from "../components/market/EconomicCalendar";
+import SectorAnalysis from "../components/market/SectorAnalysis";
+import RankingTable from "../components/market/RankingTable";
+import MarketEngineStatus from "../components/market/MarketEngineStatus";
 
 /* Scroll-reveal wrapper — fades/slides content in as it enters the viewport */
 function Reveal({ children, delay = 0, className }) {
@@ -112,52 +117,28 @@ function TopMovers({ title, data, icon: Icon, color }) {
 }
 
 function MarketBreadth({ overview }) {
-  const breadth = overview?.breadth || { advances: 1042, declines: 842, unchanged: 176 };
+  const breadth = overview?.advance_decline;
   return (
     <div className="glass-card p-5">
       <h3 className="eyebrow mb-3">Market Breadth</h3>
-      <div className="grid grid-cols-3 gap-3">
-        {[
-          { label: "Advances", value: breadth.advances, color: "var(--gain)", bg: "var(--gain-bg)" },
-          { label: "Declines", value: breadth.declines, color: "var(--loss)", bg: "var(--loss-bg)" },
-          { label: "Unchanged", value: breadth.unchanged, color: "var(--text-muted)", bg: "var(--hover)" },
-        ].map(b => (
-          <div key={b.label} className="text-center p-3 rounded-xl" style={{ background: b.bg }}>
-            <div className="text-lg font-bold font-mono" style={{ color: b.color }}>{b.value?.toLocaleString() || "—"}</div>
-            <div className="text-[10px] font-medium" style={{ color: "var(--text-muted)" }}>{b.label}</div>
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-function SectorPerformance({ sectors }) {
-  if (!sectors?.length) return null;
-  return (
-    <div className="glass-card p-5">
-      <h3 className="eyebrow mb-4">Sector Performance</h3>
-      <div className="space-y-2">
-        {sectors.map(s => {
-          const isPos = s.change_pct >= 0;
-          const barWidth = Math.min(Math.abs(s.change_pct || 0) * 15, 100);
-          return (
-            <div key={s.sector} className="flex items-center gap-3">
-              <span className="text-[11px] font-medium w-20 shrink-0 truncate" style={{ color: "var(--text-secondary)" }}>{s.sector}</span>
-              <div className="flex-1 h-5 rounded-md overflow-hidden relative" style={{ background: "var(--hover)" }}>
-                <div className="h-full rounded-md transition-all duration-500" style={{
-                  width: `${barWidth}%`,
-                  background: isPos ? "var(--gain)" : "var(--loss)",
-                  opacity: 0.7,
-                }} />
-              </div>
-              <span className="text-[11px] font-mono font-semibold min-w-[50px] text-right" style={{ color: isPos ? "var(--gain)" : "var(--loss)" }}>
-                {isPos ? "+" : ""}{s.change_pct?.toFixed(2)}%
-              </span>
+      {!breadth ? (
+        <p className="text-[12px] py-3 text-center" style={{ color: "var(--text-muted)" }}>
+          Breadth data unavailable — live market feed unreachable.
+        </p>
+      ) : (
+        <div className="grid grid-cols-3 gap-3">
+          {[
+            { label: "Advances", value: breadth.advances, color: "var(--gain)", bg: "var(--gain-bg)" },
+            { label: "Declines", value: breadth.declines, color: "var(--loss)", bg: "var(--loss-bg)" },
+            { label: "Unchanged", value: breadth.unchanged, color: "var(--text-muted)", bg: "var(--hover)" },
+          ].map(b => (
+            <div key={b.label} className="text-center p-3 rounded-xl" style={{ background: b.bg }}>
+              <div className="text-lg font-bold font-mono" style={{ color: b.color }}>{b.value?.toLocaleString() ?? "—"}</div>
+              <div className="text-[10px] font-medium" style={{ color: "var(--text-muted)" }}>{b.label}</div>
             </div>
-          );
-        })}
-      </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -174,8 +155,8 @@ function GlobalMarkets({ markets }) {
           <div key={m.name} className="p-3 rounded-xl" style={{ background: "var(--hover)" }}>
             <div className="text-[10px] font-medium" style={{ color: "var(--text-muted)" }}>{m.name}</div>
             <div className="text-[13px] font-mono font-semibold" style={{ color: "var(--text-primary)" }}>{formatNumber(m.value, 0)}</div>
-            <div className="text-[11px] font-mono" style={{ color: m.change_pct >= 0 ? "var(--gain)" : "var(--loss)" }}>
-              {m.change_pct >= 0 ? "+" : ""}{m.change_pct?.toFixed(2)}%
+            <div className="text-[11px] font-mono" style={{ color: (m.change_pct ?? 0) >= 0 ? "var(--gain)" : "var(--loss)" }}>
+              {m.change_pct != null ? `${m.change_pct >= 0 ? "+" : ""}${m.change_pct.toFixed(2)}%` : "unavailable"}
             </div>
           </div>
         ))}
@@ -183,6 +164,15 @@ function GlobalMarkets({ markets }) {
     </div>
   );
 }
+
+// Tab navigation for market sections
+const MARKET_TABS = [
+  { key: "overview", label: "Overview", icon: TrendingUp },
+  { key: "scanner", label: "Scanner", icon: SlidersHorizontal },
+  { key: "rankings", label: "Rankings", icon: Trophy },
+  { key: "sectors", label: "Sectors", icon: Layers },
+  { key: "calendar", label: "Calendar", icon: Calendar },
+];
 
 export default function Markets() {
   const [overview, setOverview] = useState(null);
@@ -192,6 +182,7 @@ export default function Markets() {
   const [globalMkts, setGlobalMkts] = useState([]);
   const [fiiDii, setFiiDii] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [activeTab, setActiveTab] = useState("overview");
 
   useEffect(() => {
     const fetchData = async () => {
@@ -230,6 +221,7 @@ export default function Markets() {
             <p className="page-subtitle mt-1">Real-time market overview and insights</p>
           </div>
           <div className="flex items-center gap-2">
+            <MarketEngineStatus compact />
             {overview?.market_status && (
               <span className="badge-status" style={{
                 background: overview.market_status === "OPEN" ? "var(--gain-bg)" : "var(--loss-bg)",
@@ -248,42 +240,119 @@ export default function Markets() {
       {/* Index Strip */}
       <IndexStrip overview={overview} />
 
-      {/* Heatmap */}
-      <Reveal><MarketHeatmap gainers={gainers} losers={losers} /></Reveal>
+      {/* Tab Navigation */}
+      <Reveal>
+        <div className="flex gap-1 p-1 rounded-xl bg-[var(--bg-secondary)] border border-[var(--border)] overflow-x-auto">
+          {MARKET_TABS.map((tab) => {
+            const Icon = tab.icon;
+            return (
+              <button
+                key={tab.key}
+                onClick={() => setActiveTab(tab.key)}
+                className={`flex items-center gap-1.5 px-4 py-2 rounded-lg text-xs font-medium transition-all whitespace-nowrap ${
+                  activeTab === tab.key
+                    ? "bg-[var(--accent)] text-white shadow-sm"
+                    : "text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]"
+                }`}
+              >
+                <Icon size={13} />
+                {tab.label}
+              </button>
+            );
+          })}
+        </div>
+      </Reveal>
 
-      {/* Two Column: Gainers + Losers */}
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-        <Reveal delay={0}><TopMovers title="Top Gainers" data={gainers} icon={TrendingUp} color="gain" /></Reveal>
-        <Reveal delay={0.06}><TopMovers title="Top Losers" data={losers} icon={TrendingDown} color="loss" /></Reveal>
-      </div>
+      {/* Tab Content */}
+      {activeTab === "overview" && (
+        <>
+          {/* Heatmap */}
+          <Reveal><MarketHeatmap gainers={gainers} losers={losers} /></Reveal>
 
-      {/* Two Column: Breadth + Sectors */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        <Reveal delay={0}><MarketBreadth overview={overview} /></Reveal>
-        <Reveal delay={0.06}><SectorPerformance sectors={sectors} /></Reveal>
-      </div>
-
-      {/* FII/DII */}
-      {fiiDii && (
-        <Reveal>
-          <div className="glass-card p-5">
-            <h3 className="eyebrow mb-3">FII / DII Activity (₹ Cr)</h3>
-            <div className="grid grid-cols-2 gap-6">
-              {[{ label: "FII Net", val: fiiDii.fii?.net }, { label: "DII Net", val: fiiDii.dii?.net }].map(({ label, val }) => (
-                <div key={label}>
-                  <span className="stat-label">{label}</span>
-                  <div className="text-xl font-mono font-bold" style={{ color: val >= 0 ? "var(--gain)" : "var(--loss)" }}>
-                    {val >= 0 ? "+" : ""}{formatNumber(val)}
-                  </div>
-                </div>
-              ))}
-            </div>
+          {/* Two Column: Gainers + Losers */}
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <Reveal delay={0}><TopMovers title="Top Gainers" data={gainers} icon={TrendingUp} color="gain" /></Reveal>
+            <Reveal delay={0.06}><TopMovers title="Top Losers" data={losers} icon={TrendingDown} color="loss" /></Reveal>
           </div>
+
+          {/* Two Column: Breadth + Sectors */}
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+            <Reveal delay={0}><MarketBreadth overview={overview} /></Reveal>
+            <Reveal delay={0.06}>
+              <div className="glass-card p-5">
+                <h3 className="eyebrow mb-4">Sector Performance</h3>
+                <div className="space-y-2">
+                  {sectors?.map(s => {
+                    const isPos = s.change_pct >= 0;
+                    const barWidth = Math.min(Math.abs(s.change_pct || 0) * 15, 100);
+                    return (
+                      <div key={s.sector} className="flex items-center gap-3">
+                        <span className="text-[11px] font-medium w-20 shrink-0 truncate" style={{ color: "var(--text-secondary)" }}>{s.sector}</span>
+                        <div className="flex-1 h-5 rounded-md overflow-hidden relative" style={{ background: "var(--hover)" }}>
+                          <div className="h-full rounded-md transition-all duration-500" style={{
+                            width: `${barWidth}%`,
+                            background: isPos ? "var(--gain)" : "var(--loss)",
+                            opacity: 0.7,
+                          }} />
+                        </div>
+                        <span className="text-[11px] font-mono font-semibold min-w-[50px] text-right" style={{ color: isPos ? "var(--gain)" : "var(--loss)" }}>
+                          {isPos ? "+" : ""}{s.change_pct?.toFixed(2)}%
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            </Reveal>
+          </div>
+
+          {/* FII/DII */}
+          {fiiDii && (
+            <Reveal>
+              <div className="glass-card p-5">
+                <h3 className="eyebrow mb-3">FII / DII Activity (₹ Cr)</h3>
+                <div className="grid grid-cols-2 gap-6">
+                  {[{ label: "FII Net", val: fiiDii.fii?.net }, { label: "DII Net", val: fiiDii.dii?.net }].map(({ label, val }) => (
+                    <div key={label}>
+                      <span className="stat-label">{label}</span>
+                      <div className="text-xl font-mono font-bold" style={{ color: (val ?? 0) >= 0 ? "var(--gain)" : "var(--loss)" }}>
+                        {val != null ? `${val >= 0 ? "+" : ""}${formatNumber(val)}` : "unavailable"}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </Reveal>
+          )}
+
+          {/* Global Markets */}
+          <Reveal><GlobalMarkets markets={globalMkts} /></Reveal>
+        </>
+      )}
+
+      {activeTab === "scanner" && (
+        <Reveal>
+          <MarketScanner />
         </Reveal>
       )}
 
-      {/* Global Markets */}
-      <Reveal><GlobalMarkets markets={globalMkts} /></Reveal>
+      {activeTab === "rankings" && (
+        <Reveal>
+          <RankingTable />
+        </Reveal>
+      )}
+
+      {activeTab === "sectors" && (
+        <Reveal>
+          <SectorAnalysis />
+        </Reveal>
+      )}
+
+      {activeTab === "calendar" && (
+        <Reveal>
+          <EconomicCalendar />
+        </Reveal>
+      )}
     </div>
   );
 }

@@ -127,9 +127,9 @@ function SetupPerformanceHistory() {
         <h3 className="eyebrow flex items-center gap-1.5">
           <BarChart3 size={12} /> Setup Performance History
         </h3>
-        {data?.is_demo && (
-          <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full" style={{ background: "var(--ai-accent-soft)", color: "var(--ai-accent)" }}>
-            Sample Data
+        {data?.empty_reason && (
+          <span className="text-[10px] px-2 py-0.5 rounded-full" style={{ background: "var(--hover)", color: "var(--text-muted)" }}>
+            No data yet
           </span>
         )}
       </div>
@@ -370,6 +370,7 @@ export default function StockPicks() {
   const [tradingPick, setTradingPick] = useState(null);
   const [tradeLoading, setTradeLoading] = useState(false);
   const [tradeResult, setTradeResult] = useState(null);
+  const [unavailableNote, setUnavailableNote] = useState("");
 
   useEffect(() => {
     fetchPicks();
@@ -380,8 +381,10 @@ export default function StockPicks() {
     try {
       const { data } = await api.get("/analysis/top-picks");
       setPicks(data.picks || []);
+      setUnavailableNote(data.available === false ? (data.note || "Live market data is temporarily unavailable.") : "");
     } catch (err) {
       console.error("Picks error:", err);
+      setUnavailableNote("Unable to load AI picks. Please retry.");
     } finally {
       setLoading(false);
     }
@@ -443,6 +446,13 @@ export default function StockPicks() {
       {loading ? (
         <div className="space-y-4">
           {[1, 2, 3].map((i) => <div key={i} className="h-48 rounded-2xl skeleton" />)}
+        </div>
+      ) : picks.length === 0 ? (
+        <div className="glass-card p-12 text-center">
+          <p className="body-text mb-4" style={{ color: "var(--text-muted)" }}>
+            {unavailableNote || "No AI picks available right now."}
+          </p>
+          <button onClick={fetchPicks} className="btn-primary btn-sm">Retry</button>
         </div>
       ) : (
         <div className="space-y-3">

@@ -254,6 +254,68 @@ async def send_email(to_email: str, subject: str, html_body: str):
     }
 
 
+def build_morning_report_email(report: dict, app_url: str = ""):
+    """Render a branded HTML morning-report email from a full report doc.
+
+    Reuses the AlphaPartner `_base_html` shell so the email stays visually
+    consistent with the other templated notifications. Returns
+    ``(subject, html_body)`` so the caller can send via ``send_email``.
+
+    Kept separate from TEMPLATES because a morning report carries structured
+    data (mood, indices, picks, risks) that reads far better as a laid-out
+    summary than a single interpolated string.
+    """
+    mood = report.get("market_mood", "Neutral")
+    mood_emoji = {"Bullish": "🟢", "Cautious": "🟡", "Neutral": "🟡", "Bearish": "🔴"}.get(mood, "🟡")
+    briefing = report.get("ai_briefing", "")
+    picks = report.get("top_picks") or []
+    risks = report.get("key_risks") or []
+
+    def _idx_row(label, d):
+        d = d or {}
+        val = d.get("value", 0) or 0
+        chg = d.get("change_pct", 0) or 0
+        color = "#10B981" if chg >= 0 else "#F43F5E"
+        return (
+            f'<tr><td style="color:#52525B;font-size:12px;padding:4px 0;">{label}</td>'
+            f'<td style="color:#FAFAFA;font-family:monospace;text-align:right;">'
+            f'{val:,.0f} <span style="color:{color};">({chg:+.2f}%)</span></td></tr>'
+        )
+
+    idx_rows = (
+        _idx_row("Nifty 50", report.get("nifty"))
+        + _idx_row("Bank Nifty", report.get("banknifty"))
+        + _idx_row("Sensex", report.get("sensex"))
+    )
+    picks_html = "".join(
+        f'<li style="margin:2px 0;">{p.get("name", p.get("symbol", ""))} — '
+        f'<span style="color:#818CF8;">{p.get("confidence", "")}% confidence</span></li>'
+        for p in picks[:3]
+    ) or "<li>No high-conviction setups flagged today.</li>"
+    risks_html = "".join(f'<li style="margin:2px 0;">{r}</li>' for r in risks[:3]) or "<li>No elevated risks flagged.</li>"
+    link = app_url or "#"
+
+    body = f"""
+        <p style="font-size:15px;color:#FAFAFA;margin:0 0 4px;">Good morning ☀️ — today's market report is ready.</p>
+        <div style="margin:12px 0;padding:12px 16px;background:rgba(99,102,241,0.08);border-left:3px solid #6366F1;border-radius:8px;">
+            <span style="font-size:12px;color:#52525B;">Market Mood</span><br>
+            <span style="font-size:18px;font-weight:700;color:#FAFAFA;">{mood_emoji} {mood}</span>
+        </div>
+        <p style="font-size:13px;color:#A1A1AA;">{briefing}</p>
+        <table width="100%" cellpadding="0" cellspacing="0" style="margin:12px 0;">{idx_rows}</table>
+        <p style="font-size:12px;color:#52525B;text-transform:uppercase;letter-spacing:0.04em;margin:16px 0 4px;">Stocks to Watch</p>
+        <ul style="margin:0;padding-left:18px;color:#FAFAFA;font-size:13px;">{picks_html}</ul>
+        <p style="font-size:12px;color:#52525B;text-transform:uppercase;letter-spacing:0.04em;margin:16px 0 4px;">Risk Warnings</p>
+        <ul style="margin:0;padding-left:18px;color:#A1A1AA;font-size:13px;">{risks_html}</ul>
+        <p style="margin-top:20px;">
+            <a href="{link}" style="display:inline-block;padding:10px 20px;background:#6366F1;color:#fff;border-radius:8px;text-decoration:none;font-weight:600;font-size:13px;">Open Full Report</a>
+        </p>
+    """
+    nifty_val = (report.get("nifty") or {}).get("value", 0) or 0
+    subject = f"☀️ Morning Report — {mood} | Nifty {nifty_val:,.0f}"
+    return subject, _base_html("Good Morning ☀️", body)
+
+
 async def send_notification(notif_type: str, to_email: str, **kwargs):
     """Send a templated email notification."""
     template = TEMPLATES.get(notif_type)

@@ -39,16 +39,13 @@ from models import (
     WatchlistAdd,
     ChatMessage, ChatResponse,
     StockAnalysisRequest, SIPRequest,
+    AdvisorRequest, AdvisorRecommendation, AdvisorEntryZone,
 )
-from market_data import (
-    get_market_overview, get_sector_performance,
-    get_stock_quote, generate_top_picks,
-    search_stocks, STOCK_UNIVERSE,
-)
-# NOTE: market_data.* are SIMULATED (random) generators. They are used ONLY as a
-# last-resort fallback when the live Yahoo Finance path in services.real_market
-# fails or returns nothing. Prefer the real_* fetchers (and the helpers below)
-# for every user-facing code path — see .claude/CLAUDE.md "Never use fake market data".
+from market_data import get_stock_meta, search_stocks, STOCK_UNIVERSE
+# NOTE: market_data contains ONLY factual reference metadata (symbols, company
+# names, sectors). All market values come from services.real_market (live
+# Yahoo Finance / NSE). When live data is unavailable, endpoints return an
+# explicit "unavailable" payload — never simulated values.
 
 # MongoDB
 mongo_url = os.environ['MONGO_URL']
@@ -57,42 +54,40 @@ db = client[os.environ['DB_NAME']]
 
 
 # ============ LIVE MARKET DATA HELPERS ============
-# These wrap services.real_market (live Yahoo Finance) and fall back to the
-# simulated market_data.* generators ONLY when the live API fails or returns
-# nothing. This keeps every user-facing path on real data while remaining
-# functional (and test-passing) without network access / API keys.
+# These wrap services.real_market (live Yahoo Finance). There is NO simulated
+# fallback: when the live API fails, helpers return None and endpoints surface
+# an explicit unavailable state.
+
+def _apply_stock_meta(quote: dict, symbol: str) -> dict:
+    """Merge factual reference metadata (name/sector) into a live quote and
+    guarantee descriptive keys exist. Fields with no live source are None."""
+    meta = get_stock_meta(symbol) or {}
+    quote.setdefault("name", meta.get("name", symbol.upper()))
+    quote.setdefault("sector", meta.get("sector", ""))
+    quote.setdefault("day_range", f"{quote.get('low', 0)} - {quote.get('high', 0)}")
+    for k in ("week_52_high", "week_52_low", "market_cap_cr", "pe_ratio"):
+        quote.setdefault(k, None)
+    return quote
+
 
 async def real_quote(symbol: str):
-    """Live quote for `symbol`, enriched with descriptive fields Yahoo's chart
-    endpoint doesn't provide (name, sector, 52-week range, P/E, market cap) so
-    callers relying on the simulated quote's shape keep working.
-    Falls back to the simulated quote only if the live fetch fails/returns nothing."""
+    """Live quote for `symbol`, enriched with factual metadata.
+    Returns None when live market data is unavailable — never simulated."""
     from services.real_market import fetch_real_stock_quote
-    real = None
     try:
         real = await fetch_real_stock_quote(symbol)
     except Exception as e:
         logging.warning(f"real_quote live fetch failed for {symbol}: {e}")
-    sim = get_stock_quote(symbol)
+        real = None
     if not real:
-        return sim
-    if sim:
-        for k in ("name", "sector", "day_range", "week_52_high",
-                  "week_52_low", "market_cap_cr", "pe_ratio"):
-            real.setdefault(k, sim.get(k))
-    # Guarantee descriptive keys exist even for symbols outside the mock universe
-    real.setdefault("name", symbol.upper())
-    real.setdefault("sector", "")
-    real.setdefault("day_range", f"{real.get('low', 0)} - {real.get('high', 0)}")
-    for k in ("week_52_high", "week_52_low", "market_cap_cr", "pe_ratio"):
-        real.setdefault(k, 0)
-    return real
+        return None
+    return _apply_stock_meta(real, symbol)
 
 
 async def real_quotes_map(symbols):
     """Fetch live quotes for many symbols concurrently (Yahoo layer is cached),
-    returning {UPPER_SYMBOL: quote|None}. Each value prefers the live quote and
-    falls back to the simulated one, so loops never fire N slow calls twice."""
+    returning {UPPER_SYMBOL: quote|None}. None means live data is unavailable
+    for that symbol — callers must treat it as explicitly unavailable."""
     from services.real_market import fetch_real_stock_quote
     uniq = list({(s or "").upper() for s in symbols if s})
     if not uniq:
@@ -103,47 +98,32 @@ async def real_quotes_map(symbols):
     out = {}
     for sym, res in zip(uniq, results):
         if isinstance(res, Exception) or not res:
-            out[sym] = get_stock_quote(sym)
+            out[sym] = None
             continue
-        sim = get_stock_quote(sym)
-        if sim:
-            res.setdefault("name", sim.get("name"))
-            res.setdefault("sector", sim.get("sector"))
-        res.setdefault("name", sym)
-        res.setdefault("sector", "")
-        out[sym] = res
+        out[sym] = _apply_stock_meta(res, sym)
     return out
 
 
 async def real_overview():
-    """Live market overview (Nifty/Bank Nifty/Sensex from Yahoo). India VIX,
-    sentiment and advance/decline have no free real-time feed, so they are merged
-    in from the simulated generator as clearly-supplementary estimates. Falls back
-    entirely to the simulated overview only if the live fetch fails."""
+    """Live market overview (indices + India VIX + breadth/sentiment derived
+    from live universe quotes). Returns None when live data is unavailable."""
     from services.real_market import fetch_real_market_overview
-    real = await fetch_real_market_overview()
-    sim = get_market_overview()
-    if not real:
-        return sim
-    real.setdefault("india_vix", sim.get("india_vix"))
-    real.setdefault("market_sentiment", sim.get("market_sentiment"))
-    real.setdefault("advance_decline", sim.get("advance_decline"))
-    return real
+    return await fetch_real_market_overview()
 
 
 async def prefetch_quote_func(user_id):
     """Build a SYNC quote lookup backed by prefetched LIVE quotes for the given
     user's open positions. services.portfolio_monitor.analyze_portfolio_health
     calls its quote_func synchronously (no await), so we resolve the async live
-    quotes up-front and hand it a plain dict lookup — keeping portfolio health on
-    real prices instead of random ones, without editing portfolio_monitor."""
+    quotes up-front and hand it a plain dict lookup. Symbols with no live quote
+    resolve to None and are skipped by the monitor — never simulated."""
     open_trades = await db.trades.find(
         {"user_id": user_id, "status": "OPEN"}
     ).to_list(50)
     quotes = await real_quotes_map([t["symbol"] for t in open_trades])
 
     def quote_func(symbol):
-        return quotes.get((symbol or "").upper()) or get_stock_quote(symbol)
+        return quotes.get((symbol or "").upper())
 
     return quote_func
 
@@ -261,28 +241,37 @@ async def ai_market_summary():
     """Generate AI market summary — uses Gemini as primary for speed."""
     from services.real_market import fetch_real_sectors, fetch_real_fii_dii
     overview = await real_overview()
-    sectors = await fetch_real_sectors() or get_sector_performance()
-    fii_dii = await fetch_real_fii_dii()
-    top_sector = sectors[0] if sectors else {"sector": "N/A", "change_pct": 0}
+    if not overview:
+        return "Market summary unavailable — live market data cannot be fetched right now. Please retry shortly."
 
-    sign = '+' if overview['nifty']['change'] >= 0 else ''
+    sectors = await fetch_real_sectors() or []
+    fii_dii = await fetch_real_fii_dii()
+    top_sector = sectors[0] if sectors else None
+
+    def _fmt_num(v, suffix=""):
+        return f"{v}{suffix}" if v is not None else "unavailable"
+
+    fii_net = fii_dii.get("fii", {}).get("net")
+    sentiment = overview.get("market_sentiment")
+    sign = '+' if (overview['nifty']['change'] or 0) >= 0 else ''
     fallback = (f"Nifty at {overview['nifty']['value']} ({sign}{overview['nifty']['change_pct']}%). "
-                f"{top_sector['sector']} sector leading at +{top_sector['change_pct']}%. "
-                f"FII net: {fii_dii['fii']['net']} Cr. Market sentiment: {overview['market_sentiment']}/100.")
+                + (f"{top_sector['sector']} sector leading at {top_sector['change_pct']:+}%. " if top_sector else "Sector data unavailable. ")
+                + f"FII net: {_fmt_num(fii_net, ' Cr')}. Market sentiment: {_fmt_num(sentiment, '/100')}.")
 
     if not (claude_configured() or gemini_configured()):
         return fallback
 
     engine = get_debate_engine()
     system_msg = ("You are a professional Indian market analyst. Generate a 3-4 sentence market summary. "
-                  "Be concise, data-driven, no fluff. Include specific numbers.")
+                  "Be concise, data-driven, no fluff. Include specific numbers. "
+                  "If a data point is marked unavailable, do not invent it.")
     prompt = f"""Summarize today's Indian market:
 - Nifty: {overview['nifty']['value']} ({overview['nifty']['change_pct']}%)
 - Bank Nifty: {overview['bank_nifty']['value']} ({overview['bank_nifty']['change_pct']}%)
-- Top sector: {top_sector['sector']} (+{top_sector['change_pct']}%)
-- FII net: {fii_dii['fii']['net']} Cr, DII net: {fii_dii['dii']['net']} Cr
-- India VIX: {overview['india_vix']}
-- Sentiment: {overview['market_sentiment']}/100"""
+- Top sector: {f"{top_sector['sector']} ({top_sector['change_pct']:+}%)" if top_sector else "unavailable"}
+- FII net: {_fmt_num(fii_net, ' Cr')}, DII net: {_fmt_num(fii_dii.get('dii', {}).get('net'), ' Cr')}
+- India VIX: {_fmt_num(overview.get('india_vix'))}
+- Sentiment: {_fmt_num(sentiment, '/100')}"""
     try:
         return await engine.simple_chat(system_msg, prompt, prefer="gemini", max_tokens=300)
     except Exception as e:
@@ -312,6 +301,409 @@ Provide: Top 3 fund recommendations (name, category, expected CAGR, expense rati
         return f"SIP analysis error: {str(e)}"
 
 
+# ============ AI INVESTMENT ADVISOR ============
+# Expands the SIP Advisor into a full multi-horizon stock advisor. Every
+# recommendation is built from REAL market data (services.real_market: live
+# Yahoo quotes + technical indicators + chart patterns + sector performance)
+# and tuned per horizon (intraday = tight stops/targets, long term = wide).
+# The AI (ai_debate_engine.simple_chat) only writes the narrative from the
+# real numbers — it never invents prices. Fully degrades to a deterministic,
+# clearly-marked structured result if AI keys or Yahoo are unavailable.
+
+# Per-horizon risk/reward geometry. Percentages are applied to the live price.
+# entry_band = half-width of the entry zone around the live price.
+HORIZON_CONFIG = {
+    "intraday": {
+        "label": "Intraday",
+        "holding_period": "Same day — square off before 3:15 PM",
+        "sl_pct": 0.012, "target_pcts": [0.012, 0.02, 0.03], "entry_band": 0.003,
+        "base_return": 1.8, "risk_bias": 1,
+    },
+    "swing": {
+        "label": "Swing Trading",
+        "holding_period": "3 to 10 trading days",
+        "sl_pct": 0.03, "target_pcts": [0.045, 0.08, 0.12], "entry_band": 0.008,
+        "base_return": 6.0, "risk_bias": 1,
+    },
+    "short": {
+        "label": "Short Term",
+        "holding_period": "2 to 4 weeks",
+        "sl_pct": 0.05, "target_pcts": [0.08, 0.13, 0.18], "entry_band": 0.012,
+        "base_return": 10.0, "risk_bias": 0,
+    },
+    "medium": {
+        "label": "Medium Term",
+        "holding_period": "3 to 6 months",
+        "sl_pct": 0.08, "target_pcts": [0.15, 0.24, 0.35], "entry_band": 0.02,
+        "base_return": 18.0, "risk_bias": -1,
+    },
+    "long": {
+        "label": "Long Term",
+        "holding_period": "1 to 3 years",
+        "sl_pct": 0.12, "target_pcts": [0.30, 0.55, 0.90], "entry_band": 0.03,
+        "base_return": 40.0, "risk_bias": -1,
+    },
+}
+
+
+def _advisor_score(quote: dict, patterns: list, horizon: str) -> tuple:
+    """Technical score (0-100 conviction) + human-readable reasons for a stock,
+    computed entirely from REAL indicators. Weighting is nudged per horizon:
+    shorter horizons lean on momentum/volume, longer ones on trend (MACD)."""
+    rsi = quote.get("rsi", 50.0) or 50.0
+    volume_ratio = quote.get("volume_ratio", 1.0) or 1.0
+    macd = quote.get("macd", 0.0) or 0.0
+    macd_signal = quote.get("macd_signal", 0.0) or 0.0
+    change_pct = quote.get("change_pct", 0.0) or 0.0
+
+    short_horizon = horizon in ("intraday", "swing")
+    score = 50.0
+    reasons = []
+
+    # RSI — momentum vs mean-reversion
+    if 50 <= rsi <= 68:
+        score += 15
+        reasons.append(f"RSI at {rsi:.0f} sits in a healthy bullish zone with room before overbought.")
+    elif 40 <= rsi < 50:
+        score += 8
+        reasons.append(f"RSI at {rsi:.0f} is neutral-to-constructive, basing before a potential move up.")
+    elif rsi < 35:
+        score += 10
+        reasons.append(f"RSI at {rsi:.0f} is oversold, hinting at a mean-reversion bounce.")
+    elif rsi > 72:
+        score -= 6
+        reasons.append(f"RSI at {rsi:.0f} is overbought — momentum is strong but entries need discipline.")
+
+    # Volume — conviction behind the move (weighted more for short horizons)
+    vol_weight = 20 if short_horizon else 12
+    if volume_ratio >= 1.5:
+        score += vol_weight
+        reasons.append(f"Volume is {volume_ratio:.1f}x the 20-day average — strong participation.")
+    elif volume_ratio >= 1.1:
+        score += vol_weight * 0.5
+        reasons.append(f"Volume is elevated at {volume_ratio:.1f}x the 20-day average.")
+
+    # MACD — trend (weighted more for longer horizons)
+    macd_weight = 18 if not short_horizon else 12
+    if macd > macd_signal:
+        score += macd_weight
+        reasons.append("MACD is in a bullish crossover, confirming upward trend momentum.")
+    else:
+        score -= 4
+        reasons.append("MACD has yet to cross bullish — wait for confirmation on strength.")
+
+    # Live day change
+    if change_pct >= 1.0:
+        score += 6
+        reasons.append(f"Trading up {change_pct:+.1f}% today with positive intraday momentum.")
+    elif change_pct <= -1.5:
+        score -= 4
+
+    # Chart patterns (real detector output)
+    for p in patterns[:2]:
+        sig = p.get("signal")
+        name = p.get("pattern", "")
+        if sig == "bullish":
+            score += 12
+            reasons.append(f"{name} pattern detected on the daily chart — a bullish signal.")
+        elif sig == "bearish":
+            score -= 10
+            reasons.append(f"Caution: a {name} pattern is present — manage risk tightly.")
+
+    confidence = int(min(95, max(55, round(score))))
+    return confidence, reasons
+
+
+def _advisor_risk_level(confidence: int, horizon: str) -> str:
+    """Map confidence + horizon bias to Low/Medium/High. Shorter horizons
+    (intraday/swing) carry structurally higher risk; longer horizons lower."""
+    levels = ["Low", "Medium", "High"]
+    base = 0 if confidence >= 80 else (1 if confidence >= 70 else 2)
+    bias = HORIZON_CONFIG.get(horizon, {}).get("risk_bias", 0)
+    idx = min(2, max(0, base + bias))
+    return levels[idx]
+
+
+def _advisor_deterministic_narrative(rec: dict, horizon_label: str) -> dict:
+    """Build the narrative fields (ai_summary, news_impact) deterministically
+    from the real numbers. Used as the base and as the fallback when no AI key
+    is configured — always structured, always honest about what it models."""
+    name = rec["name"]
+    entry = rec["entry_zone"]
+    t = rec["targets"]
+    summary = (
+        f"{name} scores {rec['confidence']}/100 as a {horizon_label.lower()} idea "
+        f"({rec['risk'].lower()} risk). Accumulate in the ₹{entry['low']}–₹{entry['high']} zone "
+        f"with a stop at ₹{rec['stop_loss']}, targeting ₹{t[0]}"
+        + (f" and ₹{t[1]}" if len(t) > 1 else "")
+        + f" — an expected move of about {rec['expected_return_pct']:+.1f}%. "
+        f"Reasoning is driven by live technicals: {rec['technical_reasons'][0] if rec['technical_reasons'] else 'positive setup'}"
+    )
+    news = (
+        f"No stock-specific news feed is modeled for this recommendation. "
+        f"{rec['sector_strength']} Watch upcoming earnings, sector headlines and broad-market cues "
+        f"before acting."
+    )
+    return {"ai_summary": summary, "news_impact": news}
+
+
+async def _advisor_ai_enrich(recs: list, horizon_label: str, risk_appetite, capital) -> None:
+    """Enrich ai_summary + news_impact for each rec via a single batched
+    simple_chat call, feeding the AI ONLY the real numbers. Mutates recs in
+    place. Silently keeps the deterministic narrative on any failure so the
+    endpoint never crashes and needs no API key to succeed."""
+    if not recs or not (claude_configured() or gemini_configured()):
+        return
+    engine = get_debate_engine()
+    lines = []
+    for r in recs:
+        lines.append(
+            f"- {r['symbol']} ({r['name']}, {r['sector']}): live price ₹{r['price']}, "
+            f"RSI {r.get('rsi')}, volume {r.get('volume_ratio')}x avg, pattern "
+            f"'{r.get('pattern') or 'none'}', confidence {r['confidence']}/100, {r['risk']} risk, "
+            f"entry ₹{r['entry_zone']['low']}-₹{r['entry_zone']['high']}, SL ₹{r['stop_loss']}, "
+            f"targets {r['targets']}, sector today: {r['sector_strength']}"
+        )
+    cap_txt = f" The investor has about ₹{int(capital)} to deploy." if capital else ""
+    system_msg = (
+        "You are AlphaPartner's senior equity strategist for Indian markets (NSE/BSE). "
+        "You are given REAL, pre-computed price levels and technicals — never change or invent "
+        "any number, only explain them. For EACH stock write a crisp 2-3 sentence 'summary' "
+        "(why it fits this horizon, referencing the given levels) and a 1-2 sentence 'news_impact' "
+        "(likely news/earnings catalysts and risks for that sector — be honest, no fabricated headlines). "
+        "Return ONLY a JSON object mapping each SYMBOL to {\"summary\": str, \"news_impact\": str}."
+    )
+    prompt = (
+        f"Horizon: {horizon_label}. Risk appetite: {risk_appetite or 'moderate'}.{cap_txt}\n"
+        f"Stocks (with real live data):\n" + "\n".join(lines) +
+        "\n\nReturn the JSON object now."
+    )
+    try:
+        raw = await engine.simple_chat(system_msg, prompt, prefer="claude", max_tokens=900)
+        start, end = raw.find("{"), raw.rfind("}")
+        if start == -1 or end == -1:
+            return
+        parsed = json.loads(raw[start:end + 1])
+        for r in recs:
+            entry = parsed.get(r["symbol"]) or parsed.get(r["symbol"].upper())
+            if isinstance(entry, dict):
+                if entry.get("summary"):
+                    r["ai_summary"] = str(entry["summary"]).strip()
+                if entry.get("news_impact"):
+                    r["news_impact"] = str(entry["news_impact"]).strip()
+    except Exception as e:
+        logging.warning(f"Advisor AI narrative enrichment failed (using deterministic): {e}")
+
+
+async def build_advisor_recommendations(
+    horizon: str = "swing",
+    risk_appetite: Optional[str] = None,
+    sectors: Optional[list] = None,
+    capital: Optional[float] = None,
+    count: int = 5,
+) -> dict:
+    """Core advisor engine. Pipeline (all REAL data):
+      1. Live 2-day quotes for the whole NSE universe (fetch_all_universe_quotes).
+      2. Optional sector filter + momentum shortlist.
+      3. Full technical quote (RSI/MACD/volume) + chart patterns for the shortlist.
+      4. Per-horizon scoring, confidence, entry/SL/targets from the live price.
+      5. Real sector-strength ranking (fetch_real_sectors).
+      6. AI narrative (batched simple_chat) with a deterministic fallback.
+    Never raises on data/AI failure — always returns a structured payload."""
+    horizon = (horizon or "swing").lower()
+    if horizon not in HORIZON_CONFIG:
+        horizon = "swing"
+    cfg = HORIZON_CONFIG[horizon]
+    count = max(3, min(6, int(count or 5)))
+
+    from services.real_market import (
+        fetch_all_universe_quotes, fetch_real_stock_quote,
+        detect_chart_patterns, fetch_real_sectors,
+    )
+
+    data_source = "yahoo_finance"
+    try:
+        universe = await fetch_all_universe_quotes()
+    except Exception as e:
+        logging.warning(f"Advisor universe fetch failed: {e}")
+        universe = []
+    if not universe:
+        # Live data unavailable — return an explicit unavailable payload,
+        # never recommendations built on simulated values.
+        return {
+            "horizon": horizon,
+            "horizon_label": cfg["label"],
+            "risk_appetite": risk_appetite,
+            "count": 0,
+            "ai_powered": False,
+            "data_source": "unavailable",
+            "available": False,
+            "note": "Live market data is temporarily unavailable — recommendations cannot be generated right now.",
+            "recommendations": [],
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    # Sector filter (case-insensitive); relax if it leaves too few candidates.
+    if sectors:
+        wanted = {s.strip().lower() for s in sectors if s and s.strip()}
+        filtered = [u for u in universe if (u.get("sector") or "").lower() in wanted]
+        if len(filtered) >= 3:
+            universe = filtered
+
+    # Momentum shortlist: prefer positive day change + participation, but keep a
+    # broad enough pool to still fill `count` after scoring.
+    shortlist = sorted(
+        universe,
+        key=lambda u: (u.get("change_pct", 0) or 0) + min((u.get("volume_ratio", 1) or 1), 3),
+        reverse=True,
+    )[: max(8, count + 3)]
+
+    # Real technicals + patterns for the shortlist, concurrently.
+    async def _enrich(u):
+        sym = u.get("symbol")
+        try:
+            full = await fetch_real_stock_quote(sym)
+        except Exception:
+            full = None
+        quote = full or u
+        try:
+            pat = await detect_chart_patterns(sym)
+            patterns = pat.get("patterns", [])
+        except Exception:
+            patterns = []
+        # Carry descriptive fields from the universe entry
+        quote.setdefault("name", u.get("name", sym))
+        quote.setdefault("sector", u.get("sector", ""))
+        quote["symbol"] = sym
+        return quote, patterns
+
+    enriched = await asyncio.gather(*[_enrich(u) for u in shortlist], return_exceptions=True)
+
+    # Real sector-strength ranking
+    try:
+        sector_perf = await fetch_real_sectors()
+    except Exception:
+        sector_perf = []
+    sector_rank = {s["sector"]: i for i, s in enumerate(sector_perf)}
+    sector_change = {s["sector"]: s.get("change_pct", 0) for s in sector_perf}
+    total_sectors = len(sector_perf) or 1
+
+    scored = []
+    for item in enriched:
+        if isinstance(item, Exception) or not item:
+            continue
+        quote, patterns = item
+        price = quote.get("price") or 0
+        if not price:
+            continue
+        confidence, tech_reasons = _advisor_score(quote, patterns, horizon)
+        risk = _advisor_risk_level(confidence, horizon)
+
+        entry_low = round(price * (1 - cfg["entry_band"]), 2)
+        entry_high = round(price * (1 + cfg["entry_band"]), 2)
+        stop_loss = round(price * (1 - cfg["sl_pct"]), 2)
+        targets = [round(price * (1 + p), 2) for p in cfg["target_pcts"]]
+        # Expected return = midpoint of the first two targets vs live price,
+        # gently scaled by conviction so low-confidence ideas read more modestly.
+        mid_target = sum(targets[:2]) / min(2, len(targets))
+        raw_ret = (mid_target / price - 1) * 100
+        expected_return_pct = round(raw_ret * (0.7 + 0.3 * confidence / 100), 1)
+
+        sector = quote.get("sector", "") or ""
+        rank = sector_rank.get(sector)
+        chg = sector_change.get(sector)
+        if rank is not None and chg is not None:
+            standing = "leading" if rank < total_sectors / 3 else ("mid-pack" if rank < 2 * total_sectors / 3 else "lagging")
+            sector_strength = (
+                f"The {sector} sector is {standing} today at {chg:+.1f}% "
+                f"(ranked #{rank + 1} of {total_sectors} NSE sectors)."
+            )
+        elif sector:
+            sector_strength = f"The {sector} sector is a core part of the NSE universe."
+        else:
+            sector_strength = "Broad-market sector strength is mixed today."
+
+        fundamental_reasons = [
+            f"{quote.get('name', quote['symbol'])} is an established {sector or 'NSE'} name with deep "
+            f"liquidity and institutional coverage — suitable for {cfg['label'].lower()} positioning.",
+            (f"Aligned to a {cfg['holding_period'].split('—')[0].strip().lower()} holding window, "
+             f"letting the thesis play out while the {sector or 'broader'} trend develops."),
+        ]
+
+        pattern_name = None
+        for p in patterns:
+            if p.get("signal") == "bullish":
+                pattern_name = p.get("pattern")
+                break
+        if not pattern_name and patterns:
+            pattern_name = patterns[0].get("pattern")
+
+        rec = {
+            "symbol": quote["symbol"],
+            "name": quote.get("name", quote["symbol"]),
+            "sector": sector,
+            "confidence": confidence,
+            "risk": risk,
+            "expected_return_pct": expected_return_pct,
+            "holding_period": cfg["holding_period"],
+            "entry_zone": {"low": entry_low, "high": entry_high},
+            "stop_loss": stop_loss,
+            "targets": targets,
+            "technical_reasons": tech_reasons[:4] or ["Constructive technical setup on the daily timeframe."],
+            "fundamental_reasons": fundamental_reasons,
+            "news_impact": "",
+            "sector_strength": sector_strength,
+            "ai_summary": "",
+            "price": round(price, 2),
+            "horizon": horizon,
+            "rsi": quote.get("rsi"),
+            "volume_ratio": quote.get("volume_ratio"),
+            "pattern": pattern_name,
+        }
+        scored.append(rec)
+
+    # Rank by conviction; for a conservative appetite, prefer lower-risk ideas.
+    scored.sort(key=lambda r: r["confidence"], reverse=True)
+    if (risk_appetite or "").lower() == "conservative":
+        low_med = [r for r in scored if r["risk"] in ("Low", "Medium")]
+        if len(low_med) >= 3:
+            scored = low_med
+    elif (risk_appetite or "").lower() == "aggressive":
+        # Reward higher expected return for aggressive investors.
+        scored.sort(key=lambda r: (r["expected_return_pct"], r["confidence"]), reverse=True)
+
+    selected = scored[:count]
+
+    # Deterministic narrative base (works with zero AI keys) …
+    for r in selected:
+        base = _advisor_deterministic_narrative(r, cfg["label"])
+        r["ai_summary"] = base["ai_summary"]
+        r["news_impact"] = base["news_impact"]
+    # … then AI enrichment on top (best-effort, real numbers only).
+    ai_powered = bool(claude_configured() or gemini_configured())
+    await _advisor_ai_enrich(selected, cfg["label"], risk_appetite, capital)
+
+    # Validate/shape through the Pydantic contract so the response is stable.
+    recommendations = [
+        AdvisorRecommendation(
+            **{**r, "entry_zone": AdvisorEntryZone(**r["entry_zone"])}
+        ).model_dump()
+        for r in selected
+    ]
+
+    return {
+        "horizon": horizon,
+        "horizon_label": cfg["label"],
+        "risk_appetite": risk_appetite,
+        "count": len(recommendations),
+        "ai_powered": ai_powered,
+        "data_source": data_source,
+        "available": True,
+        "recommendations": recommendations,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 # ============ ROUTERS ============
 
 auth_router = APIRouter(prefix="/api/auth", tags=["Auth"])
@@ -322,6 +714,7 @@ trades_router = APIRouter(prefix="/api/trades", tags=["Trades"])
 portfolio_router = APIRouter(prefix="/api/portfolio", tags=["Portfolio"])
 notifications_router = APIRouter(prefix="/api/notifications", tags=["Notifications"])
 sip_router = APIRouter(prefix="/api/sip", tags=["SIP"])
+advisor_router = APIRouter(prefix="/api/advisor", tags=["AI Investment Advisor"])
 chat_router = APIRouter(prefix="/api/chat", tags=["Chat"])
 paper_router = APIRouter(prefix="/api/paper", tags=["Paper Trading"])
 backtest_router = APIRouter(prefix="/api/backtest", tags=["Backtesting"])
@@ -425,8 +818,14 @@ async def refresh_token(request: Request, response: Response):
 
 @market_router.get("/overview")
 async def market_overview():
-    """Get market overview — live Yahoo Finance indices, simulated only on failure."""
-    return await real_overview()
+    """Get market overview — live Yahoo Finance indices. Explicitly unavailable on failure."""
+    overview = await real_overview()
+    if not overview:
+        return {
+            "available": False,
+            "note": "Live market data is temporarily unavailable. Please retry shortly.",
+        }
+    return {**overview, "available": True}
 
 @market_router.get("/gainers")
 async def top_gainers():
@@ -469,11 +868,173 @@ async def activity_feed():
     return get_recent_activity()
 
 
+# ── Market Engine endpoints ──────────────────────────
+
+@market_router.get("/scanner")
+async def market_scanner(
+    strategy: Optional[str] = None,
+    sector: Optional[str] = None,
+    rsi_min: Optional[float] = None,
+    rsi_max: Optional[float] = None,
+    volume_ratio_min: Optional[float] = None,
+    change_pct_min: Optional[float] = None,
+    price_min: Optional[float] = None,
+    price_max: Optional[float] = None,
+    limit: int = 15,
+):
+    """Advanced market scanner with strategy presets and custom filters."""
+    from services.market_engine.scanner_engine import scan
+
+    custom_filters = {}
+    if rsi_min is not None:
+        custom_filters["rsi_min"] = rsi_min
+    if rsi_max is not None:
+        custom_filters["rsi_max"] = rsi_max
+    if volume_ratio_min is not None:
+        custom_filters["volume_ratio_min"] = volume_ratio_min
+    if change_pct_min is not None:
+        custom_filters["change_pct_min"] = change_pct_min
+    if price_min is not None:
+        custom_filters["price_min"] = price_min
+    if price_max is not None:
+        custom_filters["price_max"] = price_max
+
+    return await scan(
+        strategy=strategy,
+        filters=custom_filters if custom_filters else None,
+        sector=sector,
+        limit=min(limit, 30),
+    )
+
+
+@market_router.get("/scanner/presets")
+async def scanner_presets():
+    """Return available scanner strategy presets."""
+    from services.market_engine.scanner_engine import get_presets
+    return {"presets": get_presets()}
+
+
+@market_router.get("/ranking")
+async def market_ranking(
+    top_n: int = 10,
+    sector: Optional[str] = None,
+):
+    """Top-ranked stock opportunities by multi-dimensional scoring."""
+    from services.market_engine.ranking_engine import rank_universe
+    ranked = await rank_universe(top_n=min(top_n, 30), sector_filter=sector)
+    return {
+        "rankings": ranked,
+        "count": len(ranked),
+        "available": bool(ranked),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@market_router.get("/sector-analysis")
+async def sector_analysis():
+    """Deep sector analysis with rotation, momentum, and breadth."""
+    from services.market_engine.sector_engine import analyze_sectors
+    return await analyze_sectors()
+
+
+@market_router.get("/calendar")
+async def economic_calendar(
+    category: Optional[str] = None,
+    importance: Optional[str] = None,
+    days_ahead: int = 30,
+):
+    """Economic calendar events for Indian markets."""
+    from services.market_engine.economic_calendar import get_calendar
+    return await get_calendar(
+        category=category,
+        importance=importance,
+        days_ahead=min(days_ahead, 90),
+    )
+
+
+@market_router.get("/events")
+async def market_events(event_type: Optional[str] = None, limit: int = 50):
+    """Recent market engine events from the event bus."""
+    from services.market_engine.event_bus import event_bus
+    events = event_bus.recent_events(event_type=event_type, limit=min(limit, 200))
+    return {"events": events, "count": len(events)}
+
+
+@market_router.get("/engine/status")
+async def engine_status():
+    """Market engine health and status."""
+    from services.market_engine import market_gateway
+    from services.market_engine.validator import is_market_hours, is_pre_market
+    return {
+        **market_gateway.status,
+        "market_hours": is_market_hours(),
+        "pre_market": is_pre_market(),
+        "engine": "market_engine",
+        "version": "1.0.0",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@market_router.get("/heatmap")
+async def market_heatmap():
+    """Enhanced heatmap data with ranking scores for all universe stocks."""
+    from services.market_engine.gateway import market_gateway
+    from services.market_engine.ranking_engine import rank_stock
+
+    quotes = await market_gateway.get_universe_quotes()
+    if not quotes:
+        return {"stocks": [], "available": False}
+
+    sectors = await market_gateway.get_sectors()
+    sector_rank_map = {}
+    sector_change_map = {}
+    for i, s in enumerate(sectors or []):
+        name = s.get("name") or s.get("sector", "")
+        sector_rank_map[name] = i
+        sector_change_map[name] = s.get("change_pct", 0)
+    total_sectors = len(sectors) or 1
+
+    heatmap_stocks = []
+    for q in quotes:
+        sector = q.get("sector", "")
+        ranking = rank_stock(
+            quote=q,
+            sector_rank=sector_rank_map.get(sector),
+            total_sectors=total_sectors,
+            sector_change=sector_change_map.get(sector),
+        )
+        heatmap_stocks.append({
+            "symbol": q.get("symbol", ""),
+            "name": q.get("name", ""),
+            "price": q.get("price"),
+            "change_pct": q.get("change_pct"),
+            "volume_ratio": q.get("volume_ratio"),
+            "sector": sector,
+            "opportunity_score": ranking["opportunity_score"],
+            "signal": ranking["signal"],
+        })
+
+    heatmap_stocks.sort(key=lambda s: abs(s.get("change_pct") or 0), reverse=True)
+
+    return {
+        "stocks": heatmap_stocks,
+        "count": len(heatmap_stocks),
+        "available": True,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 # ============ STOCKS ROUTES ============
 
 @stocks_router.get("/search")
 async def search(q: str = ""):
-    return search_stocks(q)
+    """Live NSE/BSE stock search via Yahoo Finance; static metadata search
+    (factual names/sectors, no market values) when the live API is unreachable."""
+    from services.real_market import search_yahoo_stocks
+    results = await search_yahoo_stocks(q)
+    if results is None:
+        return search_stocks(q)
+    return results
 
 @stocks_router.get("/universe")
 async def stock_universe():
@@ -481,24 +1042,13 @@ async def stock_universe():
 
 @stocks_router.get("/{symbol}")
 async def stock_detail(symbol: str):
-    """Get stock details — tries real Yahoo Finance data first."""
-    from services.real_market import fetch_real_stock_quote
-    real = await fetch_real_stock_quote(symbol)
-    if real:
-        # Merge with simulated for missing fields
-        sim = get_stock_quote(symbol) or {}
-        real.setdefault("name", sim.get("name", symbol))
-        real.setdefault("sector", sim.get("sector", ""))
-        real.setdefault("day_range", f"{real.get('low', 0):.2f} - {real.get('high', 0):.2f}")
-        real.setdefault("week_52_high", sim.get("week_52_high", 0))
-        real.setdefault("week_52_low", sim.get("week_52_low", 0))
-        real.setdefault("market_cap_cr", sim.get("market_cap_cr", 0))
-        real.setdefault("pe_ratio", sim.get("pe_ratio", 0))
-        return real
-    quote = get_stock_quote(symbol)
-    if not quote:
+    """Get stock details from live Yahoo Finance data. Explicit error when unavailable."""
+    quote = await real_quote(symbol)
+    if quote:
+        return quote
+    if not get_stock_meta(symbol):
         raise HTTPException(status_code=404, detail="Stock not found")
-    return quote
+    raise HTTPException(status_code=503, detail="Live market data temporarily unavailable for this stock")
 
 @stocks_router.get("/{symbol}/chart")
 async def stock_chart(symbol: str, period: str = "1D"):
@@ -523,26 +1073,33 @@ async def top_picks():
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     cached = await db.market_analysis.find_one({"date": today})
     if cached and cached.get("top_picks"):
-        picks = cached["top_picks"]
-    else:
-        from services.real_market import fetch_real_top_picks
-        res = await fetch_real_top_picks(3)
-        picks = res.get("picks", [])
-        await db.market_analysis.update_one(
-            {"date": today},
-            {"$set": {"top_picks": picks, "generated_at": datetime.now(timezone.utc).isoformat()}},
-            upsert=True
-        )
-    return {"picks": picks, "date": today}
+        return {"picks": cached["top_picks"], "date": today, "available": True}
+
+    from services.real_market import fetch_real_top_picks
+    res = await fetch_real_top_picks(3)
+    picks = res.get("picks", [])
+    if not picks:
+        # Live data unavailable — do not persist, surface explicitly
+        return {
+            "picks": [],
+            "date": today,
+            "available": False,
+            "note": res.get("note", "Live market data is temporarily unavailable."),
+        }
+    await db.market_analysis.update_one(
+        {"date": today},
+        {"$set": {"top_picks": picks, "generated_at": datetime.now(timezone.utc).isoformat()}},
+        upsert=True
+    )
+    return {"picks": picks, "date": today, "available": True}
 
 @analysis_router.post("/explain")
 async def explain_stock(data: StockAnalysisRequest):
-    from services.real_market import fetch_real_stock_quote
-    quote = await fetch_real_stock_quote(data.symbol)
+    quote = await real_quote(data.symbol)
     if not quote:
-        quote = get_stock_quote(data.symbol)
-    if not quote:
-        raise HTTPException(status_code=404, detail="Stock not found")
+        if not get_stock_meta(data.symbol):
+            raise HTTPException(status_code=404, detail="Stock not found")
+        raise HTTPException(status_code=503, detail="Live market data temporarily unavailable for this stock")
     name = data.name or quote.get("name", data.symbol)
     prompt = f"""Analyze this NSE stock for intraday trading:
 Stock: {name} ({data.symbol})
@@ -564,34 +1121,42 @@ async def morning_report():
     picks_res = await fetch_real_top_picks(3)
     picks = picks_res.get("picks", [])
 
-    # real_overview() merges India VIX / sentiment (no free live feed) so the
-    # prompt below can reference overview['india_vix'] / ['market_sentiment'].
     overview = await real_overview()
+    if not overview:
+        return {
+            "available": False,
+            "report": "Morning report unavailable — live market data cannot be fetched right now.",
+            "picks": picks,
+            "overview": None,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+        }
 
-    sectors = await fetch_real_sectors()
-    if not sectors:
-        sectors = get_sector_performance()
+    sectors = await fetch_real_sectors() or []
+    sentiment = overview.get("market_sentiment")
+    vix = overview.get("india_vix")
 
     report = ""
     if claude_configured() or gemini_configured():
         try:
             engine = get_debate_engine()
             system_msg = ("You are AlphaPartner morning briefing AI. Create a concise, actionable morning "
-                          "market report for Indian intraday traders. Professional tone, use data provided.")
+                          "market report for Indian intraday traders. Professional tone, use data provided. "
+                          "If a data point is marked unavailable, do not invent it.")
             prompt = f"""Generate morning market report:
 Nifty: {overview['nifty']['value']} | Bank Nifty: {overview['bank_nifty']['value']}
-Sentiment: {overview['market_sentiment']}/100 | VIX: {overview['india_vix']}
-Top Sectors: {', '.join([f"{s['sector']} ({s['change_pct']}%)" for s in sectors[:3]])}
-Top Picks: {', '.join([f"{p['name']} (Confidence: {p['confidence']}%)" for p in picks])}"""
+Sentiment: {f"{sentiment}/100" if sentiment is not None else "unavailable"} | VIX: {vix if vix is not None else "unavailable"}
+Top Sectors: {', '.join([f"{s['sector']} ({s['change_pct']}%)" for s in sectors[:3]]) or "unavailable"}
+Top Picks: {', '.join([f"{p['name']} (Confidence: {p['confidence']}%)" for p in picks]) or "unavailable"}"""
             report = await engine.simple_chat(system_msg, prompt, prefer="claude", max_tokens=400)
         except Exception as e:
             report = f"Morning report generation failed: {str(e)}"
     else:
+        top_pick_line = (f"Top pick: {picks[0]['name']} ({picks[0]['confidence']}% confidence)."
+                         if picks else "Live pick data is unavailable right now.")
         report = (f"Good morning! Nifty at {overview['nifty']['value']}. "
-                  f"{len(picks)} strong setups found. "
-                  f"Top pick: {picks[0]['name']} ({picks[0]['confidence']}% confidence).")
+                  f"{len(picks)} strong setups found. {top_pick_line}")
 
-    return {"report": report, "picks": picks, "overview": overview, "generated_at": datetime.now(timezone.utc).isoformat()}
+    return {"available": True, "report": report, "picks": picks, "overview": overview, "generated_at": datetime.now(timezone.utc).isoformat()}
 
 
 @analysis_router.get("/reports/morning")
@@ -603,43 +1168,59 @@ async def morning_report_full(user: dict = Depends(get_current_user)):
         cached.pop("_id", None)
         return cached
 
-    # Generate fresh report
+    # Generate fresh report — live data only; explicit unavailable otherwise
     from services.real_market import fetch_real_top_picks, fetch_real_sectors, fetch_real_fii_dii
-    overview = await real_overview()   # live indices + merged VIX/sentiment supplements
+    overview = await real_overview()
+    if not overview:
+        return {
+            "date": today,
+            "type": "morning",
+            "available": False,
+            "note": "Live market data is temporarily unavailable — the morning report cannot be generated right now.",
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+        }
     picks_res = await fetch_real_top_picks(3)
     picks = picks_res.get("picks", [])
     fii_dii = await fetch_real_fii_dii()
-    sectors = await fetch_real_sectors()
-    if not sectors:
-        sectors = get_sector_performance()
+    sectors = await fetch_real_sectors() or []
 
-    nifty_chg = overview.get("nifty", {}).get("change_pct", 0)
-    banknifty_chg = overview.get("bank_nifty", {}).get("change_pct", 0)
-    nifty_val = overview.get("nifty", {}).get("value", 0)
-    bnk_val = overview.get("bank_nifty", {}).get("value", 0)
-    sensex_val = overview.get("sensex", {}).get("value", 79000)
-    sensex_chg = overview.get("sensex", {}).get("change_pct", 0)
+    nifty_chg = overview.get("nifty", {}).get("change_pct") or 0
+    banknifty_chg = overview.get("bank_nifty", {}).get("change_pct") or 0
+    nifty_val = overview.get("nifty", {}).get("value")
+    bnk_val = overview.get("bank_nifty", {}).get("value")
+    sensex_val = overview.get("sensex", {}).get("value")
+    sensex_chg = overview.get("sensex", {}).get("change_pct")
+    sentiment = overview.get("market_sentiment")
+    vix = overview.get("india_vix")
+    fii_net = fii_dii.get("fii", {}).get("net")
 
-    mood_score = round((nifty_chg * 0.5 + banknifty_chg * 0.3 + overview["market_sentiment"] / 100 * 0.2), 3)
+    sentiment_component = (sentiment / 100 * 0.2) if sentiment is not None else 0.1  # neutral when unavailable
+    mood_score = round((nifty_chg * 0.5 + banknifty_chg * 0.3 + sentiment_component), 3)
     if mood_score > 0.5: market_mood = "Bullish"
     elif mood_score > 0: market_mood = "Cautious"
     elif mood_score > -0.5: market_mood = "Neutral"
     else: market_mood = "Bearish"
 
     key_risks = [
-        f"Nifty VIX at {overview.get('india_vix', 14.5)} — {'elevated volatility risk' if overview.get('india_vix', 14) > 15 else 'moderate volatility'}",
-        f"FII net flow: ₹{fii_dii['fii']['net']} Cr — {'selling pressure' if fii_dii['fii']['net'] < 0 else 'supportive buying'}",
+        (f"Nifty VIX at {vix} — {'elevated volatility risk' if vix > 15 else 'moderate volatility'}"
+         if vix is not None else "India VIX unavailable — volatility reading pending"),
+        (f"FII net flow: ₹{fii_net} Cr — {'selling pressure' if fii_net < 0 else 'supportive buying'}"
+         if fii_net is not None else "FII/DII flow data unavailable — NSE updates after market close"),
         f"{'Weak' if banknifty_chg < -0.5 else 'Mixed'} Bank Nifty — watch banking sector for direction cues",
     ]
-    global_cues = f"US futures and Asian markets influencing early Indian session. Keep stop losses tight. Top sectors: {', '.join([s['sector'] for s in sectors[:3]])}."
+    top_sector_names = ', '.join([s['sector'] for s in sectors[:3]]) or "unavailable"
+    global_cues = f"US futures and Asian markets influencing early Indian session. Keep stop losses tight. Top sectors: {top_sector_names}."
 
-    ai_briefing = f"Good morning! Nifty at {nifty_val:,.0f} ({nifty_chg:+.2f}%), Bank Nifty at {bnk_val:,.0f}. Market mood: {market_mood}. {len(picks)} quality setups identified. Stay disciplined."
+    nifty_str = f"{nifty_val:,.0f}" if nifty_val is not None else "unavailable"
+    bnk_str = f"{bnk_val:,.0f}" if bnk_val is not None else "unavailable"
+    ai_briefing = f"Good morning! Nifty at {nifty_str} ({nifty_chg:+.2f}%), Bank Nifty at {bnk_str}. Market mood: {market_mood}. {len(picks)} quality setups identified. Stay disciplined."
     if claude_configured() or gemini_configured():
         try:
             engine = get_debate_engine()
             ai_briefing = await engine.simple_chat(
-                "You are AlphaPartner morning briefing AI. Be concise, professional, data-driven.",
-                f"Write a 3-sentence morning briefing for Indian traders:\nNifty: {nifty_val} ({nifty_chg:+.2f}%)\nBank Nifty: {bnk_val} ({banknifty_chg:+.2f}%)\nSensex: {sensex_val}\nMood: {market_mood}\nFII: ₹{fii_dii['fii']['net']}Cr\nTop picks: {', '.join(p['name'] for p in picks[:3])}",
+                "You are AlphaPartner morning briefing AI. Be concise, professional, data-driven. "
+                "If a data point is marked unavailable, do not invent it.",
+                f"Write a 3-sentence morning briefing for Indian traders:\nNifty: {nifty_str} ({nifty_chg:+.2f}%)\nBank Nifty: {bnk_str} ({banknifty_chg:+.2f}%)\nSensex: {sensex_val if sensex_val is not None else 'unavailable'}\nMood: {market_mood}\nFII: {f'₹{fii_net}Cr' if fii_net is not None else 'unavailable'}\nTop picks: {', '.join(p['name'] for p in picks[:3]) or 'unavailable'}",
                 prefer="gemini", max_tokens=200,
             )
         except Exception:
@@ -648,6 +1229,7 @@ async def morning_report_full(user: dict = Depends(get_current_user)):
     report = {
         "date": today,
         "type": "morning",
+        "available": True,
         "market_mood": market_mood,
         "mood_score": mood_score,
         "nifty": {"value": nifty_val, "change_pct": nifty_chg},
@@ -657,7 +1239,7 @@ async def morning_report_full(user: dict = Depends(get_current_user)):
         "top_picks": picks,
         "key_risks": key_risks,
         "global_cues": global_cues,
-        "fii_dii": {"fii_net": fii_dii["fii"]["net"], "dii_net": fii_dii["dii"]["net"]},
+        "fii_dii": {"fii_net": fii_net, "dii_net": fii_dii.get("dii", {}).get("net")},
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
     await db.reports.insert_one({**report})
@@ -1059,6 +1641,38 @@ async def sip_calculator(amount: float = 5000, years: int = 10, rate: float = 12
     }
 
 
+# ============ AI INVESTMENT ADVISOR ROUTES ============
+
+@advisor_router.post("/recommend")
+async def advisor_recommend(data: AdvisorRequest, user: dict = Depends(get_current_user)):
+    """Recommend 3-6 NSE stocks for the requested horizon (long/medium/short/
+    swing/intraday), each fully explained with confidence, risk, expected return,
+    holding period, entry zone, stop loss, targets, technical + fundamental
+    reasons, news impact, sector strength and an AI summary. All price levels
+    are derived from LIVE market data; the AI only narrates the real numbers."""
+    from services.activity_logger import log_activity
+    log_activity(f"AI Advisor scanning for {data.horizon} opportunities", "rank", "running")
+    result = await build_advisor_recommendations(
+        horizon=data.horizon,
+        risk_appetite=data.risk_appetite,
+        sectors=data.sectors,
+        capital=data.capital,
+    )
+    return result
+
+
+@advisor_router.get("/horizons")
+async def advisor_horizons():
+    """List the supported horizons and their holding-period semantics — powers
+    the frontend segmented control without hardcoding copy on the client."""
+    return {
+        "horizons": [
+            {"key": k, "label": v["label"], "holding_period": v["holding_period"]}
+            for k, v in HORIZON_CONFIG.items()
+        ]
+    }
+
+
 # ============ SETTINGS ============
 
 settings_router = APIRouter(prefix="/api/settings", tags=["Settings"])
@@ -1186,13 +1800,12 @@ async def market_broadcast_loop():
             if ws_manager.active:
                 from services.real_market import fetch_real_market_overview
                 overview = await fetch_real_market_overview()
-                if not overview:
-                    overview = get_market_overview()  # fallback
-                await ws_manager.broadcast({
-                    "type": "market_update",
-                    "data": overview,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                })
+                if overview:
+                    await ws_manager.broadcast({
+                        "type": "market_update",
+                        "data": overview,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    })
         except Exception as e:
             logging.error(f"Broadcast error: {e}")
         await asyncio.sleep(10)
@@ -1670,13 +2283,12 @@ async def stock_live_quote(symbol: str):
         if av_quote:
             av_quote["source"] = "alpha_vantage"
             return av_quote
-    from services.real_market import fetch_real_stock_quote
-    quote = await fetch_real_stock_quote(symbol)
+    quote = await real_quote(symbol)
     if not quote:
-        quote = get_stock_quote(symbol)
-    if not quote:
-        raise HTTPException(status_code=404, detail="Stock not found")
-    quote["source"] = "simulated"
+        if not get_stock_meta(symbol):
+            raise HTTPException(status_code=404, detail="Stock not found")
+        raise HTTPException(status_code=503, detail="Live market data temporarily unavailable for this stock")
+    quote["source"] = "yahoo_finance"
     return quote
 
 @stocks_router.get("/{symbol}/intraday")
@@ -1688,7 +2300,7 @@ async def stock_intraday(symbol: str, interval: str = "5min"):
             return {"data": av_data, "source": "alpha_vantage"}
     from services.real_market import fetch_real_chart_data
     chart = await fetch_real_chart_data(symbol, "1D")
-    return {"data": chart, "source": "simulated"}
+    return {"data": chart, "source": "yahoo_finance", "available": bool(chart)}
 
 
 # ============ DATA SOURCE STATUS ============
@@ -1701,7 +2313,7 @@ async def data_sources():
     from services.telegram_service import get_status as tg_status
     engine_status = get_debate_engine().get_status()
     return {
-        "alpha_vantage": {"configured": av_configured(), "mode": "live" if av_configured() else "simulated"},
+        "alpha_vantage": {"configured": av_configured(), "mode": "live" if av_configured() else "yahoo_finance"},
         "zerodha": kite_status(),
         "ai": {
             "configured": engine_status["debate_ready"],
@@ -1908,6 +2520,13 @@ async def get_stock_news(symbol: str, name: str = ""):
     articles = await search_stock_news(symbol, name)
     return {"articles": articles, "symbol": symbol}
 
+@news_router.get("/sentiment")
+async def news_sentiment():
+    """Aggregate market sentiment derived from real news headlines.
+    Explicitly unavailable when feeds cannot be reached — never simulated."""
+    from services.news_service import get_market_sentiment
+    return await get_market_sentiment()
+
 @news_router.get("/refresh")
 async def refresh_news():
     """Force refresh news cache."""
@@ -1985,10 +2604,7 @@ async def webhook_morning_scan(_: bool = Depends(verify_webhook_key)):
     """Run the morning analysis job (scan stocks, generate picks, morning report)."""
     from services.scheduler import morning_analysis_job
     try:
-        # morning_analysis_job fetches live picks/overview internally via
-        # services.real_market; the market_func / pick_func args below are accepted
-        # for signature compatibility but never invoked, so no simulated data leaks.
-        await morning_analysis_job(db, ai_market_summary, get_market_overview, generate_top_picks)
+        await morning_analysis_job(db, ai_market_summary)
         await _log_webhook("morning_scan", "success")
         return {"status": "success", "workflow": "morning_scan"}
     except Exception as e:
@@ -2074,14 +2690,13 @@ async def webhook_logs(user: dict = Depends(get_current_user)):
 
 @watchlist_router.get("")
 async def get_watchlist(user: dict = Depends(get_current_user)):
-    """Get user's watchlist enriched with live quotes."""
-    from services.real_market import fetch_all_universe_quotes
+    """Get user's watchlist enriched with live quotes. Items whose live quote is
+    unavailable carry quote=None so the UI can show an explicit unavailable state."""
     items = await db.watchlist.find({"user_id": user["_id"]}).sort("added_at", -1).to_list(100)
-    quotes = await fetch_all_universe_quotes()
-    quote_map = {q["symbol"]: q for q in quotes if q}
+    quotes = await real_quotes_map([item["symbol"] for item in items])
     for item in items:
         item["_id"] = str(item["_id"])
-        quote = quote_map.get(item["symbol"]) or get_stock_quote(item["symbol"])
+        quote = quotes.get(item["symbol"].upper())
         if quote:
             item["quote"] = {
                 "price": quote.get("price"),
@@ -2095,21 +2710,23 @@ async def get_watchlist(user: dict = Depends(get_current_user)):
                 item["since_added_pct"] = round(
                     (quote["price"] - item["added_price"]) / item["added_price"] * 100, 2
                 )
+        else:
+            item["quote"] = None
     return items
 
 @watchlist_router.post("")
 async def add_to_watchlist(data: WatchlistAdd, user: dict = Depends(get_current_user)):
-    """Add a stock to the watchlist. Idempotent per user+symbol."""
+    """Add a stock to the watchlist. Idempotent per user+symbol. Accepts any
+    symbol resolvable via metadata or a live quote (supports live search results)."""
     symbol = data.symbol.upper().strip()
-    if not any(s["symbol"] == symbol for s in STOCK_UNIVERSE):
-        raise HTTPException(status_code=404, detail=f"Unknown symbol: {symbol}")
     existing = await db.watchlist.find_one({"user_id": user["_id"], "symbol": symbol})
     if existing:
         existing["_id"] = str(existing["_id"])
         return existing
     # Real quote first so added_price matches the live prices used for since-added P&L
-    from services.real_market import fetch_real_stock_quote
-    quote = await fetch_real_stock_quote(symbol) or get_stock_quote(symbol) or {}
+    quote = await real_quote(symbol) or {}
+    if not quote and not get_stock_meta(symbol):
+        raise HTTPException(status_code=404, detail=f"Unknown symbol: {symbol}")
     doc = {
         "user_id": user["_id"],
         "symbol": symbol,
@@ -2137,7 +2754,9 @@ async def full_ai_report(data: StockAnalysisRequest):
     """Generate comprehensive AI analysis report with full transparency."""
     quote = await real_quote(data.symbol)
     if not quote:
-        raise HTTPException(status_code=404, detail="Stock not found")
+        if not get_stock_meta(data.symbol):
+            raise HTTPException(status_code=404, detail="Stock not found")
+        raise HTTPException(status_code=503, detail="Live market data temporarily unavailable for this stock")
 
     name = data.name or quote["name"]
 
@@ -2182,27 +2801,34 @@ async def full_ai_report(data: StockAnalysisRequest):
         score += 8
         breakdown.append({"factor": "VWAP", "score": 8, "max": 20, "reason": f"Price below VWAP — sellers dominant"})
 
-    # News sentiment (simulated)
-    import random
-    news_score = random.randint(10, 20)
+    # News sentiment — derived from real headlines mentioning this stock
+    from services.news_service import search_stock_news
+    news = await search_stock_news(data.symbol, name)
+    if news:
+        positive = sum(1 for n in news if n.get("sentiment") == "positive")
+        negative = sum(1 for n in news if n.get("sentiment") == "negative")
+        news_score = int(round(10 + (positive - negative) / len(news) * 10))  # 0..20
+        news_reason = f"{positive} positive / {negative} negative of {len(news)} recent headlines mentioning {name}"
+    else:
+        news_score = 10
+        news_reason = "No recent news found for this stock — neutral sentiment assumed"
     score += news_score
-    breakdown.append({"factor": "News Sentiment", "score": news_score, "max": 20, "reason": "Based on recent news analysis and sector outlook"})
+    breakdown.append({"factor": "News Sentiment", "score": news_score, "max": 20, "reason": news_reason})
 
     # Get AI debate
+    def _na(v):
+        return v if v is not None else "unavailable"
+
     prompt = f"""Deep analysis for {name} ({data.symbol}):
 Price: INR {quote['price']} ({quote['change_pct']}%)
 RSI: {rsi} | MACD: {quote['macd']} | Volume: {vol_ratio}x avg
 VWAP: {vwap} | Sector: {quote['sector']}
-52W Range: {quote['week_52_low']} - {quote['week_52_high']}
-P/E: {quote['pe_ratio']} | Market Cap: {quote['market_cap_cr']} Cr
+52W Range: {_na(quote['week_52_low'])} - {_na(quote['week_52_high'])}
+P/E: {_na(quote['pe_ratio'])} | Market Cap: {_na(quote['market_cap_cr'])} Cr
 
-Provide detailed analysis: entry strategy, risk factors, key support/resistance levels, sector outlook, and specific trading plan with exact price levels."""
+Provide detailed analysis: entry strategy, risk factors, key support/resistance levels, sector outlook, and specific trading plan with exact price levels. If a data point is marked unavailable, do not invent it."""
 
     debate = await ai_dual_debate(prompt, f"report-{data.symbol}")
-
-    # Get related news
-    from services.news_service import search_stock_news
-    news = await search_stock_news(data.symbol, name)
 
     return {
         "symbol": data.symbol,
@@ -2253,14 +2879,13 @@ async def gemini_status():
 async def gemini_analyze_stock(data: StockAnalysisRequest, user: dict = Depends(get_current_user)):
     """Get Gemini real-time analysis for a stock."""
     from services.gemini_direct import gemini_realtime_analysis
-    quote = get_stock_quote(data.symbol)
-    if not quote:
-        raise HTTPException(status_code=404, detail="Stock not found")
-    # Try real quote first
-    from services.real_market import fetch_real_stock_quote
-    real_quote = await fetch_real_stock_quote(data.symbol)
-    stock_data = real_quote or quote
-    stock_data["name"] = data.name or quote.get("name", data.symbol)
+    stock_data = await real_quote(data.symbol)
+    if not stock_data:
+        if not get_stock_meta(data.symbol):
+            raise HTTPException(status_code=404, detail="Stock not found")
+        raise HTTPException(status_code=503, detail="Live market data temporarily unavailable for this stock")
+    if data.name:
+        stock_data["name"] = data.name
     analysis = await gemini_realtime_analysis(stock_data)
     return {"symbol": data.symbol, "analysis": analysis, "quote": stock_data}
 
@@ -2394,6 +3019,7 @@ app.include_router(portfolio_router)
 app.include_router(notifications_router)
 app.include_router(chat_router)
 app.include_router(sip_router)
+app.include_router(advisor_router)
 app.include_router(settings_router)
 app.include_router(zerodha_router)
 app.include_router(monitor_router)
@@ -2490,16 +3116,19 @@ async def startup():
 - GET /api/data-sources
 """)
 
+    # Initialize Market Engine gateway
+    try:
+        from services.market_engine import market_gateway
+        await market_gateway.initialize()
+        logger.info("Market Engine gateway initialized")
+    except Exception as e:
+        logger.error(f"Market Engine init error: {e}")
+
     # Setup scheduler (cron jobs)
     try:
-        # market_overview_func / generate_picks_func are passed through to
-        # morning_analysis_job for signature compatibility only — that job pulls
-        # live data from services.real_market and never calls these simulated fns.
         setup_scheduler(
             db=db,
             ai_summary_func=ai_market_summary,
-            market_overview_func=get_market_overview,
-            generate_picks_func=generate_top_picks,
             ws_broadcast=ws_manager.broadcast,
         )
         logger.info("Cron scheduler initialized")

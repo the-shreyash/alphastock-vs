@@ -14,6 +14,7 @@ import TradeMonitor from "./pages/TradeMonitor";
 import Portfolio from "./pages/Portfolio";
 import AIAssistant from "./pages/AIAssistant";
 import SIPAdvisor from "./pages/SIPAdvisor";
+import InvestmentAdvisor from "./pages/InvestmentAdvisor";
 import Settings from "./pages/Settings";
 import News from "./pages/News";
 import TradeJournal from "./pages/TradeJournal";
@@ -69,6 +70,7 @@ function AppRouter() {
         <Route path="portfolio" element={<Portfolio />} />
         <Route path="assistant" element={<AIAssistant />} />
         <Route path="sip" element={<SIPAdvisor />} />
+        <Route path="advisor" element={<InvestmentAdvisor />} />
         <Route path="news" element={<News />} />
         <Route path="journal" element={<TradeJournal />} />
         <Route path="settings" element={<Settings />} />

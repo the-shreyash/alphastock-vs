@@ -4,6 +4,7 @@ import { motion, AnimatePresence } from "framer-motion";
 import Sidebar, { SIDEBAR_COLLAPSED_W, SIDEBAR_EXPANDED_W, SIDEBAR_MOBILE_W } from "./Sidebar";
 import Navbar from "./Navbar";
 import NotificationPanel from "../notifications/NotificationPanel";
+import AIQuickAction from "../AIQuickAction";
 
 export default function Layout() {
   // Hover-expand is the primary interaction: the sidebar starts collapsed
@@ -86,6 +87,11 @@ export default function Layout() {
         </main>
       </div>
       {showNotifs && <NotificationPanel onClose={() => setShowNotifs(false)} />}
+
+      {/* Context-aware floating AI companion — rendered once so it appears
+          on every authenticated page (never on Login/Register/Landing, which
+          live outside this Layout). */}
+      <AIQuickAction />
     </div>
   );
 }

@@ -1,16 +1,9 @@
 """Tests for services/trade_journal.py's get_setup_success_rates() and
 GET /api/journal/setup-stats, plus setup_type acceptance on trade creation.
 
-NOTE (testability gap — not fixed here, see final report): TradeCreate
-accepts a `setup_type` field and POST /api/trades returns 200 for it, but
-server.py's create_trade() never copies data.setup_type into the inserted
-trade_doc — it is silently dropped. Only paper trades (services/paper_trade.py
-execute_paper_trade) actually persist setup_type today. This means
-get_setup_success_rates() can never see non-demo grouped data from trades
-created via the normal (non-paper) POST /api/trades flow. The test below
-therefore only asserts that the request is accepted (200), not that
-setup_type round-trips — asserting persistence would fail against current
-behavior.
+Both normal trades (POST /api/trades) and paper trades persist setup_type.
+When no trades have a setup_type tag, get_setup_success_rates() returns an
+empty list with an explanatory empty_reason — no mock/demo data is returned.
 """
 import asyncio
 
@@ -60,7 +53,7 @@ def test_win_rate_calculation_correct():
     asyncio.run(run())
 
 
-def test_setup_stats_returns_demo_when_no_trades():
+def test_setup_stats_returns_empty_when_no_trades():
     async def run():
         # ARRANGE
         db = FakeDB()
@@ -69,9 +62,10 @@ def test_setup_stats_returns_demo_when_no_trades():
         # ACT
         result = await get_setup_success_rates(db, user_id)
 
-        # ASSERT
-        assert result["is_demo"] is True
-        assert len(result["setups"]) > 0
+        # ASSERT — should return empty setups with an explanation, not demo data
+        assert result["is_demo"] is False
+        assert len(result["setups"]) == 0
+        assert "empty_reason" in result
 
     asyncio.run(run())
 

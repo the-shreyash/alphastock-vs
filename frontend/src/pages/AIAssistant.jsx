@@ -15,22 +15,26 @@ const QUICK_ACTIONS = [
   "Market outlook today",
 ];
 
-const TRADE_IDEAS = [
-  { symbol: "RELIANCE", type: "BUY", entry: "₹2,950", sl: "₹2,880", target: "₹3,100", confidence: 89 },
-  { symbol: "TCS", type: "BUY", entry: "₹3,450", sl: "₹3,380", target: "₹3,600", confidence: 82 },
-  { symbol: "HDFCBANK", type: "HOLD", entry: "₹1,620", sl: "₹1,580", target: "₹1,700", confidence: 76 },
-];
-
 export default function AIAssistant() {
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [sessionId] = useState(() => `chat-${Date.now()}`);
   const [tab, setTab] = useState("AI Chat");
+  const [tradeIdeas, setTradeIdeas] = useState(null); // null = loading, [] = unavailable
   const bottomRef = useRef(null);
 
-  useEffect(() => { fetchHistory(); }, []);
+  useEffect(() => { fetchHistory(); fetchTradeIdeas(); }, []);
   useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: "smooth" }); }, [messages]);
+
+  const fetchTradeIdeas = async () => {
+    try {
+      const { data } = await api.get("/analysis/top-picks");
+      setTradeIdeas(data.picks || []);
+    } catch {
+      setTradeIdeas([]);
+    }
+  };
 
   const fetchHistory = async () => {
     try {
@@ -179,24 +183,31 @@ export default function AIAssistant() {
                 <Sparkles size={13} style={{ color: "var(--ai-accent)" }} /> AI Trade Ideas
               </h3>
               <div className="space-y-2">
-                {TRADE_IDEAS.map(t => (
-                  <Link key={t.symbol} to={`/stock/${t.symbol}`} className="block p-3 rounded-xl transition-all" style={{ background: "var(--hover)", border: "1px solid var(--border)" }}
-                    onMouseEnter={e => e.currentTarget.style.borderColor = "var(--ai-accent-glow)"}
-                    onMouseLeave={e => e.currentTarget.style.borderColor = "var(--border)"}>
-                    <div className="flex items-center justify-between mb-1">
-                      <span className="text-[13px] font-semibold" style={{ color: "var(--text-primary)" }}>{t.symbol}</span>
-                      <span className="text-[10px] font-bold px-2 py-0.5 rounded-md" style={{
-                        background: t.type === "BUY" ? "var(--gain-bg)" : "var(--ai-accent-soft)",
-                        color: t.type === "BUY" ? "var(--gain)" : "var(--ai-accent)",
-                      }}>{t.type}</span>
-                    </div>
-                    <div className="grid grid-cols-3 gap-2 text-[10px]">
-                      <div><span style={{ color: "var(--text-muted)" }}>Entry</span><div className="font-mono font-semibold" style={{ color: "var(--text-secondary)" }}>{t.entry}</div></div>
-                      <div><span style={{ color: "var(--text-muted)" }}>SL</span><div className="font-mono font-semibold" style={{ color: "var(--loss)" }}>{t.sl}</div></div>
-                      <div><span style={{ color: "var(--text-muted)" }}>Target</span><div className="font-mono font-semibold" style={{ color: "var(--gain)" }}>{t.target}</div></div>
-                    </div>
-                  </Link>
-                ))}
+                {tradeIdeas === null ? (
+                  [1, 2, 3].map(i => <div key={i} className="h-16 rounded-xl skeleton" />)
+                ) : tradeIdeas.length === 0 ? (
+                  <p className="text-[11px] py-3 text-center" style={{ color: "var(--text-muted)" }}>
+                    Trade ideas unavailable — live market data unreachable.
+                  </p>
+                ) : (
+                  tradeIdeas.slice(0, 3).map(t => (
+                    <Link key={t.symbol} to={`/stock/${t.symbol}`} className="block p-3 rounded-xl transition-all" style={{ background: "var(--hover)", border: "1px solid var(--border)" }}
+                      onMouseEnter={e => e.currentTarget.style.borderColor = "var(--ai-accent-glow)"}
+                      onMouseLeave={e => e.currentTarget.style.borderColor = "var(--border)"}>
+                      <div className="flex items-center justify-between mb-1">
+                        <span className="text-[13px] font-semibold" style={{ color: "var(--text-primary)" }}>{t.symbol}</span>
+                        <span className="text-[10px] font-bold px-2 py-0.5 rounded-md" style={{ background: "var(--gain-bg)", color: "var(--gain)" }}>
+                          BUY · {t.confidence}%
+                        </span>
+                      </div>
+                      <div className="grid grid-cols-3 gap-2 text-[10px]">
+                        <div><span style={{ color: "var(--text-muted)" }}>Entry</span><div className="font-mono font-semibold" style={{ color: "var(--text-secondary)" }}>₹{t.entry?.toLocaleString("en-IN")}</div></div>
+                        <div><span style={{ color: "var(--text-muted)" }}>SL</span><div className="font-mono font-semibold" style={{ color: "var(--loss)" }}>₹{t.stop_loss?.toLocaleString("en-IN")}</div></div>
+                        <div><span style={{ color: "var(--text-muted)" }}>Target</span><div className="font-mono font-semibold" style={{ color: "var(--gain)" }}>₹{t.target1?.toLocaleString("en-IN")}</div></div>
+                      </div>
+                    </Link>
+                  ))
+                )}
               </div>
             </motion.div>
 

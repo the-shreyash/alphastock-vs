@@ -129,6 +129,57 @@ class SIPRequest(BaseModel):
     tax_bracket: str = "30%"
 
 
+# --- Investment Advisor Models ---
+# The AI Investment Advisor recommends stocks across multiple horizons
+# (long / medium / short / swing / intraday). Every recommendation is built
+# from REAL market data (services.real_market) and is fully self-explaining —
+# see .claude/project.md: each AI recommendation must justify why / confidence /
+# technical / fundamental / risk / reward / news / sector.
+
+class AdvisorRequest(BaseModel):
+    # One of: "long" | "medium" | "short" | "swing" | "intraday".
+    horizon: str = "swing"
+    # Optional: "conservative" | "moderate" | "aggressive" — biases selection.
+    risk_appetite: Optional[str] = None
+    # Optional sector filter (e.g. ["Banking", "IT"]) — matched case-insensitively.
+    sectors: Optional[List[str]] = None
+    # Optional investable capital in INR (used only for context in the narrative).
+    capital: Optional[float] = None
+
+
+class AdvisorEntryZone(BaseModel):
+    low: float = 0.0
+    high: float = 0.0
+
+
+class AdvisorRecommendation(BaseModel):
+    """Shape of a single stock recommendation returned by the advisor.
+
+    Constructed server-side to guarantee a stable, documented contract for the
+    frontend even when the AI narrative or live data degrades gracefully."""
+    symbol: str
+    name: str
+    sector: str = ""
+    confidence: int = 0            # 0-100 technical conviction
+    risk: str = "Medium"          # "Low" | "Medium" | "High"
+    expected_return_pct: float = 0.0
+    holding_period: str = ""      # human string tuned to the horizon
+    entry_zone: AdvisorEntryZone = Field(default_factory=AdvisorEntryZone)
+    stop_loss: float = 0.0
+    targets: List[float] = Field(default_factory=list)
+    technical_reasons: List[str] = Field(default_factory=list)
+    fundamental_reasons: List[str] = Field(default_factory=list)
+    news_impact: str = ""
+    sector_strength: str = ""
+    ai_summary: str = ""
+    # Supplementary context (real values that drove the recommendation)
+    price: float = 0.0
+    horizon: str = ""
+    rsi: Optional[float] = None
+    volume_ratio: Optional[float] = None
+    pattern: Optional[str] = None
+
+
 # --- Settings Models ---
 class UserSettingsUpdate(BaseModel):
     name: Optional[str] = None

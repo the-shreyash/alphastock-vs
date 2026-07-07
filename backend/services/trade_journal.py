@@ -69,33 +69,13 @@ async def get_performance_stats(db, user_id, days=7):
     }
 
 
-def _demo_setup_success_rates():
-    """Realistic demo/fallback data for users with no closed-trade history yet.
-
-    Deterministic so the chart stays stable across refreshes. Covers the full
-    win-rate colour range (green >60, amber 40-60, red <40) for a good preview.
-    """
-    setups = [
-        {"setup_type": "Bull Flag Breakout", "total_trades": 14, "winning_trades": 10,
-         "avg_pnl_percent": 3.4, "best_trade_pnl": 8420.0, "worst_trade_pnl": -1950.0},
-        {"setup_type": "Cup & Handle", "total_trades": 9, "winning_trades": 6,
-         "avg_pnl_percent": 2.1, "best_trade_pnl": 5100.0, "worst_trade_pnl": -2300.0},
-        {"setup_type": "VWAP Crossover", "total_trades": 11, "winning_trades": 5,
-         "avg_pnl_percent": 0.4, "best_trade_pnl": 3600.0, "worst_trade_pnl": -3100.0},
-        {"setup_type": "Reversal / Double Bottom", "total_trades": 7, "winning_trades": 2,
-         "avg_pnl_percent": -1.2, "best_trade_pnl": 2400.0, "worst_trade_pnl": -4200.0},
-    ]
-    for s in setups:
-        s["win_rate"] = round(s["winning_trades"] / s["total_trades"] * 100, 1)
-    return {"setups": setups, "is_demo": True}
-
-
 async def get_setup_success_rates(db, user_id):
     """Historical success rate grouped by trade setup type.
 
     Returns per-setup stats (total_trades, winning_trades, win_rate %,
-    avg_pnl_percent, best_trade_pnl, worst_trade_pnl). Falls back to demo
-    data when the user has no closed trades or no setup_type tagging yet.
+    avg_pnl_percent, best_trade_pnl, worst_trade_pnl). Returns an empty
+    list when the user has no closed trades or no setup_type tagging yet —
+    the frontend should show an appropriate empty state.
     """
     all_trades = await db.trades.find({"user_id": user_id}).to_list(500)
     closed = [t for t in all_trades if t.get("status") != "OPEN"]
@@ -109,7 +89,11 @@ async def get_setup_success_rates(db, user_id):
         groups.setdefault(setup, []).append(t)
 
     if not groups:
-        return _demo_setup_success_rates()
+        return {
+            "setups": [],
+            "is_demo": False,
+            "empty_reason": "Close some trades and tag them with a setup type to see your performance history.",
+        }
 
     setups = []
     for setup_type, trades_list in groups.items():

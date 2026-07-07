@@ -131,10 +131,26 @@ export default function StockDetail() {
   const [patternsLoading, setPatternsLoading] = useState(false);
   const [patternsError, setPatternsError] = useState(null);
 
+  // Watchlist state
+  const [inWatchlist, setInWatchlist] = useState(false);
+  const [watchlistLoading, setWatchlistLoading] = useState(false);
+
   useEffect(() => {
     if (!symbol) return;
     fetchData();
     fetchPatterns();
+    checkWatchlist();
+
+    // Track recently viewed stocks for the Dashboard widget
+    try {
+      const key = "sa_recent_stocks";
+      const max = 6;
+      const stored = JSON.parse(localStorage.getItem(key) || "[]");
+      const filtered = stored.filter((s) => s.symbol !== symbol);
+      const updated = [{ symbol, viewedAt: Date.now() }, ...filtered].slice(0, max);
+      localStorage.setItem(key, JSON.stringify(updated));
+    } catch { /* localStorage unavailable */ }
+
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [symbol, period]);
 
@@ -165,6 +181,33 @@ export default function StockDetail() {
       setPatternsError("Could not load pattern data.");
     } finally {
       setPatternsLoading(false);
+    }
+  };
+
+  const checkWatchlist = async () => {
+    try {
+      const { data } = await api.get("/watchlist");
+      const symbols = (data || []).map((w) => (w.symbol || "").toUpperCase());
+      setInWatchlist(symbols.includes((symbol || "").toUpperCase()));
+    } catch {
+      // Not logged in or watchlist unavailable — leave as false
+    }
+  };
+
+  const toggleWatchlist = async () => {
+    setWatchlistLoading(true);
+    try {
+      if (inWatchlist) {
+        await api.delete(`/watchlist/${symbol}`);
+        setInWatchlist(false);
+      } else {
+        await api.post("/watchlist", { symbol: symbol.toUpperCase() });
+        setInWatchlist(true);
+      }
+    } catch (err) {
+      console.error("Watchlist toggle error:", err);
+    } finally {
+      setWatchlistLoading(false);
     }
   };
 
@@ -221,8 +264,15 @@ export default function StockDetail() {
               {isPos ? "+" : ""}₹{formatNumber(Math.abs(quote.change))} ({isPos ? "+" : ""}{quote.change_pct?.toFixed(2)}%)
             </div>
           </div>
-          <button className="btn-secondary btn-sm hidden sm:inline-flex" title="Add to Watchlist">
-            <Star size={13} /> Watchlist
+          <button
+            onClick={toggleWatchlist}
+            disabled={watchlistLoading}
+            className={`btn-secondary btn-sm hidden sm:inline-flex transition-all ${inWatchlist ? "!bg-[var(--accent)]/15 !border-[var(--accent)]" : ""}`}
+            title={inWatchlist ? "Remove from Watchlist" : "Add to Watchlist"}
+            style={inWatchlist ? { color: "var(--accent)" } : undefined}
+          >
+            <Star size={13} fill={inWatchlist ? "currentColor" : "none"} />
+            {watchlistLoading ? "..." : inWatchlist ? "Watching" : "Watchlist"}
           </button>
           <button className="btn-primary btn-sm hidden sm:inline-flex">
             <Brain size={13} /> AI Analysis

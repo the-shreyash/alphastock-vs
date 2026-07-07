@@ -8,11 +8,11 @@ import json
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor
 
+from services.cache import cache_get, cache_set
+
 logger = logging.getLogger(__name__)
 executor = ThreadPoolExecutor(max_workers=5)
 
-# Cache for real market data
-_cache = {}
 CACHE_TTL = 60  # 1 minute cache for live data, longer when market closed
 
 ALPHA_VANTAGE_BASE = "https://www.alphavantage.co/query"
@@ -36,23 +36,12 @@ INDEX_TICKERS = {
     "NIFTY": "^NSEI",
     "BANKNIFTY": "^NSEBANK",
     "SENSEX": "^BSESN",
+    "INDIAVIX": "^INDIAVIX",
 }
 
 
 def _get_av_key():
     return os.environ.get("ALPHA_VANTAGE_KEY", "").strip()
-
-
-def _get_cache(key, ttl=CACHE_TTL):
-    if key in _cache:
-        entry = _cache[key]
-        if (datetime.now(timezone.utc) - entry["ts"]).total_seconds() < ttl:
-            return entry["data"]
-    return None
-
-
-def _set_cache(key, data):
-    _cache[key] = {"data": data, "ts": datetime.now(timezone.utc)}
 
 
 async def fetch_yahoo_quote(symbol: str, range_str: str = "2d"):
@@ -75,7 +64,7 @@ async def fetch_yahoo_quote(symbol: str, range_str: str = "2d"):
             yahoo_ticker = f"{symbol.upper()}.NS"
 
     cache_key = f"yahoo_{yahoo_ticker}_{range_str}"
-    cached = _get_cache(cache_key)
+    cached = await cache_get(cache_key)
     if cached:
         return cached
 
@@ -125,7 +114,7 @@ async def fetch_yahoo_quote(symbol: str, range_str: str = "2d"):
                 "historical_opens": opens,
                 "historical_timestamps": raw_timestamps,
             }
-            _set_cache(cache_key, quote)
+            await cache_set(cache_key, quote, CACHE_TTL)
             return quote
     except Exception as e:
         logger.error(f"Yahoo Finance error for {symbol}: {e}")
@@ -137,10 +126,51 @@ async def fetch_real_index(index_name: str):
     return await fetch_yahoo_quote(index_name)
 
 
+def compute_market_breadth(quotes):
+    """Advance/decline breadth over the tracked universe of live quotes.
+    Derived from real prices — returns None when no live quotes are available."""
+    changes = [q.get("change_pct") for q in (quotes or []) if q and q.get("change_pct") is not None]
+    if not changes:
+        return None
+    advances = sum(1 for c in changes if c > 0)
+    declines = sum(1 for c in changes if c < 0)
+    unchanged = len(changes) - advances - declines
+    return {
+        "advances": advances,
+        "declines": declines,
+        "unchanged": unchanged,
+        "coverage": "nifty50_sample",
+    }
+
+
+def compute_market_sentiment(breadth, nifty_change_pct):
+    """Deterministic 0-100 sentiment from real breadth + Nifty day change.
+    Returns None when breadth is unavailable."""
+    if not breadth:
+        return None
+    total = breadth["advances"] + breadth["declines"]
+    if total == 0:
+        return None
+    breadth_score = breadth["advances"] / total * 100
+    # Nifty change contributes ±20 points, clamped at ±2%
+    nifty_score = max(-20.0, min(20.0, (nifty_change_pct or 0) * 10))
+    return int(max(0, min(100, round(breadth_score * 0.8 + 50 * 0.2 + nifty_score))))
+
+
+async def fetch_india_vix():
+    """Live India VIX from Yahoo Finance (^INDIAVIX). None when unavailable."""
+    data = await fetch_yahoo_quote("INDIAVIX")
+    if not data or not data.get("price"):
+        return None
+    return round(data["price"], 2)
+
+
 async def fetch_real_market_overview():
-    """Fetch real market overview with actual index values."""
+    """Fetch real market overview with actual index values, live India VIX and
+    breadth/sentiment derived from live universe quotes. Fields with no live
+    data are None — never simulated. Returns None only if every index fails."""
     cache_key = "market_overview_real"
-    cached = _get_cache(cache_key, ttl=30)
+    cached = await cache_get(cache_key)
     if cached:
         return cached
 
@@ -148,26 +178,38 @@ async def fetch_real_market_overview():
         from services.activity_logger import log_activity
         log_activity("Fetching live Nifty/BankNifty data", "scan", "done")
 
-        nifty, banknifty, sensex = await asyncio.gather(
+        nifty, banknifty, sensex, vix, universe = await asyncio.gather(
             fetch_yahoo_quote("NIFTY"),
             fetch_yahoo_quote("BANKNIFTY"),
             fetch_yahoo_quote("SENSEX"),
+            fetch_india_vix(),
+            fetch_all_universe_quotes(),
             return_exceptions=True,
         )
 
-        def _fmt(data, fallback_val):
+        def _fmt(data):
             if isinstance(data, Exception) or data is None:
-                return {"value": fallback_val, "change": 0, "change_pct": 0}
-            return {"value": data["price"], "change": data["change"], "change_pct": data["change_pct"]}
+                return {"value": None, "change": None, "change_pct": None, "available": False}
+            return {"value": data["price"], "change": data["change"], "change_pct": data["change_pct"], "available": True}
+
+        indices = {"nifty": _fmt(nifty), "bank_nifty": _fmt(banknifty), "sensex": _fmt(sensex)}
+        if not any(v["available"] for v in indices.values()):
+            return None
+
+        if isinstance(universe, Exception):
+            universe = []
+        breadth = compute_market_breadth(universe)
+        nifty_chg = indices["nifty"]["change_pct"]
 
         overview = {
-            "nifty": _fmt(nifty, 24180),
-            "bank_nifty": _fmt(banknifty, 52340),
-            "sensex": _fmt(sensex, 79820),
+            **indices,
+            "india_vix": vix if not isinstance(vix, Exception) else None,
+            "market_sentiment": compute_market_sentiment(breadth, nifty_chg),
+            "advance_decline": breadth,
             "market_status": "OPEN" if (isinstance(nifty, dict) and nifty.get("market_state") == "REGULAR") else "CLOSED",
             "source": "yahoo_finance",
         }
-        _set_cache(cache_key, overview)
+        await cache_set(cache_key, overview, 30)
         return overview
     except Exception as e:
         logger.error(f"Real market overview error: {e}")
@@ -494,7 +536,7 @@ async def detect_chart_patterns(symbol: str) -> dict:
     Returns a dict with 'patterns' list and 'summary'.
     """
     cache_key = f"patterns_{symbol.upper()}"
-    cached = _get_cache(cache_key, ttl=300)  # 5-minute cache
+    cached = await cache_get(cache_key)  # 5-minute cache
     if cached:
         return cached
 
@@ -574,7 +616,7 @@ async def detect_chart_patterns(symbol: str) -> dict:
         "bearish_count": bearish_count,
         "data_points": min_len,
     }
-    _set_cache(cache_key, result)
+    await cache_set(cache_key, result, 300)
     return result
 
 
@@ -583,7 +625,7 @@ async def fetch_all_universe_quotes():
     from market_data import STOCK_UNIVERSE
     
     cache_key = "all_universe_quotes_2d"
-    cached = _get_cache(cache_key, ttl=30)
+    cached = await cache_get(cache_key)
     if cached:
         return cached
 
@@ -593,18 +635,17 @@ async def fetch_all_universe_quotes():
     quotes = []
     for s, res in zip(STOCK_UNIVERSE, results):
         if isinstance(res, Exception) or res is None:
-            # Fallback to simulated quote
-            from market_data import get_stock_quote as mock_quote
-            mq = mock_quote(s["symbol"])
-            quotes.append(mq)
-        else:
-            # Add sector and name from universe
-            res["name"] = s["name"]
-            res["sector"] = s["sector"]
-            res["symbol"] = s["symbol"]
-            quotes.append(res)
-            
-    _set_cache(cache_key, quotes)
+            # Live quote unavailable — skip. Never substitute simulated data.
+            continue
+        # Add sector and name from universe metadata
+        res["name"] = s["name"]
+        res["sector"] = s["sector"]
+        res["symbol"] = s["symbol"]
+        quotes.append(res)
+
+    if not quotes:
+        return []  # do not cache an empty result — retry on next call
+    await cache_set(cache_key, quotes, 30)
     return quotes
 
 
@@ -661,21 +702,12 @@ async def fetch_real_global_markets():
     
     markets = []
     for name, res in zip(names, results):
+        region = "US" if "S&P" in name or "Nasdaq" in name or "Dow" in name else ("UK" if "FTSE" in name else "Asia")
         if isinstance(res, Exception) or res is None:
-            # Fallback
-            markets.append({
-                "name": name,
-                "region": "US" if "S&P" in name or "Nasdaq" in name or "Dow" in name else ("UK" if "FTSE" in name else "Asia"),
-                "value": 0.0,
-                "change_pct": 0.0
-            })
+            # Explicitly unavailable — never simulated
+            markets.append({"name": name, "region": region, "value": None, "change_pct": None, "available": False})
         else:
-            markets.append({
-                "name": name,
-                "region": "US" if "S&P" in name or "Nasdaq" in name or "Dow" in name else ("UK" if "FTSE" in name else "Asia"),
-                "value": res["price"],
-                "change_pct": res["change_pct"]
-            })
+            markets.append({"name": name, "region": region, "value": res["price"], "change_pct": res["change_pct"], "available": True})
     return markets
 
 
@@ -697,20 +729,10 @@ async def fetch_real_commodities():
     for key, res in zip(keys, results):
         info = commodity_tickers[key]
         if isinstance(res, Exception) or res is None:
-            # Fallback
-            response[key] = {
-                "name": info["name"],
-                "value": 0.0,
-                "unit": info["unit"],
-                "change_pct": 0.0
-            }
+            # Explicitly unavailable — never simulated
+            response[key] = {"name": info["name"], "value": None, "unit": info["unit"], "change_pct": None, "available": False}
         else:
-            response[key] = {
-                "name": info["name"],
-                "value": res["price"],
-                "unit": info["unit"],
-                "change_pct": res["change_pct"]
-            }
+            response[key] = {"name": info["name"], "value": res["price"], "unit": info["unit"], "change_pct": res["change_pct"], "available": True}
     return response
 
 
@@ -728,15 +750,13 @@ async def fetch_real_chart_data(symbol: str, period: str = "1D"):
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
             if resp.status_code != 200:
-                # Fallback to simulated chart data
-                from market_data import get_chart_data as mock_chart
-                return mock_chart(symbol, period)
-                
+                # Live chart unavailable — return empty, never simulated candles
+                return []
+
             data = resp.json()
             result = data.get("chart", {}).get("result", [])
             if not result:
-                from market_data import get_chart_data as mock_chart
-                return mock_chart(symbol, period)
+                return []
                 
             timestamps = result[0].get("timestamp", [])
             indicators = result[0].get("indicators", {}).get("quote", [{}])[0]
@@ -773,14 +793,13 @@ async def fetch_real_chart_data(symbol: str, period: str = "1D"):
             return chart_candles
     except Exception as e:
         logger.error(f"Error fetching real chart data for {symbol}: {e}")
-        from market_data import get_chart_data as mock_chart
-        return mock_chart(symbol, period)
+        return []
 
 
 async def fetch_real_top_picks(count=3):
     """Fetch live data for all stocks, analyze technically, and select top picks."""
     cache_key = "real_top_picks"
-    cached = _get_cache(cache_key, ttl=1800)  # 30-minute cache
+    cached = await cache_get(cache_key)  # 30-minute cache
     if cached:
         return cached
 
@@ -794,13 +813,25 @@ async def fetch_real_top_picks(count=3):
     for s, res in zip(STOCK_UNIVERSE, results):
         if isinstance(res, Exception) or res is None:
             continue
+        res.setdefault("name", s["name"])
+        res.setdefault("sector", s["sector"])
         valid_stocks.append(res)
-        
+
     if not valid_stocks:
-        # Fallback to simulated picks
-        from market_data import generate_top_picks as mock_picks
-        return {"picks": mock_picks(count)}
-        
+        # Live data unavailable — return explicit unavailable, never simulated picks
+        return {
+            "picks": [],
+            "available": False,
+            "note": "Live market data is temporarily unavailable. Picks will resume once Yahoo Finance is reachable.",
+        }
+
+    # Real sector performance for per-pick sector change
+    try:
+        sector_perf = await fetch_real_sectors()
+    except Exception:
+        sector_perf = []
+    sector_change_map = {sp["sector"]: sp.get("change_pct") for sp in sector_perf}
+
     # 2. Score each stock
     scored_stocks = []
     for s in valid_stocks:
@@ -878,7 +909,7 @@ async def fetch_real_top_picks(count=3):
                 {"pattern": p["pattern"], "signal": p["signal"]}
                 for p in patterns_list[:2]
             ],
-            "sector_change": 1.2, # approximate placeholder
+            "sector_change": sector_change_map.get(s.get("sector")),
             "risk_level": "LOW" if confidence > 82 else ("MEDIUM" if confidence > 72 else "HIGH"),
             "reasons": reasons if len(reasons) >= 2 else reasons + [f"Price action is above key support level", f"Consolidating near recent highs"],
             "risk_factors": [
@@ -890,8 +921,8 @@ async def fetch_real_top_picks(count=3):
         
     # Sort by confidence/score
     picks = sorted(scored_stocks, key=lambda x: x["confidence"], reverse=True)[:count]
-    result = {"picks": picks}
-    _set_cache(cache_key, result)
+    result = {"picks": picks, "available": True}
+    await cache_set(cache_key, result, 1800)
     return result
 
 
@@ -911,7 +942,7 @@ async def fetch_real_fii_dii() -> dict:
     """
     global _last_fii_dii
     cache_key = "real_fii_dii"
-    cached = _get_cache(cache_key, ttl=14400)  # 4 hour cache
+    cached = await cache_get(cache_key)  # 4 hour cache
     if cached:
         return cached
 
@@ -963,7 +994,7 @@ async def fetch_real_fii_dii() -> dict:
                     "source": "nse_india",
                 }
                 _last_fii_dii = data
-                _set_cache(cache_key, data)
+                await cache_set(cache_key, data, 14400)
                 logger.info(f"Real FII/DII data fetched: FII net={data['fii']['net']}Cr")
                 return data
     except Exception as e:
@@ -974,11 +1005,69 @@ async def fetch_real_fii_dii() -> dict:
         logger.info("Returning last known FII/DII data (API unavailable)")
         return {**_last_fii_dii, "source": "cached_last_known"}
 
-    # Ultimate fallback: zeroes clearly labelled as unavailable
+    # Ultimate fallback: explicitly unavailable — no values at all
     return {
-        "fii": {"net": 0.0, "buy": 0.0, "sell": 0.0},
-        "dii": {"net": 0.0, "buy": 0.0, "sell": 0.0},
+        "fii": {"net": None, "buy": None, "sell": None},
+        "dii": {"net": None, "buy": None, "sell": None},
         "date": today,
+        "available": False,
         "source": "unavailable",
         "note": "Real-time FII/DII data temporarily unavailable. NSE updates this after market close.",
     }
+
+
+# ─────────────────────────────────────────────────────────────
+# LIVE STOCK SEARCH (Yahoo Finance)
+# ─────────────────────────────────────────────────────────────
+
+async def search_yahoo_stocks(query: str, limit: int = 10):
+    """Search Indian equities (NSE/BSE) via Yahoo Finance's search API.
+    Returns a list of {symbol, name, sector, exchange}. None on API failure
+    (caller decides the fallback), [] for a valid empty result."""
+    q = (query or "").strip()
+    if not q:
+        return []
+
+    cache_key = f"yahoo_search_{q.lower()}"
+    cached = await cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    try:
+        url = "https://query1.finance.yahoo.com/v1/finance/search"
+        params = {"q": q, "quotesCount": 20, "newsCount": 0, "listsCount": 0}
+        async with httpx.AsyncClient(timeout=8) as client:
+            resp = await client.get(url, params=params, headers={"User-Agent": "Mozilla/5.0"})
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+    except Exception as e:
+        logger.error(f"Yahoo search error for '{q}': {e}")
+        return None
+
+    from market_data import get_stock_meta
+    results = []
+    for item in data.get("quotes", []):
+        if item.get("quoteType") != "EQUITY":
+            continue
+        exchange = item.get("exchange", "")
+        if exchange not in ("NSI", "BSE"):  # Indian listings only
+            continue
+        raw_symbol = item.get("symbol", "")
+        symbol = raw_symbol.replace(".NS", "").replace(".BO", "").upper()
+        meta = get_stock_meta(symbol)
+        results.append({
+            "symbol": symbol,
+            "name": item.get("longname") or item.get("shortname") or symbol,
+            "sector": (meta or {}).get("sector") or item.get("sectorDisp") or item.get("sector") or "",
+            "exchange": "NSE" if exchange == "NSI" else "BSE",
+        })
+        if len(results) >= limit:
+            break
+
+    # Deduplicate NSE/BSE dual listings by symbol (prefer first = higher relevance)
+    seen = set()
+    unique = [r for r in results if not (r["symbol"] in seen or seen.add(r["symbol"]))]
+
+    await cache_set(cache_key, unique, 3600)
+    return unique

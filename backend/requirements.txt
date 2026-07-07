@@ -1,4 +1,4 @@
-aiohappyeyeballs==2.6.2
+aiohappyeyeballs>=2.6.1
 aiohttp==3.13.5
 aiohttp-retry==2.9.1
 aiosignal==1.4.0
@@ -96,6 +96,7 @@ python-jose==3.5.0
 python-multipart==0.0.29
 pytokens==0.4.1
 PyYAML==6.0.3
+redis==5.0.8
 referencing==0.37.0
 regex==2026.5.9
 requests==2.34.2
