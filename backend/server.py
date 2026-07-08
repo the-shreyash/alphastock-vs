@@ -40,6 +40,7 @@ from models import (
     ChatMessage, ChatResponse,
     StockAnalysisRequest, SIPRequest,
     AdvisorRequest, AdvisorRecommendation, AdvisorEntryZone,
+    AIMemoryUpdate, LearnRequest, TradeReviewRequest,
 )
 from market_data import get_stock_meta, search_stocks, STOCK_UNIVERSE
 # NOTE: market_data contains ONLY factual reference metadata (symbols, company
@@ -201,39 +202,39 @@ async def ai_dual_debate(prompt: str, session_id: str = "default"):
         }
 
 async def ai_chat(message: str, session_id: str, user_context: dict):
-    """AI chat assistant — uses Claude as primary, Gemini as fallback."""
-    engine = get_debate_engine()
-    system_msg = f"""You are AlphaPartner, a professional Indian stock market AI assistant.
-You have deep knowledge of NSE/BSE markets, technical analysis (RSI, MACD, VWAP, Bollinger Bands),
-intraday trading strategies, risk management, and mutual funds/SIP investing.
+    """AI chat assistant (Personal Investment Assistant).
 
-Current user context:
-- Capital: INR {user_context.get('capital', 100000)}
-- Risk Level: {user_context.get('risk_level', 'moderate')}
+    Uses the centralized Prompt Library (`ai_chat` prompt) + AI Memory so the
+    assistant reasons with what it remembers about the user, and routes the call
+    through the Model Router (Claude-preferred for chat). Conversation memory is
+    the last 10 turns of this session, matching AI_AGENT_SYSTEM.md → AI Memory.
+    """
+    from services.prompt_library import get_prompt
+    from services.model_router import get_model_router
+    from services.ai_memory import get_user_memory, build_memory_context
+    from services.ai_provider import AIMessage
 
-Rules:
-- Be encouraging but honest
-- Explain technical terms simply
-- Prioritize risk management
-- Never guarantee profits
-- Use INR currency format
-- Keep responses concise and actionable"""
+    router = get_model_router()
     try:
-        # Load last 10 messages from DB to provide context
+        memory = await get_user_memory(db, user_context.get("_id"))
+        memory_ctx = build_memory_context(user_context, memory)
+    except Exception as e:
+        logging.warning(f"AI chat memory load failed: {e}")
+        memory_ctx = ""
+
+    system_msg = get_prompt("ai_chat", memory=memory_ctx)
+
+    try:
+        # Conversation memory: last 10 messages of this session for continuity.
         history = await db.chat_messages.find({"session_id": session_id}).sort("created_at", -1).to_list(10)
         history.reverse()
-        
-        from services.ai_provider import AIMessage
-        messages_list = []
-        for h in history:
-            messages_list.append(AIMessage(role=h["role"], content=h["content"]))
+        messages_list = [AIMessage(role=h["role"], content=h["content"]) for h in history]
         messages_list.append(AIMessage(role="user", content=message))
-        
-        return await engine.simple_chat(system_msg, messages_list, prefer="claude", max_tokens=800)
+        return await router.run_raw(system_msg, messages_list, prefer="claude", max_tokens=800)
     except Exception as e:
         logging.error(f"AI chat error with history: {e}")
         try:
-            return await engine.simple_chat(system_msg, message, prefer="claude", max_tokens=800)
+            return await router.run_raw(system_msg, message, prefer="claude", max_tokens=800)
         except Exception as err:
             return f"AI temporarily unavailable. Error: {str(err)}"
 
@@ -716,6 +717,7 @@ notifications_router = APIRouter(prefix="/api/notifications", tags=["Notificatio
 sip_router = APIRouter(prefix="/api/sip", tags=["SIP"])
 advisor_router = APIRouter(prefix="/api/advisor", tags=["AI Investment Advisor"])
 chat_router = APIRouter(prefix="/api/chat", tags=["Chat"])
+ai_router = APIRouter(prefix="/api/ai", tags=["AI Workspace"])
 paper_router = APIRouter(prefix="/api/paper", tags=["Paper Trading"])
 backtest_router = APIRouter(prefix="/api/backtest", tags=["Backtesting"])
 watchlist_router = APIRouter(prefix="/api/watchlist", tags=["Watchlist"])
@@ -1066,6 +1068,59 @@ async def stock_patterns(symbol: str):
     return result
 
 
+# ── Stock Details (Sprint 5) — live quoteSummary/chart-derived panels.
+# Routes stay thin; all logic lives in services.stock_details. Each service
+# returns None for an unknown symbol (→ 404) and an explicit
+# {"available": false, "note": ...} payload when the live source is down.
+
+def _stock_section_or_404(result):
+    if result is None:
+        raise HTTPException(status_code=404, detail="Stock not found")
+    return result
+
+@stocks_router.get("/{symbol}/profile")
+async def stock_profile(symbol: str):
+    """Company profile (Yahoo quoteSummary assetProfile)."""
+    from services.stock_details import get_stock_profile
+    return _stock_section_or_404(await get_stock_profile(symbol))
+
+@stocks_router.get("/{symbol}/fundamentals")
+async def stock_fundamentals(symbol: str):
+    """Grouped fundamentals: valuation, per-share, profitability, growth, health, market."""
+    from services.stock_details import get_stock_fundamentals
+    return _stock_section_or_404(await get_stock_fundamentals(symbol))
+
+@stocks_router.get("/{symbol}/financials")
+async def stock_financials(symbol: str, statement: str = "income", period: str = "annual"):
+    """Income / balance-sheet / cash-flow statements (annual or quarterly), ₹ Cr."""
+    from services.stock_details import get_stock_financials, VALID_STATEMENTS, VALID_PERIODS
+    if statement not in VALID_STATEMENTS or period not in VALID_PERIODS:
+        raise HTTPException(status_code=400, detail=f"statement must be one of {VALID_STATEMENTS}, period one of {VALID_PERIODS}")
+    return _stock_section_or_404(await get_stock_financials(symbol, statement, period))
+
+@stocks_router.get("/{symbol}/peers")
+async def stock_peers(symbol: str):
+    """Same-sector peers from the stock universe with live quotes."""
+    from services.stock_details import get_stock_peers
+    return _stock_section_or_404(await get_stock_peers(symbol))
+
+@stocks_router.get("/{symbol}/levels")
+async def stock_levels(symbol: str):
+    """Pivot points + clustered swing support/resistance from 3-month history."""
+    from services.stock_details import get_stock_levels
+    return _stock_section_or_404(await get_stock_levels(symbol))
+
+@stocks_router.get("/{symbol}/trade-setup")
+async def stock_trade_setup(symbol: str):
+    """Education-first trade setup: entry/SL/targets from levels + ATR + indicators."""
+    from services.stock_details import get_trade_setup
+    return _stock_section_or_404(await get_trade_setup(symbol))
+
+@stocks_router.get("/{symbol}/risk")
+async def stock_risk(symbol: str):
+    """Risk profile: volatility, beta vs Nifty, drawdown, ATR, weighted risk score."""
+    from services.stock_details import get_risk_analysis
+    return _stock_section_or_404(await get_risk_analysis(symbol))
 
 
 @analysis_router.get("/top-picks")
@@ -1095,6 +1150,16 @@ async def top_picks():
 
 @analysis_router.post("/explain")
 async def explain_stock(data: StockAnalysisRequest):
+    # AI debates are expensive — cache per symbol per day (4h TTL);
+    # `force: true` bypasses for an explicit re-run.
+    from services.cache import cache_get, cache_set
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    explain_cache_key = f"ai_explain_{data.symbol.upper()}_{today}"
+    if not data.force:
+        cached = await cache_get(explain_cache_key)
+        if cached:
+            return cached
+
     quote = await real_quote(data.symbol)
     if not quote:
         if not get_stock_meta(data.symbol):
@@ -1113,7 +1178,11 @@ VWAP: {quote['vwap']}
 Explain: WHY this stock could be a good trade, momentum factors, entry reasoning, risks, and what to watch after entering. Simple language, bullet points, under 200 words."""
 
     result = await ai_dual_debate(prompt, f"explain-{data.symbol}")
-    return {"symbol": data.symbol, "name": name, "quote": quote, **result}
+    response = {"symbol": data.symbol, "name": name, "quote": quote, **result}
+    # Only cache successful debates — never a provider-failure payload
+    if result.get("providers_active"):
+        await cache_set(explain_cache_key, response, 14400)
+    return response
 
 @analysis_router.get("/morning-report")
 async def morning_report():
@@ -1613,6 +1682,234 @@ async def chat_history(user: dict = Depends(get_current_user), session_id: str =
     for m in messages:
         m["_id"] = str(m["_id"])
     return messages
+
+
+# ============ AI WORKSPACE ROUTES ============
+# The AI Workspace (Sprint 6) unifies Chat, Memory, Conversation History,
+# Trade Review, Learning, Portfolio AI, the Activity Timeline and the Model
+# Router behind one namespace. Every AI call here flows through the Model
+# Router + centralized Prompt Library (services/model_router.py,
+# services/prompt_library.py) so behaviour stays consistent and auditable.
+
+def _ai_online() -> bool:
+    return claude_configured() or gemini_configured()
+
+
+def _summarize_trade_for_review(t: dict) -> str:
+    """Build a factual, number-only summary of a trade for the review prompt.
+
+    Feeds the AI ONLY real values from the trade document — never invented
+    context — honouring the no-fabrication rule in PROMPT.md."""
+    pnl = t.get("pnl")
+    pnl_pct = t.get("pnl_percent")
+    return (
+        f"Symbol: {t.get('symbol')} ({t.get('stock_name', '')})\n"
+        f"Direction: {t.get('type', 'BUY')}\n"
+        f"Entry: ₹{t.get('entry_price')}  Exit: ₹{t.get('exit_price')}\n"
+        f"Quantity: {t.get('quantity')}\n"
+        f"Stop loss: ₹{t.get('stop_loss')}  Target: ₹{t.get('target1')}\n"
+        f"Result: P&L ₹{pnl if pnl is not None else 'n/a'} "
+        f"({pnl_pct if pnl_pct is not None else 'n/a'}%)\n"
+        f"Setup: {t.get('setup_type') or 'unspecified'}\n"
+        f"Status: {t.get('status', 'CLOSED')}\n"
+        f"User notes: {t.get('notes') or 'none'}"
+    )
+
+
+@ai_router.get("/status")
+async def ai_status():
+    """Model Router + provider health and the task→model routing table.
+
+    Powers the frontend model-status pill and the AI Activity header. Public
+    (no auth) so the workspace can render an honest offline state pre-login."""
+    from services.model_router import get_model_router
+    return get_model_router().status()
+
+
+@ai_router.get("/prompts")
+async def ai_prompts():
+    """List the centralized Prompt Library (metadata only, no templates).
+
+    Transparency + prompt-testing surface required by PROMPT.md → Prompt
+    Testing. Never exposes the raw prompt text (Forbidden Behaviors)."""
+    from services.prompt_library import list_prompts, LIBRARY_VERSION
+    return {"version": LIBRARY_VERSION, "prompts": list_prompts()}
+
+
+@ai_router.get("/activity")
+async def ai_activity():
+    """AI Activity Timeline — the truthful running/done trace of background AI
+    work (heartbeat engine, scans, monitoring). Reuses the activity logger."""
+    from services.activity_logger import get_recent_activity
+    return get_recent_activity()
+
+
+@ai_router.get("/memory")
+async def ai_get_memory(user: dict = Depends(get_current_user)):
+    """Return what the AI remembers about the user (User Memory)."""
+    from services.ai_memory import get_user_memory
+    return await get_user_memory(db, user["_id"])
+
+
+@ai_router.put("/memory")
+async def ai_update_memory(data: AIMemoryUpdate, user: dict = Depends(get_current_user)):
+    """Update the user's AI memory (risk, goals, sectors, favourites, notes)."""
+    from services.ai_memory import update_user_memory
+    return await update_user_memory(db, user["_id"], data.model_dump(exclude_none=True))
+
+
+@ai_router.get("/conversations")
+async def ai_list_conversations(user: dict = Depends(get_current_user)):
+    """List the user's chat sessions (Conversation History), newest first."""
+    from services.ai_memory import list_conversations
+    return await list_conversations(db, user["_id"])
+
+
+@ai_router.post("/conversations")
+async def ai_new_conversation(user: dict = Depends(get_current_user)):
+    """Start a new conversation and return its session id.
+
+    Sessions are lazily materialised by the first message, so this simply mints
+    an id the frontend can use immediately."""
+    return {"session_id": f"chat-{user['_id']}-{int(datetime.now(timezone.utc).timestamp())}"}
+
+
+@ai_router.delete("/conversations/{session_id}")
+async def ai_delete_conversation(session_id: str, user: dict = Depends(get_current_user)):
+    """Delete a conversation and all of its messages (owned by the user only)."""
+    from services.ai_memory import delete_conversation
+    deleted = await delete_conversation(db, user["_id"], session_id)
+    return {"session_id": session_id, "deleted": deleted}
+
+
+@ai_router.post("/learn")
+async def ai_learn(data: LearnRequest, user: dict = Depends(get_current_user)):
+    """Learning Mentor — teach a concept in beginner-friendly language."""
+    from services.model_router import get_model_router
+    from services.activity_logger import log_activity
+    log_activity(f"Teaching concept: {data.topic}", "monitor", "running")
+    router = get_model_router()
+    result = await router.run(
+        "learning_mentor",
+        f"Teach me about: {data.topic}",
+        level=data.level,
+        max_tokens=700,
+    )
+    log_activity(f"Explained concept: {data.topic}", "monitor", "done")
+    return {"topic": data.topic, "level": data.level, **result}
+
+
+@ai_router.post("/trade-review")
+async def ai_trade_review(data: TradeReviewRequest, user: dict = Depends(get_current_user)):
+    """Trading Coach — review a closed trade (entry/exit/risk/execution).
+
+    Accepts either an existing `trade_id` (owned by the user) or a raw `trade`
+    dict for ad-hoc review. Persists the review on the trade document when a
+    trade_id is supplied so it is not regenerated on every view."""
+    from services.model_router import get_model_router
+    from services.activity_logger import log_activity
+
+    trade = None
+    if data.trade_id:
+        trade = await db.trades.find_one({"_id": ObjectId(data.trade_id), "user_id": user["_id"]})
+        if not trade:
+            raise HTTPException(status_code=404, detail="Trade not found")
+        if trade.get("status") == "OPEN":
+            raise HTTPException(status_code=400, detail="Reviews are only available for closed trades")
+        if trade.get("ai_review"):
+            return {"trade_id": data.trade_id, "cached": True, **trade["ai_review"]}
+    elif data.trade:
+        trade = data.trade
+    else:
+        raise HTTPException(status_code=400, detail="Provide trade_id or trade")
+
+    log_activity(f"Reviewing {trade.get('symbol')} trade", "monitor", "running")
+    router = get_model_router()
+    result = await router.run(
+        "trade_review",
+        _summarize_trade_for_review(trade),
+        max_tokens=600,
+    )
+    review = {"content": result["content"], "model_used": result["model_used"],
+              "symbol": trade.get("symbol")}
+    if data.trade_id:
+        await db.trades.update_one({"_id": ObjectId(data.trade_id)}, {"$set": {"ai_review": review}})
+    log_activity(f"Trade review ready for {trade.get('symbol')}", "monitor", "done")
+    return {"trade_id": data.trade_id, "cached": False, **review}
+
+
+@ai_router.post("/portfolio-review")
+async def ai_portfolio_review(user: dict = Depends(get_current_user)):
+    """Portfolio AI — narrative review of the user's holdings via the Portfolio
+    Manager prompt, grounded in live holdings + the deterministic health scan."""
+    from services.portfolio_monitor import analyze_portfolio_health
+    from services.model_router import get_model_router
+    from services.activity_logger import log_activity
+
+    portfolio = await get_portfolio(user)
+    if not portfolio:
+        return {
+            "content": "Your portfolio is empty. Add holdings to receive an AI review.",
+            "empty": True,
+            "holdings_count": 0,
+        }
+
+    quote_func = await prefetch_quote_func(user["_id"])
+    health = await analyze_portfolio_health(db, user["_id"], None, quote_func)
+
+    lines = [f"Capital: ₹{user.get('capital', 100000):,.0f}",
+             f"Risk level: {user.get('risk_level', 'moderate')}",
+             f"Holdings ({len(portfolio)}):"]
+    for h in portfolio[:25]:
+        lines.append(
+            f"- {h.get('symbol')}: qty {h.get('quantity')}, invested "
+            f"₹{h.get('invested', 0):,.0f}, current ₹{h.get('current_value', 0):,.0f}, "
+            f"P&L {h.get('pnl_pct', 0)}%"
+        )
+    if health:
+        lines.append(
+            f"Health scan: score {health.get('health_score', 'n/a')}/100, "
+            f"{health.get('at_risk', 0)} position(s) at risk, "
+            f"unrealised P&L ₹{health.get('total_unrealized_pnl', 0):,.0f}."
+        )
+    summary = "\n".join(lines)
+
+    log_activity("Reviewing portfolio allocation & risk", "monitor", "running")
+    router = get_model_router()
+    result = await router.run("portfolio_manager", summary, max_tokens=800)
+    log_activity("Portfolio AI review ready", "monitor", "done")
+    return {"holdings_count": len(portfolio), "health": health, **result}
+
+
+@ai_router.post("/reflect")
+async def ai_reflect(user: dict = Depends(get_current_user)):
+    """Reflection Engine — review recent closed trades, extract durable lessons
+    and store them in AI Memory so future advice is personalised."""
+    from services.model_router import get_model_router
+    from services.ai_memory import add_lesson
+    from services.activity_logger import log_activity
+
+    closed = await db.trades.find(
+        {"user_id": user["_id"], "status": {"$ne": "OPEN"}}
+    ).sort("exit_time", -1).to_list(10)
+    if not closed:
+        return {"content": "No closed trades yet — take a few trades and I'll reflect on your patterns.",
+                "lessons_added": 0}
+
+    summary = "Recent closed trades:\n" + "\n\n".join(
+        _summarize_trade_for_review(t) for t in closed
+    )
+    log_activity("Reflecting on recent trades", "rank", "running")
+    router = get_model_router()
+    result = await router.run("reflection", summary, max_tokens=500)
+
+    # Persist up to 3 concise lessons parsed from the reflection output.
+    lessons = [l.strip("-• \t") for l in (result["content"] or "").splitlines()
+               if l.strip().startswith(("-", "•")) and len(l.strip()) > 4][:3]
+    for lesson in lessons:
+        await add_lesson(db, user["_id"], lesson)
+    log_activity("Reflection complete — lessons saved", "rank", "done")
+    return {"lessons_added": len(lessons), "lessons": lessons, **result}
 
 
 # ============ SIP ROUTES ============
@@ -3018,6 +3315,7 @@ app.include_router(backtest_router)
 app.include_router(portfolio_router)
 app.include_router(notifications_router)
 app.include_router(chat_router)
+app.include_router(ai_router)
 app.include_router(sip_router)
 app.include_router(advisor_router)
 app.include_router(settings_router)

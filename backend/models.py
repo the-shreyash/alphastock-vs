@@ -119,6 +119,7 @@ class ChatResponse(BaseModel):
 class StockAnalysisRequest(BaseModel):
     symbol: str
     name: Optional[str] = None
+    force: bool = False  # bypass the per-day AI explain cache
 
 class SIPRequest(BaseModel):
     amount: float
@@ -178,6 +179,35 @@ class AdvisorRecommendation(BaseModel):
     rsi: Optional[float] = None
     volume_ratio: Optional[float] = None
     pattern: Optional[str] = None
+
+
+# --- AI Workspace Models ---
+# Powers the AI Workspace (Sprint 6). Memory + conversation + learning +
+# trade review flows are served by the /api/ai router and follow the
+# centralized Prompt Library (services/prompt_library.py).
+
+class AIMemoryUpdate(BaseModel):
+    """Editable slice of a user's AI memory (see services/ai_memory.py)."""
+    risk_preference: Optional[str] = None
+    goals: Optional[str] = None
+    preferred_sectors: Optional[List[str]] = None
+    favorite_companies: Optional[List[str]] = None
+    experience_level: Optional[str] = None
+    preferred_language: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class LearnRequest(BaseModel):
+    """Ask the Learning Mentor to teach a concept."""
+    topic: str
+    level: str = "beginner"  # beginner | intermediate | advanced
+
+
+class TradeReviewRequest(BaseModel):
+    """Review a closed trade. Either reference an existing trade by id, or pass
+    a raw trade dict for ad-hoc review (e.g. a paper/manual trade)."""
+    trade_id: Optional[str] = None
+    trade: Optional[dict] = None
 
 
 # --- Settings Models ---

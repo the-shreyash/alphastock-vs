@@ -114,6 +114,21 @@ class FakeCollection:
                 n += 1
         return _Result(modified=n, matched=n)
 
+    async def delete_one(self, flt):
+        for i, d in enumerate(self.docs):
+            if _match(d, flt or {}):
+                del self.docs[i]
+                return _Result(modified=1, matched=1)
+        return _Result(modified=0, matched=0)
+
+    async def delete_many(self, flt):
+        before = len(self.docs)
+        self.docs = [d for d in self.docs if not _match(d, flt or {})]
+        return _Result(modified=before - len(self.docs), matched=before - len(self.docs))
+
+    async def count_documents(self, flt=None):
+        return len([d for d in self.docs if _match(d, flt or {})])
+
     async def create_index(self, *args, **kwargs):
         return None
 

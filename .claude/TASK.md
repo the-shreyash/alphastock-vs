@@ -283,22 +283,30 @@ AI Intelligence
 
 Status
 
-NOT_STARTED
+COMPLETED
+
+Sprint 6 (AI Workspace) delivered the unified AI intelligence layer:
+centralized Prompt Library, Model Router, AI Memory, and the /api/ai
+namespace, wired into the AI Workspace frontend.
 
 ---
 
 Tasks
 
-- AI Chat
-- AI Memory
-- Morning Report
-- Portfolio Review
-- Stock Advisor
-- SIP Advisor
-- Trade Review
-- AI Debate
-- Reflection Engine
-- AI Activity Timeline
+- [x] AI Chat — Prompt-Library + Memory + Model Router (POST /api/chat)
+- [x] AI Memory — user memory + lessons (GET/PUT /api/ai/memory, services/ai_memory.py)
+- [x] Morning Report — page + heartbeat/scheduler (GET /api/analysis/morning-report)
+- [x] Portfolio Review — Portfolio AI (POST /api/ai/portfolio-review)
+- [x] Stock Advisor — AI Investment Advisor (POST /api/advisor/recommend)
+- [x] SIP Advisor — (POST /api/sip/recommend)
+- [x] Trade Review — Trading Coach (POST /api/ai/trade-review)
+- [x] AI Debate — dual-AI debate engine (services/ai_debate_engine.py)
+- [x] Reflection Engine — extracts + stores durable lessons (POST /api/ai/reflect)
+- [x] Learning Mentor — teach any concept (POST /api/ai/learn)
+- [x] Conversation History — sessions list/create/delete (/api/ai/conversations)
+- [x] Model Router — task→model routing + status (services/model_router.py, GET /api/ai/status)
+- [x] Prompt Library — centralized versioned prompts (services/prompt_library.py, GET /api/ai/prompts)
+- [x] AI Activity Timeline — live background-work feed (GET /api/ai/activity)
 
 ---
 

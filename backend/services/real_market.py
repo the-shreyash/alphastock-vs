@@ -44,11 +44,13 @@ def _get_av_key():
     return os.environ.get("ALPHA_VANTAGE_KEY", "").strip()
 
 
-async def fetch_yahoo_quote(symbol: str, range_str: str = "2d"):
-    """Fetch real-time quote from Yahoo Finance."""
-    # Check if it's already a properly formatted ticker (index, commodity, forex)
-    # Tickers starting with ^ (indices), ending with =F (futures), =X (forex),
-    # or already matching a known ticker map should NOT get .NS appended
+def resolve_yahoo_ticker(symbol: str) -> str:
+    """Map an app symbol to its Yahoo Finance ticker.
+
+    Tickers starting with ^ (indices), ending with =F (futures), =X (forex),
+    or already matching a known ticker map are passed through unchanged;
+    everything else is treated as an NSE equity and gets `.NS` appended.
+    Shared by the quote/chart clients here and services.stock_details."""
     already_formatted = (
         symbol.startswith("^") or
         symbol.endswith("=F") or
@@ -58,10 +60,13 @@ async def fetch_yahoo_quote(symbol: str, range_str: str = "2d"):
     )
     yahoo_ticker = YAHOO_TICKERS.get(symbol.upper()) or INDEX_TICKERS.get(symbol.upper())
     if not yahoo_ticker:
-        if already_formatted:
-            yahoo_ticker = symbol
-        else:
-            yahoo_ticker = f"{symbol.upper()}.NS"
+        yahoo_ticker = symbol if already_formatted else f"{symbol.upper()}.NS"
+    return yahoo_ticker
+
+
+async def fetch_yahoo_quote(symbol: str, range_str: str = "2d"):
+    """Fetch real-time quote from Yahoo Finance."""
+    yahoo_ticker = resolve_yahoo_ticker(symbol)
 
     cache_key = f"yahoo_{yahoo_ticker}_{range_str}"
     cached = await cache_get(cache_key)
@@ -93,6 +98,12 @@ async def fetch_yahoo_quote(symbol: str, range_str: str = "2d"):
             lows = [l for l in indicators.get("low", []) if l is not None]
             volumes = [v for v in indicators.get("volume", []) if v is not None]
             raw_timestamps = result[0].get("timestamp", []) or []
+            raw_closes = indicators.get("close", []) or []
+            # Timestamps filtered in lockstep with historical_closes so
+            # consumers can date-align two symbols' close series (beta).
+            close_timestamps = [
+                t for t, c in zip(raw_timestamps, raw_closes) if c is not None
+            ]
 
             quote = {
                 "price": round(price, 2),
@@ -107,7 +118,8 @@ async def fetch_yahoo_quote(symbol: str, range_str: str = "2d"):
                 "exchange": meta.get("exchangeName", "NSE"),
                 "currency": meta.get("currency", "INR"),
                 "source": "yahoo_finance",
-                "historical_closes": [c for c in indicators.get("close", []) if c is not None],
+                "historical_closes": [c for c in raw_closes if c is not None],
+                "historical_close_timestamps": close_timestamps,
                 "historical_volumes": volumes,
                 "historical_highs": highs,
                 "historical_lows": lows,
@@ -736,15 +748,25 @@ async def fetch_real_commodities():
     return response
 
 
+# Explicit (interval, range) map — Yahoo rejects ranges like "1w"/"1m",
+# which previously broke the 1W and 1M chart periods.
+CHART_PERIODS = {
+    "1D": ("5m", "1d"),
+    "1W": ("30m", "5d"),
+    "1M": ("1d", "1mo"),
+    "3M": ("1d", "3mo"),
+    "3MO": ("1d", "3mo"),  # legacy alias
+    "6M": ("1d", "6mo"),
+    "1Y": ("1d", "1y"),
+}
+
+
 async def fetch_real_chart_data(symbol: str, period: str = "1D"):
     """Fetch actual chart data from Yahoo Finance for a stock."""
-    yahoo_ticker = YAHOO_TICKERS.get(symbol.upper())
-    if not yahoo_ticker:
-        yahoo_ticker = f"{symbol.upper()}.NS"
-        
-    interval = "5m" if period == "1D" else "1d"
-    range_str = "1d" if period == "1D" else ("3mo" if period == "3Mo" else period.lower())
-    
+    yahoo_ticker = resolve_yahoo_ticker(symbol)
+    interval, range_str = CHART_PERIODS.get((period or "1D").upper(), ("1d", "1mo"))
+    intraday = interval.endswith("m")
+
     try:
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{yahoo_ticker}?interval={interval}&range={range_str}"
         async with httpx.AsyncClient(timeout=10) as client:
@@ -780,7 +802,8 @@ async def fetch_real_chart_data(symbol: str, period: str = "1D"):
                     continue
                     
                 dt = datetime.fromtimestamp(ts, tz=timezone.utc)
-                time_str = dt.isoformat() if period == "1D" else dt.strftime("%Y-%m-%d")
+                # Intraday candles (5m/30m) need full timestamps; daily candles use dates
+                time_str = dt.isoformat() if intraday else dt.strftime("%Y-%m-%d")
                 
                 chart_candles.append({
                     "time": time_str,
