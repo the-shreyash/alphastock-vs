@@ -2,8 +2,9 @@ import { useState, useEffect } from "react";
 import { useSearchParams } from "react-router-dom";
 import { motion } from "framer-motion";
 import api from "../services/api";
+import brokerService, { brokerErrorMessage } from "../services/brokerService";
 import { useAuth } from "../context/AuthContext";
-import { Save, User, Shield, ShieldAlert, Bell, Link2, ExternalLink, Database, Check, X, Wifi, MessageSquare, Mail, Workflow, Clock } from "lucide-react";
+import { Save, User, Shield, ShieldAlert, Bell, Link2, ExternalLink, Database, Check, X, Wifi, MessageSquare, Mail, Workflow, Clock, RefreshCw, Unplug } from "lucide-react";
 
 const fadeUp = {
   initial: { opacity: 0, y: 16 },
@@ -20,9 +21,10 @@ export default function SettingsPage() {
   const [saved, setSaved] = useState(false);
   const [stopping, setStopping] = useState(false);
   const [stopResult, setStopResult] = useState(null);
-  const [zerodhaStatus, setZerodhaStatus] = useState(null);
+  const [brokerStatus, setBrokerStatus] = useState(null);
   const [dataSources, setDataSources] = useState(null);
-  const [zerodhaMessage, setZerodhaMessage] = useState(null);
+  const [brokerMessage, setBrokerMessage] = useState(null);
+  const [brokerBusy, setBrokerBusy] = useState({});
   const [webhookLogs, setWebhookLogs] = useState(null);
 
   useEffect(() => {
@@ -39,29 +41,36 @@ export default function SettingsPage() {
         setNotifPrefs(prev => ({ ...prev, ...user.notification_prefs }));
       }
     }
-    api.get("/zerodha/status").then(({ data }) => setZerodhaStatus(data)).catch(() => {});
+    refreshBrokerStatus();
     api.get("/data-sources").then(({ data }) => setDataSources(data)).catch(() => {});
     api.get("/webhooks/logs").then(({ data }) => setWebhookLogs(data)).catch(() => {});
 
-    // Handle Zerodha redirect callback
+    // Handle broker OAuth redirect callbacks.
+    // Legacy Zerodha format: ?zerodha=connected|failed|cancelled
+    // Unified format:        ?broker=<name>&status=connected|failed|cancelled
     const zerodhaParam = searchParams.get("zerodha");
-    if (zerodhaParam === "connected") {
-      setZerodhaMessage({ type: "success", text: "Zerodha connected successfully! Live data is now flowing." });
-      api.get("/zerodha/status").then(({ data }) => setZerodhaStatus(data)).catch(() => {});
-      searchParams.delete("zerodha");
-      setSearchParams(searchParams, { replace: true });
-    } else if (zerodhaParam === "failed") {
-      const detail = searchParams.get("error");
-      setZerodhaMessage({ type: "error", text: detail ? `Zerodha login failed: ${detail}` : "Zerodha login failed. Please try again." });
-      searchParams.delete("zerodha");
-      searchParams.delete("error");
-      setSearchParams(searchParams, { replace: true });
-    } else if (zerodhaParam === "cancelled") {
-      setZerodhaMessage({ type: "error", text: "Zerodha login was cancelled." });
-      searchParams.delete("zerodha");
+    const brokerParam = searchParams.get("broker");
+    const statusParam = zerodhaParam || searchParams.get("status");
+    const brokerName = brokerParam || (zerodhaParam ? "zerodha" : null);
+    if (brokerName && statusParam) {
+      const label = brokerName.charAt(0).toUpperCase() + brokerName.slice(1);
+      if (statusParam === "connected") {
+        setBrokerMessage({ type: "success", text: `${label} connected successfully! Live account data is now syncing.` });
+        refreshBrokerStatus();
+      } else if (statusParam === "failed") {
+        const detail = searchParams.get("error");
+        setBrokerMessage({ type: "error", text: detail ? `${label} login failed: ${detail}` : `${label} login failed. Please try again.` });
+      } else if (statusParam === "cancelled") {
+        setBrokerMessage({ type: "error", text: `${label} login was cancelled.` });
+      }
+      ["zerodha", "broker", "status", "error"].forEach((k) => searchParams.delete(k));
       setSearchParams(searchParams, { replace: true });
     }
   }, [user]);
+
+  const refreshBrokerStatus = () => {
+    brokerService.status().then(setBrokerStatus).catch(() => {});
+  };
 
   const handleSave = async () => {
     setSaving(true); setSaved(false);
@@ -73,16 +82,47 @@ export default function SettingsPage() {
     finally { setSaving(false); }
   };
 
-  const connectZerodha = async () => {
+  const connectBroker = async (broker) => {
     try {
-      const { data } = await api.get("/zerodha/login-url");
+      const data = await brokerService.getLoginUrl(broker);
       if (data.url) {
         window.location.href = data.url;
       } else {
-        setZerodhaMessage({ type: "error", text: data.message || "Zerodha API key not configured" });
+        setBrokerMessage({ type: "error", text: data.message || `${broker} API keys not configured` });
       }
     } catch (err) {
-      setZerodhaMessage({ type: "error", text: "Failed to get Zerodha login URL" });
+      setBrokerMessage({ type: "error", text: brokerErrorMessage(err, `Failed to get ${broker} login URL`) });
+    }
+  };
+
+  const disconnectBroker = async (broker) => {
+    if (!window.confirm(`Disconnect ${broker}? Live sync and trading through this account will stop until you reconnect.`)) return;
+    setBrokerBusy((b) => ({ ...b, [broker]: true }));
+    try {
+      await brokerService.disconnect(broker);
+      setBrokerMessage({ type: "success", text: `${broker.charAt(0).toUpperCase() + broker.slice(1)} disconnected.` });
+      refreshBrokerStatus();
+    } catch (err) {
+      setBrokerMessage({ type: "error", text: brokerErrorMessage(err, `Failed to disconnect ${broker}`) });
+    } finally {
+      setBrokerBusy((b) => ({ ...b, [broker]: false }));
+    }
+  };
+
+  const syncBroker = async (broker) => {
+    setBrokerBusy((b) => ({ ...b, [broker]: true }));
+    try {
+      const result = await brokerService.sync(broker);
+      const s = result?.summary;
+      setBrokerMessage({
+        type: "success",
+        text: s ? `Portfolio synced: ${s.holdings_count} holdings, ${s.positions_count} positions.` : "Portfolio synced.",
+      });
+      refreshBrokerStatus();
+    } catch (err) {
+      setBrokerMessage({ type: "error", text: brokerErrorMessage(err, `Failed to sync ${broker} portfolio`) });
+    } finally {
+      setBrokerBusy((b) => ({ ...b, [broker]: false }));
     }
   };
 
@@ -113,50 +153,76 @@ export default function SettingsPage() {
         <p className="page-subtitle mt-1">Configure your trading preferences and integrations</p>
       </motion.div>
 
-      {/* Zerodha Connection — Top Priority */}
+      {/* Broker Accounts — Top Priority */}
       <motion.div className="glass-card p-6" {...fadeUp} transition={{ duration: 0.4 }}>
         <h3 className="eyebrow flex items-center gap-2 mb-4">
-          <Link2 size={13} /> Zerodha Kite Connect
+          <Link2 size={13} /> Broker Accounts
         </h3>
 
-        {zerodhaMessage && (
+        {brokerMessage && (
           <div className="flex items-center gap-2 p-3 rounded-xl mb-3" style={{
-            background: zerodhaMessage.type === "success" ? "rgba(16,185,129,0.08)" : "rgba(244,63,94,0.08)",
-            color: zerodhaMessage.type === "success" ? "var(--gain)" : "var(--loss)"
+            background: brokerMessage.type === "success" ? "rgba(16,185,129,0.08)" : "rgba(244,63,94,0.08)",
+            color: brokerMessage.type === "success" ? "var(--gain)" : "var(--loss)"
           }}>
-            {zerodhaMessage.type === "success" ? <Check size={14} /> : <X size={14} />}
-            <span className="text-sm">{zerodhaMessage.text}</span>
+            {brokerMessage.type === "success" ? <Check size={14} /> : <X size={14} />}
+            <span className="text-sm">{brokerMessage.text}</span>
           </div>
         )}
 
-        {zerodhaStatus && (
-          <div className="space-y-3">
-            <div className="flex items-center gap-3">
-              <div className={`w-3 h-3 rounded-full ${zerodhaStatus.connected ? "animate-pulse" : ""}`}
-                style={{ background: zerodhaStatus.connected ? "var(--gain)" : zerodhaStatus.configured ? "#F59E0B" : "var(--text-muted)" }} />
-              <span className="text-sm font-medium" style={{ color: "var(--text-primary)" }}>{zerodhaStatus.message}</span>
-              <span className="text-[10px] font-mono px-2 py-0.5 rounded-lg ml-auto"
-                style={{ background: zerodhaStatus.connected ? "rgba(16,185,129,0.08)" : "var(--bg-surface)", color: zerodhaStatus.connected ? "var(--gain)" : "var(--text-muted)" }}>
-                {zerodhaStatus.mode?.toUpperCase()}
-              </span>
-            </div>
+        {brokerStatus && (
+          <div className="space-y-5">
+            {Object.values(brokerStatus).map((b) => (
+              <div key={b.broker} data-testid={`broker-card-${b.broker}`} className="space-y-3 pb-4 border-b last:border-0 last:pb-0" style={{ borderColor: "var(--border)" }}>
+                <div className="flex items-center gap-3">
+                  <div className={`w-3 h-3 rounded-full ${b.connected ? "animate-pulse" : ""}`}
+                    style={{ background: b.connected ? "var(--gain)" : b.session_expired ? "var(--loss)" : b.configured ? "#F59E0B" : "var(--text-muted)" }} />
+                  <div className="min-w-0">
+                    <span className="text-sm font-semibold block" style={{ color: "var(--text-primary)" }}>{b.display_name}</span>
+                    <span className="caption">{b.message}</span>
+                  </div>
+                  <div className="flex items-center gap-2 ml-auto shrink-0">
+                    {b.streaming && (
+                      <span className="text-[10px] font-mono px-2 py-0.5 rounded-lg flex items-center gap-1"
+                        style={{ background: "rgba(16,185,129,0.08)", color: "var(--gain)" }}>
+                        <Wifi size={10} /> STREAM
+                      </span>
+                    )}
+                    <span className="text-[10px] font-mono px-2 py-0.5 rounded-lg"
+                      style={{ background: b.connected ? "rgba(16,185,129,0.08)" : "var(--bg-surface)", color: b.connected ? "var(--gain)" : "var(--text-muted)" }}>
+                      {b.mode?.toUpperCase()}
+                    </span>
+                  </div>
+                </div>
 
-            {zerodhaStatus.connected ? (
-              <div className="p-3 rounded-xl flex items-center gap-2" style={{ background: "rgba(16,185,129,0.05)" }}>
-                <Wifi size={14} style={{ color: "var(--gain)" }} />
-                <span className="text-sm" style={{ color: "var(--gain)" }}>Live trading active. Your Zerodha account data is synced.</span>
+                {b.connected ? (
+                  <div className="flex flex-col sm:flex-row gap-2">
+                    <div className="p-3 rounded-xl flex items-center gap-2 flex-1" style={{ background: "rgba(16,185,129,0.05)" }}>
+                      <Wifi size={14} style={{ color: "var(--gain)" }} />
+                      <span className="text-sm" style={{ color: "var(--gain)" }}>
+                        Live trading active{b.last_sync ? ` · synced ${new Date(b.last_sync).toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" })}` : ""}
+                      </span>
+                    </div>
+                    <button data-testid={`broker-sync-btn-${b.broker}`} onClick={() => syncBroker(b.broker)} disabled={brokerBusy[b.broker]}
+                      className="btn-secondary shrink-0">
+                      <RefreshCw size={14} className={brokerBusy[b.broker] ? "animate-spin" : ""} /> Sync Now
+                    </button>
+                    <button data-testid={`broker-disconnect-btn-${b.broker}`} onClick={() => disconnectBroker(b.broker)} disabled={brokerBusy[b.broker]}
+                      className="btn-secondary shrink-0" style={{ color: "var(--loss)" }}>
+                      <Unplug size={14} /> Disconnect
+                    </button>
+                  </div>
+                ) : (
+                  <button data-testid={`broker-login-btn-${b.broker}`} onClick={() => connectBroker(b.broker)}
+                    disabled={!b.configured} className="btn-primary btn-block" style={!b.configured ? { opacity: 0.5, cursor: "not-allowed" } : {}}>
+                    <ExternalLink size={16} /> {b.session_expired ? `Reconnect ${b.display_name}` : `Connect ${b.display_name} Account`}
+                  </button>
+                )}
               </div>
-            ) : (
-              <button data-testid="zerodha-login-btn" onClick={connectZerodha} className="btn-primary btn-block">
-                <ExternalLink size={16} /> Connect Zerodha Account
-              </button>
-            )}
-
-            {!zerodhaStatus.connected && (
-              <p className="caption leading-relaxed">
-                Clicking "Connect" will redirect you to Zerodha's secure login page. After login, you'll be redirected back here and your account data will sync automatically.
-              </p>
-            )}
+            ))}
+            <p className="caption leading-relaxed">
+              Connecting redirects you to your broker's secure login page — credentials never touch StockAssist. Broker
+              sessions expire daily per exchange rules (Zerodha ~6:00 AM, Upstox ~3:30 AM IST) and will ask to reconnect.
+            </p>
           </div>
         )}
       </motion.div>

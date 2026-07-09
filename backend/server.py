@@ -23,14 +23,12 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional, Set
 
 from services.alpha_vantage import get_global_quote as av_get_quote, get_intraday_data as av_intraday, is_configured as av_configured
-from services.zerodha_service import (
-    get_login_url as kite_login_url, generate_session as kite_session,
-    get_holdings as kite_holdings, get_positions as kite_positions,
-    place_order as kite_order, cancel_order as kite_cancel, get_status as kite_status,
-    is_configured as kite_configured, get_funds as kite_funds,
-    get_profile as kite_profile, get_orders as kite_orders,
-    load_saved_session as kite_load_saved_session,
-)
+# Legacy single-session Zerodha shim (data-sources status + startup log only).
+# All broker routes go through services.broker_engine (Sprint 7).
+from services.zerodha_service import get_status as kite_status, is_configured as kite_configured
+from services.broker_engine import broker_engine
+from services.brokers.base import BrokerAuthError, BrokerError
+from services.brokers.stream import stream_manager
 from services.scheduler import setup_scheduler
 
 from models import (
@@ -41,6 +39,7 @@ from models import (
     StockAnalysisRequest, SIPRequest,
     AdvisorRequest, AdvisorRecommendation, AdvisorEntryZone,
     AIMemoryUpdate, LearnRequest, TradeReviewRequest,
+    BrokerOrderCreate, BrokerOrderModify,
 )
 from market_data import get_stock_meta, search_stocks, STOCK_UNIVERSE
 # NOTE: market_data contains ONLY factual reference metadata (symbols, company
@@ -130,6 +129,22 @@ async def prefetch_quote_func(user_id):
 
 
 app = FastAPI(title="AlphaPartner API")
+
+
+# Broker errors → consistent HTTP responses. Auth problems use 409 (NOT 401:
+# the frontend interceptor treats 401 as an app-session failure and would try
+# to refresh/log out the user over a broker issue).
+from starlette.responses import JSONResponse as _JSONResponse
+
+@app.exception_handler(BrokerAuthError)
+async def broker_auth_error_handler(request, exc: BrokerAuthError):
+    return _JSONResponse(status_code=409, content={"detail": exc.user_message, "code": "BROKER_AUTH"})
+
+@app.exception_handler(BrokerError)
+async def broker_error_handler(request, exc: BrokerError):
+    status = 429 if exc.code == "RATE_LIMIT" else 502
+    return _JSONResponse(status_code=status, content={"detail": exc.user_message, "code": exc.code})
+
 
 # JWT Config
 JWT_ALGORITHM = "HS256"
@@ -1581,47 +1596,86 @@ async def get_trade_live_tip(trade_id: str, user: dict = Depends(get_current_use
 
 
 # ============ PORTFOLIO ROUTES ============
+# Sprint 8 — Portfolio Intelligence. All analytics are computed server-side in
+# services.portfolio_engine (single source of truth) over a broker-primary merge
+# of real broker holdings (db.holdings) and manual non-paper open trades
+# (db.trades). See services/portfolio_engine.py for the merge/de-dup rules.
 
 @portfolio_router.get("")
 async def get_portfolio(user: dict = Depends(get_current_user)):
-    trades = await db.trades.find({"user_id": user["_id"]}).to_list(500)
-    holdings = {}
-    for t in trades:
-        sym = t["symbol"]
-        if t["status"] == "OPEN":
-            if sym not in holdings:
-                holdings[sym] = {"symbol": sym, "name": t["stock_name"], "quantity": 0, "avg_price": 0, "invested": 0}
-            h = holdings[sym]
-            h["quantity"] += t["quantity"]
-            h["invested"] += t["entry_price"] * t["quantity"]
-            h["avg_price"] = round(h["invested"] / h["quantity"], 2) if h["quantity"] > 0 else 0
-
-    quotes = await real_quotes_map(list(holdings.keys()))
-    for sym, h in holdings.items():
-        quote = quotes.get(sym.upper())
-        if quote:
-            h["current_price"] = quote["price"]
-            h["current_value"] = round(quote["price"] * h["quantity"], 2)
-            h["pnl"] = round(h["current_value"] - h["invested"], 2)
-            h["pnl_pct"] = round((h["pnl"] / h["invested"]) * 100, 2) if h["invested"] > 0 else 0
-            h["sector"] = quote.get("sector", "")
-
-    return list(holdings.values())
+    """Unified, live-enriched holdings (broker holdings + manual open trades)."""
+    from services import portfolio_engine
+    return await portfolio_engine.build_holdings(db, user, real_quotes_map)
 
 @portfolio_router.get("/summary")
 async def portfolio_summary(user: dict = Depends(get_current_user)):
-    portfolio = await get_portfolio(user)
-    total_invested = sum(h.get("invested", 0) for h in portfolio)
-    total_current = sum(h.get("current_value", 0) for h in portfolio)
-    total_pnl = round(total_current - total_invested, 2)
+    from services import portfolio_engine
+    holdings = await portfolio_engine.build_holdings(db, user, real_quotes_map)
+    closed = await db.trades.find(
+        {"user_id": user["_id"], "status": {"$ne": "OPEN"}}
+    ).to_list(500)
+    realized = round(sum((t.get("pnl") or 0) for t in closed), 2)
+    pnl = portfolio_engine.compute_pnl(holdings, realized)
     return {
-        "total_invested": round(total_invested, 2),
-        "current_value": round(total_current, 2),
-        "total_pnl": total_pnl,
-        "total_pnl_pct": round((total_pnl / total_invested) * 100, 2) if total_invested > 0 else 0,
-        "holdings_count": len(portfolio),
+        "total_invested": pnl["invested"],
+        "current_value": pnl["current_value"],
+        "total_pnl": pnl["unrealized"],
+        "total_pnl_pct": pnl["unrealized_pct"],
+        "realized_pnl": pnl["realized"],
+        "holdings_count": len(holdings),
+        "sources": sorted({h.get("source") for h in holdings if h.get("source")}),
         "capital": user.get("capital", 100000),
     }
+
+
+@portfolio_router.get("/intelligence")
+async def portfolio_intelligence(user: dict = Depends(get_current_user)):
+    """Full Portfolio Intelligence bundle: unified holdings, allocation, sector
+    exposure, diversification (HHI), risk score, P&L, dividends, movers and
+    rebalancing suggestions — the single payload the Portfolio page consumes."""
+    from services import portfolio_engine
+    from services.portfolio_monitor import analyze_portfolio_health
+    # Health scan runs over open trades with a sync quote lookup (its contract);
+    # the engine folds it into the risk score + suggestions.
+    quote_func = await prefetch_quote_func(user["_id"])
+    health = await analyze_portfolio_health(db, user["_id"], None, quote_func)
+    return await portfolio_engine.build_intelligence(db, user, real_quotes_map, health=health)
+
+
+@portfolio_router.get("/performance")
+async def portfolio_performance(range: str = "ALL", user: dict = Depends(get_current_user)):
+    """Equity curve + returns from stored daily snapshots. Returns
+    available:false until at least two end-of-day snapshots exist (the curve is
+    built forward from real marks — never back-filled with synthetic history)."""
+    from services import portfolio_engine
+    return await portfolio_engine.get_performance(db, user["_id"], range)
+
+
+@portfolio_router.get("/export")
+async def portfolio_export(user: dict = Depends(get_current_user)):
+    """Export current holdings as CSV (feeds the Portfolio Download action)."""
+    import csv
+    import io
+    from services import portfolio_engine
+    holdings = await portfolio_engine.build_holdings(db, user, real_quotes_map)
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["Symbol", "Name", "Source", "Sector", "Quantity",
+                     "Avg Price", "Invested", "Current Price", "Current Value",
+                     "P&L", "P&L %", "Day Change %"])
+    for h in holdings:
+        writer.writerow([
+            h.get("symbol", ""), h.get("name", ""), h.get("source", ""),
+            h.get("sector", ""), h.get("quantity", 0), h.get("avg_price", 0),
+            h.get("invested", 0), h.get("current_price", ""),
+            h.get("current_value", 0), h.get("pnl", 0), h.get("pnl_pct", 0),
+            h.get("day_change_pct", ""),
+        ])
+    return Response(
+        content=buf.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=portfolio.csv"},
+    )
 
 
 # ============ NOTIFICATIONS ROUTES ============
@@ -2043,6 +2097,10 @@ class ConnectionManager:
 
 ws_manager = ConnectionManager()
 
+# Broker Engine wiring: Mongo storage + per-user WebSocket push for realtime
+# broker order updates / price ticks / connection status.
+broker_engine.configure(db, ws_push=ws_manager.send_to_user)
+
 
 async def ws_activity_broadcast(entry: dict):
     await ws_manager.broadcast({
@@ -2339,17 +2397,165 @@ async def google_auth_session(request: Request, response: Response):
 
 
 
-# ============ ZERODHA ROUTES ============
+# ============ BROKER ROUTES (Sprint 7 — unified Broker Engine) ============
+
+brokers_router = APIRouter(prefix="/api/brokers", tags=["Brokers"])
+
+
+def _require_broker(broker: str) -> str:
+    from services.brokers import SUPPORTED_BROKERS
+    broker = (broker or "").lower()
+    if broker not in SUPPORTED_BROKERS:
+        raise HTTPException(status_code=404, detail=f"Unsupported broker: {broker}")
+    return broker
+
+
+def _frontend_base() -> str:
+    base = os.environ.get("FRONTEND_URL")
+    if not base:
+        base = os.environ.get("KITE_REDIRECT_URL", "").replace("/api/zerodha/callback", "")
+    return (base or "http://localhost:3000").rstrip("/")
+
+
+@brokers_router.get("")
+async def brokers_list(user: dict = Depends(get_current_user)):
+    """Supported brokers + this user's connection status for each."""
+    return {
+        "brokers": broker_engine.list_brokers(),
+        "status": await broker_engine.get_status(str(user["_id"])),
+    }
+
+@brokers_router.get("/status")
+async def brokers_status(user: dict = Depends(get_current_user)):
+    return await broker_engine.get_status(str(user["_id"]))
+
+@brokers_router.get("/{broker}/login-url")
+async def broker_login_url(broker: str, user: dict = Depends(get_current_user)):
+    return broker_engine.get_login_url(_require_broker(broker), str(user["_id"]))
+
+@brokers_router.post("/{broker}/session")
+async def broker_session(broker: str, request: Request, user: dict = Depends(get_current_user)):
+    """Exchange the OAuth callback payload (Zerodha request_token / Upstox code)."""
+    broker = _require_broker(broker)
+    body = await request.json()
+    result = await broker_engine.complete_auth(broker, str(user["_id"]), body)
+    await db.users.update_one({"_id": ObjectId(user["_id"])},
+                              {"$set": {f"{broker}_connected": True}})
+    # Never return tokens to the browser — profile + sync summary only.
+    return {"success": True, "broker": broker, "profile": result.get("profile", {}),
+            "sync": (result.get("sync") or {}).get("summary")}
+
+@brokers_router.get("/{broker}/callback")
+async def broker_oauth_callback(broker: str, request: Request):
+    """Public browser redirect target for broker OAuth.
+    Zerodha sends ?request_token=&status=&uid=; Upstox sends ?code=&state=uid=...
+    Always bounces back to the frontend Settings page with the outcome."""
+    from starlette.responses import RedirectResponse
+    broker = _require_broker(broker)
+    params = request.query_params
+    frontend = _frontend_base()
+
+    uid = params.get("uid")
+    state = params.get("state", "")
+    if not uid and state.startswith("uid="):
+        uid = state[4:]
+
+    auth_payload = {}
+    if broker == "zerodha":
+        if params.get("status") != "success" or not params.get("request_token"):
+            return RedirectResponse(url=f"{frontend}/settings?broker=zerodha&status=cancelled")
+        auth_payload = {"request_token": params.get("request_token")}
+    else:  # upstox
+        if params.get("error") or not params.get("code"):
+            return RedirectResponse(url=f"{frontend}/settings?broker={broker}&status=cancelled")
+        auth_payload = {"code": params.get("code")}
+
+    try:
+        await broker_engine.complete_auth(broker, uid, auth_payload)
+        if uid:
+            try:
+                await db.users.update_one({"_id": ObjectId(uid)}, {"$set": {f"{broker}_connected": True}})
+            except Exception:
+                pass
+        return RedirectResponse(url=f"{frontend}/settings?broker={broker}&status=connected")
+    except (BrokerError, Exception) as e:
+        message = getattr(e, "user_message", "connection failed")
+        logger.error(f"{broker} OAuth callback failed: {e}")
+        return RedirectResponse(url=f"{frontend}/settings?broker={broker}&status=failed&error={message}")
+
+@brokers_router.post("/{broker}/disconnect")
+async def broker_disconnect(broker: str, user: dict = Depends(get_current_user)):
+    broker = _require_broker(broker)
+    result = await broker_engine.disconnect(broker, str(user["_id"]))
+    await db.users.update_one({"_id": ObjectId(user["_id"])},
+                              {"$set": {f"{broker}_connected": False}})
+    return result
+
+@brokers_router.post("/{broker}/sync")
+async def broker_sync(broker: str, user: dict = Depends(get_current_user)):
+    """Full portfolio sync: holdings + positions + funds persisted to Mongo."""
+    return await broker_engine.sync_portfolio(str(user["_id"]), _require_broker(broker))
+
+@brokers_router.get("/{broker}/profile")
+async def broker_profile(broker: str, user: dict = Depends(get_current_user)):
+    return await broker_engine.get_profile(str(user["_id"]), _require_broker(broker))
+
+@brokers_router.get("/{broker}/holdings")
+async def broker_holdings(broker: str, user: dict = Depends(get_current_user)):
+    return {"broker": broker, "holdings": await broker_engine.get_holdings(str(user["_id"]), _require_broker(broker))}
+
+@brokers_router.get("/{broker}/positions")
+async def broker_positions(broker: str, user: dict = Depends(get_current_user)):
+    return {"broker": broker, "positions": await broker_engine.get_positions(str(user["_id"]), _require_broker(broker))}
+
+@brokers_router.get("/{broker}/funds")
+async def broker_funds(broker: str, user: dict = Depends(get_current_user)):
+    return {"broker": broker, "funds": await broker_engine.get_funds(str(user["_id"]), _require_broker(broker))}
+
+@brokers_router.get("/{broker}/margins")
+async def broker_margins(broker: str, user: dict = Depends(get_current_user)):
+    return {"broker": broker, "margins": await broker_engine.get_margins(str(user["_id"]), _require_broker(broker))}
+
+@brokers_router.get("/{broker}/orders")
+async def broker_orders(broker: str, user: dict = Depends(get_current_user)):
+    return {"broker": broker, "orders": await broker_engine.get_orders(str(user["_id"]), _require_broker(broker))}
+
+@brokers_router.get("/{broker}/trades")
+async def broker_trades(broker: str, user: dict = Depends(get_current_user)):
+    """Executed trade history for the day (official broker trade book)."""
+    return {"broker": broker, "trades": await broker_engine.get_trades(str(user["_id"]), _require_broker(broker))}
+
+@brokers_router.post("/{broker}/orders")
+async def broker_place_order(broker: str, order: BrokerOrderCreate, user: dict = Depends(get_current_user)):
+    """Place a LIVE order via the official broker API (no simulation)."""
+    broker = _require_broker(broker)
+    payload = order.model_dump(exclude_none=True)
+    payload.setdefault("product", "CNC" if broker == "zerodha" else "D")
+    return await broker_engine.place_order(str(user["_id"]), broker, payload)
+
+@brokers_router.patch("/{broker}/orders/{order_id}")
+async def broker_modify_order(broker: str, order_id: str, changes: BrokerOrderModify,
+                              user: dict = Depends(get_current_user)):
+    broker = _require_broker(broker)
+    return await broker_engine.modify_order(str(user["_id"]), broker, order_id,
+                                            changes.model_dump(exclude_none=True))
+
+@brokers_router.delete("/{broker}/orders/{order_id}")
+async def broker_cancel_order(broker: str, order_id: str, user: dict = Depends(get_current_user)):
+    return await broker_engine.cancel_order(str(user["_id"]), _require_broker(broker), order_id)
+
+
+# ============ ZERODHA ROUTES (legacy paths — delegate to Broker Engine) ============
 
 zerodha_router = APIRouter(prefix="/api/zerodha", tags=["Zerodha"])
 
 @zerodha_router.get("/status")
 async def zerodha_status(user: dict = Depends(get_current_user)):
-    return kite_status()
+    return (await broker_engine.get_status(str(user["_id"])))["zerodha"]
 
 @zerodha_router.get("/login-url")
 async def zerodha_login(user: dict = Depends(get_current_user)):
-    return kite_login_url(user_id=str(user["_id"]))
+    return broker_engine.get_login_url("zerodha", str(user["_id"]))
 
 @zerodha_router.post("/session")
 async def zerodha_session(request: Request, user: dict = Depends(get_current_user)):
@@ -2357,60 +2563,107 @@ async def zerodha_session(request: Request, user: dict = Depends(get_current_use
     request_token = body.get("request_token")
     if not request_token:
         raise HTTPException(status_code=400, detail="request_token required")
-    result = await kite_session(request_token, db, user_id=str(user["_id"]))
-    if result.get("success"):
-        await db.users.update_one({"_id": ObjectId(user["_id"])}, {"$set": {"zerodha_connected": True}})
-    return result
+    try:
+        result = await broker_engine.complete_auth("zerodha", str(user["_id"]),
+                                                   {"request_token": request_token})
+    except BrokerError as e:
+        return {"success": False, "message": e.user_message}
+    await db.users.update_one({"_id": ObjectId(user["_id"])}, {"$set": {"zerodha_connected": True}})
+    return {"success": True, "user": result.get("profile", {})}
 
 @zerodha_router.get("/holdings")
 async def zerodha_holdings(user: dict = Depends(get_current_user)):
-    return await kite_holdings()
+    try:
+        return {"source": "zerodha", "holdings": await broker_engine.get_holdings(str(user["_id"]), "zerodha")}
+    except BrokerAuthError as e:
+        return {"source": "zerodha", "holdings": [], "error": e.user_message}
 
 @zerodha_router.get("/positions")
 async def zerodha_positions(user: dict = Depends(get_current_user)):
-    return await kite_positions()
+    try:
+        positions = await broker_engine.get_positions(str(user["_id"]), "zerodha")
+        return {"source": "zerodha", "net": positions, "day": []}
+    except BrokerAuthError as e:
+        return {"source": "zerodha", "net": [], "day": [], "error": e.user_message}
 
 @zerodha_router.post("/order")
 async def zerodha_order(request: Request, user: dict = Depends(get_current_user)):
     body = await request.json()
-    result = await kite_order(
-        symbol=body["symbol"],
-        transaction_type=body.get("transaction_type", "BUY"),
-        quantity=body["quantity"],
-        price=body["price"],
-        order_type=body.get("order_type", "LIMIT"),
-    )
-    return result
+    try:
+        result = await broker_engine.place_order(str(user["_id"]), "zerodha", {
+            "symbol": body["symbol"],
+            "transaction_type": body.get("transaction_type", "BUY"),
+            "quantity": body["quantity"],
+            "price": body.get("price"),
+            "order_type": body.get("order_type", "LIMIT"),
+            "product": body.get("product", "MIS"),
+            "exchange": body.get("exchange", "NSE"),
+        })
+        return {"source": "zerodha", "order_id": result.get("order_id"), "status": "PLACED"}
+    except BrokerError as e:
+        return {"source": "zerodha", "order_id": None, "status": "FAILED", "message": e.user_message}
 
 @zerodha_router.delete("/order/{order_id}")
 async def zerodha_cancel(order_id: str, user: dict = Depends(get_current_user)):
-    return await kite_cancel(order_id)
+    try:
+        result = await broker_engine.cancel_order(str(user["_id"]), "zerodha", order_id)
+        return {"source": "zerodha", "status": "success", "order_id": result.get("order_id")}
+    except BrokerError as e:
+        return {"source": "zerodha", "status": "ERROR", "message": e.user_message}
 
 @zerodha_router.get("/funds")
 async def zerodha_funds(user: dict = Depends(get_current_user)):
-    return await kite_funds()
+    try:
+        funds = await broker_engine.get_funds(str(user["_id"]), "zerodha")
+        # Legacy aliases used by the Portfolio page.
+        return {"source": "zerodha", **funds,
+                "available": funds.get("available_margin"),
+                "used": funds.get("used_margin"),
+                "total": funds.get("total_balance")}
+    except BrokerAuthError as e:
+        return {"source": "zerodha", "equity": {"available_margin": 0},
+                "commodity": {"available_margin": 0}, "error": e.user_message}
 
 @zerodha_router.get("/profile")
 async def zerodha_profile(user: dict = Depends(get_current_user)):
-    return await kite_profile()
+    try:
+        profile = await broker_engine.get_profile(str(user["_id"]), "zerodha")
+        return {"source": "zerodha", **profile, "user_id": profile.get("account_id", "")}
+    except BrokerAuthError as e:
+        return {"source": "zerodha", "user_name": "Not Connected", "user_id": "", "error": e.user_message}
 
 @zerodha_router.get("/orders")
 async def zerodha_orders(user: dict = Depends(get_current_user)):
-    return await kite_orders()
+    try:
+        return {"source": "zerodha", "orders": await broker_engine.get_orders(str(user["_id"]), "zerodha")}
+    except BrokerAuthError as e:
+        return {"source": "zerodha", "orders": [], "error": e.user_message}
 
 @zerodha_router.get("/account")
 async def zerodha_account(user: dict = Depends(get_current_user)):
     """Full account overview: profile + funds + holdings + positions."""
-    profile = await kite_profile()
-    funds = await kite_funds()
-    holdings = await kite_holdings()
-    positions = await kite_positions()
+    user_id = str(user["_id"])
+    status = (await broker_engine.get_status(user_id))["zerodha"]
+    if not status["connected"]:
+        return {"profile": {"error": status["message"]}, "funds": None,
+                "holdings": {"holdings": []}, "positions": {"net": [], "day": []},
+                "status": status}
+    try:
+        profile = await broker_engine.get_profile(user_id, "zerodha")
+        funds = await broker_engine.get_funds(user_id, "zerodha")
+        holdings = await broker_engine.get_holdings(user_id, "zerodha")
+        positions = await broker_engine.get_positions(user_id, "zerodha")
+    except BrokerError as e:
+        return {"profile": {"error": e.user_message}, "funds": None,
+                "holdings": {"holdings": []}, "positions": {"net": [], "day": []},
+                "status": status}
     return {
         "profile": profile,
-        "funds": funds,
-        "holdings": holdings,
-        "positions": positions,
-        "status": kite_status(),
+        "funds": {**funds, "available": funds.get("available_margin"),
+                  "used": funds.get("used_margin"), "total": funds.get("total_balance")},
+        "holdings": {"holdings": holdings},
+        "positions": {"net": positions, "day": []},
+        "status": status,
     }
 
 @zerodha_router.post("/quick-trade")
@@ -2428,8 +2681,17 @@ async def zerodha_quick_trade(request: Request, user: dict = Depends(get_current
     except (KeyError, ValueError, TypeError) as e:
         raise HTTPException(status_code=400, detail=f"Invalid payload: missing or malformed {str(e)}")
 
-    # Place order on Zerodha
-    order_result = await kite_order(symbol, "BUY", qty, entry)
+    # Place LIVE order on Zerodha via the Broker Engine (no simulation)
+    try:
+        placed = await broker_engine.place_order(str(user["_id"]), "zerodha", {
+            "symbol": symbol, "transaction_type": "BUY", "quantity": qty,
+            "price": entry, "order_type": "LIMIT", "product": "MIS", "exchange": "NSE",
+        })
+        order_result = {"source": "zerodha", "order_id": placed.get("order_id"), "status": "PLACED"}
+    except BrokerError as e:
+        # No simulated fallback: a failed broker order never creates an OPEN trade.
+        raise HTTPException(status_code=502,
+                            detail=f"Order was not placed: {e.user_message}")
 
     # Create trade record
     trade_doc = {
@@ -2456,7 +2718,7 @@ async def zerodha_quick_trade(request: Request, user: dict = Depends(get_current
         "user_id": user["_id"],
         "type": "TRADE_ENTRY",
         "title": "Trade Executed",
-        "message": f"{'[LIVE]' if order_result.get('source') == 'zerodha' else '[SIM]'} Bought {qty} {symbol} @ INR {entry}. SL: INR {sl} | Target: INR {t1}. Order: {order_result.get('order_id', 'N/A')}",
+        "message": f"[LIVE] Bought {qty} {symbol} @ INR {entry}. SL: INR {sl} | Target: INR {t1}. Order: {order_result.get('order_id', 'N/A')}",
         "read": False,
         "created_at": datetime.now(timezone.utc).isoformat(),
     })
@@ -2464,7 +2726,7 @@ async def zerodha_quick_trade(request: Request, user: dict = Depends(get_current
     return {
         "trade": trade_doc,
         "order": order_result,
-        "message": f"Trade placed {'on Zerodha' if order_result.get('source') == 'zerodha' else '(simulated)'}",
+        "message": "Trade placed on Zerodha",
     }
 
 
@@ -2478,37 +2740,47 @@ async def zerodha_emergency_stop(user: dict = Depends(get_current_user)):
     4. Marks all open trade records in DB as CLOSED with tag 'EMERGENCY_STOP'
     """
     try:
-        from services.zerodha_service import get_orders, cancel_order, get_positions, place_order
         from services.whatsapp_service import send_whatsapp, is_configured as wa_configured
         from services.email_service import send_notification as send_email_notif, is_configured as email_configured
         from services.telegram_service import send_notification as send_tg_notif, is_configured as tg_configured
-        
+
+        user_id = str(user["_id"])
         now_str = datetime.now(timezone.utc).isoformat()
 
-        # 1. Cancel all open orders
-        orders_data = await get_orders()
+        # 1. Cancel all open orders (per-user, via the Broker Engine)
         cancelled_count = 0
-        if isinstance(orders_data, dict) and "orders" in orders_data:
-            for o in orders_data["orders"]:
-                if o.get("status") in ("OPEN", "PENDING", "VALIDATION PENDING"):
-                    await cancel_order(o["order_id"])
-                    cancelled_count += 1
+        try:
+            for o in await broker_engine.get_orders(user_id, "zerodha"):
+                if o.get("status") in ("OPEN", "PENDING", "PARTIALLY_FILLED"):
+                    try:
+                        await broker_engine.cancel_order(user_id, "zerodha", o["order_id"])
+                        cancelled_count += 1
+                    except BrokerError as e:
+                        logger.error(f"Emergency stop: cancel {o['order_id']} failed: {e}")
+        except BrokerAuthError:
+            pass  # broker not connected — still close DB trades below
 
-        # 2. Liquidate active open positions
-        positions_data = await get_positions()
+        # 2. Liquidate active open positions at market
         liquidated_count = 0
-        positions_list = []
-        if isinstance(positions_data, dict):
-            positions_list = positions_data.get("net", []) or positions_data.get("day", [])
-            
-        for pos in positions_list:
-            qty = pos.get("quantity", 0)
-            if qty != 0:
-                symbol = pos["tradingsymbol"]
-                tx_type = "SELL" if qty > 0 else "BUY"
-                abs_qty = abs(qty)
-                await place_order(symbol, tx_type, abs_qty, 0, "MARKET")
-                liquidated_count += 1
+        try:
+            for pos in await broker_engine.get_positions(user_id, "zerodha"):
+                qty = pos.get("quantity", 0)
+                if qty != 0:
+                    try:
+                        await broker_engine.place_order(user_id, "zerodha", {
+                            "symbol": pos["symbol"],
+                            "exchange": pos.get("exchange", "NSE"),
+                            "transaction_type": "SELL" if qty > 0 else "BUY",
+                            "quantity": abs(qty),
+                            "order_type": "MARKET",
+                            "product": pos.get("product", "MIS"),
+                            "tag": "EMERGENCY_STOP",
+                        })
+                        liquidated_count += 1
+                    except BrokerError as e:
+                        logger.error(f"Emergency stop: liquidation of {pos.get('symbol')} failed: {e}")
+        except BrokerAuthError:
+            pass
 
         # 3. Update DB: set all open trades for this user to CLOSED
         result = await db.trades.update_many(
@@ -2749,27 +3021,22 @@ async def zerodha_callback(request: Request):
     status_param = request.query_params.get("status")
     uid = request.query_params.get("uid")
     from starlette.responses import RedirectResponse
-    from services.activity_logger import log_activity
 
-    frontend_base = os.environ.get("FRONTEND_URL")
-    if not frontend_base:
-        frontend_base = os.environ.get("KITE_REDIRECT_URL", "").replace("/api/zerodha/callback", "")
-    if not frontend_base:
-        frontend_base = "http://localhost:3000"
-    frontend_base = frontend_base.rstrip("/")
+    frontend_base = _frontend_base()
 
     if status_param == "success" and request_token:
-        result = await kite_session(request_token, db, user_id=uid)
-        if result.get("success"):
+        try:
+            await broker_engine.complete_auth("zerodha", uid, {"request_token": request_token})
             if uid:
                 try:
                     await db.users.update_one({"_id": ObjectId(uid)}, {"$set": {"zerodha_connected": True}})
                 except Exception:
                     pass
-            log_activity("Zerodha account connected — live broker session active", "monitor", "done")
             return RedirectResponse(url=f"{frontend_base}/settings?zerodha=connected")
-        logger.error(f"Zerodha session exchange failed: {result.get('message')}")
-        return RedirectResponse(url=f"{frontend_base}/settings?zerodha=failed&error={result.get('message', 'unknown')}")
+        except (BrokerError, Exception) as e:
+            message = getattr(e, "user_message", str(e))
+            logger.error(f"Zerodha session exchange failed: {message}")
+            return RedirectResponse(url=f"{frontend_base}/settings?zerodha=failed&error={message}")
     return RedirectResponse(url=f"{frontend_base}/settings?zerodha=cancelled")
 
 @zerodha_router.post("/postback")
@@ -3319,6 +3586,7 @@ app.include_router(ai_router)
 app.include_router(sip_router)
 app.include_router(advisor_router)
 app.include_router(settings_router)
+app.include_router(brokers_router)
 app.include_router(zerodha_router)
 app.include_router(monitor_router)
 app.include_router(whatsapp_router)
@@ -3362,8 +3630,9 @@ async def startup():
     await db.chat_messages.create_index([("user_id", 1), ("session_id", 1)])
     await db.broker_accounts.create_index([("user_id", 1), ("broker", 1)], unique=True)
 
-    # Restore a same-day Zerodha session so a backend restart doesn't force re-login
-    await kite_load_saved_session(db)
+    # Restore same-day broker sessions (Zerodha/Upstox) + realtime streams so
+    # a backend restart doesn't force re-login. Encrypts legacy plaintext tokens.
+    await broker_engine.load_sessions()
 
     # Seed admin
     admin_email = os.environ.get("ADMIN_EMAIL", "admin@alphapartner.com")
@@ -3459,4 +3728,5 @@ async def shutdown():
     from services.scheduler import scheduler
     if scheduler.running:
         scheduler.shutdown(wait=False)
+    await broker_engine.shutdown()  # close live broker WebSocket streams
     client.close()

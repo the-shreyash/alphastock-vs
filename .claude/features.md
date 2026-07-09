@@ -289,15 +289,27 @@ Delivered Before Market Open.
 
 # Portfolio
 
+Status
+
+Production (Sprint 8) — server-side Portfolio Intelligence engine
+(services/portfolio_engine.py) is the single source of truth over a
+broker-primary merge of real broker holdings + manual trades.
+
 Features
 
-- Holdings
-- Allocation
-- Diversification
-- Performance
-- AI Portfolio Review
-- Dividend Tracking
-- Risk Analysis
+- [x] Holdings — unified broker + manual, source-tagged
+- [x] Allocation — by holding and by sector
+- [x] Diversification — HHI + effective-holdings + label
+- [x] Performance — forward-built equity curve from daily snapshots
+- [x] AI Portfolio Review — Portfolio Manager narrative (POST /api/ai/portfolio-review)
+- [x] Dividend Tracking — real trailing rates, else explicit unavailable
+- [x] Risk Analysis — additive 0-100 risk score with explainable factors
+- [x] Rebalancing Suggestions — concentration + AI-alert driven
+
+Notes
+
+- Sector Exposure, Risk Score, Suggestions and P&L are all computed server-side
+  and reused by the AI review and the dashboard summary card.
 
 ---
 

@@ -236,14 +236,16 @@ Trading
 
 Status
 
-NOT_STARTED
+IN_PROGRESS
 
 ---
 
 Tasks
 
-- Portfolio
-- Holdings
+- [x] Portfolio — Portfolio Intelligence (Sprint 8): server-side allocation,
+  diversification, risk score, sector exposure, P&L, dividends, performance,
+  suggestions over a broker-primary holdings merge
+- [x] Holdings — unified broker + manual holdings (source-tagged)
 - Positions
 - Orders
 - Trade Monitor
@@ -260,21 +262,23 @@ Broker Integration
 
 Status
 
-NOT_STARTED
+COMPLETED (Sprint 7)
 
 ---
 
 Tasks
 
-- Zerodha OAuth
-- Upstox OAuth
-- Token Refresh
-- Holdings Sync
-- Portfolio Sync
-- Orders
-- Positions
-- WebSocket
-- Live Quotes
+- [x] Zerodha OAuth — Kite Connect login flow, per-user encrypted sessions
+- [x] Upstox OAuth — authorization-code flow, state carries user id
+- [x] Token Refresh — refresh_session() interface; daily-expiry brokers surface explicit reconnect (Zerodha ~6:00, Upstox ~3:30 IST)
+- [x] Holdings Sync — normalized across brokers, persisted to db.holdings
+- [x] Portfolio Sync — POST /api/brokers/{broker}/sync → db.portfolios + portfolio_synced WS event
+- [x] Orders — place/modify/cancel via unified adapter interface, audit-logged
+- [x] Positions — normalized (side, realised/unrealised P&L)
+- [x] Margins & Funds — GET /api/brokers/{broker}/funds|margins
+- [x] Trade History — GET /api/brokers/{broker}/trades (broker trade book)
+- [x] WebSocket — Kite ticker (binary LTP + order updates) & Upstox portfolio stream, auto-reconnect w/ backoff
+- [x] Live Quotes — portfolio-instrument LTP ticks pushed per-user over app WS
 
 ---
 
@@ -579,6 +583,147 @@ Verification
 
 ---
 
+# Sprint 7 — Broker Integration
+
+Status
+
+COMPLETED
+
+Objective
+
+Complete broker integration for Zerodha and Upstox using official broker APIs
+only — OAuth, portfolio sync, orders, positions, margins, funds, trade
+history, realtime WebSocket, token refresh/reconnect. No simulated trading.
+
+Delivered
+
+- **Broker adapter layer** (`backend/services/brokers/`) — provider-independent
+  `BrokerAdapter` interface (base.py) with normalized Holding/Position/Order/
+  Trade/Funds shapes and unified order statuses; `zerodha.py` (Kite Connect v3)
+  and `upstox.py` (Upstox v2) adapters. Adding a broker = one new adapter.
+- **Encrypted token storage** (`brokers/crypto.py`) — Fernet encryption at rest
+  for access/refresh/public tokens (`BROKER_TOKEN_KEY` env or key derived from
+  `JWT_SECRET`); legacy plaintext tokens auto-migrate to encrypted on first
+  load. Tokens never returned to the browser or written to logs/audits.
+- **Broker Engine** (`services/broker_engine.py`) — single entry point: per-user
+  session lifecycle (exchange → store → expiry → refresh-or-reconnect),
+  portfolio sync into `portfolios`/`holdings` collections, order
+  place/modify/cancel with immutable `audit_logs` entries, per-broker status,
+  startup session restore, WS push wiring.
+- **Realtime streaming** (`brokers/stream.py`) — official feeds only: Kite
+  ticker WebSocket (binary LTP tick parsing + JSON order updates) and Upstox
+  portfolio-stream-feed (order updates); exponential-backoff reconnect;
+  auth-expiry detection stops the stream and notifies the user. Updates
+  forwarded to the app's per-user WebSocket (`broker_order_update`,
+  `broker_price_tick`, `portfolio_synced`, `broker_status`) and persisted to
+  `db.orders`; fills/rejections create notifications.
+- **Unified API** (`/api/brokers`) — list/status, `{broker}/login-url`,
+  `session`, public OAuth `callback` (Zerodha `request_token`+`uid`, Upstox
+  `code`+`state`), `disconnect`, `sync`, `profile`, `holdings`, `positions`,
+  `funds`, `margins`, `orders` (GET/POST/PATCH/DELETE), `trades`. Pydantic
+  validation (`BrokerOrderCreate`/`BrokerOrderModify`). Broker auth failures
+  return 409 `BROKER_AUTH` (not 401, which the frontend treats as app-session
+  loss); broker upstream errors 502; rate limits 429.
+- **Legacy compatibility** — all `/api/zerodha/*` routes now delegate to the
+  Broker Engine per-user (previously one global in-memory token shared by all
+  users); `services/zerodha_service.py` reduced to a deprecated shim. Quick
+  Trade no longer creates an OPEN trade when the broker order fails (was:
+  silent `[SIM]` fallback). Emergency Stop cancels orders + liquidates
+  positions per-user through the engine. `/zerodha/funds` now also returns the
+  `available/used/total` aliases the Portfolio page reads (fixed undefined
+  fields).
+- **Frontend** — `services/brokerService.js` (single broker API gateway);
+  Settings "Broker Accounts" card lists every supported broker with
+  status/stream badges, Connect/Reconnect, Sync Now, Disconnect;
+  `BrokerCallback.jsx` handles both Zerodha (`request_token`) and Upstox
+  (`code`) redirects. No UI redesign — existing design language extended.
+- **Config** — `.env` gains `UPSTOX_API_KEY`, `UPSTOX_API_SECRET`,
+  `UPSTOX_REDIRECT_URL` (point at `/api/brokers/upstox/callback`) and optional
+  `BROKER_TOKEN_KEY`.
+
+Verification
+
+- `tests/test_broker_integration.py`: 31 hermetic tests (crypto roundtrip +
+  legacy migration, login URLs, session-expiry rules, response normalization,
+  Kite binary tick parsing, engine storage/audit/status/disconnect, route
+  registration, auth guards, validation). All broker HTTP mocked at
+  `BrokerAdapter._request` — CI never touches real broker APIs.
+- Full in-process backend suite: 116 passed.
+- Frontend production build passes (`craco build`).
+
+Notes / follow-ups
+
+- Zerodha and Upstox retail tokens cannot be silently refreshed (daily expiry
+  is a broker rule); the engine surfaces explicit reconnect states instead.
+- Upstox market-data ticks use a protobuf feed — out of scope; order updates
+  stream via the JSON portfolio feed. Zerodha ticks stream in LTP mode.
+- Upstox order placement addresses instruments by instrument key; the adapter
+  resolves symbols from the user's holdings/positions, or accepts
+  `instrument_token` explicitly.
+
+---
+
+# Sprint 8 — Portfolio Intelligence
+
+Status
+
+COMPLETED
+
+Objective
+
+Turn the Portfolio surface into a production-grade, server-side Portfolio
+Intelligence layer that is the single source of truth for holdings, allocation,
+diversification, risk, P&L, dividends, performance and rebalancing — powered by
+a broker-primary merge of real broker holdings and manual trades. No fabricated
+data anywhere.
+
+Delivered
+
+- **Portfolio Engine** (`backend/services/portfolio_engine.py`) — the single
+  source of truth. `build_holdings` performs a **broker-primary merge**: real
+  broker holdings (`db.holdings`) are the portfolio, manual non-paper open
+  trades (`db.trades`) are merged as a `source`-tagged layer, a symbol held in
+  both keeps the broker row (no double-count), paper trades are excluded. Pure,
+  unit-tested analytics: `compute_allocation` (by holding + sector),
+  `compute_diversification` (HHI + effective-holdings + label),
+  `compute_risk_score` (additive 0-100 with named, explainable factors),
+  `compute_pnl` (realized + unrealized + best/worst), `compute_movers`,
+  `build_suggestions` (concentration + AI-alert driven), `compute_dividends`
+  (real trailing rates or explicit `available:false`), and the `build_intelligence`
+  orchestrator.
+- **Live dividend data** — `services/real_market.fetch_dividend_info` pulls real
+  trailing annual dividend rate/yield from Yahoo `quoteSummary` (cached); missing
+  data surfaces `available:false` and is never fabricated.
+- **Performance / equity curve** — new `portfolio_snapshots` collection +
+  `portfolio_snapshot_job` scheduled 4:05 PM IST (6th cron job). `get_performance`
+  returns the equity curve + returns + best/worst day, or `available:false` until
+  ≥2 real end-of-day snapshots exist (built forward, never back-filled).
+- **API** — `GET /api/portfolio` and `/summary` now delegate to the engine
+  (broker-inclusive, `source` + `day_change_pct` added). New:
+  `GET /api/portfolio/intelligence`, `GET /api/portfolio/performance?range=`,
+  `GET /api/portfolio/export` (CSV).
+- **Frontend** (`frontend/src/pages/Portfolio.jsx`) — consumes the server bundle
+  (drops all client-side math). The tab bar is now **functional**: Overview,
+  Holdings (with Broker/Manual source badges), Performance (recharts equity curve
+  + returns, real empty-state), Allocation (holding + sector), AI Review (wires
+  `POST /api/ai/portfolio-review`), Transactions (`/api/trades/history`). Dividend
+  section shows real income/yield or explicit unavailable; the Download button
+  now exports CSV. No UI redesign — existing design language extended.
+
+Verification
+
+- `tests/test_portfolio_engine.py`: 18 hermetic tests (merge/de-dup, broker-mark
+  fallback, allocation, diversification/HHI, P&L, movers, risk factors,
+  suggestions, dividend real + unavailable paths, performance empty-state +
+  returns, snapshot upsert, orchestrator bundle). Live market/dividend fetchers
+  injected as stubs — CI never touches Yahoo.
+- Full in-process backend suite: 232 passed (the 4 `test_phase*` failures are the
+  pre-existing `requests`-based tests that require a running dev server + live
+  Yahoo; unaffected by this sprint).
+- Frontend production build passes (`craco build`); no warnings in Portfolio.jsx.
+
+---
+
 # Technical Debt
 
 Every technical debt item must contain
@@ -761,13 +906,17 @@ This section should always contain the next highest-priority work.
 
 Current Objective
 
-Sprint 3 (Dashboard Completion) is COMPLETE — the Dashboard now has all planned
-widgets: Quick Actions, Index Sparklines, Commodities/Forex Strip, Watchlist,
-Market News, Notifications, Recent Stocks, Global Markets, Market Status Badge,
-and Breadth Bar. All data is live from backend APIs. Loading states, animations,
-and performance are improved.
+Sprint 8 (Portfolio Intelligence) is COMPLETE — a server-side
+`portfolio_engine` is now the single source of truth for the Portfolio surface:
+broker-primary merge of real broker holdings + manual trades, allocation,
+sector exposure, diversification (HHI), an explainable risk score, realized +
+unrealized P&L, real dividend estimates (or explicit unavailable), a
+forward-built equity curve (daily snapshots), and rebalancing suggestions. The
+Portfolio page consumes the bundle with functional tabs, AI review, and CSV
+export.
 
-Next: broker connectivity depth, admin portal, and payments/subscriptions.
+Next: Milestone 3 trading surfaces (orders UI, positions dashboard) on top of
+the /api/brokers endpoints, then admin portal and payments/subscriptions.
 
 ---
 

@@ -219,3 +219,29 @@ class UserSettingsUpdate(BaseModel):
     max_trades_per_day: Optional[int] = None
     telegram_chat_id: Optional[str] = None
     notification_prefs: Optional[NotificationPrefs] = None
+
+
+# --- Broker Models (Sprint 7) ---
+class BrokerOrderCreate(BaseModel):
+    """Normalized order request routed through the Broker Engine.
+    `instrument_token` is only needed for Upstox symbols that are not already
+    in the user's holdings/positions."""
+    symbol: str = Field(min_length=1, max_length=32)
+    exchange: str = "NSE"
+    transaction_type: str = Field(default="BUY", pattern="^(BUY|SELL)$")
+    quantity: int = Field(gt=0, le=100000)
+    order_type: str = Field(default="MARKET", pattern="^(MARKET|LIMIT|SL|SL-M)$")
+    product: Optional[str] = None       # CNC/MIS/NRML (Zerodha) or D/I (Upstox)
+    price: Optional[float] = Field(default=None, ge=0)
+    trigger_price: Optional[float] = Field(default=None, ge=0)
+    validity: str = Field(default="DAY", pattern="^(DAY|IOC)$")
+    instrument_token: Optional[str] = None
+    tag: Optional[str] = Field(default=None, max_length=20)
+
+
+class BrokerOrderModify(BaseModel):
+    quantity: Optional[int] = Field(default=None, gt=0, le=100000)
+    price: Optional[float] = Field(default=None, ge=0)
+    trigger_price: Optional[float] = Field(default=None, ge=0)
+    order_type: Optional[str] = Field(default=None, pattern="^(MARKET|LIMIT|SL|SL-M)$")
+    validity: Optional[str] = Field(default=None, pattern="^(DAY|IOC)$")

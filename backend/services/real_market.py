@@ -133,6 +133,56 @@ async def fetch_yahoo_quote(symbol: str, range_str: str = "2d"):
         return None
 
 
+async def fetch_dividend_info(symbols):
+    """Real trailing-dividend info per symbol from Yahoo `quoteSummary`.
+
+    Returns {UPPER_SYMBOL: {rate, yield, available}} where `rate` is the
+    trailing annual dividend per share (INR) and `yield` is the percentage.
+    Symbols with no dividend data (or a fetch failure) resolve to
+    {available: False} — the platform never fabricates dividend figures.
+    Cached (1h) via the shared cache to respect the upstream API."""
+    out = {}
+    uniq = list({(s or "").upper() for s in symbols if s})
+
+    async def _one(sym):
+        yahoo_ticker = resolve_yahoo_ticker(sym)
+        cache_key = f"yahoo_div_{yahoo_ticker}"
+        cached = await cache_get(cache_key)
+        if cached is not None:
+            return sym, cached
+        result = {"available": False, "rate": None, "yield": None}
+        try:
+            url = (f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/"
+                   f"{yahoo_ticker}?modules=summaryDetail")
+            async with httpx.AsyncClient(timeout=8) as client:
+                resp = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
+                if resp.status_code == 200:
+                    data = resp.json()
+                    rows = (data.get("quoteSummary", {}) or {}).get("result") or []
+                    detail = (rows[0].get("summaryDetail", {}) if rows else {}) or {}
+                    rate = (detail.get("trailingAnnualDividendRate") or {}).get("raw")
+                    dyield = (detail.get("dividendYield") or {}).get("raw")
+                    if rate:
+                        result = {
+                            "available": True,
+                            "rate": round(float(rate), 2),
+                            "yield": round(float(dyield) * 100, 2) if dyield else None,
+                        }
+        except Exception as e:
+            logger.warning(f"dividend info fetch failed for {sym}: {e}")
+        # Cache both hits and misses (misses briefly) to avoid hammering Yahoo.
+        await cache_set(cache_key, result, 3600 if result["available"] else 600)
+        return sym, result
+
+    results = await asyncio.gather(*[_one(s) for s in uniq], return_exceptions=True)
+    for res in results:
+        if isinstance(res, Exception):
+            continue
+        sym, info = res
+        out[sym] = info
+    return out
+
+
 async def fetch_real_index(index_name: str):
     """Fetch real index value (Nifty, BankNifty, Sensex)."""
     return await fetch_yahoo_quote(index_name)

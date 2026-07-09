@@ -1,18 +1,14 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 import api from "../services/api";
 import { formatNumber } from "../utils/formatters";
-import { Wallet, RefreshCw, Download, ArrowUpRight, ArrowDownRight, Brain, Shield, AlertTriangle, Layers, Scale, Award, TrendingDown, Coins, Sparkles, Loader2 } from "lucide-react";
-import { PieChart as RechartsPie, Pie, Cell, ResponsiveContainer, Tooltip } from "recharts";
+import { Wallet, RefreshCw, Download, ArrowUpRight, ArrowDownRight, Brain, Shield, AlertTriangle, Layers, Scale, Award, TrendingDown, Coins, Sparkles, Loader2, Activity, LineChart as LineChartIcon } from "lucide-react";
+import { PieChart as RechartsPie, Pie, Cell, ResponsiveContainer, Tooltip, AreaChart, Area, XAxis, YAxis, CartesianGrid } from "recharts";
 import { motion } from "framer-motion";
 
 const COLORS = ["#6366F1", "#10B981", "#F59E0B", "#F43F5E", "#06B6D4", "#8B5CF6", "#EC4899", "#14B8A6"];
 const TABS = ["Overview", "Holdings", "Performance", "Allocation", "AI Review", "Transactions"];
 const AMBER = "#F59E0B";
-
-// Concentration guidelines used for overexposure detection. Kept conservative:
-// a single name above 30% or a single sector above 40% flags rebalancing.
-const STOCK_LIMIT = 30;
-const SECTOR_LIMIT = 40;
+const SEVERITY_COLOR = { critical: "var(--loss)", warning: AMBER, positive: "var(--gain)", info: "var(--ai-accent)" };
 
 /* Scroll-reveal wrapper — fades/slides content in as it enters the viewport */
 function Reveal({ children, delay = 0, className }) {
@@ -63,113 +59,127 @@ function DimensionCard({ icon: Icon, label, value, valueColor, note, testid }) {
   );
 }
 
-const SEVERITY_COLOR = { critical: "var(--loss)", warning: AMBER, positive: "var(--gain)", info: "var(--ai-accent)" };
+function SourceBadge({ source }) {
+  const isBroker = source === "broker";
+  return (
+    <span className="badge-status ml-2" style={{
+      background: isBroker ? "var(--ai-accent-bg, var(--hover))" : "var(--hover)",
+      color: isBroker ? "var(--ai-accent)" : "var(--text-muted)",
+      fontSize: 9,
+    }}>{isBroker ? "BROKER" : "MANUAL"}</span>
+  );
+}
+
+/* Sector allocation bars — shared by Overview + Allocation tabs. */
+function SectorBars({ sectors }) {
+  if (!sectors?.length) return <p className="text-[12px]" style={{ color: "var(--text-muted)" }}>No sector data — add holdings to see allocation.</p>;
+  return (
+    <div className="space-y-2">
+      {sectors.map((s, i) => {
+        const over = s.pct > 40;
+        return (
+          <div key={s.sector} data-testid={`sector-${s.sector}`}>
+            <div className="flex items-center justify-between text-[12px] mb-1">
+              <span style={{ color: "var(--text-secondary)" }}>{s.sector}</span>
+              <span className="font-mono font-semibold" style={{ color: over ? "var(--loss)" : "var(--text-primary)" }}>{s.pct.toFixed(1)}%</span>
+            </div>
+            <div className="h-2 rounded-full overflow-hidden" style={{ background: "var(--hover)" }}>
+              <motion.div className="h-full rounded-full" initial={{ width: 0 }} whileInView={{ width: `${Math.min(100, s.pct)}%` }}
+                viewport={{ once: true }} transition={{ duration: 0.6, delay: i * 0.05, ease: [0.16, 1, 0.3, 1] }}
+                style={{ background: over ? "var(--loss)" : COLORS[i % COLORS.length] }} />
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function AllocationPie({ data }) {
+  if (!data?.length) return (
+    <div className="h-[120px] flex items-center justify-center">
+      <span className="body-text" style={{ color: "var(--text-muted)" }}>No holdings yet</span>
+    </div>
+  );
+  return (
+    <ResponsiveContainer width="100%" height={140}>
+      <RechartsPie>
+        <Pie data={data} dataKey="value" nameKey="name" cx="50%" cy="50%" innerRadius={34} outerRadius={58} paddingAngle={2} stroke="none">
+          {data.map((_, i) => <Cell key={i} fill={COLORS[i % COLORS.length]} />)}
+        </Pie>
+        <Tooltip contentStyle={{ background: "var(--bg-elevated)", border: "1px solid var(--border)", borderRadius: 12, fontSize: 11 }} />
+      </RechartsPie>
+    </ResponsiveContainer>
+  );
+}
 
 export default function Portfolio() {
-  const [holdings, setHoldings] = useState([]);
-  const [summary, setSummary] = useState(null);
+  const [intel, setIntel] = useState(null);
+  const [performance, setPerformance] = useState(null);
   const [zerodhaAccount, setZerodhaAccount] = useState(null);
-  const [health, setHealth] = useState(null);
-  const [analyzing, setAnalyzing] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [analyzing, setAnalyzing] = useState(false);
+  const [exporting, setExporting] = useState(false);
   const [tab, setTab] = useState("Overview");
 
-  useEffect(() => { fetchPortfolio(); }, []);
+  // AI Review (on-demand narrative) + Transactions (lazy-loaded per tab)
+  const [aiReview, setAiReview] = useState(null);
+  const [aiLoading, setAiLoading] = useState(false);
+  const [transactions, setTransactions] = useState(null);
+  const [txLoading, setTxLoading] = useState(false);
 
-  const fetchPortfolio = async () => {
+  const fetchPortfolio = useCallback(async () => {
     try {
-      const [h, s, z, m] = await Promise.all([
-        api.get("/portfolio"),
-        api.get("/portfolio/summary"),
+      const [i, p, z] = await Promise.all([
+        api.get("/portfolio/intelligence"),
+        api.get("/portfolio/performance").catch(() => ({ data: { available: false } })),
         api.get("/zerodha/account").catch(() => ({ data: null })),
-        api.get("/monitor/health").catch(() => ({ data: null })),
       ]);
-      setHoldings(h.data); setSummary(s.data); setZerodhaAccount(z.data); setHealth(m.data);
+      setIntel(i.data); setPerformance(p.data); setZerodhaAccount(z.data);
     } catch (err) { console.error(err); }
     finally { setLoading(false); }
-  };
+  }, []);
 
-  // Re-run the AI portfolio monitor on demand. POST /monitor/run recomputes
-  // health, persists any critical/positive alerts, and returns the fresh result.
+  useEffect(() => { fetchPortfolio(); }, [fetchPortfolio]);
+
+  // Lazy-load transactions the first time the tab is opened.
+  useEffect(() => {
+    if (tab === "Transactions" && transactions === null && !txLoading) {
+      setTxLoading(true);
+      api.get("/trades/history")
+        .then(({ data }) => setTransactions(data || []))
+        .catch(() => setTransactions([]))
+        .finally(() => setTxLoading(false));
+    }
+  }, [tab, transactions, txLoading]);
+
+  // Re-run the AI portfolio monitor, then refresh the server intelligence bundle.
   const runAnalysis = async () => {
     setAnalyzing(true);
-    try {
-      const { data } = await api.post("/monitor/run");
-      if (data) setHealth(data);
-    } catch (err) { console.error(err); }
+    try { await api.post("/monitor/run").catch(() => {}); await fetchPortfolio(); }
     finally { setAnalyzing(false); }
   };
 
-  const pieData = holdings.map(h => ({ name: h.symbol, value: h.current_value || h.invested }));
-  const totalPnl = summary?.total_pnl ?? 0;
-  const totalPnlPct = summary?.total_pnl_pct ?? 0;
-  const isPos = totalPnl >= 0;
+  // On-demand AI narrative review (Portfolio Manager prompt).
+  const runAiReview = async () => {
+    setAiLoading(true);
+    try { const { data } = await api.post("/ai/portfolio-review"); setAiReview(data); }
+    catch (err) { console.error(err); setAiReview({ content: "AI review is temporarily unavailable. Please try again." }); }
+    finally { setAiLoading(false); }
+  };
 
-  // ─── Derived intelligence (client-side over real holdings) ───────────────
-  const enriched = holdings.map(h => {
-    const invested = h.invested ?? (h.avg_price * h.quantity) ?? 0;
-    const value = h.current_value ?? (h.current_price * h.quantity) ?? invested;
-    const pnl = h.pnl ?? (value - invested);
-    const pnlPct = h.pnl_pct ?? (invested ? (pnl / invested) * 100 : 0);
-    const sector = h.sector && String(h.sector).trim() ? h.sector : "Unclassified";
-    return { ...h, invested, value, pnl, pnlPct, sector };
-  });
-  const totalValue = enriched.reduce((a, h) => a + h.value, 0) || (summary?.current_value ?? 0);
-
-  // Sector allocation weights
-  const sectorMap = {};
-  enriched.forEach(h => { sectorMap[h.sector] = (sectorMap[h.sector] || 0) + h.value; });
-  const sectorWeights = Object.entries(sectorMap)
-    .map(([name, val]) => ({ name, value: val, pct: totalValue ? (val / totalValue) * 100 : 0 }))
-    .sort((a, b) => b.value - a.value);
-
-  // Single-name weights (for overexposure)
-  const stockWeights = enriched
-    .map(h => ({ ...h, weight: totalValue ? (h.value / totalValue) * 100 : 0 }))
-    .sort((a, b) => b.weight - a.weight);
-
-  const overStocks = stockWeights.filter(s => s.weight > STOCK_LIMIT);
-  const overSectors = sectorWeights.filter(s => s.pct > SECTOR_LIMIT);
-  const overCount = overStocks.length + overSectors.length;
-
-  // Strong vs weak holdings by P&L %
-  const byPnl = [...enriched].sort((a, b) => b.pnlPct - a.pnlPct);
-  const strong = byPnl.filter(h => h.pnlPct > 0).slice(0, 3);
-  const weak = [...byPnl].reverse().filter(h => h.pnlPct < 0).slice(0, 3);
-
-  // Diversification assessment
-  const nHoldings = enriched.length;
-  const nSectors = sectorWeights.length;
-  const topWeight = stockWeights[0]?.weight ?? 0;
-  const divLabel = nHoldings === 0 ? "—"
-    : (nHoldings >= 8 && topWeight < 25) ? "Excellent"
-    : (nHoldings >= 5 && topWeight < 35) ? "Good"
-    : (nHoldings >= 3) ? "Moderate" : "Concentrated";
-  const divColor = divLabel === "Excellent" || divLabel === "Good" ? "var(--gain)"
-    : divLabel === "Moderate" ? AMBER : "var(--loss)";
-
-  // Risk assessment (from AI health)
-  const alerts = health?.alerts ?? [];
-  const criticalAlerts = alerts.filter(a => a.severity === "critical");
-  const atRisk = health?.at_risk ?? 0;
-  const riskLevel = nHoldings === 0 ? "—"
-    : (criticalAlerts.length >= 2 || atRisk >= 2) ? "High"
-    : (criticalAlerts.length >= 1 || atRisk >= 1) ? "Elevated" : "Low";
-  const riskColor = riskLevel === "High" ? "var(--loss)" : riskLevel === "Elevated" ? AMBER : "var(--gain)";
-
-  // Profit potential (winners + AI target-proximity signals)
-  const winners = enriched.filter(h => h.pnl > 0);
-  const unrealizedGain = winners.reduce((a, h) => a + h.pnl, 0);
-  const targetSignals = alerts.filter(a => ["NEAR_TARGET", "TARGET_HIT"].includes(a.type));
-
-  // Rebalancing suggestions (overexposure + AI actionable alerts)
-  const rebalance = [];
-  overStocks.forEach(s => rebalance.push({ tone: "warning", text: `Trim ${s.symbol} — it is ${s.weight.toFixed(1)}% of the portfolio, above the ${STOCK_LIMIT}% single-stock guideline. Concentrated positions amplify single-name risk.` }));
-  overSectors.forEach(s => rebalance.push({ tone: "warning", text: `Diversify out of ${s.name} — ${s.pct.toFixed(1)}% of holdings sit in one sector (above ${SECTOR_LIMIT}%), which raises correlated drawdown risk.` }));
-  alerts
-    .filter(a => ["RISK_HIGH", "STOP_LOSS_HIT", "SIGNIFICANT_LOSS", "RSI_OVERBOUGHT"].includes(a.type) && a.action)
-    .slice(0, 4)
-    .forEach(a => rebalance.push({ tone: a.severity === "critical" ? "critical" : "warning", text: `${a.symbol}: ${a.action}. ${a.message}` }));
+  const handleExport = async () => {
+    setExporting(true);
+    try {
+      const res = await api.get("/portfolio/export", { responseType: "blob" });
+      const url = window.URL.createObjectURL(new Blob([res.data], { type: "text/csv" }));
+      const a = document.createElement("a");
+      a.href = url; a.download = "portfolio.csv";
+      document.body.appendChild(a); a.click(); a.remove();
+      window.URL.revokeObjectURL(url);
+    } catch (err) { console.error(err); }
+    finally { setExporting(false); }
+  };
 
   if (loading) return (
     <div className="space-y-5 animate-fade-in-up">
@@ -181,6 +191,31 @@ export default function Portfolio() {
     </div>
   );
 
+  // ─── Server-computed intelligence (single source of truth) ───────────────
+  const holdings = intel?.holdings ?? [];
+  const pnl = intel?.pnl ?? {};
+  const allocation = intel?.allocation ?? { by_holding: [], by_sector: [] };
+  const diversification = intel?.diversification ?? {};
+  const risk = intel?.risk ?? {};
+  const movers = intel?.movers ?? { strong: [], weak: [] };
+  const suggestions = intel?.suggestions ?? [];
+  const dividends = intel?.dividends ?? { available: false };
+  const health = intel?.health ?? null;
+  const alerts = health?.alerts ?? [];
+  const sources = intel?.sources ?? [];
+
+  const totalPnl = pnl.unrealized ?? 0;
+  const totalPnlPct = pnl.unrealized_pct ?? 0;
+  const isPos = totalPnl >= 0;
+
+  const pieData = allocation.by_holding.map(h => ({ name: h.symbol, value: h.value }));
+  const overCount = allocation.by_holding.filter(h => h.pct > 30).length + allocation.by_sector.filter(s => s.pct > 40).length;
+  const winners = holdings.filter(h => (h.pnl ?? 0) > 0);
+  const unrealizedGain = winners.reduce((a, h) => a + (h.pnl ?? 0), 0);
+  const riskColor = risk.level === "High" ? "var(--loss)" : risk.level === "Elevated" ? AMBER : "var(--gain)";
+  const divColor = ["Excellent", "Good"].includes(diversification.label) ? "var(--gain)"
+    : diversification.label === "Moderate" ? AMBER : "var(--loss)";
+
   return (
     <div data-testid="portfolio-page" className="space-y-5">
       {/* Header */}
@@ -188,14 +223,17 @@ export default function Portfolio() {
         <div className="flex items-center justify-between">
           <div>
             <h1 className="page-title">Portfolio</h1>
-            <p className="page-subtitle mt-1">Your holdings and performance overview</p>
+            <p className="page-subtitle mt-1">
+              Your holdings and performance overview
+              {sources.length > 0 && <span className="caption ml-2">· {sources.map(s => s === "broker" ? "Broker" : "Manual").join(" + ")}</span>}
+            </p>
           </div>
           <div className="flex items-center gap-2">
-            <button onClick={fetchPortfolio} className="btn-ghost btn-sm" style={{ padding: "10px" }}>
+            <button onClick={fetchPortfolio} className="btn-ghost btn-sm" style={{ padding: "10px" }} title="Refresh">
               <RefreshCw size={15} />
             </button>
-            <button className="btn-ghost btn-sm" style={{ padding: "10px" }}>
-              <Download size={15} />
+            <button onClick={handleExport} disabled={exporting || holdings.length === 0} className="btn-ghost btn-sm" style={{ padding: "10px" }} title="Export CSV">
+              {exporting ? <Loader2 size={15} className="animate-spin" /> : <Download size={15} />}
             </button>
           </div>
         </div>
@@ -210,272 +248,405 @@ export default function Portfolio() {
         </div>
       </Reveal>
 
-      {/* Portfolio Value Strip */}
+      {/* Portfolio Value Strip — shown on every tab for constant context */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
         <Reveal delay={0} className="lg:col-span-2">
-        <div className="glass-card p-5 h-full">
-          <span className="stat-label block mb-1.5">Total Portfolio Value</span>
-          <div className="flex items-baseline gap-3 flex-wrap">
-            <span className="stat-value">
-              ₹{formatNumber(summary?.current_value ?? summary?.total_value ?? 0)}
-            </span>
-            <span className="text-sm font-mono font-semibold flex items-center gap-1" style={{ color: isPos ? "var(--gain)" : "var(--loss)" }}>
-              {isPos ? <ArrowUpRight size={14} /> : <ArrowDownRight size={14} />}
-              {isPos ? "+" : ""}₹{formatNumber(Math.abs(totalPnl))} ({isPos ? "+" : ""}{totalPnlPct.toFixed(2)}%)
-            </span>
+          <div className="glass-card p-5 h-full">
+            <span className="stat-label block mb-1.5">Total Portfolio Value</span>
+            <div className="flex items-baseline gap-3 flex-wrap">
+              <span className="stat-value">₹{formatNumber(pnl.current_value ?? 0)}</span>
+              <span className="text-sm font-mono font-semibold flex items-center gap-1" style={{ color: isPos ? "var(--gain)" : "var(--loss)" }}>
+                {isPos ? <ArrowUpRight size={14} /> : <ArrowDownRight size={14} />}
+                {isPos ? "+" : ""}₹{formatNumber(Math.abs(totalPnl))} ({isPos ? "+" : ""}{totalPnlPct.toFixed(2)}%)
+              </span>
+            </div>
+            <div className="flex items-center gap-4 mt-2 flex-wrap">
+              <span className="caption">Invested: <b style={{ color: "var(--text-primary)" }}>₹{formatNumber(pnl.invested ?? 0)}</b></span>
+              <span className="caption">Realized P&L: <b style={{ color: (pnl.realized ?? 0) >= 0 ? "var(--gain)" : "var(--loss)" }}>{(pnl.realized ?? 0) >= 0 ? "+" : ""}₹{formatNumber(Math.abs(pnl.realized ?? 0))}</b></span>
+              <span className="caption">Holdings: <b style={{ color: "var(--text-primary)" }}>{intel?.holdings_count ?? 0}</b></span>
+            </div>
           </div>
-        </div>
         </Reveal>
-
-        {/* Allocation Chart */}
         <Reveal delay={0.06}>
-        <div className="glass-card p-5 h-full">
-          <span className="stat-label block mb-2">Allocation by Holding</span>
-          {pieData.length > 0 ? (
-            <ResponsiveContainer width="100%" height={120}>
-              <RechartsPie>
-                <Pie data={pieData} dataKey="value" cx="50%" cy="50%" innerRadius={30} outerRadius={50} paddingAngle={2} stroke="none">
-                  {pieData.map((_, i) => <Cell key={i} fill={COLORS[i % COLORS.length]} />)}
-                </Pie>
-                <Tooltip contentStyle={{ background: "var(--bg-elevated)", border: "1px solid var(--border)", borderRadius: 12, fontSize: 11 }} />
-              </RechartsPie>
-            </ResponsiveContainer>
-          ) : (
-            <div className="h-[120px] flex items-center justify-center">
-              <span className="body-text" style={{ color: "var(--text-muted)" }}>No holdings yet</span>
-            </div>
-          )}
-        </div>
+          <div className="glass-card p-5 h-full">
+            <span className="stat-label block mb-2">Allocation by Holding</span>
+            <AllocationPie data={pieData} />
+          </div>
         </Reveal>
       </div>
 
-      {/* ═══════════ Portfolio Intelligence ═══════════ */}
-      <Reveal>
-      <div data-testid="portfolio-intelligence" className="glass-card p-5">
-        {/* Hero: score ring + summary + re-analyze */}
-        <div className="flex items-start justify-between gap-4 flex-wrap">
-          <div className="flex items-center gap-4 min-w-0">
-            <ScoreRing score={health?.health_score ?? 100} />
-            <div className="min-w-0">
-              <h3 className="eyebrow flex items-center gap-2 mb-1">
-                <Brain size={13} style={{ color: "var(--ai-accent)" }} /> Portfolio Intelligence
-              </h3>
-              <p className="text-[13px] leading-snug" style={{ color: "var(--text-secondary)" }}>
-                {health?.summary || "Add open positions to unlock AI portfolio analysis."}
-              </p>
-              <div className="flex items-center gap-3 mt-1.5 flex-wrap">
-                <span className="caption">Open positions: <b style={{ color: "var(--text-primary)" }}>{health?.open_positions ?? nHoldings}</b></span>
-                <span className="caption">At risk: <b style={{ color: atRisk ? "var(--loss)" : "var(--text-primary)" }}>{atRisk}</b></span>
-                {health?.last_check && <span className="caption">Updated {new Date(health.last_check).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span>}
-              </div>
-            </div>
-          </div>
-          <button data-testid="reanalyze-btn" onClick={runAnalysis} disabled={analyzing} className="btn-secondary btn-sm shrink-0">
-            {analyzing ? <Loader2 size={14} className="animate-spin" /> : <Sparkles size={14} />}
-            {analyzing ? "Analyzing…" : "Re-analyze"}
-          </button>
-        </div>
-
-        {/* Dimension grid */}
-        <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 mt-4">
-          <DimensionCard icon={Layers} testid="dim-diversification" label="Diversification" value={divLabel} valueColor={divColor}
-            note={nHoldings ? `${nHoldings} holdings across ${nSectors} sector${nSectors === 1 ? "" : "s"}; top position ${topWeight.toFixed(0)}%.` : "No holdings yet."} />
-          <DimensionCard icon={AlertTriangle} testid="dim-overexposure" label="Overexposure" value={overCount === 0 ? "Balanced" : `${overCount} flag${overCount === 1 ? "" : "s"}`}
-            valueColor={overCount ? "var(--loss)" : "var(--gain)"}
-            note={overCount ? "One or more positions/sectors exceed safe concentration limits." : `No single name >${STOCK_LIMIT}% or sector >${SECTOR_LIMIT}%.`} />
-          <DimensionCard icon={Shield} testid="dim-risk" label="Risk" value={riskLevel} valueColor={riskColor}
-            note={nHoldings ? `${criticalAlerts.length} critical alert${criticalAlerts.length === 1 ? "" : "s"}, ${atRisk} position${atRisk === 1 ? "" : "s"} near stop.` : "No exposure."} />
-          <DimensionCard icon={Coins} testid="dim-profit-potential" label="Profit Potential" value={`₹${formatNumber(unrealizedGain, 0)}`} valueColor={unrealizedGain > 0 ? "var(--gain)" : "var(--text-primary)"}
-            note={`${winners.length} winner${winners.length === 1 ? "" : "s"}${targetSignals.length ? `, ${targetSignals.length} near target` : ""}.`} />
-        </div>
-
-        {/* Sector allocation bars */}
-        <div className="mt-5">
-          <div className="flex items-center gap-1.5 mb-2.5">
-            <Scale size={13} style={{ color: "var(--text-muted)" }} />
-            <span className="eyebrow">Sector Allocation</span>
-          </div>
-          {sectorWeights.length ? (
-            <div className="space-y-2">
-              {sectorWeights.map((s, i) => {
-                const over = s.pct > SECTOR_LIMIT;
-                return (
-                  <div key={s.name} data-testid={`sector-${s.name}`}>
-                    <div className="flex items-center justify-between text-[12px] mb-1">
-                      <span style={{ color: "var(--text-secondary)" }}>{s.name}</span>
-                      <span className="font-mono font-semibold" style={{ color: over ? "var(--loss)" : "var(--text-primary)" }}>{s.pct.toFixed(1)}%</span>
-                    </div>
-                    <div className="h-2 rounded-full overflow-hidden" style={{ background: "var(--hover)" }}>
-                      <motion.div className="h-full rounded-full" initial={{ width: 0 }} whileInView={{ width: `${Math.min(100, s.pct)}%` }}
-                        viewport={{ once: true }} transition={{ duration: 0.6, delay: i * 0.05, ease: [0.16, 1, 0.3, 1] }}
-                        style={{ background: over ? "var(--loss)" : COLORS[i % COLORS.length] }} />
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          ) : (
-            <p className="text-[12px]" style={{ color: "var(--text-muted)" }}>No sector data — add holdings to see allocation.</p>
-          )}
-        </div>
-
-        {/* Strong vs Weak holdings */}
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mt-5">
-          <div data-testid="strong-holdings" className="rounded-2xl p-3.5" style={{ background: "var(--gain-bg)", border: "1px solid var(--border)" }}>
-            <div className="flex items-center gap-1.5 mb-2">
-              <Award size={13} style={{ color: "var(--gain)" }} />
-              <span className="eyebrow" style={{ color: "var(--gain)" }}>Strong Holdings</span>
-            </div>
-            {strong.length ? strong.map(h => (
-              <div key={h.symbol} className="flex items-center justify-between py-1">
-                <span className="text-[12px] font-semibold" style={{ color: "var(--text-primary)" }}>{h.symbol}</span>
-                <span className="text-[12px] font-mono font-semibold" style={{ color: "var(--gain)" }}>+{h.pnlPct.toFixed(2)}%</span>
-              </div>
-            )) : <p className="text-[12px]" style={{ color: "var(--text-muted)" }}>No profitable positions yet.</p>}
-          </div>
-          <div data-testid="weak-holdings" className="rounded-2xl p-3.5" style={{ background: "var(--loss-bg)", border: "1px solid var(--border)" }}>
-            <div className="flex items-center gap-1.5 mb-2">
-              <TrendingDown size={13} style={{ color: "var(--loss)" }} />
-              <span className="eyebrow" style={{ color: "var(--loss)" }}>Weak Holdings</span>
-            </div>
-            {weak.length ? weak.map(h => (
-              <div key={h.symbol} className="flex items-center justify-between py-1">
-                <span className="text-[12px] font-semibold" style={{ color: "var(--text-primary)" }}>{h.symbol}</span>
-                <span className="text-[12px] font-mono font-semibold" style={{ color: "var(--loss)" }}>{h.pnlPct.toFixed(2)}%</span>
-              </div>
-            )) : <p className="text-[12px]" style={{ color: "var(--text-muted)" }}>No losing positions — nice work.</p>}
-          </div>
-        </div>
-
-        {/* Rebalancing suggestions */}
-        <div className="mt-5">
-          <div className="flex items-center gap-1.5 mb-2.5">
-            <Sparkles size={13} style={{ color: "var(--ai-accent)" }} />
-            <span className="eyebrow">Rebalancing Suggestions</span>
-          </div>
-          {rebalance.length ? (
-            <div className="space-y-1.5">
-              {rebalance.map((r, i) => (
-                <div key={i} data-testid={`rebalance-${i}`} className="flex items-start gap-2 p-2.5 rounded-xl" style={{ background: "var(--bg-surface)", border: "1px solid var(--border)" }}>
-                  <span className="w-1.5 h-1.5 rounded-full mt-1.5 shrink-0" style={{ background: SEVERITY_COLOR[r.tone] || "var(--ai-accent)" }} />
-                  <span className="text-[12px] leading-snug" style={{ color: "var(--text-secondary)" }}>{r.text}</span>
-                </div>
-              ))}
-            </div>
-          ) : (
-            <div className="flex items-start gap-2 p-2.5 rounded-xl" style={{ background: "var(--gain-bg)", border: "1px solid var(--border)" }}>
-              <span className="text-[11px] mt-0.5" style={{ color: "var(--gain)" }}>✓</span>
-              <span className="text-[12px]" style={{ color: "var(--text-secondary)" }}>Portfolio is well balanced — no rebalancing needed right now.</span>
-            </div>
-          )}
-        </div>
-
-        {/* AI alert feed (only when the monitor produced alerts) */}
-        {alerts.length > 0 && (
-          <div className="mt-5">
-            <div className="flex items-center gap-1.5 mb-2.5">
-              <Brain size={13} style={{ color: "var(--ai-accent)" }} />
-              <span className="eyebrow">AI Alerts</span>
-            </div>
-            <div className="space-y-1.5">
-              {alerts.slice(0, 6).map((a, i) => (
-                <div key={i} className="flex items-start gap-2 p-2.5 rounded-xl" style={{ background: "var(--bg-surface)", border: "1px solid var(--border)" }}>
-                  <span className="w-1.5 h-1.5 rounded-full mt-1.5 shrink-0" style={{ background: SEVERITY_COLOR[a.severity] || "var(--text-muted)" }} />
-                  <div className="min-w-0">
-                    <span className="text-[12px] leading-snug" style={{ color: "var(--text-secondary)" }}>{a.message}</span>
-                    {a.action && <span className="text-[11px] font-semibold ml-1" style={{ color: SEVERITY_COLOR[a.severity] || "var(--text-muted)" }}>→ {a.action}</span>}
-                  </div>
-                </div>
-              ))}
-            </div>
-          </div>
-        )}
-
-        {/* Dividend analysis — not yet available from the data layer */}
-        <div data-testid="dim-dividend" className="mt-5 flex items-center justify-between p-3 rounded-xl" style={{ background: "var(--bg-surface)", border: "1px dashed var(--border)" }}>
-          <div className="flex items-center gap-2">
-            <Coins size={13} style={{ color: "var(--text-muted)" }} />
-            <span className="eyebrow" style={{ color: "var(--text-muted)" }}>Dividend Analysis</span>
-          </div>
-          <span className="badge-status" style={{ background: "var(--hover)", color: "var(--text-muted)" }}>Coming soon</span>
-        </div>
-      </div>
-      </Reveal>
-
-      {/* Holdings Table */}
-      <Reveal>
-      <div className="glass-card overflow-hidden">
-        <div className="p-4 pb-0">
-          <h3 className="eyebrow">Holdings ({holdings.length})</h3>
-        </div>
-        <div className="overflow-x-auto">
-          <table className="data-table mt-3">
-            <thead>
-              <tr>
-                <th>Stock</th>
-                <th>Qty</th>
-                <th>Avg Price</th>
-                <th>Current Price</th>
-                <th>P/L</th>
-                <th>P/L %</th>
-                <th>Day Change</th>
-              </tr>
-            </thead>
-            <tbody>
-              {holdings.map(h => {
-                const pnl = (h.current_price - h.avg_price) * h.quantity;
-                const pnlPct = h.avg_price ? ((h.current_price - h.avg_price) / h.avg_price * 100) : 0;
-                const isPosH = pnl >= 0;
-                return (
-                  <tr key={h.symbol}>
-                    <td>
-                      <span className="text-[13px] font-semibold" style={{ color: "var(--text-primary)" }}>{h.symbol}</span>
-                    </td>
-                    <td className="font-mono text-[13px]">{h.quantity}</td>
-                    <td className="font-mono text-[13px]">₹{formatNumber(h.avg_price)}</td>
-                    <td className="font-mono text-[13px]">₹{formatNumber(h.current_price)}</td>
-                    <td className="font-mono text-[13px] font-semibold" style={{ color: isPosH ? "var(--gain)" : "var(--loss)" }}>
-                      {isPosH ? "+" : ""}₹{formatNumber(Math.abs(pnl))}
-                    </td>
-                    <td className="font-mono text-[13px] font-semibold" style={{ color: isPosH ? "var(--gain)" : "var(--loss)" }}>
-                      {isPosH ? "+" : ""}{pnlPct.toFixed(2)}%
-                    </td>
-                    <td className="font-mono text-[13px]" style={{ color: (h.day_change_pct ?? 0) >= 0 ? "var(--gain)" : "var(--loss)" }}>
-                      {(h.day_change_pct ?? 0) >= 0 ? "+" : ""}{(h.day_change_pct ?? 0).toFixed(2)}%
-                    </td>
-                  </tr>
-                );
-              })}
-              {holdings.length === 0 && (
-                <tr><td colSpan={7} className="text-center py-8 text-[13px]" style={{ color: "var(--text-muted)" }}>No holdings found. Start trading to build your portfolio.</td></tr>
-              )}
-            </tbody>
-          </table>
-        </div>
-      </div>
-      </Reveal>
-
-      {/* Zerodha Account */}
-      {zerodhaAccount && (
+      {/* ═══════════ OVERVIEW ═══════════ */}
+      {tab === "Overview" && (
         <Reveal>
-        <div className="glass-card p-5">
-          <h3 className="eyebrow mb-3 flex items-center gap-2">
-            <Wallet size={13} /> Zerodha Account
-            <span className="badge-status" style={{
-              background: zerodhaAccount.status?.connected ? "var(--gain-bg)" : "var(--hover)",
-              color: zerodhaAccount.status?.connected ? "var(--gain)" : "var(--text-muted)",
-            }}>
-              {zerodhaAccount.status?.mode?.toUpperCase()}
-            </span>
-          </h3>
-          {zerodhaAccount.funds && (
-            <div className="grid grid-cols-3 gap-4">
-              <div><span className="stat-label">Available</span><div className="text-lg font-mono font-semibold" style={{ color: "var(--text-primary)" }}>₹{formatNumber(zerodhaAccount.funds.available)}</div></div>
-              <div><span className="stat-label">Used</span><div className="text-lg font-mono font-semibold" style={{ color: "var(--text-primary)" }}>₹{formatNumber(zerodhaAccount.funds.used)}</div></div>
-              <div><span className="stat-label">Total</span><div className="text-lg font-mono font-semibold" style={{ color: "var(--text-primary)" }}>₹{formatNumber(zerodhaAccount.funds.total)}</div></div>
+          <div data-testid="portfolio-intelligence" className="glass-card p-5">
+            {/* Hero: score ring + summary + re-analyze */}
+            <div className="flex items-start justify-between gap-4 flex-wrap">
+              <div className="flex items-center gap-4 min-w-0">
+                <ScoreRing score={health?.health_score ?? 100} />
+                <div className="min-w-0">
+                  <h3 className="eyebrow flex items-center gap-2 mb-1">
+                    <Brain size={13} style={{ color: "var(--ai-accent)" }} /> Portfolio Intelligence
+                  </h3>
+                  <p className="text-[13px] leading-snug" style={{ color: "var(--text-secondary)" }}>
+                    {intel?.summary || "Add open positions to unlock AI portfolio analysis."}
+                  </p>
+                  <div className="flex items-center gap-3 mt-1.5 flex-wrap">
+                    <span className="caption">Open positions: <b style={{ color: "var(--text-primary)" }}>{health?.open_positions ?? holdings.length}</b></span>
+                    <span className="caption">At risk: <b style={{ color: (health?.at_risk ?? 0) ? "var(--loss)" : "var(--text-primary)" }}>{health?.at_risk ?? 0}</b></span>
+                    {health?.last_check && <span className="caption">Updated {new Date(health.last_check).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span>}
+                  </div>
+                </div>
+              </div>
+              <button data-testid="reanalyze-btn" onClick={runAnalysis} disabled={analyzing} className="btn-secondary btn-sm shrink-0">
+                {analyzing ? <Loader2 size={14} className="animate-spin" /> : <Sparkles size={14} />}
+                {analyzing ? "Analyzing…" : "Re-analyze"}
+              </button>
             </div>
-          )}
+
+            {/* Dimension grid */}
+            <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 mt-4">
+              <DimensionCard icon={Layers} testid="dim-diversification" label="Diversification" value={diversification.label || "—"} valueColor={divColor}
+                note={holdings.length ? `${diversification.n_holdings} holdings · ${diversification.n_sectors} sector${diversification.n_sectors === 1 ? "" : "s"} · top ${(diversification.top_weight ?? 0).toFixed(0)}% · eff. ${diversification.effective_holdings}` : "No holdings yet."} />
+              <DimensionCard icon={AlertTriangle} testid="dim-overexposure" label="Overexposure" value={overCount === 0 ? "Balanced" : `${overCount} flag${overCount === 1 ? "" : "s"}`}
+                valueColor={overCount ? "var(--loss)" : "var(--gain)"}
+                note={overCount ? "One or more positions/sectors exceed safe concentration limits." : "No single name >30% or sector >40%."} />
+              <DimensionCard icon={Shield} testid="dim-risk" label="Risk" value={risk.level || "—"} valueColor={riskColor}
+                note={holdings.length ? `Risk score ${risk.score}/100 across ${risk.factors?.length ?? 0} factor${(risk.factors?.length ?? 0) === 1 ? "" : "s"}.` : "No exposure."} />
+              <DimensionCard icon={Coins} testid="dim-profit-potential" label="Unrealized Gain" value={`₹${formatNumber(unrealizedGain, 0)}`} valueColor={unrealizedGain > 0 ? "var(--gain)" : "var(--text-primary)"}
+                note={`${winners.length} winner${winners.length === 1 ? "" : "s"} of ${holdings.length}.`} />
+            </div>
+
+            {/* Risk factors */}
+            {risk.factors?.length > 0 && (
+              <div className="mt-5">
+                <div className="flex items-center gap-1.5 mb-2.5">
+                  <Shield size={13} style={{ color: "var(--text-muted)" }} />
+                  <span className="eyebrow">Risk Factors</span>
+                </div>
+                <div className="space-y-1.5">
+                  {risk.factors.map((f, i) => (
+                    <div key={i} className="flex items-center justify-between gap-2 p-2.5 rounded-xl" style={{ background: "var(--bg-surface)", border: "1px solid var(--border)" }}>
+                      <span className="text-[12px]" style={{ color: "var(--text-secondary)" }}>{f.name} — <span style={{ color: "var(--text-muted)" }}>{f.detail}</span></span>
+                      <span className="text-[12px] font-mono font-semibold shrink-0" style={{ color: AMBER }}>+{f.points}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Sector allocation bars */}
+            <div className="mt-5">
+              <div className="flex items-center gap-1.5 mb-2.5">
+                <Scale size={13} style={{ color: "var(--text-muted)" }} />
+                <span className="eyebrow">Sector Allocation</span>
+              </div>
+              <SectorBars sectors={allocation.by_sector} />
+            </div>
+
+            {/* Strong vs Weak holdings */}
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mt-5">
+              <div data-testid="strong-holdings" className="rounded-2xl p-3.5" style={{ background: "var(--gain-bg)", border: "1px solid var(--border)" }}>
+                <div className="flex items-center gap-1.5 mb-2">
+                  <Award size={13} style={{ color: "var(--gain)" }} />
+                  <span className="eyebrow" style={{ color: "var(--gain)" }}>Strong Holdings</span>
+                </div>
+                {movers.strong.length ? movers.strong.map(h => (
+                  <div key={h.symbol} className="flex items-center justify-between py-1">
+                    <span className="text-[12px] font-semibold" style={{ color: "var(--text-primary)" }}>{h.symbol}</span>
+                    <span className="text-[12px] font-mono font-semibold" style={{ color: "var(--gain)" }}>+{h.pnl_pct.toFixed(2)}%</span>
+                  </div>
+                )) : <p className="text-[12px]" style={{ color: "var(--text-muted)" }}>No profitable positions yet.</p>}
+              </div>
+              <div data-testid="weak-holdings" className="rounded-2xl p-3.5" style={{ background: "var(--loss-bg)", border: "1px solid var(--border)" }}>
+                <div className="flex items-center gap-1.5 mb-2">
+                  <TrendingDown size={13} style={{ color: "var(--loss)" }} />
+                  <span className="eyebrow" style={{ color: "var(--loss)" }}>Weak Holdings</span>
+                </div>
+                {movers.weak.length ? movers.weak.map(h => (
+                  <div key={h.symbol} className="flex items-center justify-between py-1">
+                    <span className="text-[12px] font-semibold" style={{ color: "var(--text-primary)" }}>{h.symbol}</span>
+                    <span className="text-[12px] font-mono font-semibold" style={{ color: "var(--loss)" }}>{h.pnl_pct.toFixed(2)}%</span>
+                  </div>
+                )) : <p className="text-[12px]" style={{ color: "var(--text-muted)" }}>No losing positions — nice work.</p>}
+              </div>
+            </div>
+
+            {/* Rebalancing suggestions */}
+            <div className="mt-5">
+              <div className="flex items-center gap-1.5 mb-2.5">
+                <Sparkles size={13} style={{ color: "var(--ai-accent)" }} />
+                <span className="eyebrow">Rebalancing Suggestions</span>
+              </div>
+              <div className="space-y-1.5">
+                {suggestions.map((r, i) => (
+                  <div key={i} data-testid={`rebalance-${i}`} className="flex items-start gap-2 p-2.5 rounded-xl" style={{ background: r.tone === "positive" ? "var(--gain-bg)" : "var(--bg-surface)", border: "1px solid var(--border)" }}>
+                    <span className="w-1.5 h-1.5 rounded-full mt-1.5 shrink-0" style={{ background: SEVERITY_COLOR[r.tone] || "var(--ai-accent)" }} />
+                    <span className="text-[12px] leading-snug" style={{ color: "var(--text-secondary)" }}>{r.text}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {/* AI alert feed */}
+            {alerts.length > 0 && (
+              <div className="mt-5">
+                <div className="flex items-center gap-1.5 mb-2.5">
+                  <Brain size={13} style={{ color: "var(--ai-accent)" }} />
+                  <span className="eyebrow">AI Alerts</span>
+                </div>
+                <div className="space-y-1.5">
+                  {alerts.slice(0, 6).map((a, i) => (
+                    <div key={i} className="flex items-start gap-2 p-2.5 rounded-xl" style={{ background: "var(--bg-surface)", border: "1px solid var(--border)" }}>
+                      <span className="w-1.5 h-1.5 rounded-full mt-1.5 shrink-0" style={{ background: SEVERITY_COLOR[a.severity] || "var(--text-muted)" }} />
+                      <div className="min-w-0">
+                        <span className="text-[12px] leading-snug" style={{ color: "var(--text-secondary)" }}>{a.message}</span>
+                        {a.action && <span className="text-[11px] font-semibold ml-1" style={{ color: SEVERITY_COLOR[a.severity] || "var(--text-muted)" }}>→ {a.action}</span>}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Dividend analysis — real trailing data, else explicit unavailable */}
+            <div data-testid="dim-dividend" className="mt-5 p-3.5 rounded-xl" style={{ background: "var(--bg-surface)", border: "1px solid var(--border)" }}>
+              <div className="flex items-center justify-between mb-1">
+                <div className="flex items-center gap-2">
+                  <Coins size={13} style={{ color: dividends.available ? "var(--gain)" : "var(--text-muted)" }} />
+                  <span className="eyebrow">Dividend Analysis</span>
+                </div>
+                {dividends.available ? (
+                  <span className="text-[13px] font-mono font-semibold" style={{ color: "var(--gain)" }}>
+                    ~₹{formatNumber(dividends.annual_income, 0)}/yr · {dividends.portfolio_yield?.toFixed(2)}%
+                  </span>
+                ) : (
+                  <span className="badge-status" style={{ background: "var(--hover)", color: "var(--text-muted)" }}>Unavailable</span>
+                )}
+              </div>
+              <p className="text-[11px] leading-snug" style={{ color: "var(--text-muted)" }}>
+                {dividends.available
+                  ? "Estimated annual dividend income from live trailing dividend rates across your holdings."
+                  : (dividends.reason || "Live dividend data is not available for the current holdings.")}
+              </p>
+            </div>
+          </div>
+        </Reveal>
+      )}
+
+      {/* ═══════════ HOLDINGS ═══════════ */}
+      {tab === "Holdings" && (
+        <Reveal>
+          <div className="glass-card overflow-hidden">
+            <div className="p-4 pb-0">
+              <h3 className="eyebrow">Holdings ({holdings.length})</h3>
+            </div>
+            <div className="overflow-x-auto">
+              <table className="data-table mt-3">
+                <thead>
+                  <tr>
+                    <th>Stock</th><th>Qty</th><th>Avg Price</th><th>Current Price</th>
+                    <th>Invested</th><th>Value</th><th>P/L</th><th>P/L %</th><th>Day Change</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {holdings.map(h => {
+                    const isPosH = (h.pnl ?? 0) >= 0;
+                    return (
+                      <tr key={h.symbol}>
+                        <td>
+                          <span className="text-[13px] font-semibold" style={{ color: "var(--text-primary)" }}>{h.symbol}</span>
+                          <SourceBadge source={h.source} />
+                        </td>
+                        <td className="font-mono text-[13px]">{h.quantity}</td>
+                        <td className="font-mono text-[13px]">₹{formatNumber(h.avg_price)}</td>
+                        <td className="font-mono text-[13px]">{h.current_price != null ? `₹${formatNumber(h.current_price)}` : "--"}</td>
+                        <td className="font-mono text-[13px]">₹{formatNumber(h.invested)}</td>
+                        <td className="font-mono text-[13px]">₹{formatNumber(h.current_value)}</td>
+                        <td className="font-mono text-[13px] font-semibold" style={{ color: isPosH ? "var(--gain)" : "var(--loss)" }}>
+                          {isPosH ? "+" : ""}₹{formatNumber(Math.abs(h.pnl ?? 0))}
+                        </td>
+                        <td className="font-mono text-[13px] font-semibold" style={{ color: isPosH ? "var(--gain)" : "var(--loss)" }}>
+                          {isPosH ? "+" : ""}{(h.pnl_pct ?? 0).toFixed(2)}%
+                        </td>
+                        <td className="font-mono text-[13px]" style={{ color: (h.day_change_pct ?? 0) >= 0 ? "var(--gain)" : "var(--loss)" }}>
+                          {h.day_change_pct != null ? `${h.day_change_pct >= 0 ? "+" : ""}${h.day_change_pct.toFixed(2)}%` : "--"}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                  {holdings.length === 0 && (
+                    <tr><td colSpan={9} className="text-center py-8 text-[13px]" style={{ color: "var(--text-muted)" }}>No holdings found. Connect a broker or log a trade to build your portfolio.</td></tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </Reveal>
+      )}
+
+      {/* ═══════════ PERFORMANCE ═══════════ */}
+      {tab === "Performance" && (
+        <Reveal>
+          <div className="glass-card p-5">
+            <h3 className="eyebrow flex items-center gap-2 mb-4"><LineChartIcon size={13} style={{ color: "var(--ai-accent)" }} /> Equity Curve</h3>
+            {performance?.available ? (
+              <>
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-5">
+                  <DimensionCard icon={Activity} label="Return" value={`${performance.pct_return >= 0 ? "+" : ""}${performance.pct_return.toFixed(2)}%`} valueColor={performance.pct_return >= 0 ? "var(--gain)" : "var(--loss)"} note={`₹${formatNumber(performance.abs_return)} since ${performance.start_date}`} />
+                  <DimensionCard icon={LineChartIcon} label="Data Points" value={performance.points} note="Daily EOD snapshots" />
+                  <DimensionCard icon={ArrowUpRight} label="Best Day" value={performance.best_day ? `+${performance.best_day.pct.toFixed(2)}%` : "--"} valueColor="var(--gain)" note={performance.best_day?.date} />
+                  <DimensionCard icon={ArrowDownRight} label="Worst Day" value={performance.worst_day ? `${performance.worst_day.pct.toFixed(2)}%` : "--"} valueColor="var(--loss)" note={performance.worst_day?.date} />
+                </div>
+                <ResponsiveContainer width="100%" height={260}>
+                  <AreaChart data={performance.curve} margin={{ top: 4, right: 8, left: 8, bottom: 0 }}>
+                    <defs>
+                      <linearGradient id="eqGrad" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="0%" stopColor="#6366F1" stopOpacity={0.35} />
+                        <stop offset="100%" stopColor="#6366F1" stopOpacity={0} />
+                      </linearGradient>
+                    </defs>
+                    <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" vertical={false} />
+                    <XAxis dataKey="date" tick={{ fontSize: 10, fill: "var(--text-muted)" }} tickLine={false} axisLine={false} minTickGap={24} />
+                    <YAxis tick={{ fontSize: 10, fill: "var(--text-muted)" }} tickLine={false} axisLine={false} width={54} tickFormatter={v => `₹${formatNumber(v, 0)}`} domain={["auto", "auto"]} />
+                    <Tooltip contentStyle={{ background: "var(--bg-elevated)", border: "1px solid var(--border)", borderRadius: 12, fontSize: 11 }} formatter={v => [`₹${formatNumber(v)}`, "Value"]} />
+                    <Area type="monotone" dataKey="value" stroke="#6366F1" strokeWidth={2} fill="url(#eqGrad)" />
+                  </AreaChart>
+                </ResponsiveContainer>
+              </>
+            ) : (
+              <div className="flex flex-col items-center justify-center text-center py-12">
+                <LineChartIcon size={32} style={{ color: "var(--text-muted)" }} />
+                <p className="text-[14px] font-semibold mt-3" style={{ color: "var(--text-primary)" }}>Equity curve is being recorded</p>
+                <p className="text-[12px] mt-1 max-w-md" style={{ color: "var(--text-muted)" }}>
+                  {performance?.reason || "Your performance chart appears after a couple of end-of-day snapshots. We build it forward from real marks — never with synthetic history."}
+                </p>
+              </div>
+            )}
+          </div>
+        </Reveal>
+      )}
+
+      {/* ═══════════ ALLOCATION ═══════════ */}
+      {tab === "Allocation" && (
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+          <Reveal>
+            <div className="glass-card p-5 h-full">
+              <h3 className="eyebrow mb-3">By Holding</h3>
+              <AllocationPie data={pieData} />
+              <div className="mt-4 space-y-1.5">
+                {allocation.by_holding.map((h, i) => (
+                  <div key={h.symbol} className="flex items-center justify-between text-[12px]">
+                    <span className="flex items-center gap-2" style={{ color: "var(--text-secondary)" }}>
+                      <span className="w-2 h-2 rounded-full" style={{ background: COLORS[i % COLORS.length] }} />{h.symbol}
+                    </span>
+                    <span className="font-mono font-semibold" style={{ color: "var(--text-primary)" }}>{h.pct.toFixed(1)}%</span>
+                  </div>
+                ))}
+                {allocation.by_holding.length === 0 && <p className="text-[12px]" style={{ color: "var(--text-muted)" }}>No holdings yet.</p>}
+              </div>
+            </div>
+          </Reveal>
+          <Reveal delay={0.06}>
+            <div className="glass-card p-5 h-full">
+              <h3 className="eyebrow mb-3">By Sector</h3>
+              <SectorBars sectors={allocation.by_sector} />
+            </div>
+          </Reveal>
         </div>
+      )}
+
+      {/* ═══════════ AI REVIEW ═══════════ */}
+      {tab === "AI Review" && (
+        <Reveal>
+          <div className="glass-card p-5">
+            <div className="flex items-start justify-between gap-3 flex-wrap mb-3">
+              <h3 className="eyebrow flex items-center gap-2"><Brain size={13} style={{ color: "var(--ai-accent)" }} /> AI Portfolio Review</h3>
+              <button onClick={runAiReview} disabled={aiLoading || holdings.length === 0} className="btn-secondary btn-sm">
+                {aiLoading ? <Loader2 size={14} className="animate-spin" /> : <Sparkles size={14} />}
+                {aiLoading ? "Reviewing…" : aiReview ? "Regenerate" : "Generate Review"}
+              </button>
+            </div>
+            {holdings.length === 0 ? (
+              <p className="text-[13px]" style={{ color: "var(--text-muted)" }}>Add holdings to receive an AI portfolio review.</p>
+            ) : aiReview ? (
+              <div className="space-y-3">
+                {aiReview.model_used && <span className="badge-status" style={{ background: "var(--hover)", color: "var(--ai-accent)" }}>{aiReview.model_used}</span>}
+                <p className="text-[13.5px] leading-relaxed whitespace-pre-wrap" style={{ color: "var(--text-secondary)" }}>{aiReview.content}</p>
+              </div>
+            ) : (
+              <div className="flex flex-col items-center justify-center text-center py-10">
+                <Brain size={30} style={{ color: "var(--ai-accent)" }} />
+                <p className="text-[13px] mt-3 max-w-md" style={{ color: "var(--text-muted)" }}>
+                  Generate a narrative review of your allocation, risk and rebalancing priorities — grounded in your live holdings and the health scan.
+                </p>
+              </div>
+            )}
+          </div>
+        </Reveal>
+      )}
+
+      {/* ═══════════ TRANSACTIONS ═══════════ */}
+      {tab === "Transactions" && (
+        <Reveal>
+          <div className="glass-card overflow-hidden">
+            <div className="p-4 pb-0"><h3 className="eyebrow">Closed Trades</h3></div>
+            {txLoading ? (
+              <div className="p-5 space-y-2">{[...Array(4)].map((_, i) => <div key={i} className="h-8 skeleton rounded-lg" />)}</div>
+            ) : (
+              <div className="overflow-x-auto">
+                <table className="data-table mt-3">
+                  <thead>
+                    <tr><th>Stock</th><th>Type</th><th>Entry</th><th>Exit</th><th>Qty</th><th>P/L</th><th>Closed</th></tr>
+                  </thead>
+                  <tbody>
+                    {(transactions ?? []).map(t => {
+                      const isPosT = (t.pnl ?? 0) >= 0;
+                      return (
+                        <tr key={t._id}>
+                          <td><span className="text-[13px] font-semibold" style={{ color: "var(--text-primary)" }}>{t.symbol}</span></td>
+                          <td className="text-[13px]">{t.type}</td>
+                          <td className="font-mono text-[13px]">₹{formatNumber(t.entry_price)}</td>
+                          <td className="font-mono text-[13px]">{t.exit_price != null ? `₹${formatNumber(t.exit_price)}` : "--"}</td>
+                          <td className="font-mono text-[13px]">{t.quantity}</td>
+                          <td className="font-mono text-[13px] font-semibold" style={{ color: isPosT ? "var(--gain)" : "var(--loss)" }}>
+                            {t.pnl != null ? `${isPosT ? "+" : ""}₹${formatNumber(Math.abs(t.pnl))}` : "--"}
+                          </td>
+                          <td className="text-[12px]" style={{ color: "var(--text-muted)" }}>{t.exit_time ? new Date(t.exit_time).toLocaleDateString() : "--"}</td>
+                        </tr>
+                      );
+                    })}
+                    {(transactions ?? []).length === 0 && (
+                      <tr><td colSpan={7} className="text-center py-8 text-[13px]" style={{ color: "var(--text-muted)" }}>No closed trades yet.</td></tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+        </Reveal>
+      )}
+
+      {/* Zerodha Account — shown on Overview + Holdings for quick funds context */}
+      {zerodhaAccount && ["Overview", "Holdings"].includes(tab) && (
+        <Reveal>
+          <div className="glass-card p-5">
+            <h3 className="eyebrow mb-3 flex items-center gap-2">
+              <Wallet size={13} /> Zerodha Account
+              <span className="badge-status" style={{
+                background: zerodhaAccount.status?.connected ? "var(--gain-bg)" : "var(--hover)",
+                color: zerodhaAccount.status?.connected ? "var(--gain)" : "var(--text-muted)",
+              }}>
+                {zerodhaAccount.status?.mode?.toUpperCase()}
+              </span>
+            </h3>
+            {zerodhaAccount.funds && (
+              <div className="grid grid-cols-3 gap-4">
+                <div><span className="stat-label">Available</span><div className="text-lg font-mono font-semibold" style={{ color: "var(--text-primary)" }}>₹{formatNumber(zerodhaAccount.funds.available)}</div></div>
+                <div><span className="stat-label">Used</span><div className="text-lg font-mono font-semibold" style={{ color: "var(--text-primary)" }}>₹{formatNumber(zerodhaAccount.funds.used)}</div></div>
+                <div><span className="stat-label">Total</span><div className="text-lg font-mono font-semibold" style={{ color: "var(--text-primary)" }}>₹{formatNumber(zerodhaAccount.funds.total)}</div></div>
+              </div>
+            )}
+          </div>
         </Reveal>
       )}
     </div>

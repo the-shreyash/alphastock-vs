@@ -467,25 +467,39 @@ GET
 
 /portfolio
 
-GET
-
-/portfolio/holdings
-
-GET
-
-/portfolio/performance
+Unified, live-enriched holdings (broker-primary merge of db.holdings + manual
+non-paper open trades). Each row carries `source` (broker|manual), sector,
+current price/value, P&L and `day_change_pct`. (Sprint 8)
 
 GET
 
-/portfolio/history
+/portfolio/summary
 
-POST
+Totals: invested, current value, unrealized + realized P&L, holdings count,
+`sources`. (Sprint 8: broker-inclusive)
 
-/portfolio/sync
+GET
 
-PATCH
+/portfolio/intelligence
 
-/portfolio/settings
+Full Portfolio Intelligence bundle — `{holdings, summary, sources, allocation
+(by_holding + by_sector), diversification (HHI/label/effective_holdings), pnl,
+risk (score 0-100 + explainable factors), movers, suggestions, dividends,
+health}`. Single payload the Portfolio page consumes. (Sprint 8)
+
+GET
+
+/portfolio/performance?range=1M|3M|6M|1Y|ALL
+
+Equity curve + returns (abs/pct) + best/worst day from stored daily snapshots;
+`available:false` until ≥2 end-of-day snapshots exist (built forward, never
+back-filled). (Sprint 8)
+
+GET
+
+/portfolio/export
+
+Current holdings as `text/csv` (feeds the Portfolio Download action). (Sprint 8)
 
 ---
 

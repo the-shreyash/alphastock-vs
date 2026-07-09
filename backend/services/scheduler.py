@@ -236,6 +236,37 @@ async def eod_report_job(db):
         logger.error(f"EOD report error: {e}")
 
 
+async def portfolio_snapshot_job(db):
+    """4:05 PM IST weekdays: record each user's end-of-day portfolio equity
+    snapshot (Sprint 8). The Performance equity curve is built forward from
+    these real marks — never back-filled with synthetic history."""
+    try:
+        import asyncio
+        from services import portfolio_engine
+        from services.real_market import fetch_real_stock_quote
+
+        async def quotes_map_func(symbols):
+            uniq = list({(s or "").upper() for s in symbols if s})
+            if not uniq:
+                return {}
+            results = await asyncio.gather(
+                *[fetch_real_stock_quote(s) for s in uniq], return_exceptions=True)
+            return {sym: (None if isinstance(r, Exception) else r)
+                    for sym, r in zip(uniq, results)}
+
+        broker_users = set(await db.holdings.distinct("user_id"))
+        trade_users = set(await db.trades.distinct(
+            "user_id", {"status": "OPEN", "is_paper": {"$ne": True}}))
+        recorded = 0
+        for uid in (broker_users | trade_users):
+            snap = await portfolio_engine.record_snapshot(db, {"_id": uid}, quotes_map_func)
+            if snap:
+                recorded += 1
+        logger.info(f"Portfolio snapshots recorded for {recorded} user(s)")
+    except Exception as e:
+        logger.error(f"Portfolio snapshot error: {e}")
+
+
 def setup_scheduler(db, ai_summary_func, ws_broadcast=None):
     """Set up all cron jobs."""
 
@@ -284,6 +315,15 @@ def setup_scheduler(db, ai_summary_func, ws_broadcast=None):
         replace_existing=True,
     )
 
+    # Portfolio Snapshot — 4:05 PM IST weekdays (after EOD marks settle)
+    scheduler.add_job(
+        portfolio_snapshot_job,
+        CronTrigger(hour=16, minute=5, day_of_week="mon-fri"),
+        args=[db],
+        id="portfolio_snapshot",
+        replace_existing=True,
+    )
+
     scheduler.start()
-    logger.info("Scheduler started with 5 cron jobs (IST timezone)")
+    logger.info("Scheduler started with 6 cron jobs (IST timezone)")
     return scheduler
