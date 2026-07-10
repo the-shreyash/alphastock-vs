@@ -362,6 +362,10 @@ Each page subscribes only to required channels.
 
 ---
 
+# Transport Layer
+
+The platform uses a persistent real-time connection between the backend and frontend. The preferred implementation is FastAPI native WebSockets. Socket.IO is an acceptable alternative when its additional protocol features are required. The event-driven architecture, Redis Pub/Sub, and connection lifecycle are the primary requirements—not a specific transport library.
+
 # Live Dashboard
 
 The dashboard should always feel alive.

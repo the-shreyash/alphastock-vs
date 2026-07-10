@@ -2327,17 +2327,39 @@ class ConnectionManager:
     def __init__(self):
         self.active: Set[WebSocket] = set()
         self.user_connections: dict[str, Set[WebSocket]] = {}
+        # Per-connection channel subscriptions (Sprint R2). A socket receives a
+        # channel broadcast only if it has subscribed to that channel. This lets
+        # each page listen to just the topics it needs (market/sectors/scanner/
+        # news/…) instead of every global broadcast.
+        self.channels: dict[WebSocket, Set[str]] = {}
 
     async def connect(self, ws: WebSocket, user_id: str = None):
         await ws.accept()
         self.active.add(ws)
+        self.channels.setdefault(ws, set())
         if user_id:
             self.user_connections.setdefault(user_id, set()).add(ws)
 
     def disconnect(self, ws: WebSocket, user_id: str = None):
         self.active.discard(ws)
+        self.channels.pop(ws, None)
         if user_id and user_id in self.user_connections:
             self.user_connections[user_id].discard(ws)
+
+    def subscribe(self, ws: WebSocket, channels):
+        """Add one or more channels to a socket's subscription set."""
+        subs = self.channels.setdefault(ws, set())
+        for ch in channels or []:
+            if ch:
+                subs.add(str(ch))
+
+    def unsubscribe(self, ws: WebSocket, channels):
+        """Remove one or more channels from a socket's subscription set."""
+        subs = self.channels.get(ws)
+        if not subs:
+            return
+        for ch in channels or []:
+            subs.discard(str(ch))
 
     async def broadcast(self, message: dict):
         dead = set()
@@ -2346,7 +2368,18 @@ class ConnectionManager:
                 await ws.send_json(message)
             except Exception:
                 dead.add(ws)
-        self.active -= dead
+        self._reap(dead)
+
+    async def broadcast_to_channel(self, channel: str, message: dict):
+        """Send to sockets subscribed to `channel` (or the "*" wildcard channel)."""
+        dead = set()
+        for ws, subs in list(self.channels.items()):
+            if channel in subs or "*" in subs:
+                try:
+                    await ws.send_json(message)
+                except Exception:
+                    dead.add(ws)
+        self._reap(dead)
 
     async def send_to_user(self, user_id: str, message: dict):
         conns = self.user_connections.get(user_id, set())
@@ -2356,8 +2389,17 @@ class ConnectionManager:
                 await ws.send_json(message)
             except Exception:
                 dead.add(ws)
-        if dead:
-            self.user_connections[user_id] -= dead
+        self._reap(dead)
+
+    def _reap(self, dead: Set[WebSocket]):
+        """Drop dead sockets from every tracking structure."""
+        if not dead:
+            return
+        self.active -= dead
+        for ws in dead:
+            self.channels.pop(ws, None)
+        for conns in self.user_connections.values():
+            conns -= dead
 
 ws_manager = ConnectionManager()
 
@@ -2399,6 +2441,17 @@ async def websocket_endpoint(websocket: WebSocket):
                     if quote:
                         await websocket.send_json({"type": "price_tick", "data": quote})
 
+            elif msg.get("type") == "subscribe":
+                # Channel subscription (Sprint R2): {"type":"subscribe","channels":[...]}
+                channels = msg.get("channels", [])
+                ws_manager.subscribe(websocket, channels)
+                await websocket.send_json({"type": "subscribed", "channels": channels})
+
+            elif msg.get("type") == "unsubscribe":
+                channels = msg.get("channels", [])
+                ws_manager.unsubscribe(websocket, channels)
+                await websocket.send_json({"type": "unsubscribed", "channels": channels})
+
             elif msg.get("type") == "ping":
                 await websocket.send_json({"type": "pong", "timestamp": datetime.now(timezone.utc).isoformat()})
 
@@ -2413,7 +2466,15 @@ async def market_broadcast_loop():
     """
     Broadcasts real-time market data to all connected WebSocket clients every 10 seconds.
     Uses real Yahoo Finance data, not simulated data.
+
+    In addition to the coarse ``market_update`` (kept for backward compatibility),
+    this loop diffs each index against the previous tick and publishes a granular
+    ``market.index.updated`` event only for indices whose value changed — so the
+    bridge can update just the affected index card (Sprint R2).
     """
+    from services.market_engine.event_bus import event_bus
+    prev_index: dict = {}
+    index_keys = ("nifty", "bank_nifty", "sensex")
     while True:
         try:
             if ws_manager.active:
@@ -2425,6 +2486,21 @@ async def market_broadcast_loop():
                         "data": overview,
                         "timestamp": datetime.now(timezone.utc).isoformat(),
                     })
+                    # Granular per-index deltas for the event bus / bridge.
+                    for key in index_keys:
+                        idx = overview.get(key)
+                        if not isinstance(idx, dict) or not idx.get("available"):
+                            continue
+                        value = idx.get("value")
+                        if value is None or prev_index.get(key) == value:
+                            continue
+                        prev_index[key] = value
+                        await event_bus.publish("market.index.updated", {
+                            "symbol": key,
+                            "value": value,
+                            "change": idx.get("change"),
+                            "change_pct": idx.get("change_pct"),
+                        })
         except Exception as e:
             logging.error(f"Broadcast error: {e}")
         await asyncio.sleep(10)
@@ -2454,24 +2530,21 @@ async def ai_monitoring_loop():
                     msg = f"⚡ MARKET ALERT: Nifty is {direction} {nifty_chg_pct:+.2f}% at {nifty_val:,.0f}! Monitor your positions."
                     log_activity(f"Nifty {direction} {nifty_chg_pct:+.2f}%", "alert", "warning")
                     
-                    # Save notification for all active users
+                    # Save notification for all active users (deduped to once per
+                    # 5 min per user). create_notification also publishes
+                    # notification.created so the bridge pushes it live.
+                    from services.notification_service import create_notification
                     users = await db.users.find({}, {"_id": 1}).to_list(100)
                     for u in users:
-                        existing = await db.notifications.find_one({
-                            "user_id": str(u["_id"]),
-                            "type": "MARKET_ALERT",
-                            "created_at": {"$gte": (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()}
-                        })
-                        if not existing:  # Don't spam — only once per 5 min
-                            await db.notifications.insert_one({
-                                "user_id": str(u["_id"]),
-                                "type": "MARKET_ALERT",
-                                "title": "Market Alert",
-                                "message": msg,
-                                "severity": severity,
-                                "read": False,
-                                "created_at": datetime.now(timezone.utc).isoformat(),
-                            })
+                        await create_notification(
+                            db, str(u["_id"]),
+                            type="MARKET_ALERT",
+                            title="Market Alert",
+                            message=msg,
+                            severity=severity,
+                            data={"nifty": nifty_val, "change_pct": nifty_chg_pct},
+                            dedupe_minutes=5,
+                        )
                     
                     # Broadcast to all WebSocket clients
                     if ws_manager.active:
@@ -4001,6 +4074,16 @@ async def startup():
         logger.info("Cron scheduler initialized")
     except Exception as e:
         logger.error(f"Scheduler setup error: {e}")
+
+    # Wire the market event bus to WebSocket clients (Sprint R2). Bridges every
+    # bus event onto a socket channel and, when Redis is configured, fans events
+    # across processes. No-op cross-process fan-out in single-process/dev.
+    try:
+        from services.realtime.event_bridge import start_event_bridge
+        await start_event_bridge(ws_manager)
+        logger.info("Event bridge started — bus events now stream to sockets")
+    except Exception as e:
+        logger.error(f"Event bridge start error: {e}")
 
     # Start WebSocket broadcast loop
     asyncio.create_task(market_broadcast_loop())

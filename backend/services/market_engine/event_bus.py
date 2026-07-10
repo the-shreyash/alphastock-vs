@@ -37,7 +37,8 @@ class EventBus:
     def subscribe(self, event_type: str, handler: EventHandler) -> None:
         """Register a handler for an event type. Supports wildcards via prefix
         matching: subscribing to ``market.*`` catches ``market.open``,
-        ``market.close``, etc."""
+        ``market.close``, etc. Subscribing to ``*`` catches every event (used by
+        the WebSocket bridge to forward all domains without enumerating prefixes)."""
         self._handlers[event_type].append(handler)
         logger.debug(f"EventBus: subscribed to '{event_type}'")
 
@@ -61,10 +62,12 @@ class EventBus:
         if len(self._event_log) > self._max_log_size:
             self._event_log = self._event_log[-self._max_log_size:]
 
-        # Collect matching handlers (exact match + wildcard prefix)
+        # Collect matching handlers (exact match + wildcard prefix + global "*")
         matched: List[EventHandler] = []
         for pattern, handlers in self._handlers.items():
-            if pattern == event_type:
+            if pattern == "*":
+                matched.extend(handlers)
+            elif pattern == event_type:
                 matched.extend(handlers)
             elif pattern.endswith(".*") and event_type.startswith(pattern[:-1]):
                 matched.extend(handlers)

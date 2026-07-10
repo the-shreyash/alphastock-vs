@@ -183,7 +183,8 @@ Tasks
 - [x] Data Normalization — live Yahoo Finance quotes/indices normalized in services.real_market
 - [x] Validation — unavailable data surfaced explicitly (available:false), never simulated
 - [x] Redis Cache — services/cache.py (Redis when REDIS_URL set, in-memory fallback)
-- Event Publishing
+- [x] Event Publishing — event_bus wired to sockets via the R2 bridge; Redis
+  Pub/Sub fan-out added to services/cache.py (Sprint R2)
 - [x] Live WebSocket — market_broadcast_loop streams real overview only
 - [x] Market Health — India VIX (^INDIAVIX), breadth & sentiment derived from live quotes
 
@@ -734,6 +735,86 @@ Verification
   pre-existing `requests`-based tests that require a running dev server + live
   Yahoo; unaffected by this sprint).
 - Frontend production build passes (`craco build`); no warnings in Portfolio.jsx.
+
+---
+
+# Sprint R2 — Event Bus & Infrastructure
+
+Status
+
+COMPLETED
+
+Authority
+
+REALTIME_SYSTEM.md (Path A — evolve FastAPI native WebSocket to satisfy the
+doc's intent, per the Sprint R1 audit in REALTIME_MIGRATION_PLAN.md)
+
+Objective
+
+Build the backend real-time backbone the R1 audit found missing: wire the
+in-process market event bus to WebSocket clients, add a channel subscription
+model, add Redis Pub/Sub cross-process fan-out, and land the near-free frontend
+fix so previously-dropped messages render. All changes are additive — existing
+loops and their frontend handlers are untouched.
+
+Delivered
+
+- **Event bus catch-all** (`services/market_engine/event_bus.py`) — `subscribe("*")`
+  now matches every event, so one bridge can forward all domains. Exact and
+  `prefix.*` matching unchanged.
+- **Channel model** (`server.py` `ConnectionManager`) — per-connection channel
+  sets + `subscribe`/`unsubscribe`/`broadcast_to_channel`, with a shared
+  `_reap()` dead-socket cleanup across `active`/`channels`/`user_connections`.
+  New WS verbs `{"type":"subscribe|unsubscribe","channels":[...]}` (ack'd);
+  legacy `subscribe_prices`/`ping` preserved.
+- **Event → socket bridge** (`services/realtime/event_bridge.py`, new) — a
+  catch-all bus subscriber maps each event to a channel (`DOMAIN_CHANNEL`),
+  wraps it in a stable `{"type":"event","event","channel","data","timestamp"}`
+  envelope, and delivers per-user when the payload carries `user_id` else to the
+  channel's subscribers. Mirrors events to Redis (`sa:events`) with a
+  per-process `ORIGIN_ID` guard; a Redis listener re-delivers other processes'
+  events locally (no bus re-publish → no loop). Wired at startup in `server.py`.
+- **Redis Pub/Sub** (`services/cache.py`) — `cache_publish()` +
+  `start_pubsub_listener()` reusing the existing lazy Redis client; both are
+  graceful no-ops (publish → False, listener → None) when `REDIS_URL` is unset,
+  so single-process/dev/tests are unaffected.
+- **New event emissions** — `create_notification()` helper
+  (`services/notification_service.py`, new) inserts + publishes
+  `notification.created` (routes the `ai_monitoring_loop` market-alert path,
+  with 5-min per-user dedupe); `market_broadcast_loop` additionally diffs each
+  index and publishes `market.index.updated` per changed index (keeps the coarse
+  `market_update`).
+- **Frontend contract fixes (G6)** (`frontend/src/hooks/useWebSocket.js`) — the
+  previously-dropped `ai_alert` + `broker_status`/`portfolio_synced`/
+  `broker_order_update`/`broker_price_tick` are now handled and exposed as new
+  state (`marketAlerts`, `brokerStatus`, `portfolioSynced`, `brokerOrders`,
+  `brokerTicks`). Purely additive; existing consumers untouched. Broker ticks
+  are kept separate from the symbol-keyed price store (token-keyed).
+
+Deferred to Sprint R3 (frontend real-time client)
+
+- Single app-level socket provider (G3), Zustand real-time store (G4), GSAP
+  price animations (G7), connection-state machine + 30s heartbeat + backoff (G8),
+  consuming the new `event` envelope, and retiring the polling timers (G9).
+
+Verification
+
+- `tests/test_event_bridge.py`: 13 hermetic tests (bus `*` matching, channel
+  resolution, channel subscribe/unsubscribe/broadcast, dead-socket + disconnect
+  cleanup, bridge public-vs-user routing + envelope, Redis no-op without
+  `REDIS_URL`, `create_notification` persist+publish + dedupe). No Redis/Mongo/network.
+- Full in-process backend suite: 186 passed (the `test_phase*`/`test_backend`
+  `requests`-based suites require a running dev server — unchanged, unaffected).
+- Frontend `craco build` passes; the hook parses (pre-existing TradeJournal
+  eslint warning unrelated).
+
+Notes / follow-ups
+
+- The `event` envelope + channel names (`market`, `sectors`, `scanner`, `news`,
+  `notifications`, `portfolio`, `trades`, `ai`, `broker`) are the contract R3
+  consumes. Additional per-index/breadth/news emissions land with their feature
+  sprints; other notification insert sites can adopt `create_notification`
+  incrementally to gain the live push.
 
 ---
 

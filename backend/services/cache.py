@@ -3,11 +3,18 @@
 Uses Redis when REDIS_URL is configured (production), and falls back to a
 per-process in-memory store otherwise (local development / tests). Values
 must be JSON-serializable. TTL is set at write time.
+
+Also provides a thin Redis Pub/Sub layer (Sprint R2) used to fan real-time
+events across processes. When REDIS_URL is unset, publish is a no-op and the
+listener is never started — a single process relies solely on the in-process
+event bus, so nothing breaks in local development or tests.
 """
 import os
 import json
+import asyncio
 import logging
 from datetime import datetime, timezone
+from typing import Awaitable, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -84,3 +91,65 @@ async def cache_delete(key: str):
         except Exception as e:
             logger.warning(f"Cache delete failed for {key}: {e}")
     _memory.pop(key, None)
+
+
+# ============ Redis Pub/Sub (cross-process event fan-out) ============
+
+async def cache_publish(channel: str, payload) -> bool:
+    """Publish a JSON-serializable payload to a Redis channel.
+
+    Returns True if the message was published to Redis, False when Redis is
+    unavailable (single-process mode — the caller's in-process delivery already
+    covers local subscribers, so this is a safe no-op)."""
+    r = await _get_redis()
+    if r is None:
+        return False
+    try:
+        await r.publish(channel, json.dumps(payload, default=str))
+        return True
+    except Exception as e:
+        logger.warning(f"Cache publish failed for {channel}: {e}")
+        return False
+
+
+async def start_pubsub_listener(
+    channel: str,
+    handler: Callable[[dict], Awaitable[None]],
+) -> Optional[asyncio.Task]:
+    """Subscribe to a Redis channel and dispatch decoded messages to `handler`.
+
+    Returns the background asyncio.Task, or None when Redis is not configured/
+    reachable (no listener is started and no error is raised). Each incoming
+    message is JSON-decoded; malformed payloads are logged and skipped."""
+    r = await _get_redis()
+    if r is None:
+        return None
+    try:
+        pubsub = r.pubsub()
+        await pubsub.subscribe(channel)
+    except Exception as e:
+        logger.warning(f"Cache pubsub subscribe failed for {channel}: {e}")
+        return None
+
+    async def _listen():
+        try:
+            async for message in pubsub.listen():
+                if message is None or message.get("type") != "message":
+                    continue
+                raw = message.get("data")
+                try:
+                    payload = json.loads(raw)
+                except Exception:
+                    logger.warning(f"Pubsub {channel}: dropped non-JSON message")
+                    continue
+                try:
+                    await handler(payload)
+                except Exception as e:
+                    logger.error(f"Pubsub {channel} handler error: {e}", exc_info=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(f"Pubsub {channel} listener stopped: {e}")
+
+    logger.info(f"Cache layer: Redis pub/sub listening on '{channel}'")
+    return asyncio.create_task(_listen())

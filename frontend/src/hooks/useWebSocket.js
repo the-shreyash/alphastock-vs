@@ -11,6 +11,13 @@ export function useWebSocket(userId = "anonymous") {
   const [activityUpdates, setActivityUpdates] = useState(null);
   const [portfolioUpdate, setPortfolioUpdate] = useState(null);
   const [alerts, setAlerts] = useState([]);
+  // Sprint R2 — message-contract fixes (G6): these types were produced by the
+  // backend but previously dropped by this hook. Captured here additively.
+  const [marketAlerts, setMarketAlerts] = useState([]);
+  const [brokerStatus, setBrokerStatus] = useState(null);
+  const [portfolioSynced, setPortfolioSynced] = useState(null);
+  const [brokerOrders, setBrokerOrders] = useState([]);
+  const [brokerTicks, setBrokerTicks] = useState(null);
   const wsRef = useRef(null);
   const reconnectRef = useRef(null);
 
@@ -50,6 +57,23 @@ export function useWebSocket(userId = "anonymous") {
             setAlerts((prev) => [msg.data, ...prev.slice(0, 49)]);
           } else if (msg.type === "activity_feed") {
             setActivityUpdates(msg.data);
+          } else if (msg.type === "ai_alert") {
+            // Proactive market alert (Nifty big move / key-level cross).
+            setMarketAlerts((prev) => [
+              { message: msg.message, severity: msg.severity, ...msg.data, timestamp: msg.timestamp },
+              ...prev.slice(0, 49),
+            ]);
+          } else if (msg.type === "broker_status") {
+            setBrokerStatus(msg.data);
+          } else if (msg.type === "portfolio_synced") {
+            setPortfolioSynced(msg.data);
+          } else if (msg.type === "broker_order_update") {
+            setBrokerOrders((prev) => [msg.data, ...prev.slice(0, 49)]);
+          } else if (msg.type === "broker_price_tick") {
+            // Raw broker feed: { broker, ticks: [...] } keyed by instrument
+            // token (not symbol). Kept separate from the symbol-keyed price
+            // store; R3 maps tokens → symbols for the price UI.
+            setBrokerTicks(msg.data);
           }
         } catch {}
       };
@@ -88,5 +112,5 @@ export function useWebSocket(userId = "anonymous") {
     }
   }, []);
 
-  return { connected, marketData, priceTicks, tradeUpdates, engineEvents, activityUpdates, portfolioUpdate, alerts, subscribePrices, sendPing };
+  return { connected, marketData, priceTicks, tradeUpdates, engineEvents, activityUpdates, portfolioUpdate, alerts, marketAlerts, brokerStatus, portfolioSynced, brokerOrders, brokerTicks, subscribePrices, sendPing };
 }
