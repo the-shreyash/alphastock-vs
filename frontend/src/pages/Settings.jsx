@@ -4,7 +4,7 @@ import { motion } from "framer-motion";
 import api from "../services/api";
 import brokerService, { brokerErrorMessage } from "../services/brokerService";
 import { useAuth } from "../context/AuthContext";
-import { Save, User, Shield, ShieldAlert, Bell, Link2, ExternalLink, Database, Check, X, Wifi, MessageSquare, Mail, Workflow, Clock, RefreshCw, Unplug } from "lucide-react";
+import { Save, User, Shield, ShieldAlert, Bell, Link2, ExternalLink, Database, Check, X, Wifi, MessageSquare, Mail, Workflow, Clock, RefreshCw, Unplug, Zap } from "lucide-react";
 
 const fadeUp = {
   initial: { opacity: 0, y: 16 },
@@ -19,6 +19,9 @@ export default function SettingsPage() {
   const [notifPrefs, setNotifPrefs] = useState({ trade_alerts: true, portfolio_alerts: true, exit_reminder: true, email_alerts: false, telegram_alerts: false });
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  const [preferredBroker, setPreferredBroker] = useState("");
+  const [platformSaving, setPlatformSaving] = useState(false);
+  const [platformMessage, setPlatformMessage] = useState(null);
   const [stopping, setStopping] = useState(false);
   const [stopResult, setStopResult] = useState(null);
   const [brokerStatus, setBrokerStatus] = useState(null);
@@ -40,6 +43,7 @@ export default function SettingsPage() {
       if (user.notification_prefs) {
         setNotifPrefs(prev => ({ ...prev, ...user.notification_prefs }));
       }
+      setPreferredBroker(user.preferred_broker || "");
     }
     refreshBrokerStatus();
     api.get("/data-sources").then(({ data }) => setDataSources(data)).catch(() => {});
@@ -80,6 +84,29 @@ export default function SettingsPage() {
       setTimeout(() => setSaved(false), 3000);
     } catch (err) { console.error(err); }
     finally { setSaving(false); }
+  };
+
+  // The user's chosen trading platform — saved immediately on selection.
+  // There is deliberately NO default: quick/one-click trading stays disabled
+  // until the user makes an explicit choice here.
+  const selectPlatform = async (broker) => {
+    setPlatformSaving(true);
+    setPlatformMessage(null);
+    try {
+      await api.put("/settings", { preferred_broker: broker });
+      setPreferredBroker(broker);
+      setPlatformMessage({
+        type: "success",
+        text: broker
+          ? `${(brokerStatus?.[broker]?.display_name) || broker} is now your trading platform.`
+          : "Trading platform cleared — one-click trading is disabled.",
+      });
+      checkAuth();
+    } catch (err) {
+      setPlatformMessage({ type: "error", text: err.response?.data?.detail || "Could not save your platform choice." });
+    } finally {
+      setPlatformSaving(false);
+    }
   };
 
   const connectBroker = async (broker) => {
@@ -225,6 +252,92 @@ export default function SettingsPage() {
             </p>
           </div>
         )}
+      </motion.div>
+
+      {/* Trading Platform — the user's explicit choice, no default */}
+      <motion.div className="glass-card p-6" {...fadeUp} transition={{ duration: 0.4, delay: 0.03 }}>
+        <h3 className="eyebrow flex items-center gap-2 mb-1">
+          <Zap size={13} /> Trading Platform
+        </h3>
+        <p className="caption leading-relaxed mb-4">
+          Choose which broker executes your trades (AI quick trades and the default in the New Trade form).
+          Nothing is selected by default — one-click trading stays off until you pick a connected platform.
+        </p>
+
+        {platformMessage && (
+          <div className="flex items-center gap-2 p-3 rounded-xl mb-3" style={{
+            background: platformMessage.type === "success" ? "rgba(16,185,129,0.08)" : "rgba(244,63,94,0.08)",
+            color: platformMessage.type === "success" ? "var(--gain)" : "var(--loss)"
+          }}>
+            {platformMessage.type === "success" ? <Check size={14} /> : <X size={14} />}
+            <span className="text-sm">{platformMessage.text}</span>
+          </div>
+        )}
+
+        <div className="space-y-2">
+          {brokerStatus && Object.values(brokerStatus).map((b) => {
+            const selected = preferredBroker === b.broker;
+            const selectable = b.connected;
+            return (
+              <button
+                key={b.broker}
+                type="button"
+                data-testid={`platform-option-${b.broker}`}
+                onClick={() => selectable && !selected && selectPlatform(b.broker)}
+                disabled={!selectable || platformSaving}
+                className="w-full flex items-center gap-3 p-3 rounded-xl text-left transition-all"
+                style={{
+                  background: selected ? "rgba(16,185,129,0.08)" : "var(--bg-surface)",
+                  border: `1px solid ${selected ? "var(--gain)" : "var(--border)"}`,
+                  opacity: selectable ? 1 : 0.55,
+                  cursor: selectable ? "pointer" : "not-allowed",
+                }}
+              >
+                <span className="w-4 h-4 rounded-full flex items-center justify-center shrink-0"
+                  style={{ border: `2px solid ${selected ? "var(--gain)" : "var(--text-muted)"}` }}>
+                  {selected && <span className="w-2 h-2 rounded-full" style={{ background: "var(--gain)" }} />}
+                </span>
+                <div className="min-w-0">
+                  <span className="text-sm font-semibold block" style={{ color: "var(--text-primary)" }}>{b.display_name}</span>
+                  <span className="caption">
+                    {b.connected ? "Connected — ready to trade"
+                      : b.session_expired ? "Session expired — reconnect above to select"
+                      : b.configured ? "Not connected — connect above to select"
+                      : "API keys not configured"}
+                  </span>
+                </div>
+                {selected && (
+                  <span className="text-[10px] font-mono px-2 py-0.5 rounded-lg ml-auto shrink-0"
+                    style={{ background: "rgba(16,185,129,0.12)", color: "var(--gain)" }}>
+                    ACTIVE PLATFORM
+                  </span>
+                )}
+              </button>
+            );
+          })}
+
+          {/* Explicit opt-out */}
+          <button
+            type="button"
+            data-testid="platform-option-none"
+            onClick={() => preferredBroker && selectPlatform("")}
+            disabled={platformSaving}
+            className="w-full flex items-center gap-3 p-3 rounded-xl text-left transition-all"
+            style={{
+              background: !preferredBroker ? "var(--hover)" : "var(--bg-surface)",
+              border: `1px solid ${!preferredBroker ? "var(--text-muted)" : "var(--border)"}`,
+            }}
+          >
+            <span className="w-4 h-4 rounded-full flex items-center justify-center shrink-0"
+              style={{ border: `2px solid ${!preferredBroker ? "var(--text-primary)" : "var(--text-muted)"}` }}>
+              {!preferredBroker && <span className="w-2 h-2 rounded-full" style={{ background: "var(--text-primary)" }} />}
+            </span>
+            <div>
+              <span className="text-sm font-semibold block" style={{ color: "var(--text-primary)" }}>No platform — track only</span>
+              <span className="caption">Trades are recorded and monitored, but no live orders are placed.</span>
+            </div>
+          </button>
+        </div>
       </motion.div>
 
       {/* Profile */}

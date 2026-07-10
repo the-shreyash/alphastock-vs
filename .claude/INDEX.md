@@ -90,9 +90,9 @@ ROADMAP.md
 
 2. Architecture Documents
 
-These explain how the platform is built.
-
 SYSTEM_ARCHITECTURE.md
+
+REALTIME_SYSTEM.md
 
 DATABASE.md
 
@@ -105,8 +105,6 @@ MARKET_ENGINE.md
 SECURITY.md
 
 DEPLOYMENT.md
-
----
 
 3. AI Documents
 
@@ -291,6 +289,62 @@ Market
 News
 
 ---
+
+---
+
+REALTIME_SYSTEM.md
+
+Purpose
+
+Defines how StockAssist AI behaves as a real-time event-driven platform.
+
+It explains:
+
+• Event Driven Architecture
+
+• Redis Pub/Sub
+
+• Socket.IO
+
+• Live Dashboard
+
+• Live Scanner
+
+• Live Portfolio
+
+• Live Trade Monitor
+
+• AI Activity Timeline
+
+• Real-Time Notifications
+
+• GSAP Animations
+
+• Connection Management
+
+Read When
+
+Dashboard
+
+Market Engine
+
+Scanner
+
+Portfolio
+
+Trading
+
+Broker Integration
+
+AI Workspace
+
+Notifications
+
+Frontend Performance
+
+Real-Time Features
+
+This document is mandatory for every feature that updates continuously.
 
 AI_AGENT_SYSTEM.md
 
@@ -514,21 +568,23 @@ Changing architecture.
 
 ## Project Audit
 
-Read
-
-CLAUDE.md
-
 PROJECT.md
 
 PRODUCT_REQUIREMENTS.md
 
-SYSTEM_ARCHITECTURE.md
+REALTIME_SYSTEM.md
 
-ROADMAP.md
+FEATURES.md
+
+UI_GUIDELINES.md
+
+DESIGN_SYSTEM.md
+
+API_REFERENCE.md
+
+CODING_STANDARDS.md
 
 TASKS.md
-
-DECISIONS.md
 
 ---
 
@@ -559,6 +615,8 @@ TASKS.md
 Read
 
 MARKET_ENGINE.md
+
+REALTIME_SYSTEM.md
 
 DATABASE.md
 
@@ -612,6 +670,8 @@ AI_AGENT_SYSTEM.md
 
 PROMPTS.md
 
+REALTIME_SYSTEM.md
+
 PRODUCT_REQUIREMENTS.md
 
 API_REFERENCE.md
@@ -625,6 +685,8 @@ TASKS.md
 Read
 
 BROKER_INTEGRATION.md
+
+REALTIME_SYSTEM.md
 
 DATABASE.md
 
@@ -668,6 +730,38 @@ API_REFERENCE.md
 
 ---
 
+## Real-Time Infrastructure
+
+Read
+
+REALTIME_SYSTEM.md
+
+SYSTEM_ARCHITECTURE.md
+
+MARKET_ENGINE.md
+
+BROKER_INTEGRATION.md
+
+DATABASE.md
+
+API_REFERENCE.md
+
+AI_AGENT_SYSTEM.md
+
+CODING_STANDARDS.md
+
+TASKS.md
+
+Objective
+
+Transform StockAssist AI into a fully event-driven platform.
+
+No polling.
+
+Everything must update automatically using Redis Pub/Sub and Socket.IO.
+
+All UI updates should animate and only update the affected components.
+
 ## Testing
 
 Read
@@ -700,11 +794,11 @@ ROADMAP.md
 
 Every implementation should follow this workflow.
 
-Read Documentation
+Read INDEX.md
 
 ↓
 
-Understand Requirements
+Read Required Documentation
 
 ↓
 
@@ -712,19 +806,27 @@ Analyze Existing Code
 
 ↓
 
+Compare Code vs Documentation
+
+↓
+
+Identify Missing Features
+
+↓
+
 Create Implementation Plan
 
 ↓
 
-Implement Feature
+Implement
 
 ↓
 
-Write Tests
+Test
 
 ↓
 
-Validate Performance
+Verify Real-Time Behaviour
 
 ↓
 
@@ -736,7 +838,7 @@ Update TASKS.md
 
 ↓
 
-Commit Changes
+Commit
 
 ---
 
@@ -792,6 +894,20 @@ Update TASKS.md after implementation.
 
 Keep documentation synchronized with the codebase.
 
+Always preserve the event-driven architecture.
+
+Never introduce unnecessary polling.
+
+Always prefer Socket.IO for real-time updates.
+
+Only update affected components instead of re-rendering entire pages.
+
+All market data should flow through the Market Engine.
+
+Every new feature must integrate with the Real-Time System if live updates are required.
+
+If implementing AI, Broker, Portfolio, Scanner, Dashboard, or Notifications, read REALTIME_SYSTEM.md before coding.
+
 ---
 
 # Long-Term Vision
@@ -801,5 +917,23 @@ This documentation system should allow any engineer or AI assistant to understan
 The documentation should remain the single source of truth throughout the lifetime of the project.
 
 ---
+
+# Claude Startup Workflow
+
+Whenever Claude starts a new task:
+
+1. Read INDEX.md.
+2. Identify the current sprint or feature.
+3. Load only the relevant documentation listed in INDEX.md.
+4. Analyze the existing implementation before writing code.
+5. Compare implementation with documentation.
+6. Explain the implementation plan.
+7. Implement the feature.
+8. Verify functionality.
+9. Verify real-time behavior if applicable.
+10. Update TASKS.md and any affected documentation.
+11. Summarize completed work and remaining tasks.
+
+This workflow is mandatory for every implementation.
 
 # End of Documentation Index

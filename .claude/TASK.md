@@ -246,14 +246,27 @@ Tasks
   diversification, risk score, sector exposure, P&L, dividends, performance,
   suggestions over a broker-primary holdings merge
 - [x] Holdings — unified broker + manual holdings (source-tagged)
-- Positions
-- Orders
-- Trade Monitor
-- Journal
-- Paper Trading
-- Backtesting
+- [x] Positions — Trade Monitor active positions (live P&L, engine timeline)
+- [x] Orders — unified order history (GET /api/orders) + Orders tab with
+  cancel/modify of pending broker orders (Sprint 9)
+- [x] Trade Monitor — Trading Engine (Sprint 9): risk-gated buy/sell entry
+  with optional live broker execution, multi-target (T1–T3) partial booking,
+  trailing stop (percent/points, never loosens), server-side modify of
+  SL/targets/trailing, partial + at-market exits, per-trade event timeline,
+  consented auto-exit via broker (per-trade opt-in)
+- [x] Risk Manager — pre-trade validation (SL/target sanity, max trades/day,
+  daily loss budget, risk-per-trade guideline) + GET /api/trades/risk/summary
+  dashboard strip (Sprint 9)
+- [x] Trading Platform selection (Sprint 9.1) — users.preferred_broker chosen
+  explicitly in Settings → Trading Platform (radio list of connected brokers +
+  "track only"; NO default). Quick trades (POST /api/trades/quick) and the New
+  Trade form default route through the chosen platform; hardcoded Zerodha
+  quick-trade path retired from the UI
+- [x] Journal — trade journal + stats + weekly AI review + setup success rates
+- [x] Paper Trading
+- [x] Backtesting
 - Strategy Builder
-- Risk Dashboard
+- Risk Dashboard (dedicated page — summary strip shipped in Sprint 9)
 
 ---
 
@@ -906,17 +919,21 @@ This section should always contain the next highest-priority work.
 
 Current Objective
 
-Sprint 8 (Portfolio Intelligence) is COMPLETE — a server-side
-`portfolio_engine` is now the single source of truth for the Portfolio surface:
-broker-primary merge of real broker holdings + manual trades, allocation,
-sector exposure, diversification (HHI), an explainable risk score, realized +
-unrealized P&L, real dividend estimates (or explicit unavailable), a
-forward-built equity curve (daily snapshots), and rebalancing suggestions. The
-Portfolio page consumes the bundle with functional tabs, AI review, and CSV
-export.
+Sprint 9 (Trading Engine) is COMPLETE — `services/trading_engine.py` closes
+the trade lifecycle on top of the Broker Engine: a pre-trade Risk Manager
+enforcing the user's own limits (max trades/day, daily loss budget, SL/target
+sanity, risk-per-trade guideline), multi-target (T1–T3) partial profit
+booking, a trailing stop that ratchets toward the best price and never
+loosens, server-side modify of SL/targets/trailing, partial and at-market
+exits, a per-trade event timeline, and a unified cross-broker order history
+(GET /api/orders). Live exit orders are placed ONLY with per-trade opt-in
+consent (`auto_exit`) on broker-linked trades; everything else is alert-only.
+The Trade Monitor page gained a BUY/SELL form with a live risk-check panel,
+broker execution, an Orders tab (cancel/modify pending), and a Risk Manager
+summary strip. The engine runs inside the existing 60s trade_monitor cron.
 
-Next: Milestone 3 trading surfaces (orders UI, positions dashboard) on top of
-the /api/brokers endpoints, then admin portal and payments/subscriptions.
+Next: admin portal and payments/subscriptions (Milestones 6+), then a
+dedicated Risk Dashboard page and Strategy Builder.
 
 ---
 

@@ -128,6 +128,23 @@ async def trade_monitor_job(db, ws_broadcast):
         def sync_quote_func(symbol: str):
             return quote_cache.get(symbol)
 
+        # Trading Engine pass (Sprint 9): trailing stops, multi-target partial
+        # exits, SL detection + consented broker auto-exits. Runs BEFORE the
+        # advisory portfolio monitor so alerts reflect post-engine state.
+        try:
+            from services.trading_engine import run_cycle
+            from services.broker_engine import broker_engine
+            stats = await run_cycle(
+                db, quote_cache, broker_engine=broker_engine,
+                ws_push=broker_engine.ws_push)
+            if stats.get("trailed") or stats.get("targets_hit") or stats.get("sl_exits"):
+                log_activity(
+                    f"Trading engine: {stats['trailed']} stop(s) trailed, "
+                    f"{stats['targets_hit']} target(s) hit, {stats['sl_exits']} SL exit(s)",
+                    "monitor", "done")
+        except Exception as e:
+            logger.error(f"Trading engine cycle error: {e}")
+
         wa_func = send_whatsapp if wa_configured() else None
         alert_count = await run_monitoring_cycle(db, sync_quote_func, wa_func)
 

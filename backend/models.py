@@ -47,6 +47,10 @@ class UserResponse(BaseDocument):
     max_daily_loss: float = 5000
     max_trades_per_day: int = 3
     telegram_chat_id: Optional[str] = None
+    # Trading platform chosen by the user in Settings. There is NO default —
+    # one-click / quick trading stays disabled until the user explicitly
+    # selects a connected broker (Sprint 9.1).
+    preferred_broker: Optional[str] = None
     created_at: Optional[str] = None
 
 class NotificationPrefs(BaseModel):
@@ -61,18 +65,57 @@ class NotificationPrefs(BaseModel):
 
 
 # --- Trade Models ---
+class TrailingStopConfig(BaseModel):
+    """Trailing stop config (Sprint 9). The engine ratchets the stop toward
+    the best traded price by `value` percent/points — it never loosens."""
+    enabled: bool = False
+    type: str = Field(default="percent", pattern="^(percent|points)$")
+    value: float = Field(default=0, ge=0)
+
+
 class TradeCreate(BaseModel):
     symbol: str
     stock_name: str
-    type: str = "BUY"
-    entry_price: float
-    quantity: int
-    stop_loss: float
-    target1: float
+    type: str = Field(default="BUY", pattern="^(BUY|SELL)$")
+    entry_price: float = Field(gt=0)
+    quantity: int = Field(gt=0, le=100000)
+    stop_loss: float = Field(gt=0)
+    target1: float = Field(gt=0)
     target2: Optional[float] = None
+    target3: Optional[float] = None
+    trailing_stop: Optional[TrailingStopConfig] = None
     notes: Optional[str] = None
     setup_type: Optional[str] = None
     is_paper: bool = False
+    # Broker execution (Sprint 9): when `broker` is set the entry order is
+    # placed LIVE via the Broker Engine before the trade record is created.
+    broker: Optional[str] = None
+    product: Optional[str] = None          # CNC/MIS/NRML — defaults per broker
+    exchange: str = "NSE"
+    order_type: str = Field(default="MARKET", pattern="^(MARKET|LIMIT)$")
+    # Explicit consent for the engine to place live EXIT orders on SL/target
+    # hits for this trade (BROKER_INTEGRATION.md compliance). Default off.
+    auto_exit: bool = False
+    # Acknowledge risk warnings (violations always block regardless).
+    override_warnings: bool = False
+
+
+class TradeModify(BaseModel):
+    """Editable fields of an OPEN trade (validated against entry side)."""
+    stop_loss: Optional[float] = Field(default=None, gt=0)
+    target1: Optional[float] = Field(default=None, gt=0)
+    target2: Optional[float] = None       # 0/None clears the target
+    target3: Optional[float] = None
+    trailing_stop: Optional[TrailingStopConfig] = None
+    notes: Optional[str] = None
+
+
+class TradeExitRequest(BaseModel):
+    """Exit an open trade — fully or partially, manually or at market via the
+    connected broker (`at_market` requires the trade to be broker-linked)."""
+    exit_price: Optional[float] = Field(default=None, gt=0)
+    quantity: Optional[int] = Field(default=None, gt=0)   # None = all remaining
+    at_market: bool = False
 
 class TradeResponse(BaseDocument):
     user_id: Optional[str] = None
@@ -82,9 +125,20 @@ class TradeResponse(BaseDocument):
     entry_price: float
     exit_price: Optional[float] = None
     quantity: int
+    quantity_open: Optional[int] = None
+    realized_pnl: Optional[float] = None
     stop_loss: float
+    initial_stop_loss: Optional[float] = None
     target1: float
     target2: Optional[float] = None
+    target3: Optional[float] = None
+    trailing_stop: Optional[TrailingStopConfig] = None
+    best_price: Optional[float] = None
+    targets_hit: Optional[List[dict]] = None
+    events: Optional[List[dict]] = None
+    broker: Optional[str] = None
+    broker_order_id: Optional[str] = None
+    auto_exit: bool = False
     status: str = "OPEN"
     pnl: Optional[float] = None
     pnl_percent: Optional[float] = None
@@ -218,6 +272,8 @@ class UserSettingsUpdate(BaseModel):
     max_daily_loss: Optional[float] = None
     max_trades_per_day: Optional[int] = None
     telegram_chat_id: Optional[str] = None
+    # "" clears the selection (back to "no platform chosen").
+    preferred_broker: Optional[str] = None
     notification_prefs: Optional[NotificationPrefs] = None
 
 

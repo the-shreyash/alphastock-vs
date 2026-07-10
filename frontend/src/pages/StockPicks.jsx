@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, Link } from "react-router-dom";
 import api from "../services/api";
 import { formatCurrency, formatPercent } from "../utils/formatters";
 
@@ -411,7 +411,9 @@ export default function StockPicks() {
     if (!tradingPick) return;
     setTradeLoading(true);
     try {
-      const { data } = await api.post("/zerodha/quick-trade", {
+      // Quick trade goes through the user's CHOSEN platform (Settings →
+      // Trading Platform) — never a hardcoded broker.
+      const { data } = await api.post("/trades/quick", {
         symbol: tradingPick.symbol,
         stock_name: tradingPick.name,
         entry_price: tradingPick.entry,
@@ -423,7 +425,14 @@ export default function StockPicks() {
       });
       setTradeResult(data);
     } catch (err) {
-      setTradeResult({ message: "Trade failed: " + (err.response?.data?.detail || err.message) });
+      const detail = err.response?.data?.detail;
+      const message = typeof detail === "string"
+        ? detail
+        : detail?.violations?.length
+          ? `Risk check blocked this trade: ${detail.violations[0]}`
+          : (detail?.message || err.message);
+      const needsPlatform = typeof message === "string" && message.includes("Trading Platform");
+      setTradeResult({ success: false, message: `Trade failed: ${message}`, needsPlatform });
     } finally {
       setTradeLoading(false);
     }
@@ -500,20 +509,25 @@ export default function StockPicks() {
 
             {tradeResult && (
               <div className="mb-4 p-3 rounded-xl text-sm" style={{
-                background: tradeResult.order?.source === "zerodha" ? "rgba(16,185,129,0.08)" : "var(--ai-accent-soft)",
-                color: tradeResult.order?.source === "zerodha" ? "var(--gain)" : "var(--ai-accent)"
+                background: tradeResult.success ? "rgba(16,185,129,0.08)" : "rgba(244,63,94,0.08)",
+                color: tradeResult.success ? "var(--gain)" : "var(--loss)"
               }}>
                 {tradeResult.message}
-                {tradeResult.order?.order_id && <span className="block text-[10px] font-mono mt-1">Order ID: {tradeResult.order.order_id}</span>}
+                {tradeResult.order_id && <span className="block text-[10px] font-mono mt-1">Order ID: {tradeResult.order_id}</span>}
+                {tradeResult.needsPlatform && (
+                  <Link to="/settings" className="block text-[11px] font-semibold underline mt-1" style={{ color: "var(--text-primary)" }}>
+                    Choose your trading platform in Settings →
+                  </Link>
+                )}
               </div>
             )}
 
             <div className="flex gap-2">
               <button onClick={() => { setTradingPick(null); setTradeResult(null); }}
                 className="btn-ghost flex-1">Cancel</button>
-              <button data-testid="confirm-trade-btn" onClick={executeTrade} disabled={tradeLoading || tradeResult}
+              <button data-testid="confirm-trade-btn" onClick={executeTrade} disabled={tradeLoading || tradeResult?.success}
                 className="btn-primary flex-1">
-                {tradeLoading ? "Placing..." : tradeResult ? "Done" : "Place Order"}
+                {tradeLoading ? "Placing..." : tradeResult?.success ? "Done" : tradeResult ? "Retry" : "Place Order"}
               </button>
             </div>
           </div>

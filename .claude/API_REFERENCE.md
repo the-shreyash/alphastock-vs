@@ -531,27 +531,83 @@ DELETE
 
 ---
 
-# Trading APIs
+# Trading APIs (Sprint 9 — Trading Engine)
 
 POST
 
 /trades
 
+Risk-gated entry. Body accepts target1..3, trailing_stop
+{enabled, type: percent|points, value}, and optional live broker
+execution (broker, order_type MARKET|LIMIT, product, auto_exit).
+Returns 422 with {violations, warnings, metrics} when the Risk
+Manager blocks the trade; 502 when the broker rejects the order.
+
+POST
+
+/trades/validate
+
+Dry-run Risk Manager check (same body as POST /trades) — powers the
+live risk panel in the New Trade form.
+
+POST
+
+/trades/quick
+
+One-click trade (AI picks) via the user's CHOSEN trading platform
+(users.preferred_broker, set in Settings → Trading Platform; saved
+via PUT /settings {preferred_broker}). There is NO default broker:
+400 when no platform is selected or the selected one is not
+connected. Runs the same Risk Manager gate as POST /trades.
+
 GET
 
 /trades
 
 GET
 
+/trades/active
+
+GET
+
+/trades/history
+
+GET
+
+/trades/pnl
+
+GET
+
+/trades/risk/summary
+
+Today's risk usage vs the user's limits: trades_today,
+loss_budget_remaining, open_risk, open_exposure, trading_halted.
+
+PUT
+
 /trades/{id}
 
-PATCH
+Modify an OPEN trade (stop_loss, target1..3, trailing_stop, notes —
+side-aware validation, event-logged) or close it with exit_price.
 
-/trades/{id}
+POST
 
-DELETE
+/trades/{id}/exit
 
-/trades/{id}
+Exit fully or partially ({exit_price?, quantity?, at_market?}).
+at_market places a LIVE market order via the linked broker first.
+
+---
+
+# Order History API
+
+GET
+
+/orders
+
+Unified order history across every broker (db.orders, fed by
+placements + realtime streams). ?refresh=true re-syncs the live
+order book from all connected brokers; ?broker= filters.
 
 ---
 

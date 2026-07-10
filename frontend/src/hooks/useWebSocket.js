@@ -7,6 +7,7 @@ export function useWebSocket(userId = "anonymous") {
   const [marketData, setMarketData] = useState(null);
   const [priceTicks, setPriceTicks] = useState({});
   const [tradeUpdates, setTradeUpdates] = useState([]);
+  const [engineEvents, setEngineEvents] = useState([]);
   const [activityUpdates, setActivityUpdates] = useState(null);
   const [portfolioUpdate, setPortfolioUpdate] = useState(null);
   const [alerts, setAlerts] = useState([]);
@@ -39,6 +40,10 @@ export function useWebSocket(userId = "anonymous") {
             setPriceTicks((prev) => ({ ...prev, ...msg.data }));
           } else if (msg.type === "trade_update") {
             setTradeUpdates((prev) => [msg.data, ...prev.slice(0, 49)]);
+          } else if (msg.type === "trade_engine_event") {
+            // Trading Engine lifecycle pushes (trailing SL moved, target hit,
+            // SL exit) — consumers refetch positions when one arrives.
+            setEngineEvents((prev) => [msg.data, ...prev.slice(0, 19)]);
           } else if (msg.type === "portfolio_update") {
             setPortfolioUpdate(msg.data);
           } else if (msg.type === "alert") {
@@ -83,5 +88,5 @@ export function useWebSocket(userId = "anonymous") {
     }
   }, []);
 
-  return { connected, marketData, priceTicks, tradeUpdates, activityUpdates, portfolioUpdate, alerts, subscribePrices, sendPing };
+  return { connected, marketData, priceTicks, tradeUpdates, engineEvents, activityUpdates, portfolioUpdate, alerts, subscribePrices, sendPing };
 }

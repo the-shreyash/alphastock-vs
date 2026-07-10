@@ -359,6 +359,15 @@ class BrokerEngine:
             "broker": broker, "order_id": order_id})
         return result
 
+    async def sync_orders(self, user_id: str, broker: str) -> list:
+        """Pull today's order book from the broker and persist every order into
+        db.orders (the unified order-history store, also fed by placements and
+        the realtime stream). Returns the fetched orders."""
+        orders = await self.get_orders(user_id, broker)
+        for order in orders:
+            await self._record_order(user_id, broker, order)
+        return orders
+
     async def _record_order(self, user_id: str, broker: str, order: dict):
         if not order.get("order_id"):
             return

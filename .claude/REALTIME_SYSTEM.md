@@ -1,0 +1,1048 @@
+# StockAssist AI
+# Real-Time System Architecture
+
+Version: 1.0
+
+Status: Active Development
+
+Priority: Critical
+
+---
+
+# Vision
+
+StockAssist AI is not a website that occasionally fetches stock prices.
+
+It is a **real-time AI-powered market operating system**.
+
+The platform must feel alive from the moment the user opens it.
+
+Users should never need to refresh the page.
+
+Prices should move.
+
+Charts should animate.
+
+AI should think continuously.
+
+Portfolio values should change instantly.
+
+Scanner results should appear automatically.
+
+News should stream in.
+
+Notifications should arrive immediately.
+
+The platform should behave similarly to professional platforms such as:
+
+• Zerodha Kite
+• Upstox Pro
+• TradingView
+• Bloomberg Terminal
+• ThinkOrSwim
+
+---
+
+# Philosophy
+
+The frontend should never ask:
+
+"Has anything changed?"
+
+Instead the backend should continuously tell the frontend:
+
+"Something changed."
+
+This is Event Driven Architecture.
+
+---
+
+# Core Principle
+
+Never Poll.
+
+Always Push.
+
+Old Way
+
+Browser
+
+↓
+
+fetch()
+
+↓
+
+fetch()
+
+↓
+
+fetch()
+
+↓
+
+fetch()
+
+↓
+
+Refresh UI
+
+Professional Way
+
+Market
+
+↓
+
+Backend
+
+↓
+
+Redis
+
+↓
+
+Socket.IO
+
+↓
+
+Frontend
+
+↓
+
+Animate Changes
+
+---
+
+# High Level Architecture
+
+                NSE
+                BSE
+            Yahoo Finance
+            Broker APIs
+              News APIs
+                  │
+                  ▼
+        Market Gateway Layer
+                  │
+                  ▼
+         Data Normalization
+                  │
+                  ▼
+          Validation Layer
+                  │
+                  ▼
+             Redis Cache
+                  │
+                  ▼
+           Market Engine
+                  │
+        ┌─────────┼─────────┐
+        │         │         │
+        ▼         ▼         ▼
+   AI Agents   Scanner   Portfolio
+        │         │         │
+        └─────────┼─────────┘
+                  ▼
+           Event Bus
+                  │
+                  ▼
+            Socket.IO Server
+                  │
+        ┌─────────┼─────────┐
+        ▼         ▼         ▼
+ Dashboard  Mobile App  Admin Portal
+
+---
+
+# Market Engine
+
+The Market Engine is always running.
+
+It should never stop while markets are open.
+
+Responsibilities
+
+Collect market data
+
+Normalize providers
+
+Validate prices
+
+Cache updates
+
+Publish events
+
+Maintain health
+
+Trigger AI
+
+Generate alerts
+
+The Market Engine is the heartbeat of the platform.
+
+---
+
+# Market Data Flow
+
+Suppose NIFTY changes.
+
+NSE Feed
+
+↓
+
+Market Gateway
+
+↓
+
+Normalize Data
+
+↓
+
+Validate
+
+↓
+
+Redis Cache Updated
+
+↓
+
+Market Engine Detects Change
+
+↓
+
+Publish Event
+
+market.index.updated
+
+↓
+
+Socket.IO
+
+↓
+
+Dashboard
+
+↓
+
+Only NIFTY Card Updates
+
+↓
+
+Green Animation
+
+↓
+
+Mini Chart Updates
+
+↓
+
+User Sees Live Change
+
+The page never refreshes.
+
+Only the affected component updates.
+
+---
+
+# Event Driven Architecture
+
+Everything in StockAssist AI is event based.
+
+Every change creates an event.
+
+Examples
+
+market.index.updated
+
+market.stock.updated
+
+portfolio.updated
+
+scanner.breakout
+
+scanner.volume_spike
+
+scanner.momentum
+
+trade.created
+
+trade.executed
+
+trade.closed
+
+trade.pnl.updated
+
+watchlist.updated
+
+news.breaking
+
+notification.created
+
+ai.started
+
+ai.completed
+
+broker.connected
+
+broker.disconnected
+
+market.open
+
+market.close
+
+heartbeat
+
+Every module subscribes only to events it needs.
+
+---
+
+# Redis Pub/Sub
+
+Redis is the communication layer.
+
+Market Engine
+
+↓
+
+Redis
+
+↓
+
+Socket.IO
+
+↓
+
+Frontend
+
+Redis is never accessed directly by the frontend.
+
+Redis provides
+
+Caching
+
+Pub/Sub
+
+Temporary storage
+
+Fast lookups
+
+Rate limiting
+
+Job queues
+
+---
+
+# Socket.IO
+
+Only one Socket.IO connection per user.
+
+Never create multiple socket connections.
+
+Socket Events
+
+market
+
+portfolio
+
+scanner
+
+trade
+
+watchlist
+
+news
+
+ai
+
+notification
+
+heartbeat
+
+Each page subscribes only to required channels.
+
+---
+
+# Live Dashboard
+
+The dashboard should always feel alive.
+
+Live Components
+
+NIFTY
+
+Sensex
+
+Bank Nifty
+
+India VIX
+
+Portfolio
+
+Watchlist
+
+News
+
+AI Activity
+
+Trade Monitor
+
+Notifications
+
+Market Breadth
+
+Sector Performance
+
+Each widget updates independently.
+
+Never rerender the whole page.
+
+---
+
+# Live Scanner
+
+The scanner never waits for refresh.
+
+Workflow
+
+Scanner Worker
+
+↓
+
+Scans NSE
+
+↓
+
+Finds Breakout
+
+↓
+
+Publish Event
+
+scanner.breakout
+
+↓
+
+Socket.IO
+
+↓
+
+Scanner Card Appears
+
+↓
+
+GSAP Animation
+
+↓
+
+AI Starts Analysis
+
+↓
+
+Notification Sent
+
+↓
+
+Watchlist Updated
+
+---
+
+# Live Portfolio
+
+Broker WebSocket
+
+↓
+
+Portfolio Service
+
+↓
+
+Redis
+
+↓
+
+Socket.IO
+
+↓
+
+Portfolio Card
+
+↓
+
+PnL Updated
+
+↓
+
+Number Animation
+
+↓
+
+Green / Red Flash
+
+↓
+
+Allocation Chart Updates
+
+---
+
+# Live Trade Monitor
+
+Trade Created
+
+↓
+
+Waiting
+
+↓
+
+Entry Hit
+
+↓
+
+Position Open
+
+↓
+
+PnL Streams Live
+
+↓
+
+Target 1
+
+↓
+
+Trailing Stop
+
+↓
+
+Target 2
+
+↓
+
+Exit
+
+↓
+
+Trade Closed
+
+↓
+
+Journal Updated
+
+↓
+
+AI Trade Review Starts
+
+---
+
+# Live Watchlist
+
+Every stock inside the watchlist updates independently.
+
+Price
+
+Volume
+
+Change %
+
+Signal
+
+AI Rating
+
+Recommendation
+
+Support
+
+Resistance
+
+No refresh required.
+
+---
+
+# Live News
+
+News Worker
+
+↓
+
+Collects News
+
+↓
+
+AI Categorization
+
+↓
+
+Sentiment Analysis
+
+↓
+
+Relevant Stock Mapping
+
+↓
+
+Publish Event
+
+news.breaking
+
+↓
+
+News Card Appears
+
+↓
+
+Notification
+
+---
+
+# AI Activity Timeline
+
+Never fake AI progress.
+
+Always display actual AI workflow.
+
+08:45
+
+Wake AI
+
+✓
+
+08:45
+
+Collect Global Markets
+
+✓
+
+08:46
+
+Read News
+
+✓
+
+08:47
+
+Scan NSE
+
+✓
+
+08:48
+
+Analyze Portfolio
+
+✓
+
+08:49
+
+Generate Recommendations
+
+✓
+
+08:50
+
+Morning Report Ready
+
+✓
+
+This timeline updates live.
+
+---
+
+# AI Thinking Process
+
+Instead of displaying
+
+"Thinking..."
+
+Display
+
+Collecting Market Data
+
+↓
+
+Reading News
+
+↓
+
+Checking Portfolio
+
+↓
+
+Running Scanner
+
+↓
+
+Finding Opportunities
+
+↓
+
+Comparing Indicators
+
+↓
+
+Evaluating Risk
+
+↓
+
+Generating Recommendation
+
+↓
+
+Completed
+
+Users should understand how AI reached its conclusion.
+
+---
+
+# Morning Report Flow
+
+08:30
+
+AI Starts
+
+↓
+
+Global Markets
+
+↓
+
+Gift Nifty
+
+↓
+
+Economic Calendar
+
+↓
+
+Corporate Actions
+
+↓
+
+News
+
+↓
+
+Sector Analysis
+
+↓
+
+Scanner
+
+↓
+
+Top Picks
+
+↓
+
+Portfolio Review
+
+↓
+
+Generate Report
+
+↓
+
+Notify User
+
+All steps visible.
+
+---
+
+# Frontend Data Flow
+
+Never
+
+fetch()
+
+fetch()
+
+fetch()
+
+fetch()
+
+Instead
+
+Socket.IO
+
+↓
+
+Global Store
+
+↓
+
+Affected Component
+
+↓
+
+GSAP Animation
+
+↓
+
+Done
+
+Only changed components rerender.
+
+---
+
+# Animations
+
+Price Up
+
+Green Flash
+
+Scale 1.05
+
+Return
+
+Price Down
+
+Red Flash
+
+Scale 0.95
+
+Return
+
+Scanner Card
+
+Slide Right
+
+Fade
+
+Glow
+
+Settle
+
+Notification
+
+Slide Down
+
+Fade
+
+Dismiss
+
+Portfolio
+
+Smooth Counter
+
+Chart Animation
+
+PnL Glow
+
+AI Timeline
+
+Progress Animation
+
+Step Completion
+
+Loading Pulse
+
+Everything should feel premium.
+
+---
+
+# Connection Management
+
+Display connection status.
+
+States
+
+Live
+
+Connecting
+
+Reconnecting
+
+Offline
+
+Disconnected
+
+Users should always know market connection status.
+
+---
+
+# Heartbeat
+
+Every 30 seconds
+
+Client
+
+↓
+
+Server
+
+↓
+
+Heartbeat
+
+↓
+
+Connection Validated
+
+If heartbeat fails
+
+Reconnect automatically.
+
+---
+
+# Error Recovery
+
+If Yahoo fails
+
+↓
+
+Fallback Provider
+
+If Socket disconnects
+
+↓
+
+Reconnect
+
+If Redis fails
+
+↓
+
+Graceful Recovery
+
+If Broker disconnects
+
+↓
+
+Reconnect
+
+Notify User
+
+No page crashes.
+
+---
+
+# Performance Rules
+
+Never rerender entire dashboard.
+
+Update only changed components.
+
+Batch updates.
+
+Use Redis.
+
+Use WebSockets.
+
+Virtualize long lists.
+
+Lazy load charts.
+
+Memoize expensive calculations.
+
+One socket connection.
+
+No unnecessary polling.
+
+---
+
+# Developer Rules
+
+Never poll every second.
+
+Never update the whole page.
+
+Never block UI.
+
+Always publish events.
+
+Always animate updates.
+
+Always use Redis Pub/Sub.
+
+Always use Socket.IO.
+
+Always update only affected components.
+
+---
+
+# Sprint 9.5
+Real-Time Infrastructure
+
+Objective
+
+Transform StockAssist AI from a static dashboard into a living trading platform.
+
+Deliverables
+
+Market Event Bus
+
+Redis Pub/Sub
+
+Socket.IO Gateway
+
+Live Dashboard
+
+Live Portfolio
+
+Live Scanner
+
+Live Watchlist
+
+Live Trade Monitor
+
+Live News
+
+Live AI Timeline
+
+Live Notifications
+
+Auto Reconnect
+
+Heartbeat
+
+Connection Status
+
+GSAP Price Animations
+
+Performance Optimization
+
+No Polling Architecture
+
+---
+
+# Definition of Done
+
+The Real-Time System is complete when:
+
+✓ Prices update automatically
+
+✓ Charts animate without refresh
+
+✓ Scanner updates live
+
+✓ Portfolio updates instantly
+
+✓ AI timeline shows actual work
+
+✓ Notifications arrive immediately
+
+✓ Trade monitor streams live
+
+✓ Watchlist updates automatically
+
+✓ Connection status is visible
+
+✓ Auto reconnect works
+
+✓ No unnecessary polling exists
+
+✓ Users feel the platform is alive
+
+---
+
+# Long-Term Vision
+
+The real-time system is the heartbeat of StockAssist AI.
+
+Every market movement, broker update, AI decision, portfolio change, and user notification should flow through a unified event-driven architecture.
+
+The platform should never feel static. It should feel like a professional financial operating system that is continuously observing, analyzing, and reacting to the market in real time.
+
+This document is the source of truth for all real-time behavior in StockAssist AI.
+
+---
+
+# End of REALTIME_SYSTEM.md

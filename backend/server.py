@@ -33,7 +33,7 @@ from services.scheduler import setup_scheduler
 
 from models import (
     UserCreate, UserLogin, UserResponse, UserSettingsUpdate,
-    TradeCreate, TradeResponse,
+    TradeCreate, TradeResponse, TradeModify, TradeExitRequest,
     WatchlistAdd,
     ChatMessage, ChatResponse,
     StockAnalysisRequest, SIPRequest,
@@ -1330,10 +1330,78 @@ async def morning_report_full(user: dict = Depends(get_current_user)):
     return report
 
 
-# ============ TRADES ROUTES ============
+# ============ TRADES ROUTES (Sprint 9 — Trading Engine) ============
+# Risk-gated entry, multi-target + trailing-stop lifecycle, broker execution.
+# All business logic lives in services/trading_engine.py; routes only wire it.
+
+async def _risk_inputs(user_id) -> tuple:
+    """(trades entered today, realized P&L of trades closed today) — the two
+    inputs the Risk Manager needs to enforce daily discipline limits."""
+    from services.trading_engine import _today
+    today = _today()
+    trades = await db.trades.find({"user_id": user_id}).to_list(500)
+    live = [t for t in trades if not t.get("is_paper")]
+    trades_today = len([t for t in live if (t.get("entry_time") or "").startswith(today)])
+    realized_today = round(sum(
+        t.get("pnl") or 0 for t in live
+        if t.get("pnl") is not None and (t.get("exit_time") or "").startswith(today)), 2)
+    return trades_today, realized_today
+
+
+def _derive_close_status(trade: dict, exit_price: float) -> str:
+    """SL_HIT / TARGET_HIT / CLOSED from where the exit landed (side-aware)."""
+    short = trade.get("type") == "SELL"
+    sl, t1 = trade.get("stop_loss"), trade.get("target1")
+    if sl and (exit_price >= sl if short else exit_price <= sl):
+        return "SL_HIT"
+    if t1 and (exit_price <= t1 if short else exit_price >= t1):
+        return "TARGET_HIT"
+    return "CLOSED"
+
+
+@trades_router.post("/validate")
+async def validate_trade_route(data: TradeCreate, user: dict = Depends(get_current_user)):
+    """Dry-run Risk Manager check — powers the live risk panel in the form."""
+    from services import trading_engine
+    trades_today, realized_today = await _risk_inputs(user["_id"])
+    return trading_engine.validate_trade(user, data.model_dump(), trades_today, realized_today)
+
 
 @trades_router.post("")
 async def create_trade(data: TradeCreate, user: dict = Depends(get_current_user)):
+    from services import trading_engine
+
+    # 1. Risk Manager gate — violations always block (warnings educate).
+    trades_today, realized_today = await _risk_inputs(user["_id"])
+    check = trading_engine.validate_trade(user, data.model_dump(), trades_today, realized_today)
+    if not check["approved"]:
+        raise HTTPException(status_code=422, detail={
+            "message": "Risk check failed — trade was not placed.",
+            "violations": check["violations"],
+            "warnings": check["warnings"],
+            "metrics": check["metrics"],
+        })
+
+    # 2. Optional LIVE entry order via the Broker Engine (no simulation — a
+    #    failed broker order never creates an OPEN trade).
+    broker_order_id = None
+    if data.broker:
+        broker = _require_broker(data.broker)
+        try:
+            placed = await broker_engine.place_order(user["_id"], broker, {
+                "symbol": data.symbol.upper(), "exchange": data.exchange,
+                "transaction_type": data.type, "quantity": data.quantity,
+                "order_type": data.order_type,
+                "price": data.entry_price if data.order_type == "LIMIT" else None,
+                "product": data.product or ("CNC" if broker == "zerodha" else "D"),
+                "tag": "engine-entry",
+            })
+            broker_order_id = placed.get("order_id")
+        except BrokerError as e:
+            raise HTTPException(status_code=502, detail=f"Order was not placed: {e.user_message}")
+
+    side_word = "Bought" if data.type == "BUY" else "Sold (short)"
+    trailing = data.trailing_stop.model_dump() if data.trailing_stop else {"enabled": False}
     trade_doc = {
         "user_id": user["_id"],
         "symbol": data.symbol.upper(),
@@ -1341,9 +1409,20 @@ async def create_trade(data: TradeCreate, user: dict = Depends(get_current_user)
         "type": data.type,
         "entry_price": data.entry_price,
         "quantity": data.quantity,
+        "quantity_open": data.quantity,
+        "realized_pnl": 0.0,
         "stop_loss": data.stop_loss,
+        "initial_stop_loss": data.stop_loss,
         "target1": data.target1,
         "target2": data.target2,
+        "target3": data.target3,
+        "trailing_stop": trailing,
+        "best_price": data.entry_price,
+        "targets_hit": [],
+        "events": [trading_engine.make_event(
+            "ENTRY", f"{side_word} {data.quantity} @ ₹{data.entry_price}"
+                     + (f" via {data.broker} (order {broker_order_id})" if data.broker else ""),
+            data.entry_price)],
         "status": "OPEN",
         "pnl": None,
         "pnl_percent": None,
@@ -1352,20 +1431,84 @@ async def create_trade(data: TradeCreate, user: dict = Depends(get_current_user)
         "notes": data.notes,
         "setup_type": data.setup_type,
         "is_paper": data.is_paper,
+        "broker": data.broker,
+        "broker_order_id": broker_order_id,
+        "product": data.product,
+        "exchange": data.exchange,
+        # Live auto-exit needs explicit per-trade consent AND a broker link.
+        "auto_exit": bool(data.auto_exit and data.broker),
+        "risk_check": {"warnings": check["warnings"], "metrics": check["metrics"],
+                       "acknowledged": data.override_warnings},
     }
     result = await db.trades.insert_one(trade_doc)
     trade_doc["_id"] = str(result.inserted_id)
 
-    # Create notification
     await db.notifications.insert_one({
         "user_id": user["_id"],
         "type": "TRADE_ENTRY",
         "title": "Trade Executed",
-        "message": f"Bought {data.quantity} {data.symbol} @ INR {data.entry_price}. SL: INR {data.stop_loss} | Target: INR {data.target1}",
+        "message": f"{side_word} {data.quantity} {data.symbol} @ INR {data.entry_price}. "
+                   f"SL: INR {data.stop_loss} | Target: INR {data.target1}"
+                   + (f" | Broker: {data.broker}" if data.broker else ""),
         "read": False,
         "created_at": datetime.now(timezone.utc).isoformat(),
     })
     return trade_doc
+
+
+@trades_router.get("/risk/summary")
+async def risk_summary(user: dict = Depends(get_current_user)):
+    """Today's risk usage vs the user's own limits (Risk Manager dashboard)."""
+    from services.trading_engine import build_risk_summary
+    return await build_risk_summary(db, user)
+
+
+@trades_router.post("/quick")
+async def quick_trade(request: Request, user: dict = Depends(get_current_user)):
+    """One-click trade (AI picks) via the user's CHOSEN trading platform.
+
+    There is no default broker: the user must pick their platform in
+    Settings → Trading Platform first, and it must be connected. Runs the
+    same Risk Manager gate + engine seeding as POST /api/trades."""
+    body = await request.json()
+    preferred = (user.get("preferred_broker") or "").strip().lower()
+    if not preferred:
+        raise HTTPException(status_code=400, detail=(
+            "No trading platform selected. Choose your broker in "
+            "Settings → Trading Platform to enable one-click trading."))
+    status = (await broker_engine.get_status(user["_id"])).get(preferred)
+    if not status or not status.get("connected"):
+        raise HTTPException(status_code=400, detail=(
+            f"Your selected platform ({(status or {}).get('display_name', preferred)}) is not "
+            "connected. Reconnect it in Settings → Broker Accounts, or choose another platform."))
+
+    try:
+        payload = TradeCreate(
+            symbol=body["symbol"],
+            stock_name=body.get("stock_name", body["symbol"]),
+            type="BUY",
+            entry_price=float(body["entry_price"]),
+            quantity=int(body.get("quantity", 1)),
+            stop_loss=float(body["stop_loss"]),
+            target1=float(body["target1"]),
+            target2=float(body["target2"]) if body.get("target2") else None,
+            broker=preferred,
+            order_type="LIMIT",
+            product="MIS",
+            notes=body.get("notes"),
+        )
+    except (KeyError, ValueError, TypeError) as e:
+        raise HTTPException(status_code=400, detail=f"Invalid payload: missing or malformed {str(e)}")
+
+    trade_doc = await create_trade(payload, user)
+    if body.get("confidence") is not None:
+        await db.trades.update_one({"_id": ObjectId(trade_doc["_id"])},
+                                   {"$set": {"ai_confidence": body["confidence"]}})
+        trade_doc["ai_confidence"] = body["confidence"]
+    return {"success": True, "broker": preferred,
+            "order_id": trade_doc.get("broker_order_id"), "trade": trade_doc,
+            "message": f"Order placed on {status.get('display_name', preferred)} — "
+                       f"BUY {payload.quantity} {payload.symbol} @ ₹{payload.entry_price}"}
 
 @trades_router.get("")
 async def get_trades(user: dict = Depends(get_current_user)):
@@ -1453,6 +1596,13 @@ async def _generate_coaching_background(trade_id: str):
 
 @trades_router.put("/{trade_id}")
 async def update_trade(trade_id: str, request: Request, background_tasks: BackgroundTasks, user: dict = Depends(get_current_user)):
+    """Modify an open trade (SL / targets / trailing stop / notes) or close it
+    with `exit_price` (full close — for partial exits use POST /{id}/exit).
+
+    Modify rules are side-aware: targets stay on the profitable side of entry
+    and in order; the stop may move ANYWHERE below target 1 (long) — including
+    above entry — so profits can be locked in (breakeven+ stops)."""
+    from services import trading_engine
     body = await request.json()
     trade = await db.trades.find_one({"_id": ObjectId(trade_id), "user_id": user["_id"]})
     if not trade:
@@ -1460,28 +1610,68 @@ async def update_trade(trade_id: str, request: Request, background_tasks: Backgr
 
     was_open = trade.get("status") == "OPEN"
     update = {}
+    events = list(trade.get("events") or [])
+
+    # ── Risk-parameter modifications (open trades only) ──
+    modify_fields = ("stop_loss", "target1", "target2", "target3", "trailing_stop")
+    if any(f in body for f in modify_fields):
+        if not was_open:
+            raise HTTPException(status_code=400, detail="Only open trades can be modified")
+        merged = {**trade, **{f: body[f] for f in modify_fields if f in body}}
+        short = trade.get("type") == "SELL"
+        entry = trade["entry_price"]
+
+        # Validate targets: profitable side of entry, strictly ordered.
+        prev = entry
+        for level in (1, 2, 3):
+            t = merged.get(f"target{level}")
+            if t in (None, 0, ""):
+                continue
+            t = float(t)
+            if (t <= entry if not short else t >= entry) or (t <= prev if not short else t >= prev):
+                raise HTTPException(status_code=422, detail=(
+                    f"Target {level} (₹{t}) must be {'above' if not short else 'below'} "
+                    f"entry ₹{entry} and beyond the previous target."))
+            prev = t
+        # Validate stop: anywhere on the protective side of target 1.
+        new_sl = merged.get("stop_loss")
+        t1 = merged.get("target1") or trade.get("target1")
+        if new_sl is not None and t1 and (float(new_sl) >= float(t1) if not short else float(new_sl) <= float(t1)):
+            raise HTTPException(status_code=422, detail=(
+                f"Stop loss (₹{new_sl}) must stay {'below' if not short else 'above'} target 1 (₹{t1})."))
+
+        changed = []
+        for f in modify_fields:
+            if f not in body or body[f] == trade.get(f):
+                continue
+            value = body[f]
+            if f.startswith("target") and value in (0, ""):
+                value = None
+            update[f] = value
+            if f == "trailing_stop":
+                enabled = bool((value or {}).get("enabled"))
+                changed.append("trailing stop " + (
+                    f"on ({(value or {}).get('value')}{'%' if (value or {}).get('type') == 'percent' else ' pts'})"
+                    if enabled else "off"))
+            else:
+                changed.append(f"{f.replace('_', ' ')} ₹{trade.get(f)} → ₹{value}"
+                               if value is not None else f"{f.replace('_', ' ')} removed")
+        if changed:
+            events.append(trading_engine.make_event("MODIFIED", "Modified: " + "; ".join(changed)))
+            update["events"] = events
+
+    # ── Full close via exit_price (legacy behavior, partial-aware P&L) ──
     if "exit_price" in body:
-        update["exit_price"] = body["exit_price"]
-        update["exit_time"] = datetime.now(timezone.utc).isoformat()
-        pnl = (body["exit_price"] - trade["entry_price"]) * trade["quantity"]
-        if trade["type"] == "SELL":
-            pnl = (trade["entry_price"] - body["exit_price"]) * trade["quantity"]
-        update["pnl"] = round(pnl, 2)
-        update["pnl_percent"] = round((pnl / (trade["entry_price"] * trade["quantity"])) * 100, 2)
-        if trade["type"] == "BUY":
-            if body["exit_price"] <= trade["stop_loss"]:
-                update["status"] = "SL_HIT"
-            elif body["exit_price"] >= trade["target1"]:
-                update["status"] = "TARGET_HIT"
-            else:
-                update["status"] = "CLOSED"
-        else:
-            if body["exit_price"] >= trade["stop_loss"]:
-                update["status"] = "SL_HIT"
-            elif body["exit_price"] <= trade["target1"]:
-                update["status"] = "TARGET_HIT"
-            else:
-                update["status"] = "CLOSED"
+        exit_price = float(body["exit_price"])
+        qty_open = trade.get("quantity_open")
+        qty_open = int(qty_open if qty_open is not None else trade["quantity"])
+        reason = _derive_close_status(trade, exit_price)
+        close = trading_engine.apply_partial_exit(trade, exit_price, qty_open, reason)
+        events.append(trading_engine.make_event(
+            "EXIT", f"Closed {qty_open} @ ₹{exit_price} ({reason})", exit_price))
+        close["events"] = events
+        update.update(close)
+
     if "status" in body:
         update["status"] = body["status"]
     if "notes" in body:
@@ -1496,6 +1686,72 @@ async def update_trade(trade_id: str, request: Request, background_tasks: Backgr
     if was_open and updated.get("status") != "OPEN":
         background_tasks.add_task(_generate_coaching_background, trade_id)
 
+    return updated
+
+
+@trades_router.post("/{trade_id}/exit")
+async def exit_trade(trade_id: str, data: TradeExitRequest, background_tasks: BackgroundTasks,
+                     user: dict = Depends(get_current_user)):
+    """Exit an open trade — fully or partially (`quantity`), manually
+    (`exit_price`) or at market via the linked broker (`at_market`).
+
+    Broker exits place a LIVE market order through the Broker Engine first;
+    if the broker rejects it, nothing is recorded (no simulation)."""
+    from services import trading_engine
+    trade = await db.trades.find_one({"_id": ObjectId(trade_id), "user_id": user["_id"]})
+    if not trade:
+        raise HTTPException(status_code=404, detail="Trade not found")
+    if trade.get("status") != "OPEN":
+        raise HTTPException(status_code=400, detail="Trade is already closed")
+
+    qty_open = trade.get("quantity_open")
+    qty_open = int(qty_open if qty_open is not None else trade["quantity"])
+    quantity = min(int(data.quantity or qty_open), qty_open)
+    if quantity <= 0:
+        raise HTTPException(status_code=400, detail="Nothing left to exit on this trade")
+
+    broker_order_id = None
+    if data.at_market:
+        if not trade.get("broker"):
+            raise HTTPException(status_code=400,
+                                detail="This trade is not linked to a broker — enter an exit price instead.")
+        side = "BUY" if trade.get("type") == "SELL" else "SELL"
+        try:
+            placed = await broker_engine.place_order(user["_id"], trade["broker"], {
+                "symbol": trade["symbol"], "exchange": trade.get("exchange", "NSE"),
+                "transaction_type": side, "quantity": quantity,
+                "order_type": "MARKET", "product": trade.get("product") or "CNC",
+                "tag": "engine-exit",
+            })
+            broker_order_id = placed.get("order_id")
+        except BrokerError as e:
+            raise HTTPException(status_code=502, detail=f"Exit order was not placed: {e.user_message}")
+
+    exit_price = data.exit_price
+    if exit_price is None:
+        quote = await real_quote(trade["symbol"])
+        if not quote:
+            raise HTTPException(status_code=422,
+                                detail="Live price unavailable — please enter the exit price.")
+        exit_price = quote["price"]
+
+    reason = _derive_close_status(trade, exit_price) if quantity == qty_open else "PARTIAL"
+    update = trading_engine.apply_partial_exit(
+        trade, exit_price, quantity,
+        reason if reason != "PARTIAL" else _derive_close_status(trade, exit_price))
+    events = list(trade.get("events") or [])
+    events.append(trading_engine.make_event(
+        "EXIT",
+        f"{'Partial exit' if quantity < qty_open else 'Closed'} {quantity} @ ₹{exit_price}"
+        + (f" via {trade['broker']} (order {broker_order_id})" if broker_order_id else ""),
+        exit_price))
+    update["events"] = events
+    await db.trades.update_one({"_id": ObjectId(trade_id)}, {"$set": update})
+
+    updated = await db.trades.find_one({"_id": ObjectId(trade_id)})
+    updated["_id"] = str(updated["_id"])
+    if updated.get("status") != "OPEN":
+        background_tasks.add_task(_generate_coaching_background, trade_id)
     return updated
 
 # ─── Trade Coaching ─────────────────────────────────
@@ -2047,6 +2303,14 @@ async def update_settings(data: UserSettingsUpdate, user: dict = Depends(get_cur
         update["max_trades_per_day"] = data.max_trades_per_day
     if data.telegram_chat_id is not None:
         update["telegram_chat_id"] = data.telegram_chat_id
+    if data.preferred_broker is not None:
+        # The user's chosen trading platform. "" clears the choice — there is
+        # never an implicit default broker.
+        from services.brokers import SUPPORTED_BROKERS
+        choice = data.preferred_broker.strip().lower()
+        if choice and choice not in SUPPORTED_BROKERS:
+            raise HTTPException(status_code=422, detail=f"Unsupported broker: {choice}")
+        update["preferred_broker"] = choice or None
     if data.notification_prefs is not None:
         update["notification_prefs"] = data.notification_prefs.model_dump()
     if update:
@@ -2543,6 +2807,41 @@ async def broker_modify_order(broker: str, order_id: str, changes: BrokerOrderMo
 @brokers_router.delete("/{broker}/orders/{order_id}")
 async def broker_cancel_order(broker: str, order_id: str, user: dict = Depends(get_current_user)):
     return await broker_engine.cancel_order(str(user["_id"]), _require_broker(broker), order_id)
+
+
+# ============ UNIFIED ORDER HISTORY (Sprint 9) ============
+# One order book across every broker: db.orders is fed by order placements,
+# the realtime broker stream (_record_order) and on-demand sync below.
+
+orders_router = APIRouter(prefix="/api/orders", tags=["Orders"])
+
+
+@orders_router.get("")
+async def unified_orders(user: dict = Depends(get_current_user),
+                         broker: Optional[str] = None, refresh: bool = False):
+    """Unified order history. `refresh=true` re-syncs the live order book from
+    every connected broker first (best-effort — a broker outage never hides
+    the locally recorded history)."""
+    user_id = str(user["_id"])
+    sync_errors = {}
+    if refresh:
+        statuses = await broker_engine.get_status(user_id)
+        for name, status in statuses.items():
+            if broker and name != broker:
+                continue
+            if not status.get("connected"):
+                continue
+            try:
+                await broker_engine.sync_orders(user_id, name)
+            except BrokerError as e:
+                sync_errors[name] = e.user_message
+    query = {"user_id": user_id}
+    if broker:
+        query["broker"] = broker
+    docs = await db.orders.find(query).sort("placed_at", -1).to_list(200)
+    for d in docs:
+        d["_id"] = str(d["_id"])
+    return {"orders": docs, "count": len(docs), "sync_errors": sync_errors}
 
 
 # ============ ZERODHA ROUTES (legacy paths — delegate to Broker Engine) ============
@@ -3587,6 +3886,7 @@ app.include_router(sip_router)
 app.include_router(advisor_router)
 app.include_router(settings_router)
 app.include_router(brokers_router)
+app.include_router(orders_router)
 app.include_router(zerodha_router)
 app.include_router(monitor_router)
 app.include_router(whatsapp_router)
