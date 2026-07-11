@@ -174,6 +174,46 @@ fetch-only to a continuous push-driven surface.
 
 ---
 
+# 2.8 Sprint R5 Status — Portfolio Live Migration (DONE)
+
+Sprint R5 closed §4.8 (Portfolio) on **Path A**, realizing the doc's flow
+*Broker WebSocket → Portfolio Service → Redis → Socket → Portfolio Card →
+PnL Updated → Number Animation → Allocation Chart Updates*.
+
+- **Live snapshot service:** `services/portfolio_stream.py` (new) recomputes a
+  user's full portfolio via `portfolio_engine` (single source of truth) and
+  publishes a per-user **`portfolio.updated`** bus event (`data.user_id` →
+  bridge delivers to that user's sockets only) carrying
+  `{pnl, allocation, holdings (light marks), open_positions, reason}` plus the
+  legacy-compat flat `total_pnl`/`total_unrealized_pnl` fields.
+- **Producers:** heartbeat `task_monitor_portfolio` (90s) now covers broker
+  holdings + manual trades with ONE shared quote prefetch and emits
+  `portfolio.updated` per user (`reason:"monitor"`; replaces the manual-only
+  legacy `portfolio_update` send); `broker_engine._on_stream_tick` maps ticks
+  (instrument_token → symbol via db.holdings), persists fresh
+  `last_price`/`market_value` marks, and emits a **throttled** (3s/user)
+  `reason:"broker_tick"` snapshot — broker streaming now drives live P&L;
+  `sync_portfolio` publishes **`portfolio.synced`** + a `reason:"broker_sync"`
+  snapshot.
+- **Store:** `portfolio.updated` → `portfolioLive` slice (+ `portfolioUpdate`
+  for legacy consumers); `portfolio.synced` → `portfolioSynced`. New selectors
+  `selectPortfolioLive`, `selectPortfolioSynced`.
+- **Portfolio page (live):** value strip animates (GSAP `AnimatedNumber`
+  count-up + `usePriceFlash` green/red flash on value and P&L, LIVE badge with
+  snapshot time); holdings rows extracted into `HoldingRow` (per-row price
+  flash; only the affected row re-renders); allocation pie + sector bars read
+  the live allocation; equity curve appends a streaming "Live" point;
+  **AI portfolio refresh** = silent intelligence-bundle refetch triggered by
+  `portfolio.synced` (immediate) and `portfolio.updated` (≥60s apart) — never
+  a timer. Dashboard summary card now also merges live
+  `current_value`/`invested` from the snapshot.
+- **Tests:** `tests/test_portfolio_stream.py` (8 hermetic tests: payload
+  shape/compat fields, per-user publish, no-holdings silence, tick override,
+  tick persistence, throttle + re-arm, unmatched tokens, heartbeat task
+  contract); bridge-mapping test extended for `portfolio.*` → `portfolio`.
+
+---
+
 # 3. Cross-Cutting Infrastructure Gaps
 
 These affect every feature and should be fixed before per-feature polish.
@@ -316,7 +356,7 @@ Effort is T-shirt sized (S ≈ ≤1d, M ≈ 2–3d, L ≈ 4–6d, XL ≈ >1wk) f
   `activity_feed` stream; delete its 15s poll.
 - **Effort:** S
 
-### 4.8 Portfolio (Value / P&L / Allocation)
+### 4.8 Portfolio (Value / P&L / Allocation) — RESOLVED (Sprint R5, see §2.8)
 - **Current:** `portfolio_update` pushed by heartbeat + on broker sync
   (heartbeat_engine.py:351, broker_engine `portfolio_synced`); Dashboard/Portfolio
   also fetch/poll (`/portfolio/summary`, PortfolioMonitor 60s). Allocation/risk are

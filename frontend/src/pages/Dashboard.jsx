@@ -764,6 +764,9 @@ export default function Dashboard() {
       ...(prev || {}),
       total_pnl: portfolioUpdate.total_pnl ?? portfolioUpdate.total_unrealized_pnl ?? prev?.total_pnl,
       open_positions: portfolioUpdate.open_positions ?? prev?.open_positions,
+      // Sprint R5 snapshots carry the full live P&L block — animate value too.
+      current_value: portfolioUpdate.pnl?.current_value ?? prev?.current_value,
+      total_invested: portfolioUpdate.pnl?.invested ?? prev?.total_invested,
     }));
   }, [portfolioUpdate]);
 

@@ -106,6 +106,8 @@ def test_resolve_channel_mapping():
     assert bridge.resolve_channel("scanner.momentum") == "scanner"
     assert bridge.resolve_channel("news.received") == "news"
     assert bridge.resolve_channel("notification.created") == "notifications"
+    assert bridge.resolve_channel("portfolio.updated") == "portfolio"
+    assert bridge.resolve_channel("portfolio.synced") == "portfolio"
     # Unknown domain falls through to the domain name itself.
     assert bridge.resolve_channel("custom.thing") == "custom"
 

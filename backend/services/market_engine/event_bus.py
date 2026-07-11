@@ -18,6 +18,10 @@ Events:
     market.alert                     Significant market movement
     calendar.event                   Economic calendar event
     breadth.updated                  Market breadth recalculated
+    portfolio.updated                Per-user live portfolio snapshot (data
+                                     carries user_id; data.reason: "monitor" |
+                                     "broker_tick" | "broker_sync")
+    portfolio.synced                 Per-user broker portfolio sync completed
 """
 import asyncio
 import logging

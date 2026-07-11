@@ -995,6 +995,103 @@ Notes / follow-ups
 
 ---
 
+# Sprint R5 — Portfolio Live Migration
+
+Status
+
+COMPLETED
+
+Authority
+
+REALTIME_SYSTEM.md (Path A — continues R1 audit / R2 backbone / R3 client /
+R4 scanner in REALTIME_MIGRATION_PLAN.md; closes the audit's §4.8 Portfolio gap)
+
+Objective
+
+Convert the portfolio from fetch-on-mount to a live, push-driven surface:
+streaming P&L, live allocation updates, broker-tick-driven recomputes,
+animated counters, live charts, and event-triggered AI portfolio refresh —
+per the doc's *Broker WebSocket → Portfolio Service → Socket → PnL Updated →
+Number Animation → Allocation Chart Updates* flow.
+
+Delivered
+
+- **Live portfolio stream** (`backend/services/portfolio_stream.py`, new) —
+  server-side recompute layer: builds a per-user snapshot through
+  `portfolio_engine` (never re-implements portfolio math) and publishes a
+  per-user `portfolio.updated` bus event (`data.user_id` → the R2 bridge
+  delivers only to that user's sockets, `portfolio` channel). Payload:
+  `{pnl, allocation, holdings (light marks), open_positions, reason}` +
+  legacy-compat flat `total_pnl`/`total_unrealized_pnl`. Light quotes map
+  (cached 2d Yahoo + factual sector metadata) — marks, not indicators.
+- **Heartbeat producer** (`services/heartbeat_engine.py`) —
+  `task_monitor_portfolio` (90s) upgraded from "manual open trades only" to
+  the FULL broker+manual portfolio for every user with positions, using one
+  shared quote prefetch per cycle; emits `portfolio.updated`
+  (`reason:"monitor"`) via the bus instead of the legacy `portfolio_update`
+  send (the store maps the event into the same consumer state).
+- **Broker streaming → live P&L** (`services/broker_engine.py`) — official
+  broker ticks now drive the portfolio: `_on_stream_tick` maps
+  `instrument_token → symbol` via the user's synced `db.holdings`, persists
+  fresh `last_price`/`market_value` marks (REST reads stay live between Yahoo
+  refreshes), and publishes a throttled (3s/user, process-local, tick prices
+  supersede cached quotes) `reason:"broker_tick"` snapshot. `sync_portfolio`
+  additionally publishes the doc's `portfolio.synced` event + a
+  `reason:"broker_sync"` snapshot. All best-effort — a recompute error never
+  breaks the raw tick forward. Events documented in `event_bus.py`.
+- **Store** (`frontend/src/store/realtimeStore.js`) — `portfolio.updated` →
+  new `portfolioLive` slice (full snapshot + `updatedAt`) while still feeding
+  `portfolioUpdate` for legacy consumers (Dashboard card, PortfolioMonitor);
+  `portfolio.synced` → `portfolioSynced`. New selectors `selectPortfolioLive`,
+  `selectPortfolioSynced`.
+- **Portfolio page live migration** (`pages/Portfolio.jsx`) — live snapshot
+  overlays the intelligence bundle (marks only; analytics stay server-computed):
+  value strip uses GSAP `AnimatedNumber` count-up + `usePriceFlash` green/red
+  flash on total value and P&L, with a pulsing LIVE badge showing snapshot
+  time; holdings rows extracted into `HoldingRow` (per-row price flash — only
+  the affected row updates); allocation pie + sector bars read the live
+  allocation; equity curve appends a streaming "Live" point so the chart moves
+  intraday; **AI portfolio refresh**: silent intelligence refetch triggered by
+  `portfolio.synced` (immediate, deduped) and `portfolio.updated` (≥60s
+  apart) — event-triggered, never a timer; no polling added (page stays
+  fetch-on-mount + events, manual refresh retained).
+- **Dashboard** (`pages/Dashboard.jsx`) — portfolio summary card now also
+  merges live `current_value`/`invested` from R5 snapshots (existing
+  AnimatedNumber animates them).
+
+Verification
+
+- `tests/test_portfolio_stream.py` (new): 8 hermetic tests — snapshot payload
+  shape + legacy-compat fields, per-user `portfolio.updated` publish,
+  no-holdings silence, tick price override, tick mark persistence, tick
+  throttle + `reset_state` re-arm, unmatched-token silence, heartbeat task
+  contract (broker + manual users each get one `reason:"monitor"` event with
+  shared-prefetch P&L). Bus spied in-process; quotes injected — no network.
+- `tests/test_event_bridge.py` extended: `portfolio.updated` /
+  `portfolio.synced` → `portfolio` channel mapping.
+- Full hermetic backend suite: 205 passed (197 pre-R5 + 8 new; the
+  `test_phase*`/`test_backend` `requests`-based suites still require a running
+  dev server — unchanged).
+- Frontend `CI=false yarn build` (craco) passes clean (+0.7 kB gz); only the
+  pre-existing TradeJournal eslint warning remains.
+- Manual (needs running backend+frontend): Portfolio page shows LIVE badge;
+  value/P&L count up and flash on heartbeat cycles (~90s); with a connected
+  Zerodha session ticks move rows/value within seconds (3s throttle);
+  allocation pie/bars follow; Performance tab shows the moving "Live" point;
+  broker sync refreshes the AI intelligence bundle silently.
+
+Notes / follow-ups
+
+- The tick throttle is process-local (same trade-off as scanner_worker's
+  cooldown; single-heartbeat deployment model). Multi-process scale moves it
+  to Redis.
+- Realized P&L is intentionally absent from live snapshots — it changes only
+  when a trade closes and stays owned by the REST intelligence bundle.
+- Zerodha funds card on the Portfolio page is still fetch-on-mount; a
+  `funds.updated` broker event is the natural next step.
+
+---
+
 # Technical Debt
 
 Every technical debt item must contain

@@ -326,6 +326,18 @@ class BrokerEngine:
         }
         await self._push(user_id, {"type": "portfolio_synced", "data": {
             "broker": broker, "summary": result["summary"], "synced_at": now}})
+        # Sprint R5: publish the doc's `portfolio.synced` event (per-user via
+        # the bridge) and follow with a fresh full snapshot so allocation/P&L
+        # surfaces update the moment a sync lands. Best-effort.
+        try:
+            from services import portfolio_stream
+            from services.market_engine.event_bus import event_bus
+            await event_bus.publish("portfolio.synced", {
+                "user_id": str(user_id), "broker": broker,
+                "summary": result["summary"], "synced_at": now})
+            await portfolio_stream.publish_snapshot(self.db, user_id, reason="broker_sync")
+        except Exception as e:
+            logger.warning(f"portfolio.synced publish after {broker} sync failed: {e}")
         try:
             await self.start_stream(user_id, broker, holdings=holdings, positions=positions)
         except Exception as e:
@@ -438,6 +450,15 @@ class BrokerEngine:
     async def _on_stream_tick(self, user_id: str, broker: str, ticks: list):
         await self._push(user_id, {"type": "broker_price_tick", "data": {
             "broker": broker, "ticks": ticks}})
+        # Sprint R5: broker ticks drive the live portfolio — recompute this
+        # user's P&L/allocation server-side and stream `portfolio.updated`
+        # (throttled inside; best-effort so a recompute error never breaks
+        # the raw tick forward above).
+        try:
+            from services import portfolio_stream
+            await portfolio_stream.apply_broker_ticks(self.db, user_id, broker, ticks)
+        except Exception as e:
+            logger.warning(f"Live portfolio recompute from {broker} ticks failed: {e}")
 
     async def _on_stream_expired(self, user_id: str, broker: str):
         self._sessions.pop((user_id, broker), None)

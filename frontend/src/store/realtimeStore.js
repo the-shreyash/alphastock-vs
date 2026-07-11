@@ -40,6 +40,9 @@ const initialState = {
 
   // Portfolio / trades
   portfolioUpdate: null,
+  // Full live snapshot from `portfolio.updated` (Sprint R5):
+  // { pnl, allocation, holdings, open_positions, reason, updatedAt }
+  portfolioLive: null,
   tradeUpdates: [],
   engineEvents: [],
 
@@ -229,9 +232,20 @@ export const useRealtimeStore = create((set, get) => ({
         }));
         break;
       }
-      case "portfolio":
-        set({ portfolioUpdate: data });
+      case "portfolio": {
+        if (event === "portfolio.synced") {
+          // Broker sync completed — refetch trigger for portfolio surfaces.
+          set({ portfolioSynced: { ...data, timestamp: envelope.timestamp } });
+        } else {
+          // portfolio.updated — live snapshot (P&L + allocation + marks).
+          // portfolioUpdate keeps the legacy consumer contract (Dashboard).
+          set({
+            portfolioUpdate: data,
+            portfolioLive: { ...data, updatedAt: envelope.timestamp || Date.now() },
+          });
+        }
         break;
+      }
       case "trade":
         set((s) => ({ tradeUpdates: [data, ...s.tradeUpdates].slice(0, MAX_TRADE_UPDATES) }));
         break;
@@ -257,6 +271,8 @@ export const selectMarketData = (s) => s.marketData;
 export const selectPriceTicks = (s) => s.priceTicks;
 export const selectActivityUpdates = (s) => s.activityUpdates;
 export const selectPortfolioUpdate = (s) => s.portfolioUpdate;
+export const selectPortfolioLive = (s) => s.portfolioLive;
+export const selectPortfolioSynced = (s) => s.portfolioSynced;
 export const selectTradeUpdates = (s) => s.tradeUpdates;
 export const selectEngineEvents = (s) => s.engineEvents;
 export const selectUnreadCount = (s) => s.unreadCount;

@@ -435,41 +435,40 @@ async def task_monitor_trades():
 
 
 async def task_monitor_portfolio():
+    """Recompute every trader's FULL portfolio (broker holdings + manual open
+    trades, via portfolio_engine) and stream a per-user `portfolio.updated`
+    event through the bus/bridge (Sprint R5 — replaces the pre-R5 legacy
+    `portfolio_update` push that covered manual trades only)."""
+    from services import portfolio_stream
     from services.activity_logger import log_activity
     log_activity("Monitoring Portfolio", "monitor", "running")
     try:
         open_trades = await _db.trades.find({"status": "OPEN"}).to_list(200)
-        if not open_trades:
+        broker_holdings = await _db.holdings.find({}).to_list(500)
+        manual = [t for t in open_trades if not t.get("is_paper")]
+        user_ids = {t["user_id"] for t in manual} | {h["user_id"] for h in broker_holdings}
+        if not user_ids:
             log_activity("No portfolios with open positions", "monitor", "done")
             return
 
-        symbols = list({t["symbol"] for t in open_trades})
-        quotes = await _price_map(symbols)
+        # One shared quote fetch for every symbol held by anyone this cycle —
+        # each user's snapshot then reads from the prefetched map (no N× fetch).
+        symbols = {t["symbol"] for t in manual} | {
+            h["symbol"] for h in broker_holdings if h.get("symbol")}
+        prefetched = await portfolio_stream.quotes_map(list(symbols))
 
-        by_user = {}
-        for trade in open_trades:
-            quote = quotes.get(trade["symbol"])
-            if not quote:
-                continue
-            pnl = round((quote["price"] - trade["entry_price"]) * trade["quantity"], 2)
-            agg = by_user.setdefault(trade["user_id"], {"pnl": 0.0, "positions": 0})
-            agg["pnl"] += pnl
-            agg["positions"] += 1
+        async def shared_quotes(syms):
+            return {(s or "").upper(): prefetched.get((s or "").upper()) for s in syms}
 
-        for user_id, agg in by_user.items():
-            await _send_user(user_id, {
-                "type": "portfolio_update",
-                "user_id": user_id,
-                "data": {
-                    "total_unrealized_pnl": round(agg["pnl"], 2),
-                    "total_pnl": round(agg["pnl"], 2),
-                    "open_positions": agg["positions"],
-                },
-                "timestamp": _now_iso(),
-            })
+        streamed = 0
+        for user_id in user_ids:
+            snapshot = await portfolio_stream.publish_snapshot(
+                _db, user_id, quotes_map_func=shared_quotes, reason="monitor")
+            if snapshot:
+                streamed += 1
 
         log_activity(
-            f"Portfolio health checked for {len(by_user)} trader(s)", "monitor", "done"
+            f"Portfolio P&L streamed for {streamed} trader(s)", "monitor", "done"
         )
     except Exception as e:
         logger.error(f"task_monitor_portfolio error: {e}")
