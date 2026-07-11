@@ -65,7 +65,7 @@ const EMPTY_FORM = {
 
 export default function TradeMonitor() {
   const { user } = useAuth();
-  const { tradeUpdates, engineEvents } = useWebSocket(user?._id || user?.id || "");
+  const { tradeUpdates, engineEvents, connected } = useWebSocket(user?._id || user?.id || "");
   const [activeTrades, setActiveTrades] = useState([]);
   const [history, setHistory] = useState([]);
   const [pnl, setPnl] = useState(null);
@@ -130,9 +130,17 @@ export default function TradeMonitor() {
 
   useEffect(() => {
     fetchAll();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Fallback poll for active positions only while the socket is down; when live,
+  // trade_update / trade_engine_event pushes keep positions current.
+  useEffect(() => {
+    if (connected) return undefined;
     const interval = setInterval(fetchActive, 15000);
     return () => clearInterval(interval);
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [connected]);
 
   // Live-patch open positions from the AI heartbeat's trade_update pushes so
   // current price / unrealized P&L tick between the 15s polling fallback.

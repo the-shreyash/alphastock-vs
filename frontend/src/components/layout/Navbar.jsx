@@ -1,22 +1,32 @@
 import { Bell, Sun, Moon, Menu } from "lucide-react";
 import { useAuth } from "../../context/AuthContext";
 import { useTheme } from "../../context/ThemeContext";
-import { useState, useEffect } from "react";
+import { useEffect } from "react";
 import api from "../../services/api";
 import SearchBox from "./SearchBox";
+import ConnectionStatus from "./ConnectionStatus";
+import { useRealtimeStore, selectUnreadCount, selectConnected } from "../../store/realtimeStore";
 
 export default function Navbar({ onNotificationClick, onMenuClick }) {
   const { user } = useAuth();
   const { theme, toggleTheme } = useTheme();
-  const [unreadCount, setUnreadCount] = useState(0);
+  // Unread badge is driven live by the store: `notification.created` pushes
+  // increment it in real time. We only seed it once from the server, and keep
+  // a slow poll as a fallback while the socket is disconnected.
+  const unreadCount = useRealtimeStore(selectUnreadCount);
+  const connected = useRealtimeStore(selectConnected);
+  const seedUnreadCount = useRealtimeStore((s) => s.seedUnreadCount);
+  const markNotificationsRead = useRealtimeStore((s) => s.markNotificationsRead);
 
   useEffect(() => {
-    if (!user) return;
-    const fetch = () => api.get("/notifications/unread-count").then(r => setUnreadCount(r.data.count || 0)).catch(() => {});
-    fetch();
+    if (!user) return undefined;
+    const fetch = () => api.get("/notifications/unread-count").then(r => seedUnreadCount(r.data.count || 0)).catch(() => {});
+    fetch(); // seed on mount
+    // Fallback poll only while the live push path is unavailable.
+    if (connected) return undefined;
     const interval = setInterval(fetch, 30000);
     return () => clearInterval(interval);
-  }, [user]);
+  }, [user, connected, seedUnreadCount]);
 
   return (
     <header
@@ -42,6 +52,9 @@ export default function Navbar({ onNotificationClick, onMenuClick }) {
 
       {/* Right: Controls */}
       <div className="flex items-center gap-1.5">
+        {/* Real-time connection status */}
+        <ConnectionStatus />
+
         {/* Theme Toggle */}
         <button
           data-testid="theme-toggle-btn"
@@ -58,7 +71,7 @@ export default function Navbar({ onNotificationClick, onMenuClick }) {
         {/* Notifications */}
         <button
           data-testid="navbar-notifications-btn"
-          onClick={() => { onNotificationClick(); setUnreadCount(0); }}
+          onClick={() => { onNotificationClick(); markNotificationsRead(); }}
           className="p-2.5 rounded-xl transition-all relative"
           style={{ color: "var(--text-secondary)" }}
           onMouseEnter={e => e.currentTarget.style.background = "var(--hover)"}

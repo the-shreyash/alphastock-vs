@@ -9,7 +9,11 @@ Events:
     price.updated                    Stock price change
     sector.updated                   Sector performance recalculated
     news.received                    New article classified
-    scanner.updated                  Scanner results refreshed
+    scanner.updated                  Scanner results refreshed (data.source:
+                                     "worker" = continuous sweep, "api" = REST)
+    scanner.breakout                 NEW breakout hit (novelty-gated)
+    scanner.volume_spike             NEW volume-spike hit (novelty-gated)
+    scanner.momentum                 NEW momentum hit (novelty-gated)
     opportunity.detected             Trading opportunity found
     market.alert                     Significant market movement
     calendar.event                   Economic calendar event

@@ -3,6 +3,8 @@ import { Link, useNavigate } from "react-router-dom";
 import api from "../services/api";
 import { formatCurrency, formatNumber, formatPercent } from "../utils/formatters";
 import { useWebSocket } from "../hooks/useWebSocket";
+import { usePriceFlash } from "../hooks/usePriceFlash";
+import AnimatedNumber from "../components/ui/AnimatedNumber";
 import {
   TrendingUp, TrendingDown, Activity, BarChart3,
   ArrowUpRight, ArrowDownRight, Zap, Brain, RefreshCw,
@@ -71,12 +73,13 @@ function QuickActions() {
 }
 
 /* ====== Stat Card (Index strip) with optional sparkline ====== */
-function StatCard({ label, value, change, changePct, sparkData, testId }) {
+function StatCard({ label, value, numericValue, change, changePct, sparkData, testId }) {
   const isPos = (change ?? changePct ?? 0) >= 0;
+  const flashRef = usePriceFlash(numericValue);
   return (
     <div data-testid={testId} className="stat-card relative overflow-hidden">
       <span className="stat-label block mb-1.5">{label}</span>
-      <div className="stat-value">{value || "—"}</div>
+      <div ref={flashRef} className="stat-value inline-block rounded-md px-0.5">{value || "—"}</div>
       {changePct != null && (
         <div className="flex items-center gap-1 mt-1 text-[11px] font-mono font-semibold" style={{ color: isPos ? "var(--gain)" : "var(--loss)" }}>
           {isPos ? <ArrowUpRight size={11} /> : <ArrowDownRight size={11} />}
@@ -365,14 +368,20 @@ function PortfolioSummaryCard({ summary }) {
       </div>
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
         {[
-          { label: "Portfolio Value", value: summary?.current_value ? `₹${formatNumber(summary.current_value)}` : summary?.total_value ? `₹${formatNumber(summary.total_value)}` : "—" },
-          { label: "Today's P/L", value: summary?.total_pnl ? `₹${formatNumber(summary.total_pnl)}` : "—", color: (summary?.total_pnl ?? 0) >= 0 ? "var(--gain)" : "var(--loss)" },
+          { label: "Portfolio Value", value: summary?.current_value ? `₹${formatNumber(summary.current_value)}` : summary?.total_value ? `₹${formatNumber(summary.total_value)}` : "—", numeric: summary?.current_value ?? summary?.total_value },
+          { label: "Today's P/L", value: summary?.total_pnl ? `₹${formatNumber(summary.total_pnl)}` : "—", numeric: summary?.total_pnl, color: (summary?.total_pnl ?? 0) >= 0 ? "var(--gain)" : "var(--loss)" },
           { label: "Investments", value: summary?.total_invested ? `₹${formatNumber(summary.total_invested)}` : "—" },
           { label: "Holdings", value: summary?.holdings_count ?? "—" },
         ].map(item => (
           <div key={item.label}>
             <span className="stat-label block mb-1">{item.label}</span>
-            <span className="text-lg font-semibold font-mono" style={{ color: item.color || "var(--text-primary)" }}>{item.value}</span>
+            {item.numeric != null ? (
+              <span className="text-lg font-semibold font-mono" style={{ color: item.color || "var(--text-primary)" }}>
+                ₹<AnimatedNumber value={item.numeric} format={(v) => formatNumber(v)} />
+              </span>
+            ) : (
+              <span className="text-lg font-semibold font-mono" style={{ color: item.color || "var(--text-primary)" }}>{item.value}</span>
+            )}
           </div>
         ))}
       </div>
@@ -780,22 +789,32 @@ export default function Dashboard() {
     return () => { if (pollInterval) clearInterval(pollInterval); };
   }, [connected]);
 
+  // Core market fetch (overview/sectors/activity). Lifted to a callback so the
+  // initial mount fetch and the disconnected-only fallback poll share one impl.
+  const fetchCore = useCallback(async () => {
+    try {
+      const [ov, sec, act] = await Promise.all([
+        api.get("/market/overview"),
+        api.get("/market/sectors"),
+        api.get("/ai-activity"),
+      ]);
+      setOverview(ov.data);
+      setSectors(sec.data);
+      setActivities(act.data);
+    } catch (err) { console.error("Dashboard core fetch:", err); }
+    finally { setLoading(false); }
+  }, []);
+
+  // Fallback poll for core market data only while the socket is down; when live,
+  // indices/sectors/activity arrive via pushes (market_update / activity_feed).
+  useEffect(() => {
+    if (connected) return undefined;
+    const coreInterval = setInterval(fetchCore, 30000);
+    return () => clearInterval(coreInterval);
+  }, [connected, fetchCore]);
+
   // Main data fetch
   useEffect(() => {
-    const fetchCore = async () => {
-      try {
-        const [ov, sec, act] = await Promise.all([
-          api.get("/market/overview"),
-          api.get("/market/sectors"),
-          api.get("/ai-activity"),
-        ]);
-        setOverview(ov.data);
-        setSectors(sec.data);
-        setActivities(act.data);
-      } catch (err) { console.error("Dashboard core fetch:", err); }
-      finally { setLoading(false); }
-    };
-
     const fetchReport = async () => {
       try { const { data } = await api.get("/analysis/reports/morning"); setMorningReport(data); }
       catch { setMorningReport(null); }
@@ -872,10 +891,6 @@ export default function Dashboard() {
     fetchCommodities();
     fetchGlobal();
     fetchNiftyChart();
-
-    // Refresh core market data every 30 seconds
-    const coreInterval = setInterval(fetchCore, 30000);
-    return () => clearInterval(coreInterval);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -967,16 +982,16 @@ export default function Dashboard() {
       {/* ===== Index Strip ===== */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
         <Reveal delay={0}>
-          <StatCard testId="nifty-card" label="Nifty 50" value={formatNumber(overview?.nifty?.value)} change={overview?.nifty?.change} changePct={overview?.nifty?.change_pct} sparkData={niftyChart} />
+          <StatCard testId="nifty-card" label="Nifty 50" value={formatNumber(overview?.nifty?.value)} numericValue={overview?.nifty?.value} change={overview?.nifty?.change} changePct={overview?.nifty?.change_pct} sparkData={niftyChart} />
         </Reveal>
         <Reveal delay={0.05}>
-          <StatCard testId="banknifty-card" label="Bank Nifty" value={formatNumber(overview?.bank_nifty?.value)} change={overview?.bank_nifty?.change} changePct={overview?.bank_nifty?.change_pct} />
+          <StatCard testId="banknifty-card" label="Bank Nifty" value={formatNumber(overview?.bank_nifty?.value)} numericValue={overview?.bank_nifty?.value} change={overview?.bank_nifty?.change} changePct={overview?.bank_nifty?.change_pct} />
         </Reveal>
         <Reveal delay={0.1}>
-          <StatCard testId="sensex-card" label="Sensex" value={formatNumber(overview?.sensex?.value)} change={overview?.sensex?.change} changePct={overview?.sensex?.change_pct} />
+          <StatCard testId="sensex-card" label="Sensex" value={formatNumber(overview?.sensex?.value)} numericValue={overview?.sensex?.value} change={overview?.sensex?.change} changePct={overview?.sensex?.change_pct} />
         </Reveal>
         <Reveal delay={0.15}>
-          <StatCard testId="vix-card" label="India VIX" value={overview?.india_vix != null ? formatNumber(overview.india_vix) : "—"} />
+          <StatCard testId="vix-card" label="India VIX" value={overview?.india_vix != null ? formatNumber(overview.india_vix) : "—"} numericValue={overview?.india_vix} />
         </Reveal>
       </div>
 

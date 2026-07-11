@@ -1,10 +1,15 @@
 import { useState, useEffect } from "react";
 import { Link } from "react-router-dom";
 import api from "../services/api";
+import {
+  useRealtimeStore, selectConnected, selectPriceTicks,
+  selectSectors, selectGlobalMarkets, selectMovers,
+} from "../store/realtimeStore";
 import { formatNumber } from "../utils/formatters";
 import { TrendingUp, TrendingDown, Globe, ArrowUpRight, ArrowDownRight, SlidersHorizontal, Layers, Calendar, Trophy } from "lucide-react";
 import { motion } from "framer-motion";
 import MarketScanner from "../components/market/MarketScanner";
+import ScannerLiveFeed from "../components/market/ScannerLiveFeed";
 import EconomicCalendar from "../components/market/EconomicCalendar";
 import SectorAnalysis from "../components/market/SectorAnalysis";
 import RankingTable from "../components/market/RankingTable";
@@ -184,6 +189,14 @@ export default function Markets() {
   const [loading, setLoading] = useState(true);
   const [activeTab, setActiveTab] = useState("overview");
 
+  // Live real-time slices (Sprint R3). When the socket is up these push, so the
+  // 30s poll drops to a disconnected-only fallback.
+  const connected = useRealtimeStore(selectConnected);
+  const priceTicks = useRealtimeStore(selectPriceTicks);
+  const liveSectors = useRealtimeStore(selectSectors);
+  const liveGlobal = useRealtimeStore(selectGlobalMarkets);
+  const liveMovers = useRealtimeStore(selectMovers);
+
   useEffect(() => {
     const fetchData = async () => {
       try {
@@ -197,9 +210,36 @@ export default function Markets() {
       finally { setLoading(false); }
     };
     fetchData();
+    // Fallback poll only while disconnected; live pushes cover it otherwise.
+    if (connected) return undefined;
     const i = setInterval(fetchData, 30000);
     return () => clearInterval(i);
-  }, []);
+  }, [connected]);
+
+  // Live-patch pushed slices onto local state without a refetch.
+  useEffect(() => { if (Array.isArray(liveSectors) && liveSectors.length) setSectors(liveSectors); }, [liveSectors]);
+  useEffect(() => { if (Array.isArray(liveGlobal) && liveGlobal.length) setGlobalMkts(liveGlobal); }, [liveGlobal]);
+  useEffect(() => {
+    if (!liveMovers) return;
+    if (Array.isArray(liveMovers.gainers) && liveMovers.gainers.length) setGainers(liveMovers.gainers);
+    if (Array.isArray(liveMovers.losers) && liveMovers.losers.length) setLosers(liveMovers.losers);
+  }, [liveMovers]);
+  useEffect(() => {
+    const idxMap = { nifty: "NIFTY", bank_nifty: "BANKNIFTY", sensex: "SENSEX" };
+    setOverview((prev) => {
+      if (!prev) return prev;
+      let changed = false;
+      const next = { ...prev };
+      for (const [key, sym] of Object.entries(idxMap)) {
+        const tick = priceTicks[sym];
+        if (tick?.price != null) {
+          next[key] = { ...(prev[key] || {}), value: tick.price, change_pct: tick.change_pct };
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
+    });
+  }, [priceTicks]);
 
   if (loading) return (
     <div className="space-y-5 animate-fade-in-up">
@@ -332,7 +372,10 @@ export default function Markets() {
 
       {activeTab === "scanner" && (
         <Reveal>
-          <MarketScanner />
+          <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_320px] gap-4 items-start">
+            <MarketScanner />
+            <ScannerLiveFeed />
+          </div>
         </Reveal>
       )}
 

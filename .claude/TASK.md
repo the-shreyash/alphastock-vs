@@ -216,6 +216,7 @@ Tasks
 - Long-Term Scanner
 - [x] Momentum Scanner — live day-change + volume shortlist (advisor)
 - [x] AI Ranking — fetch_real_top_picks scores live technicals; unavailable when no live data
+- [x] Live Scanner Feed — continuous worker + push events + animated cards (Sprint R4)
 
 ---
 
@@ -815,6 +816,182 @@ Notes / follow-ups
   consumes. Additional per-index/breadth/news emissions land with their feature
   sprints; other notification insert sites can adopt `create_notification`
   incrementally to gain the live push.
+
+---
+
+# Sprint R3 — Frontend Real-Time Client
+
+Status
+
+COMPLETED
+
+Authority
+
+REALTIME_SYSTEM.md (Path A — evolve FastAPI native WebSocket; continues the
+Sprint R1 audit / R2 backbone in REALTIME_MIGRATION_PLAN.md)
+
+Objective
+
+Consume the R2 backbone from the frontend: collapse to one socket per user,
+introduce a global real-time store, consume the new `event` envelope, add a
+real connection state machine with heartbeat + backoff, and retire the polling
+timers that now have a push path. GSAP price animations (G7) are intentionally
+deferred.
+
+Delivered
+
+- **Zustand global store** (`frontend/src/store/realtimeStore.js`, new) — a
+  single store fed by one socket. `applyLegacy(msg)` folds the pre-R2 flat
+  message switch (`market_update`, `prices`, `trade_update`, `ai_alert`,
+  `broker_*`, …); `applyEvent(envelope)` routes the R2 `{type:"event",…}`
+  envelope by domain into slices (`market.index.updated`→price store,
+  `notification.created`→unread badge + latest, `portfolio.updated`, scanner/
+  news/sector buckets). Narrow selectors so a tick re-renders only the
+  components reading that slice (G4).
+- **Single socket provider** (`frontend/src/context/RealtimeProvider.jsx`, new)
+  — owns the ONE `WebSocket(/api/ws?user_id=)`, mounted in `App.js` inside
+  `AuthProvider`. No anonymous socket. On open it subscribes to the app's
+  channels (`market`, `sectors`, `scanner`, `news`, `notifications`,
+  `portfolio`, `trades`, `ai`, `broker`) and exposes an imperative `send`.
+  **Connection state machine** connecting→live→reconnecting→offline (G8),
+  **30s heartbeat** (`ping`/`pong`, reconnect on missed pong), **exponential
+  backoff** with jitter (1s→30s cap, reset on clean open) (G3, G8).
+- **`useWebSocket` → store shim** (`frontend/src/hooks/useWebSocket.js`) — no
+  longer opens a socket; returns the same interface (plus `connectionStatus`)
+  read from the store, so Dashboard/TradeMonitor/Watchlist work unchanged while
+  the app uses exactly one socket (G3).
+- **Connection pill** (`frontend/src/components/layout/ConnectionStatus.jsx`,
+  new) — Live/Connecting/Reconnecting/Offline, rendered app-wide in `Navbar`
+  (replaces the Dashboard-only LIVE/OFFLINE badge).
+- **New backend emissions (real data only)** — the always-on heartbeat tasks
+  already computed real results but never published; they now emit onto the bus
+  (the R2 bridge forwards to channels): `news.received` (scan_news),
+  `scanner.breakout` (find_breakouts), `scanner.volume` (check_volume),
+  `sector.updated` (sector_rotation), `market.global.updated` (global_markets),
+  `market.movers.updated` + `breadth.updated` (sentiment). `market_broadcast_loop`
+  additionally publishes `market.engine.status` ~every 30s. All guarded; a
+  publish failure never breaks the task.
+- **De-poll (G9, fully resolved)** — every poll with a push path is gated on
+  `!connected` (fallback only), initial fetch retained: Dashboard core 30s +
+  activity 10s, TradeMonitor active-trades 15s, Watchlist 30s, Navbar
+  unread-count (badge live via `notification.created`), ActivityTimeline 15s
+  (streams `activity_feed`), Markets 30s (indices/sectors/global/movers now
+  pushed), MarketEngineStatus 30s (`market.engine.status`), PortfolioMonitor 60s
+  (event-triggered refetch on `portfolio_update`).
+- **GSAP animations (G7)** — `hooks/usePriceFlash.js` (green flash + scale-up on
+  rise, red flash + scale-down on fall) on the Dashboard index cards and
+  Watchlist row prices; `components/ui/AnimatedNumber.jsx` (smooth count-up) on
+  the Dashboard portfolio value + Today's P&L — the doc's animation spec.
+
+Verification
+
+- `frontend` `yarn add zustand` + `CI=false yarn build` (craco) passes clean;
+  only pre-existing eslint warnings remain (RankingTable/Settings/TradeJournal,
+  untouched). Bundle +2.6 kB gz total.
+- Backend: `python3 -m py_compile services/heartbeat_engine.py server.py` OK
+  (deps not installed in the dev session, so the pytest suite was not run here).
+- Manual (needs a running backend+frontend): one `/api/ws` connection across
+  pages in DevTools; pill Live→(kill backend)→Reconnecting→Offline→(restart)→
+  Live; polls silent while live; index cards flash on tick; portfolio value
+  counts up; notification badge increments on a `notification.created` push.
+
+Notes / follow-ups
+
+- The R2 `event` envelope + channel names are consumed verbatim from
+  `services/realtime/event_bridge.py`; new emissions route via the existing
+  `DOMAIN_CHANNEL` map with no bridge change.
+
+---
+
+# Sprint R4 — Scanner Live Migration
+
+Status
+
+COMPLETED
+
+Authority
+
+REALTIME_SYSTEM.md (Path A — continues the R1 audit / R2 backbone / R3 client
+in REALTIME_MIGRATION_PLAN.md; closes the audit's §4.5 Scanner gap)
+
+Objective
+
+Convert the scanner from fetch-only to a continuous, push-driven surface:
+a continuous scanner worker emitting live breakout / volume-spike / momentum
+events, auto-refresh of the results table via events, and animated card
+insertion per the doc's scanner-card spec.
+
+Delivered
+
+- **Scanner worker** (`backend/services/market_engine/scanner_worker.py`, new)
+  — pure novelty/detection layer for the continuous scanner:
+  `filter_novel()` keeps a per-(kind, symbol) 30-min cooldown so every
+  published `scanner.*` hit is a NEW opportunity (continuous rescans no longer
+  flood the feed with repeats); `detect_momentum()`/`momentum_pass()` compare
+  each cycle's day-change against the previous cycle's snapshot, so
+  `scanner.momentum` fires only for stocks ≥2% up that are new or still
+  accelerating (≥0.3% since last cycle). Process-local state; `reset_state()`
+  for tests.
+- **Heartbeat scanner tasks** (`services/heartbeat_engine.py`) — the existing
+  breakout/volume tasks now gate their publishes through `filter_novel`;
+  `scanner.volume` **renamed to `scanner.volume_spike`** (doc-aligned; single
+  producer, no name-specific consumer). New `task_scan_momentum` (150s)
+  publishes `scanner.momentum`. New `task_scanner_sweep` (180s) re-runs the
+  preset scanners (2 per tick, rotating through all 8; reuses the 30s-cached
+  universe quotes) and emits ONE worker-tagged `scanner.updated` — the
+  frontend's auto-refresh signal.
+- **Loop-safe refresh contract** (`services/market_engine/scanner_engine.py`)
+  — `scan()` gains `source="api"` / `publish=True`; the REST scan's
+  `scanner.updated` now carries `source:"api"` and the frontend refetches ONLY
+  on `source:"worker"`, so an API scan can never trigger a refetch loop.
+  Scanner events documented in `event_bus.py`'s contract docstring.
+- **Store** (`frontend/src/store/realtimeStore.js`) — scanner slice is now
+  event-aware: hit events become feed entries `{id, kind, event, candidates,
+  count, timestamp}` (cap 50) and bump `scannerRefreshedAt`; worker-origin
+  `scanner.updated` bumps `scannerRefreshedAt` only. New selectors
+  `selectScannerFeed`, `selectScannerRefreshedAt`.
+- **Live feed UI** (`components/market/ScannerLiveFeed.jsx`, new) — pure
+  push-driven hit feed (no fetching) beside the scanner on the Markets Scanner
+  tab (320px rail, stacks on mobile): kind badges (Breakout / Volume Spike /
+  Momentum), top-3 candidates with price/change/vol-ratio, relative time,
+  live/offline dot, honest empty + offline states.
+- **Card entrance animation** (`hooks/useCardEntrance.js`, new) — the doc's
+  scanner-card spec (Slide Right → Fade → Glow → Settle) as a GSAP mount
+  animation mirroring `usePriceFlash`; only newly inserted cards animate.
+- **Auto-refresh via events** (`components/market/MarketScanner.jsx`) — the
+  results table refetches silently (no spinner flicker) ~1.5s-debounced on
+  `scannerRefreshedAt`, shows a "Live · updated hh:mm:ss" caption, and falls
+  back to a 60s poll ONLY while the socket is down (R3 gating pattern);
+  initial fetch retained.
+
+Verification
+
+- `tests/test_scanner_worker.py` (new): 11 hermetic tests — novelty cooldown
+  (first-pass/repeat/expiry/pruning/kind-independence), momentum
+  threshold+acceleration semantics, heartbeat task contracts via bus spies
+  (momentum publishes once then dedupes; volume task emits
+  `scanner.volume_spike` and never the old name; breakout dedupes; sweep emits
+  exactly one worker-tagged `scanner.updated`), `scan(publish=False)` silent +
+  `source:"api"` tagging. All fetchers monkeypatched — no network.
+- `tests/test_event_bridge.py` extended: `scanner.breakout` /
+  `scanner.volume_spike` / `scanner.momentum` → `scanner` channel mapping.
+- Full hermetic backend suite: 197 passed (the `test_phase*`/`test_backend`
+  `requests`-based suites require a running dev server — unchanged, unaffected).
+- Frontend `CI=false yarn build` (craco) passes clean (+1.4 kB gz); only the
+  pre-existing TradeJournal eslint warning remains.
+- Manual (needs running backend+frontend): Markets → Scanner tab; hit cards
+  slide in within ~2–3 min of heartbeat cycles; table refreshes silently after
+  sweeps; preset-button REST scans do NOT trigger refetch (source gating);
+  no `/market/scanner` polling while live; offline falls back to 60s poll.
+
+Notes / follow-ups
+
+- Hit events are broadcast on the `scanner` channel (public market data);
+  per-user notification fan-out (`create_notification`) and AI auto-analysis
+  of hits are the doc's next steps for the scanner flow — deferred.
+- The dedupe cooldown is process-local; if the backend is ever scaled to
+  multiple worker processes, only one process should run the heartbeat engine
+  (already the deployment model) or the cooldown moves to Redis.
 
 ---
 

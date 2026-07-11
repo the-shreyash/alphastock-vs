@@ -2475,10 +2475,29 @@ async def market_broadcast_loop():
     from services.market_engine.event_bus import event_bus
     prev_index: dict = {}
     index_keys = ("nifty", "bank_nifty", "sensex")
+    tick = 0
     while True:
         try:
             if ws_manager.active:
                 from services.real_market import fetch_real_market_overview
+
+                # Publish market engine health (~every 30s) so the engine badge
+                # updates live instead of polling /market/engine/status.
+                if tick % 3 == 0:
+                    try:
+                        from services.market_engine import market_gateway
+                        from services.market_engine.validator import is_market_hours, is_pre_market
+                        await event_bus.publish("market.engine.status", {
+                            **market_gateway.status,
+                            "market_hours": is_market_hours(),
+                            "pre_market": is_pre_market(),
+                            "event_bus_subscribers": event_bus.subscriber_count,
+                            "recent_events_count": len(event_bus.recent_events(limit=500)),
+                            "version": "1.0.0",
+                        })
+                    except Exception as e:
+                        logging.warning(f"engine.status publish failed: {e}")
+
                 overview = await fetch_real_market_overview()
                 if overview:
                     await ws_manager.broadcast({
@@ -2503,6 +2522,7 @@ async def market_broadcast_loop():
                         })
         except Exception as e:
             logging.error(f"Broadcast error: {e}")
+        tick += 1
         await asyncio.sleep(10)
 
 

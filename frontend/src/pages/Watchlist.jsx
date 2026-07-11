@@ -3,6 +3,7 @@ import { Link } from "react-router-dom";
 import api from "../services/api";
 import { formatNumber } from "../utils/formatters";
 import { useWebSocket } from "../hooks/useWebSocket";
+import { usePriceFlash } from "../hooks/usePriceFlash";
 import { useAuth } from "../context/AuthContext";
 import { Eye, Search, Plus, Trash2, ArrowUpRight, ArrowDownRight, Activity } from "lucide-react";
 import { motion } from "framer-motion";
@@ -98,6 +99,7 @@ function WatchlistRow({ item, onRemove }) {
   const q = item.quote;
   const isPos = (q?.change_pct ?? 0) >= 0;
   const sincePos = (item.since_added_pct ?? 0) >= 0;
+  const priceFlashRef = usePriceFlash(q?.price);
   return (
     <div className="flex items-center gap-3 px-4 py-3 transition-all" style={{ borderBottom: "1px solid var(--border-subtle)" }}
       onMouseEnter={e => e.currentTarget.style.background = "var(--hover)"}
@@ -112,7 +114,7 @@ function WatchlistRow({ item, onRemove }) {
       </Link>
 
       <div className="text-right w-24 shrink-0">
-        <div className="text-[13px] font-mono font-semibold" style={{ color: "var(--text-primary)" }}>
+        <div ref={priceFlashRef} className="text-[13px] font-mono font-semibold inline-block rounded px-1" style={{ color: "var(--text-primary)" }}>
           {q?.price != null ? `₹${formatNumber(q.price)}` : "—"}
         </div>
         {q?.change_pct != null && (
@@ -154,7 +156,7 @@ function WatchlistRow({ item, onRemove }) {
 
 export default function Watchlist() {
   const { user } = useAuth();
-  const { priceTicks } = useWebSocket(user?._id || user?.id || "");
+  const { priceTicks, connected } = useWebSocket(user?._id || user?.id || "");
   const [items, setItems] = useState([]);
   const [loading, setLoading] = useState(true);
 
@@ -168,9 +170,15 @@ export default function Watchlist() {
 
   useEffect(() => {
     fetchWatchlist();
+  }, [fetchWatchlist]);
+
+  // Live prices patch each row via the WS "prices" stream. The full refetch
+  // (RSI, since-added — not streamed) is kept only as a disconnected fallback.
+  useEffect(() => {
+    if (connected) return undefined;
     const i = setInterval(fetchWatchlist, 30000);
     return () => clearInterval(i);
-  }, [fetchWatchlist]);
+  }, [connected, fetchWatchlist]);
 
   // Live-patch each row's price/change from the WS "prices" stream, keeping the
   // 30s poll as a fallback for the fields (RSI, since-added) not streamed.

@@ -1,6 +1,7 @@
 import { BrowserRouter, Routes, Route, Navigate, useLocation } from "react-router-dom";
 import { AuthProvider, useAuth } from "./context/AuthContext";
 import { ThemeProvider } from "./context/ThemeContext";
+import { RealtimeProvider } from "./context/RealtimeProvider";
 import Layout from "./components/layout/Layout";
 import Landing from "./pages/Landing";
 import Login from "./pages/Login";
@@ -88,7 +89,9 @@ function App() {
     <BrowserRouter>
       <ThemeProvider>
         <AuthProvider>
-          <AppRouter />
+          <RealtimeProvider>
+            <AppRouter />
+          </RealtimeProvider>
         </AuthProvider>
       </ThemeProvider>
     </BrowserRouter>

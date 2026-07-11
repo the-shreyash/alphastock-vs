@@ -101,6 +101,9 @@ def test_resolve_channel_mapping():
     assert bridge.resolve_channel("market.index.updated") == "market"
     assert bridge.resolve_channel("sector.analyzed") == "sectors"
     assert bridge.resolve_channel("scanner.updated") == "scanner"
+    assert bridge.resolve_channel("scanner.breakout") == "scanner"
+    assert bridge.resolve_channel("scanner.volume_spike") == "scanner"
+    assert bridge.resolve_channel("scanner.momentum") == "scanner"
     assert bridge.resolve_channel("news.received") == "news"
     assert bridge.resolve_channel("notification.created") == "notifications"
     # Unknown domain falls through to the domain name itself.

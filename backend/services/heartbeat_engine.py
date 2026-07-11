@@ -21,6 +21,8 @@ import logging
 import os
 from datetime import datetime, timezone, timedelta
 
+from services.market_engine import scanner_worker
+
 logger = logging.getLogger(__name__)
 
 # ── Tunables ──────────────────────────────────────────────────────────────
@@ -62,6 +64,21 @@ async def _broadcast(message):
         await _ws.broadcast(message)
     except Exception as e:
         logger.error(f"Heartbeat broadcast error: {e}")
+
+
+async def _publish(event_type, data):
+    """Publish a real domain event onto the market event bus (Sprint R3).
+
+    The R2 event bridge forwards every bus event to the matching socket channel,
+    so these publishes are what let the Scanner / News / Sectors / Markets
+    surfaces update live without polling. Data here is always the REAL result
+    the calling task already computed — never fabricated. Best-effort: a publish
+    failure must never break the task's core work."""
+    try:
+        from services.market_engine.event_bus import event_bus
+        await event_bus.publish(event_type, data or {})
+    except Exception as e:
+        logger.warning(f"Heartbeat publish '{event_type}' failed: {e}")
 
 
 async def _price_map(symbols):
@@ -114,6 +131,8 @@ async def task_global_markets():
             f"Read {len(valid)} global indices — {leader['name']} {leader['change_pct']:+.2f}%",
             "scan", "done",
         )
+        # Stream live global indices to the Markets page.
+        await _publish("market.global.updated", {"markets": valid})
     except Exception as e:
         logger.error(f"task_global_markets error: {e}")
         log_activity("Reading Global Markets failed", "scan", "warning")
@@ -172,6 +191,8 @@ async def task_scan_news():
             log_activity("No fresh market headlines available", "news", "warning")
             return
         log_activity(f"Scanned {len(news)} market headlines", "news", "done")
+        # Stream the latest headlines live to the News/Dashboard surfaces.
+        await _publish("news.received", {"articles": news[:10], "count": len(news)})
     except Exception as e:
         logger.error(f"task_scan_news error: {e}")
         log_activity("Scanning News failed", "news", "warning")
@@ -195,6 +216,16 @@ async def task_find_breakouts():
             log_activity(
                 f"Found {len(candidates)} breakout candidate(s): {names}", "scan", "done"
             )
+            # Stream only NEW hits to the live Scanner feed (Sprint R4): the
+            # scan re-detects the same breakout every cycle, so novelty gating
+            # keeps the feed from flooding with repeats.
+            novel = scanner_worker.filter_novel("breakout", candidates)
+            if novel:
+                await _publish("scanner.breakout", {
+                    "kind": "breakout",
+                    "candidates": novel[:10],
+                    "count": len(novel),
+                })
         else:
             log_activity("No breakouts right now — market consolidating", "scan", "done")
     except Exception as e:
@@ -221,11 +252,90 @@ async def task_check_volume():
                 f"{len(surges)}/{len(batch)} stocks with unusual volume: {names}",
                 "scan", "done",
             )
+            surges.sort(key=lambda r: r.get("volume_ratio") or 0, reverse=True)
+            # Stream only NEW volume spikes (Sprint R4; event name per
+            # REALTIME_SYSTEM.md — was `scanner.volume` before R4).
+            novel = scanner_worker.filter_novel("volume_spike", surges)
+            if novel:
+                await _publish("scanner.volume_spike", {
+                    "kind": "volume_spike",
+                    "candidates": novel[:10],
+                    "count": len(novel),
+                })
         else:
             log_activity(f"Volume normal across {len(batch)} stocks scanned", "scan", "done")
     except Exception as e:
         logger.error(f"task_check_volume error: {e}")
         log_activity("Checking Volume failed", "scan", "warning")
+
+
+async def task_scan_momentum():
+    from services.activity_logger import log_activity
+    from services.real_market import fetch_all_universe_quotes
+    log_activity("Scanning Momentum", "scan", "running")
+    try:
+        quotes = await fetch_all_universe_quotes()
+        if not quotes:
+            log_activity("Momentum scan skipped — live data unavailable", "scan", "warning")
+            return
+        candidates = scanner_worker.momentum_pass(quotes)
+        if candidates:
+            names = ", ".join(q["symbol"] for q in candidates[:3])
+            log_activity(
+                f"Found {len(candidates)} momentum mover(s): {names}", "scan", "done"
+            )
+            novel = scanner_worker.filter_novel("momentum", candidates)
+            if novel:
+                await _publish("scanner.momentum", {
+                    "kind": "momentum",
+                    "candidates": novel[:10],
+                    "count": len(novel),
+                })
+        else:
+            log_activity(f"No fresh momentum across {len(quotes)} stocks", "scan", "done")
+    except Exception as e:
+        logger.error(f"task_scan_momentum error: {e}")
+        log_activity("Scanning Momentum failed", "scan", "warning")
+
+
+_sweep_ptr = 0
+
+
+async def task_scanner_sweep():
+    """Continuously re-run the preset scanners (2 per tick, rotating) and emit
+    ONE worker-tagged `scanner.updated` — the frontend's signal to refresh the
+    scanner results table without polling (Sprint R4). Preset scans reuse the
+    30s-cached universe quotes, so a sweep costs ~zero extra upstream calls."""
+    global _sweep_ptr
+    from services.activity_logger import log_activity
+    from services.market_engine import scanner_engine
+    log_activity("Sweeping Scanner Strategies", "scan", "running")
+    try:
+        keys = list(scanner_engine.STRATEGY_PRESETS.keys())
+        picked = [keys[(_sweep_ptr + i) % len(keys)] for i in range(2)]
+        _sweep_ptr = (_sweep_ptr + 2) % len(keys)
+
+        strategies = {}
+        for key in picked:
+            result = await scanner_engine.scan(strategy=key, limit=5, publish=False)
+            if not result.get("available", True):
+                log_activity("Scanner sweep skipped — live data unavailable", "scan", "warning")
+                return
+            top = result["results"][0]["symbol"] if result.get("results") else None
+            strategies[key] = {"matched": result.get("total_matched", 0), "top": top}
+
+        summary = ", ".join(
+            f"{k}: {v['matched']}" for k, v in strategies.items()
+        )
+        log_activity(f"Scanner sweep complete — {summary}", "scan", "done")
+        await _publish("scanner.updated", {
+            "source": "worker",
+            "strategies": strategies,
+            "scanned_at": _now_iso(),
+        })
+    except Exception as e:
+        logger.error(f"task_scanner_sweep error: {e}")
+        log_activity("Scanner sweep failed", "scan", "warning")
 
 
 async def _recent_alert_exists(user_id, ntype, symbol):
@@ -408,6 +518,16 @@ async def task_sentiment():
         log_activity(
             f"Market sentiment {mood} — {up}/{total} stocks advancing", "rank", "done"
         )
+        # Stream live breadth + top movers to the Markets heatmap / breadth bar.
+        ranked = sorted(quotes, key=lambda q: q.get("change_pct", 0), reverse=True)
+        await _publish("market.movers.updated", {
+            "gainers": ranked[:5],
+            "losers": list(reversed(ranked[-5:])) if len(ranked) >= 5 else [],
+        })
+        await _publish("breadth.updated", {
+            "advances": up, "declines": total - up, "total": total,
+            "sentiment": mood, "advance_ratio": round(ratio, 3),
+        })
     except Exception as e:
         logger.error(f"task_sentiment error: {e}")
         log_activity("Analyzing Sentiment failed", "rank", "warning")
@@ -429,6 +549,8 @@ async def task_sector_rotation():
             f"{lag['sector']} lagging ({lag['change_pct']:+.2f}%)",
             "scan", "done",
         )
+        # Stream live sector performance to the Markets/Dashboard heatmap.
+        await _publish("sector.updated", {"sectors": sectors})
     except Exception as e:
         logger.error(f"task_sector_rotation error: {e}")
         log_activity("Checking Sector Rotation failed", "scan", "warning")
@@ -510,7 +632,9 @@ TASKS = [
     (task_sentiment, 100),
     (task_find_breakouts, 120),
     (task_check_volume, 140),
+    (task_scan_momentum, 150),
     (task_scan_news, 150),
+    (task_scanner_sweep, 180),
     (task_sector_rotation, 160),
     (task_global_markets, 180),
     (task_us_markets, 200),

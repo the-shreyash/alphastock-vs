@@ -104,6 +104,76 @@ G7 (GSAP), G8 (connection states + heartbeat + backoff), G9 (retire polling).
 
 ---
 
+# 2.6 Sprint R3 Status — Frontend Real-Time Client (DONE, full scope)
+
+Sprint R3 consumed the R2 backbone from the client on **Path A**, added the
+real-data backend emissions the last pollers needed, and landed the GSAP
+animation layer — closing every remaining gap.
+
+- **G3 — RESOLVED.** `context/RealtimeProvider.jsx` owns the ONE
+  `WebSocket(/api/ws?user_id=)` for the app (mounted in `App.js` inside
+  `AuthProvider`). `hooks/useWebSocket.js` is now a store-selector shim (no
+  socket), so the three former per-page sockets collapse to one.
+- **G4 — RESOLVED.** `store/realtimeStore.js` (Zustand) is the global store; the
+  provider writes, components read via narrow selectors. Consumes the R2 `event`
+  envelope (`applyEvent`) **and** the legacy flat types (`applyLegacy`).
+- **G8 — RESOLVED.** Connection state machine (connecting→live→reconnecting→
+  offline) surfaced by `components/layout/ConnectionStatus.jsx` in the Navbar;
+  30s heartbeat (`ping`/`pong`, reconnect on missed pong); exponential backoff
+  with jitter (1s→30s, reset on clean open).
+- **G9 — RESOLVED.** Every poll with a push path is gated on `!connected`
+  (fallback only): Dashboard core/activity, TradeMonitor active-trades,
+  Watchlist, Navbar unread-count (live via `notification.created`),
+  ActivityTimeline (streams `activity_feed`), Markets (indices/sectors/global/
+  movers pushed), MarketEngineStatus (`market.engine.status`), PortfolioMonitor
+  (event-triggered refetch on `portfolio_update`).
+- **G7 — RESOLVED.** `hooks/usePriceFlash.js` (green/red flash + scale) on the
+  Dashboard index cards and Watchlist row prices; `components/ui/AnimatedNumber.jsx`
+  (count-up) on the Dashboard portfolio value + P&L.
+- **New backend emissions (real data):** `news.received`, `scanner.breakout`,
+  `scanner.volume`, `sector.updated`, `market.global.updated`,
+  `market.movers.updated`, `breadth.updated` (heartbeat tasks), and
+  `market.engine.status` (`market_broadcast_loop`). These are what let the last
+  three pollers drop to fallback-only.
+
+**All nine cross-cutting gaps (G1–G9) are now closed** across R2 (backbone) and
+R3 (frontend client + emissions). Remaining work is per-feature polish, not
+architectural.
+
+---
+
+# 2.7 Sprint R4 Status — Scanner Live Migration (DONE)
+
+Sprint R4 closed §4.5 (Scanner) on **Path A**, converting the scanner from
+fetch-only to a continuous push-driven surface.
+
+- **Continuous worker:** heartbeat tasks are the worker. Existing breakout/
+  volume scans now gate publishes through
+  `services/market_engine/scanner_worker.py` (new) — a per-(kind, symbol)
+  30-min novelty cooldown so every `scanner.*` hit event is a NEW opportunity.
+  New `task_scan_momentum` (150s, `scanner.momentum`: ≥2% day-change, new or
+  accelerating ≥0.3% vs the previous cycle) and `task_scanner_sweep` (180s,
+  rotates 2 of the 8 presets per tick over the 30s-cached universe).
+- **Event names (doc-aligned):** `scanner.volume` → **`scanner.volume_spike`**;
+  final set: `scanner.breakout`, `scanner.volume_spike`, `scanner.momentum`
+  (hits) + `scanner.updated` (refresh signal).
+- **Loop guard:** `scanner_engine.scan()` gains `source`/`publish`; only
+  worker-tagged `scanner.updated` (`source:"worker"`) triggers a frontend
+  refetch — the REST scan's own event (`source:"api"`) is ignored, preventing
+  a fetch→event→fetch loop (it also has two other producers: ranking_engine).
+- **Frontend:** store scanner slice is event-aware (hit feed entries +
+  `scannerRefreshedAt`); `components/market/ScannerLiveFeed.jsx` (new) renders
+  the push-only hit feed beside `MarketScanner` on the Markets Scanner tab;
+  `hooks/useCardEntrance.js` (new) plays the doc's card entrance (Slide Right →
+  Fade → Glow → Settle, GSAP) on newly inserted cards only; `MarketScanner`
+  auto-refetches silently (1.5s debounce) on `scannerRefreshedAt` with a 60s
+  poll only while disconnected (R3 gating).
+- **Tests:** `tests/test_scanner_worker.py` (11 hermetic tests: cooldown,
+  momentum semantics, task contracts via bus spies, publish gating);
+  bridge-mapping test extended for the new event names.
+
+---
+
 # 3. Cross-Cutting Infrastructure Gaps
 
 These affect every feature and should be fixed before per-feature polish.
@@ -209,7 +279,7 @@ Effort is T-shirt sized (S ≈ ≤1d, M ≈ 2–3d, L ≈ 4–6d, XL ≈ >1wk) f
 - **Required changes:** publish `breadth.updated`; bind breadth bar to it.
 - **Effort:** S
 
-### 4.5 Scanner (Breakout / Volume / Momentum / Technical)
+### 4.5 Scanner (Breakout / Volume / Momentum / Technical) — RESOLVED (Sprint R4, see §2.7)
 - **Current:** **fetch-only** via `/api/market/scanner`,
   `/api/market/ranking` (server.py:890-947). `scanner_engine`/`ranking_engine`
   publish `scanner.updated` to the event bus, but nothing streams it. No
