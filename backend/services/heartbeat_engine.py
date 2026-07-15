@@ -350,6 +350,13 @@ async def _recent_alert_exists(user_id, ntype, symbol):
 
 
 async def task_monitor_trades():
+    """Stream per-user ``trade.updated`` snapshots for every open trade
+    (Sprint R6 — replaces the pre-R6 per-user legacy ``trade_update`` push,
+    whose P&L ignored partial exits and short direction, plus its duplicate
+    SL/target alerts: the trading engine owns real-trade lifecycle alerts,
+    correctly). Paper trades keep a side-aware crossing alert here — the
+    engine never touches them, so this is their only watchdog."""
+    from services import trade_stream
     from services.activity_logger import log_activity
     log_activity("Monitoring Open Trades", "monitor", "running")
     try:
@@ -360,74 +367,42 @@ async def task_monitor_trades():
 
         symbols = list({t["symbol"] for t in open_trades})
         quotes = await _price_map(symbols)
-        alerts_sent = 0
+        users = await trade_stream.publish_all(_db, quotes, reason="monitor")
 
+        # Paper-trade SL/target crossing alerts (side-aware, deduped).
+        alerts_sent = 0
         for trade in open_trades:
+            if not trade.get("is_paper"):
+                continue
             quote = quotes.get(trade["symbol"])
-            if not quote:
+            if not quote or quote.get("price") is None:
                 continue
             price = quote["price"]
-            entry = trade["entry_price"]
-            qty = trade["quantity"]
-            pnl = round((price - entry) * qty, 2)
-            pnl_pct = round(((price - entry) / entry) * 100, 2) if entry else 0
-            user_id = trade["user_id"]
-
-            await _send_user(user_id, {
-                "type": "trade_update",
-                "user_id": user_id,
-                "data": {
-                    "trade_id": str(trade["_id"]),
-                    "symbol": trade["symbol"],
-                    "current_price": price,
-                    "entry_price": entry,
-                    "unrealized_pnl": pnl,
-                    "unrealized_pnl_pct": pnl_pct,
-                },
-                "timestamp": _now_iso(),
-            })
-
-            # Target / stop-loss crossing → notification + alert push (deduped)
-            crossed = None
+            short = (trade.get("type") or "BUY").upper() == "SELL"
             sl = trade.get("stop_loss")
             t1 = trade.get("target1")
-            if sl and price <= sl:
+            crossed = None
+            if sl and (price <= sl if not short else price >= sl):
                 crossed = ("STOP_LOSS_HIT", "critical",
-                           f"{trade['symbol']} hit stop-loss ₹{sl}. Current ₹{price}, P&L ₹{pnl}.")
-            elif t1 and price >= t1:
+                           f"Paper trade {trade['symbol']} hit stop-loss ₹{sl}. Current ₹{price}.")
+            elif t1 and (price >= t1 if not short else price <= t1):
                 crossed = ("TARGET_HIT", "positive",
-                           f"{trade['symbol']} hit target ₹{t1}! Current ₹{price}, profit ₹{pnl}.")
+                           f"Paper trade {trade['symbol']} hit target ₹{t1}! Current ₹{price}.")
 
-            if crossed and not await _recent_alert_exists(user_id, crossed[0], trade["symbol"]):
+            if crossed and not await _recent_alert_exists(
+                    trade["user_id"], crossed[0], trade["symbol"]):
                 ntype, severity, message = crossed
-                await _db.notifications.insert_one({
-                    "user_id": user_id,
-                    "type": ntype,
-                    "symbol": trade["symbol"],
-                    "title": f"AI Alert: {trade['symbol']}",
-                    "message": message,
-                    "severity": severity,
-                    "read": False,
-                    "created_at": _now_iso(),
-                })
-                await _send_user(user_id, {
-                    "type": "alert",
-                    "data": {
-                        "type": ntype,
-                        "severity": severity,
-                        "symbol": trade["symbol"],
-                        "message": message,
-                        "trade_id": str(trade["_id"]),
-                        "price": price,
-                        "pnl": pnl,
-                    },
-                    "timestamp": _now_iso(),
-                })
+                from services.notification_service import create_notification
+                await create_notification(
+                    _db, trade["user_id"], type=ntype,
+                    title=f"AI Alert: {trade['symbol']}", message=message,
+                    severity=severity, symbol=trade["symbol"],
+                    data={"trade_id": str(trade["_id"]), "price": price})
                 alerts_sent += 1
 
-        summary = f"Monitored {len(open_trades)} open position(s)"
+        summary = f"Monitored {len(open_trades)} open position(s) across {users} trader(s)"
         if alerts_sent:
-            summary += f" — {alerts_sent} alert(s) fired"
+            summary += f" — {alerts_sent} paper alert(s) fired"
         log_activity(summary, "monitor", "warning" if alerts_sent else "done")
     except Exception as e:
         logger.error(f"task_monitor_trades error: {e}")

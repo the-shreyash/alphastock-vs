@@ -26,6 +26,7 @@ async def create_notification(
     title: str,
     message: str,
     severity: str = "info",
+    symbol: Optional[str] = None,
     data: Optional[Dict[str, Any]] = None,
     dedupe_minutes: Optional[int] = None,
 ) -> Optional[Dict[str, Any]]:
@@ -34,6 +35,9 @@ async def create_notification(
     When `dedupe_minutes` is set, a notification of the same `type` created for
     this user within the window suppresses the new one (returns None) — used to
     avoid spamming repeated market alerts.
+
+    `symbol` is persisted on the document (trade/order alerts key their dedupe
+    and UI grouping on it) and included in the published event.
 
     Returns the stored document, or None when suppressed by dedupe.
     """
@@ -58,6 +62,8 @@ async def create_notification(
         "read": False,
         "created_at": now.isoformat(),
     }
+    if symbol:
+        doc["symbol"] = symbol
     result = await db.notifications.insert_one(doc)
     doc["_id"] = str(result.inserted_id)
 
@@ -71,6 +77,7 @@ async def create_notification(
             "title": title,
             "message": message,
             "severity": severity,
+            **({"symbol": symbol} if symbol else {}),
             **(data or {}),
         })
     except Exception as e:

@@ -216,42 +216,82 @@ async def ai_dual_debate(prompt: str, session_id: str = "default"):
             "rounds_completed": 0,
         }
 
-async def ai_chat(message: str, session_id: str, user_context: dict):
+async def ai_chat(message: str, session_id: str, user_context: dict, run_id: str = None):
     """AI chat assistant (Personal Investment Assistant).
 
     Uses the centralized Prompt Library (`ai_chat` prompt) + AI Memory so the
     assistant reasons with what it remembers about the user, and routes the call
     through the Model Router (Claude-preferred for chat). Conversation memory is
     the last 10 turns of this session, matching AI_AGENT_SYSTEM.md → AI Memory.
+
+    Sprint R7: the pipeline publishes a truthful, run-correlated step timeline
+    (ai.run.* / ai.step events, per-user over the WebSocket bridge) so the client
+    can replace the static "Thinking…" with the live stages the AI is actually
+    running. Each step maps to real work below; telemetry never breaks the reply.
     """
     from services.prompt_library import get_prompt
     from services.model_router import get_model_router
-    from services.ai_memory import get_user_memory, build_memory_context
     from services.ai_provider import AIMessage
+    from services.ai_activity import AIRun
+    from services.ai_context_builder import build_chat_context
 
     router = get_model_router()
-    try:
-        memory = await get_user_memory(db, user_context.get("_id"))
-        memory_ctx = build_memory_context(user_context, memory)
-    except Exception as e:
-        logging.warning(f"AI chat memory load failed: {e}")
-        memory_ctx = ""
+    # Label the model step with the provider that will actually serve the reply
+    # (Claude preferred, Gemini fallback), not a hard-coded name.
+    _PROVIDER_LABEL = {
+        "claude": "Consulting Claude",
+        "gemini": "Consulting Gemini",
+        "simulated": "Composing your answer",
+    }
+    consult_label = _PROVIDER_LABEL.get(router.resolve_provider("claude"), "Consulting the AI")
+    run = AIRun(
+        user_context.get("_id"),
+        session_id,
+        ["Reading live market data", "Reviewing our conversation", consult_label],
+        run_id=run_id,
+    )
+    await run.start()
 
-    system_msg = get_prompt("ai_chat", memory=memory_ctx)
-
+    # Step 1 — Build the live platform context (market, portfolio, trades,
+    # watchlist, news, broker, memory). Best-effort: an empty context still
+    # yields a valid prompt whose fallback rule handles the no-data case, so the
+    # AI reasons from the Market Engine instead of disclaiming live-data access.
+    live_context = ""
     try:
-        # Conversation memory: last 10 messages of this session for continuity.
-        history = await db.chat_messages.find({"session_id": session_id}).sort("created_at", -1).to_list(10)
-        history.reverse()
-        messages_list = [AIMessage(role=h["role"], content=h["content"]) for h in history]
-        messages_list.append(AIMessage(role="user", content=message))
-        return await router.run_raw(system_msg, messages_list, prefer="claude", max_tokens=800)
+        async with run.step():
+            ctx = await build_chat_context(db, user_context, real_quotes_map, message=message)
+            live_context = ctx.text
     except Exception as e:
-        logging.error(f"AI chat error with history: {e}")
-        try:
-            return await router.run_raw(system_msg, message, prefer="claude", max_tokens=800)
-        except Exception as err:
-            return f"AI temporarily unavailable. Error: {str(err)}"
+        logging.warning(f"AI chat context build failed: {e}")
+
+    system_msg = get_prompt("ai_chat", memory="", live_context=live_context)
+
+    # Step 2 — Load this session's recent turns for continuity.
+    messages_list = []
+    try:
+        async with run.step():
+            history = await db.chat_messages.find({"session_id": session_id}).sort("created_at", -1).to_list(10)
+            history.reverse()
+            messages_list = [AIMessage(role=h["role"], content=h["content"]) for h in history]
+    except Exception as e:
+        logging.warning(f"AI chat history load failed: {e}")
+        messages_list = []
+    messages_list.append(AIMessage(role="user", content=message))
+
+    # Step 3 — Consult the model (falls back to a history-less prompt on error).
+    try:
+        async with run.step():
+            try:
+                response = await router.run_raw(system_msg, messages_list, prefer="claude", max_tokens=800)
+            except Exception as e:
+                logging.error(f"AI chat error with history: {e}")
+                response = await router.run_raw(system_msg, message, prefer="claude", max_tokens=800)
+        await run.complete()
+        return response
+    except Exception as err:
+        logging.error(f"AI chat failed: {err}")
+        await run.complete("warning")
+        return f"AI temporarily unavailable. Error: {str(err)}"
 
 async def ai_market_summary():
     """Generate AI market summary — uses Gemini as primary for speed."""
@@ -1519,15 +1559,19 @@ async def get_trades(user: dict = Depends(get_current_user)):
 
 @trades_router.get("/active")
 async def get_active_trades(user: dict = Depends(get_current_user)):
+    """Open positions with live marks. P&L math is shared with the trade
+    stream (Sprint R6) — short-aware and based on `quantity_open` — so REST
+    rows and pushed `trade.updated` rows never disagree."""
+    from services.trade_stream import trade_payload
     trades = await db.trades.find({"user_id": user["_id"], "status": "OPEN"}).sort("entry_time", -1).to_list(50)
     quotes = await real_quotes_map([t["symbol"] for t in trades])
     for t in trades:
-        t["_id"] = str(t["_id"])
         quote = quotes.get(t["symbol"].upper())
-        if quote:
-            t["current_price"] = quote["price"]
-            t["unrealized_pnl"] = round((quote["price"] - t["entry_price"]) * t["quantity"], 2)
-            t["unrealized_pnl_pct"] = round(((quote["price"] - t["entry_price"]) / t["entry_price"]) * 100, 2)
+        live = trade_payload(t, quote.get("price") if quote else None)
+        t["_id"] = str(t["_id"])
+        for key in ("current_price", "unrealized_pnl", "unrealized_pnl_pct"):
+            if key in live:
+                t[key] = live[key]
     return trades
 
 @trades_router.get("/history")
@@ -1592,6 +1636,27 @@ async def _generate_coaching_background(trade_id: str):
         log_activity(f"AI coaching generated for {trade['symbol']} trade", "monitor", "done")
     except Exception as e:
         logger.error(f"Background coaching generation failed for {trade_id}: {e}")
+
+
+async def _announce_trade_closed(trade_doc: dict):
+    """Publish `trade.closed` (source: manual) for a just-closed trade
+    (Sprint R6). The Trade Monitor refetches on it — the only lifecycle event
+    that still needs a refetch (the row leaves the Active tab) — and the AI
+    trade review pipeline follows in the background."""
+    try:
+        from services.market_engine.event_bus import event_bus
+        await event_bus.publish("trade.closed", {
+            "user_id": str(trade_doc.get("user_id")),
+            "trade_id": str(trade_doc.get("_id")),
+            "symbol": trade_doc.get("symbol"),
+            "status": trade_doc.get("status"),
+            "exit_price": trade_doc.get("exit_price"),
+            "pnl": trade_doc.get("pnl"),
+            "pnl_percent": trade_doc.get("pnl_percent"),
+            "source": "manual",
+        })
+    except Exception as e:
+        logger.warning(f"trade.closed publish failed: {e}")
 
 
 @trades_router.put("/{trade_id}")
@@ -1681,10 +1746,14 @@ async def update_trade(trade_id: str, request: Request, background_tasks: Backgr
     updated = await db.trades.find_one({"_id": ObjectId(trade_id)})
     updated["_id"] = str(updated["_id"])
 
-    # If this update just closed the trade, generate AI coaching in the
-    # background so the close response returns immediately (never block on AI).
+    # If this update just closed the trade, announce the close and generate
+    # AI coaching + trade review in the background so the close response
+    # returns immediately (never block on AI).
     if was_open and updated.get("status") != "OPEN":
+        from services.trade_review import generate_close_intelligence
+        await _announce_trade_closed(updated)
         background_tasks.add_task(_generate_coaching_background, trade_id)
+        background_tasks.add_task(generate_close_intelligence, db, trade_id)
 
     return updated
 
@@ -1751,7 +1820,10 @@ async def exit_trade(trade_id: str, data: TradeExitRequest, background_tasks: Ba
     updated = await db.trades.find_one({"_id": ObjectId(trade_id)})
     updated["_id"] = str(updated["_id"])
     if updated.get("status") != "OPEN":
+        from services.trade_review import generate_close_intelligence
+        await _announce_trade_closed(updated)
         background_tasks.add_task(_generate_coaching_background, trade_id)
+        background_tasks.add_task(generate_close_intelligence, db, trade_id)
     return updated
 
 # ─── Trade Coaching ─────────────────────────────────
@@ -1964,7 +2036,7 @@ async def mark_read(notif_id: str, user: dict = Depends(get_current_user)):
 @chat_router.post("")
 async def chat_endpoint(data: ChatMessage, user: dict = Depends(get_current_user)):
     session_id = data.session_id or f"chat-{user['_id']}"
-    response = await ai_chat(data.message, session_id, user)
+    response = await ai_chat(data.message, session_id, user, run_id=data.run_id)
 
     # Save to DB
     await db.chat_messages.insert_one({
@@ -2008,22 +2080,10 @@ def _ai_online() -> bool:
 def _summarize_trade_for_review(t: dict) -> str:
     """Build a factual, number-only summary of a trade for the review prompt.
 
-    Feeds the AI ONLY real values from the trade document — never invented
-    context — honouring the no-fabrication rule in PROMPT.md."""
-    pnl = t.get("pnl")
-    pnl_pct = t.get("pnl_percent")
-    return (
-        f"Symbol: {t.get('symbol')} ({t.get('stock_name', '')})\n"
-        f"Direction: {t.get('type', 'BUY')}\n"
-        f"Entry: ₹{t.get('entry_price')}  Exit: ₹{t.get('exit_price')}\n"
-        f"Quantity: {t.get('quantity')}\n"
-        f"Stop loss: ₹{t.get('stop_loss')}  Target: ₹{t.get('target1')}\n"
-        f"Result: P&L ₹{pnl if pnl is not None else 'n/a'} "
-        f"({pnl_pct if pnl_pct is not None else 'n/a'}%)\n"
-        f"Setup: {t.get('setup_type') or 'unspecified'}\n"
-        f"Status: {t.get('status', 'CLOSED')}\n"
-        f"User notes: {t.get('notes') or 'none'}"
-    )
+    Moved to services.trade_review (Sprint R6) so the auto-review pipeline and
+    this endpoint share one summary; kept importable under the old name."""
+    from services.trade_review import summarize_trade_for_review
+    return summarize_trade_for_review(t)
 
 
 @ai_router.get("/status")

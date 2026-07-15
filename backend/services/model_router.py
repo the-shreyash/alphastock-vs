@@ -91,6 +91,13 @@ class ModelRouter:
         )
 
     # ── Introspection ───────────────────────────────────────────────
+    def resolve_provider(self, prefer: Prefer) -> str:
+        """Public: the provider (``claude`` | ``gemini`` | ``simulated``) that
+        will actually serve a request for the given preference, mirroring the
+        debate engine's fall-back order. Lets callers label live AI activity
+        with the real model instead of the requested one (Sprint R7)."""
+        return self._resolve_used(prefer)
+
     def _resolve_used(self, prefer: Prefer) -> str:
         """Best-effort report of which provider actually served a request.
 

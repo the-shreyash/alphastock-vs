@@ -131,6 +131,7 @@ async def trade_monitor_job(db, ws_broadcast):
         # Trading Engine pass (Sprint 9): trailing stops, multi-target partial
         # exits, SL detection + consented broker auto-exits. Runs BEFORE the
         # advisory portfolio monitor so alerts reflect post-engine state.
+        stats = {}
         try:
             from services.trading_engine import run_cycle
             from services.broker_engine import broker_engine
@@ -148,24 +149,25 @@ async def trade_monitor_job(db, ws_broadcast):
         wa_func = send_whatsapp if wa_configured() else None
         alert_count = await run_monitoring_cycle(db, sync_quote_func, wa_func)
 
-        # Also broadcast updates via WebSocket
-        for trade in open_trades:
-            quote = quote_cache.get(trade["symbol"])
-            if not quote:
-                continue
-            if ws_broadcast:
-                await ws_broadcast({
-                    "type": "trade_update",
-                    "user_id": trade["user_id"],
-                    "data": {
-                        "trade_id": str(trade["_id"]),
-                        "symbol": trade["symbol"],
-                        "current_price": quote["price"],
-                        "entry_price": trade["entry_price"],
-                        "unrealized_pnl": round((quote["price"] - trade["entry_price"]) * trade["quantity"], 2),
-                    },
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                })
+        # Sprint R6: stream per-user `trade.updated` snapshots through the
+        # event bus (bridge → per-user delivery on the `trades` channel).
+        # Replaces the legacy `trade_update` BROADCAST, which sent every
+        # user's open-trade P&L to every connected socket.
+        try:
+            from services import trade_stream
+            await trade_stream.publish_all(db, quote_cache, reason="engine")
+        except Exception as e:
+            logger.error(f"Trade stream publish error: {e}")
+
+        # Engine-closed trades → background AI trade review (the doc's flow:
+        # Trade Closed → Journal Updated → AI Trade Review Starts).
+        for closed in stats.get("closed_trades") or []:
+            try:
+                from services.trade_review import generate_close_intelligence
+                asyncio.create_task(generate_close_intelligence(db, closed["trade_id"]))
+            except Exception as e:
+                logger.error(
+                    f"Trade review scheduling failed for {closed.get('symbol')}: {e}")
 
     except Exception as e:
         logger.error(f"Trade monitor error: {e}")

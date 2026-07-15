@@ -161,6 +161,9 @@ class WatchlistAdd(BaseModel):
 class ChatMessage(BaseModel):
     message: str
     session_id: Optional[str] = None
+    # Client-generated correlation id (Sprint R7). Lets the live AI step timeline
+    # (ai.run.* / ai.step events over WebSocket) be matched to this request.
+    run_id: Optional[str] = None
 
 class ChatResponse(BaseModel):
     response: str

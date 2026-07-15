@@ -45,9 +45,19 @@ const initialState = {
   portfolioLive: null,
   tradeUpdates: [],
   engineEvents: [],
+  // Live open-trade rows from `trade.updated` (Sprint R6), keyed by trade_id.
+  // Rows keep their previous object identity when unchanged so memoized
+  // per-trade components skip re-render.
+  tradeLive: { byId: {}, reason: null, updatedAt: null },
+  // AI reviews streamed by `trade.review.ready`, keyed by trade_id.
+  tradeReviews: {},
 
   // AI
   activityUpdates: null,
+  // Live per-request "thinking" timeline (Sprint R7). Populated by ai.run.* /
+  // ai.step events; correlated to a chat request by runId. Shape:
+  //   { runId, sessionId, steps:[{ label, status }], active, startedAt, updatedAt }
+  aiRun: null,
 
   // Notifications / alerts
   alerts: [], // legacy `alert`
@@ -70,6 +80,15 @@ const initialState = {
 
 // Index symbol aliases used when folding index events into the price store.
 const INDEX_SYMBOL = { nifty: "NIFTY", bank_nifty: "BANKNIFTY", sensex: "SENSEX" };
+
+// Granular trade lifecycle events (Sprint R6) routed into `engineEvents`.
+const TRADE_LIFECYCLE_EVENTS = new Set([
+  "trade.trailing_stop", "trade.target_hit", "trade.sl_hit", "trade.closed",
+]);
+
+// Cheap value-equality for small live trade rows (~12 primitive fields plus
+// targets_hit levels) — keeps object identity stable across no-op snapshots.
+const sameRow = (a, b) => JSON.stringify(a) === JSON.stringify(b);
 
 export const useRealtimeStore = create((set, get) => ({
   ...initialState,
@@ -246,16 +265,106 @@ export const useRealtimeStore = create((set, get) => ({
         }
         break;
       }
-      case "trade":
-        set((s) => ({ tradeUpdates: [data, ...s.tradeUpdates].slice(0, MAX_TRADE_UPDATES) }));
+      case "trade": {
+        if (event === "trade.updated") {
+          // Per-user open-trades snapshot (Sprint R6). Merge rows by
+          // trade_id, reusing the previous row object when unchanged so
+          // memoized per-trade components skip re-render.
+          set((s) => {
+            const byId = { ...s.tradeLive.byId };
+            (Array.isArray(data.trades) ? data.trades : []).forEach((row) => {
+              if (!row || !row.trade_id) return;
+              const prev = byId[row.trade_id];
+              byId[row.trade_id] = prev && sameRow(prev, row) ? prev : row;
+            });
+            return {
+              tradeLive: {
+                byId,
+                reason: data.reason || null,
+                updatedAt: envelope.timestamp || Date.now(),
+              },
+            };
+          });
+        } else if (event === "trade.review.ready") {
+          set((s) => ({
+            tradeReviews: { ...s.tradeReviews, [data.trade_id]: data.review },
+          }));
+        } else if (TRADE_LIFECYCLE_EVENTS.has(event)) {
+          // Trailing ratchet / target hit / SL hit / close — the Trade
+          // Monitor patches rows in place from these (refetch only on close).
+          set((s) => ({
+            engineEvents: [{ event, ...data }, ...s.engineEvents].slice(0, MAX_ENGINE_EVENTS),
+          }));
+        } else {
+          set((s) => ({ tradeUpdates: [data, ...s.tradeUpdates].slice(0, MAX_TRADE_UPDATES) }));
+        }
         break;
-      case "ai":
-        set({ activityUpdates: data });
+      }
+      case "ai": {
+        // Per-request "thinking" timeline (Sprint R7) — replaces the static
+        // "Thinking…" with the live stages the AI is actually running. Kept in
+        // its own slice so it never clobbers the background activity feed.
+        if (event === "ai.run.started") {
+          set({
+            aiRun: {
+              runId: data.run_id,
+              sessionId: data.session_id,
+              steps: (Array.isArray(data.steps) ? data.steps : []).map((label) => ({
+                label,
+                status: "pending",
+              })),
+              active: true,
+              startedAt: data.started_at || envelope.timestamp || Date.now(),
+              updatedAt: envelope.timestamp || Date.now(),
+            },
+          });
+        } else if (event === "ai.step") {
+          set((s) => {
+            // Ignore steps for a stale/unknown run to avoid cross-talk.
+            if (!s.aiRun || s.aiRun.runId !== data.run_id) return {};
+            const steps = s.aiRun.steps.slice();
+            if (data.index >= 0 && data.index < steps.length) {
+              steps[data.index] = { ...steps[data.index], status: data.status };
+            }
+            return { aiRun: { ...s.aiRun, steps, updatedAt: envelope.timestamp || Date.now() } };
+          });
+        } else if (event === "ai.run.completed") {
+          set((s) => {
+            if (!s.aiRun || s.aiRun.runId !== data.run_id) return {};
+            return {
+              aiRun: {
+                ...s.aiRun,
+                active: false,
+                status: data.status || "done",
+                updatedAt: envelope.timestamp || Date.now(),
+              },
+            };
+          });
+        } else {
+          // Any other ai.* event feeds the background activity timeline.
+          set({ activityUpdates: data });
+        }
         break;
-      case "broker":
-        // Generic broker event fallthrough (specifics still arrive as legacy types).
-        set({ brokerStatus: data });
+      }
+      case "broker": {
+        if (event === "broker.order.updated") {
+          // Live order status (Sprint R6) — upsert by order_id so a fill
+          // updates the existing row instead of duplicating it.
+          set((s) => {
+            const order = { ...(data.order || {}), broker: data.broker };
+            if (!order.order_id) return {};
+            const idx = s.brokerOrders.findIndex((o) => o.order_id === order.order_id);
+            const brokerOrders = idx >= 0
+              ? s.brokerOrders.map((o, i) => (i === idx ? { ...o, ...order } : o))
+              : [order, ...s.brokerOrders].slice(0, MAX_BROKER_ORDERS);
+            return { brokerOrders };
+          });
+        } else {
+          // Generic broker event fallthrough (status/connection changes).
+          set({ brokerStatus: data });
+        }
         break;
+      }
       default:
         break;
     }
@@ -270,11 +379,15 @@ export const selectConnectionStatus = (s) => s.connection.status;
 export const selectMarketData = (s) => s.marketData;
 export const selectPriceTicks = (s) => s.priceTicks;
 export const selectActivityUpdates = (s) => s.activityUpdates;
+export const selectAIRun = (s) => s.aiRun;
 export const selectPortfolioUpdate = (s) => s.portfolioUpdate;
 export const selectPortfolioLive = (s) => s.portfolioLive;
 export const selectPortfolioSynced = (s) => s.portfolioSynced;
 export const selectTradeUpdates = (s) => s.tradeUpdates;
 export const selectEngineEvents = (s) => s.engineEvents;
+export const selectTradeLive = (s) => s.tradeLive;
+export const selectTradeReviews = (s) => s.tradeReviews;
+export const selectBrokerOrders = (s) => s.brokerOrders;
 export const selectUnreadCount = (s) => s.unreadCount;
 export const selectSectors = (s) => s.sectors;
 export const selectGlobalMarkets = (s) => s.globalMarkets;

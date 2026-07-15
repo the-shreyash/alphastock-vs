@@ -429,21 +429,32 @@ class BrokerEngine:
         except Exception as e:
             logger.error(f"Failed to persist streamed order update: {e}")
         await self._push(user_id, {"type": "broker_order_update", "data": order})
+        # Sprint R6: also publish on the event bus — the bridge delivers a
+        # `broker.order.updated` envelope per-user on the `broker` channel
+        # (the Orders tab patches rows live from it). The legacy push above
+        # stays one sprint for compatibility.
+        try:
+            from services.market_engine.event_bus import event_bus
+            await event_bus.publish("broker.order.updated", {
+                "user_id": str(user_id), "broker": broker, "order": order})
+        except Exception as e:
+            logger.warning(f"broker.order.updated publish failed: {e}")
         status = order.get("status")
         if status in ("FILLED", "REJECTED", "CANCELLED") and self.db is not None:
             verb = {"FILLED": "executed", "REJECTED": "rejected", "CANCELLED": "cancelled"}[status]
             try:
-                await self.db.notifications.insert_one({
-                    "user_id": user_id,
-                    "type": f"ORDER_{status}",
-                    "title": f"Order {verb}",
-                    "message": f"{order.get('transaction_type', '')} {order.get('quantity', '')} "
-                               f"{order.get('symbol', '')} — {verb} on {self.adapter(broker).display_name}."
-                               + (f" Reason: {order.get('status_message')}" if status == "REJECTED" and order.get("status_message") else ""),
-                    "severity": "critical" if status == "REJECTED" else "info",
-                    "read": False,
-                    "created_at": _now_iso(),
-                })
+                from services.notification_service import create_notification
+                await create_notification(
+                    self.db, user_id,
+                    type=f"ORDER_{status}",
+                    title=f"Order {verb}",
+                    message=f"{order.get('transaction_type', '')} {order.get('quantity', '')} "
+                            f"{order.get('symbol', '')} — {verb} on {self.adapter(broker).display_name}."
+                            + (f" Reason: {order.get('status_message')}" if status == "REJECTED" and order.get("status_message") else ""),
+                    severity="critical" if status == "REJECTED" else "info",
+                    symbol=order.get("symbol"),
+                    data={"order_id": order.get("order_id"), "broker": broker},
+                )
             except Exception:
                 pass
 
@@ -459,6 +470,14 @@ class BrokerEngine:
             await portfolio_stream.apply_broker_ticks(self.db, user_id, broker, ticks)
         except Exception as e:
             logger.warning(f"Live portfolio recompute from {broker} ticks failed: {e}")
+        # Sprint R6: the same ticks drive open-trade P&L — recompute this
+        # user's trade snapshot and stream `trade.updated` (throttled inside;
+        # best-effort, same contract as the portfolio recompute above).
+        try:
+            from services import trade_stream
+            await trade_stream.apply_broker_ticks(self.db, user_id, broker, ticks)
+        except Exception as e:
+            logger.warning(f"Live trade recompute from {broker} ticks failed: {e}")
 
     async def _on_stream_expired(self, user_id: str, broker: str):
         self._sessions.pop((user_id, broker), None)

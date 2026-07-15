@@ -23,6 +23,9 @@ export default function useAIWorkspace() {
   const [activeId, setActiveId] = useState(null);
   const [messages, setMessages] = useState([WELCOME]);
   const [sending, setSending] = useState(false);
+  // Correlation id for the request in flight, so the live AI step timeline
+  // (ai.run.* / ai.step over WebSocket) can be matched to it (Sprint R7).
+  const [activeRunId, setActiveRunId] = useState(null);
   const initialised = useRef(false);
 
   const refreshConversations = useCallback(async () => {
@@ -95,10 +98,12 @@ export default function useAIWorkspace() {
     const msg = (text || "").trim();
     if (!msg || sending) return;
     const isFirstUserMessage = !messages.some((m) => m.role === "user");
+    const runId = (crypto?.randomUUID?.() || `run-${Date.now()}-${Math.random().toString(36).slice(2)}`);
     setMessages((prev) => [...prev, { role: "user", content: msg }]);
+    setActiveRunId(runId);
     setSending(true);
     try {
-      const { data } = await api.post("/chat", { message: msg, session_id: activeId });
+      const { data } = await api.post("/chat", { message: msg, session_id: activeId, run_id: runId });
       setMessages((prev) => [...prev, { role: "assistant", content: data.response }]);
       // First exchange creates the session server-side — refresh the sidebar.
       if (isFirstUserMessage) refreshConversations();
@@ -106,6 +111,7 @@ export default function useAIWorkspace() {
       setMessages((prev) => [...prev, { role: "assistant", content: "Sorry, I hit an error. Please try again." }]);
     } finally {
       setSending(false);
+      setActiveRunId(null);
     }
   }, [sending, activeId, messages, refreshConversations]);
 
@@ -115,6 +121,7 @@ export default function useAIWorkspace() {
     activeId,
     messages,
     sending,
+    activeRunId,
     send,
     newChat,
     selectConversation,

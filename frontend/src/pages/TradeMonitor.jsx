@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback, useRef, memo } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { Link } from "react-router-dom";
 import api from "../services/api";
@@ -6,6 +6,9 @@ import tradeService, { tradeErrorDetails } from "../services/tradeService";
 import brokerService, { brokerErrorMessage } from "../services/brokerService";
 import { formatCurrency, formatPercent } from "../utils/formatters";
 import { useWebSocket } from "../hooks/useWebSocket";
+import { useRealtimeStore, selectTradeReviews } from "../store/realtimeStore";
+import { usePriceFlash } from "../hooks/usePriceFlash";
+import AnimatedNumber from "../components/ui/AnimatedNumber";
 import { useAuth } from "../context/AuthContext";
 import {
   Plus, X, Sparkles, Sliders, BarChart3, Newspaper, ChevronDown, Loader2,
@@ -63,9 +66,232 @@ const EMPTY_FORM = {
   broker: "", order_type: "MARKET", auto_exit: false,
 };
 
+const targetLevels = (t) =>
+  [1, 2, 3].filter((n) => t[`target${n}`] != null && t[`target${n}`] !== 0);
+// targets_hit is [{level,...}] on REST rows and [level, ...] on live rows.
+const hitLevels = (t) =>
+  new Set((t.targets_hit || []).map((h) => (typeof h === "number" ? h : h.level)));
+
+/* Pulsing LIVE badge with the latest snapshot time (Sprint R6 — mirrors the
+   Portfolio page's badge). */
+function TradeLiveBadge() {
+  const connected = useRealtimeStore((s) => s.connection.status === "live");
+  const updatedAt = useRealtimeStore((s) => s.tradeLive.updatedAt);
+  if (!connected || !updatedAt) return null;
+  const at = new Date(updatedAt);
+  return (
+    <span data-testid="trades-live-badge" className="badge-status inline-flex items-center gap-1.5" style={{ background: "var(--gain-bg)", color: "var(--gain)" }}>
+      <span className="w-1.5 h-1.5 rounded-full animate-pulse" style={{ background: "var(--gain)" }} />
+      LIVE{Number.isNaN(at.getTime()) ? "" : ` · ${at.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}`}
+    </span>
+  );
+}
+
+const signedCurrency = (v) => `${v >= 0 ? "+" : ""}${formatCurrency(v)}`;
+
+/* One active-position card (Sprint R6). Isolated + memoized so a live tick
+   re-renders and flashes ONLY the affected card — the event-driven "update
+   only what changed" mandate. Live fields streamed by `trade.updated`
+   snapshots overlay the REST base row; GSAP flash/count-up per the doc's
+   animation spec. */
+const ActiveTradeRow = memo(function ActiveTradeRow({
+  trade: base, index, expanded, tip, analyzing,
+  onAnalyze, onModify, onToggleDetails, onClose,
+}) {
+  const live = useRealtimeStore((s) => s.tradeLive.byId[base._id]);
+  const trade = live ? { ...base, ...live } : base;
+  const priceRef = usePriceFlash(trade.current_price);
+  const pnlRef = usePriceFlash(trade.unrealized_pnl);
+  const slRef = usePriceFlash(trade.stop_loss); // flashes when the trail ratchets
+  const risk = tradeRisk(trade);
+  const { nearTarget, nearSL } = proximityFlags(trade);
+  const qtyOpen = trade.quantity_open ?? trade.quantity;
+  const invested = (trade.entry_price || 0) * (qtyOpen || 0);
+  const levels = targetLevels(trade);
+  const hits = hitLevels(trade);
+  const trailing = trade.trailing_stop?.enabled;
+  return (
+    <motion.div
+      data-testid={`active-trade-${trade.symbol}`}
+      className="glass-card p-4"
+      initial={{ opacity: 0, y: 16 }}
+      whileInView={{ opacity: 1, y: 0 }}
+      viewport={{ once: true, margin: "-40px" }}
+      transition={{ duration: 0.4, delay: Math.min(index, 8) * 0.05 }}
+    >
+      <div className="flex items-center justify-between mb-2">
+        <div className="flex items-center gap-3 flex-wrap">
+          <span className={`px-1.5 py-0.5 text-[10px] font-mono rounded-xl ${trade.type === "BUY" ? "bg-gain/10 text-gain border border-gain/30" : "bg-loss/10 text-loss border border-loss/30"}`}>
+            {trade.type}
+          </span>
+          <div>
+            <span className="card-subtitle font-semibold" style={{ color: "var(--text-primary)" }}>{trade.stock_name}</span>
+            <span className="text-xs text-muted ml-2 font-mono">{trade.symbol}</span>
+          </div>
+          {trade.broker && (
+            <span data-testid={`broker-badge-${trade.symbol}`} className="px-1.5 py-0.5 text-[10px] font-semibold rounded-lg flex items-center gap-1" style={{ background: "var(--ai-accent-soft)", color: "var(--ai-accent)" }}>
+              <Zap size={10} /> {trade.broker}{trade.auto_exit ? " · auto-exit" : ""}
+            </span>
+          )}
+          {trailing && (
+            <span data-testid={`trailing-badge-${trade.symbol}`} className="px-1.5 py-0.5 text-[10px] font-semibold rounded-lg flex items-center gap-1" style={{ background: "var(--gain-bg)", color: "var(--gain)" }}>
+              <TrendingUp size={10} /> TSL {trade.trailing_stop.value}{trade.trailing_stop.type === "percent" ? "%" : " pts"}
+            </span>
+          )}
+          {/* Multi-target progress — a badge pops when its level is hit live */}
+          {levels.length > 0 && (
+            <span className="flex items-center gap-1">
+              {levels.map((n) => {
+                const hit = hits.has(n);
+                return (
+                  <motion.span
+                    key={`${n}-${hit}`}
+                    initial={hit ? { scale: 1.5 } : false}
+                    animate={{ scale: 1 }}
+                    transition={{ type: "spring", stiffness: 500, damping: 18 }}
+                    className="px-1.5 py-0.5 text-[10px] font-mono rounded-lg"
+                    style={hit
+                      ? { background: "var(--gain-bg)", color: "var(--gain)" }
+                      : { background: "var(--bg-surface)", color: "var(--text-muted)", border: "1px solid var(--border)" }}
+                  >
+                    T{n}{hit ? " ✓" : ""}
+                  </motion.span>
+                );
+              })}
+            </span>
+          )}
+          {/* Proximity alerts */}
+          {nearTarget && (
+            <span data-testid={`near-target-${trade.symbol}`} className="px-1.5 py-0.5 text-[10px] font-semibold rounded-lg flex items-center gap-1" style={{ background: "var(--gain-bg)", color: "var(--gain)" }}>
+              <Target size={10} /> Near Target
+            </span>
+          )}
+          {nearSL && (
+            <span data-testid={`near-sl-${trade.symbol}`} className="px-1.5 py-0.5 text-[10px] font-semibold rounded-lg flex items-center gap-1" style={{ background: "var(--loss-bg)", color: "var(--loss)" }}>
+              <ShieldAlert size={10} /> Near SL
+            </span>
+          )}
+        </div>
+        <div className="text-right">
+          {trade.unrealized_pnl != null && (
+            <div ref={pnlRef} className={`text-sm font-mono rounded-lg px-1 ${trade.unrealized_pnl >= 0 ? "text-gain" : "text-loss"}`}>
+              <AnimatedNumber value={trade.unrealized_pnl} format={signedCurrency} />
+              <span className="text-[10px] ml-1">({formatPercent(trade.unrealized_pnl_pct)})</span>
+            </div>
+          )}
+          {trade.realized_pnl ? (
+            <div className="text-[10px] font-mono text-muted">
+              booked {trade.realized_pnl >= 0 ? "+" : ""}{formatCurrency(trade.realized_pnl)}
+            </div>
+          ) : null}
+        </div>
+      </div>
+      <div className="grid grid-cols-3 md:grid-cols-6 gap-2 text-xs">
+        <div><span className="text-muted">Entry</span><div className="font-mono text-primary">{formatCurrency(trade.entry_price)}</div></div>
+        <div><span className="text-muted">Current</span><div ref={priceRef} className="font-mono text-primary rounded px-0.5 inline-block">{formatCurrency(trade.current_price)}</div></div>
+        <div><span className="text-muted">SL{trailing ? " (trailing)" : ""}</span><div ref={slRef} className="font-mono text-loss rounded px-0.5 inline-block">{formatCurrency(trade.stop_loss)}</div></div>
+        <div><span className="text-muted">Target</span><div className="font-mono text-gain">{formatCurrency(trade.target1)}</div></div>
+        <div><span className="text-muted">Qty Open</span><div className="font-mono text-primary">{qtyOpen}{qtyOpen !== trade.quantity ? ` / ${trade.quantity}` : ""}</div></div>
+        <div data-testid={`risk-${trade.symbol}`}><span className="text-muted">Risk</span><div className="font-mono text-loss">{formatCurrency(Math.abs(risk.riskAmt))}<span className="text-[10px] ml-1">({risk.riskPct.toFixed(1)}%)</span></div></div>
+      </div>
+      {tip && (
+        <div data-testid={`live-tip-${trade.symbol}`} className="flex items-start gap-2 mt-3 p-2.5 rounded-xl" style={{ background: "var(--ai-accent-soft)", border: "1px solid var(--ai-accent-glow)" }}>
+          <Sparkles size={13} className="shrink-0 mt-0.5" style={{ color: "var(--ai-accent)" }} />
+          <div className="min-w-0">
+            <span className="text-[9px] font-bold uppercase tracking-[0.12em] block mb-0.5" style={{ color: "var(--ai-accent)" }}>Live Coaching Tip</span>
+            <p className="text-[11px] leading-relaxed" style={{ color: "var(--text-secondary)" }}>{tip}</p>
+          </div>
+        </div>
+      )}
+
+      {/* Expandable details + risk math + engine timeline */}
+      <AnimatePresence initial={false}>
+        {expanded && (
+          <motion.div
+            data-testid={`details-${trade.symbol}`}
+            initial={{ opacity: 0, height: 0 }}
+            animate={{ opacity: 1, height: "auto" }}
+            exit={{ opacity: 0, height: 0 }}
+            transition={{ duration: 0.25, ease: [0.16, 1, 0.3, 1] }}
+            className="overflow-hidden"
+          >
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mt-3 p-3 rounded-xl text-xs" style={{ background: "var(--bg-surface)", border: "1px solid var(--border)" }}>
+              <div><span className="text-muted">Invested (open)</span><div className="font-mono text-primary">{formatCurrency(invested)}</div></div>
+              <div><span className="text-muted">Target 2</span><div className="font-mono text-gain">{trade.target2 ? formatCurrency(trade.target2) : "—"}</div></div>
+              <div><span className="text-muted">Target 3</span><div className="font-mono text-gain">{trade.target3 ? formatCurrency(trade.target3) : "—"}</div></div>
+              <div><span className="text-muted">Entry Time</span><div className="font-mono text-primary">{trade.entry_time ? new Date(trade.entry_time).toLocaleDateString() : "—"}</div></div>
+              <div><span className="text-muted">Initial SL</span><div className="font-mono text-loss">{trade.initial_stop_loss ? formatCurrency(trade.initial_stop_loss) : formatCurrency(trade.stop_loss)}</div></div>
+              <div><span className="text-muted">Total Risk</span><div className="font-mono text-loss">{formatCurrency(Math.abs(risk.riskAmt))} ({risk.riskPct.toFixed(2)}%)</div></div>
+              <div><span className="text-muted">Reward @ T1</span><div className="font-mono text-gain">{formatCurrency(Math.abs(risk.rewardAmt))}</div></div>
+              <div><span className="text-muted">Risk : Reward</span><div className="font-mono text-primary">1 : {risk.rr.toFixed(2)}</div></div>
+            </div>
+            {(base.events || []).length > 0 && (
+              <div data-testid={`events-${trade.symbol}`} className="mt-2 p-2.5 rounded-xl text-[11px] space-y-1" style={{ background: "var(--bg-surface)", border: "1px solid var(--border)" }}>
+                <span className="text-muted font-semibold block mb-1">Engine Timeline</span>
+                {[...base.events].slice(-5).reverse().map((ev, idx) => (
+                  <div key={idx} className="flex items-start gap-2">
+                    <span className="font-mono text-[9px] px-1 py-0.5 rounded shrink-0" style={{ background: "var(--bg-elevated)", color: "var(--ai-accent)" }}>{ev.type}</span>
+                    <span style={{ color: "var(--text-secondary)" }}>{ev.message}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+            {trade.notes && (
+              <div className="mt-2 p-2.5 rounded-xl text-[11px]" style={{ background: "var(--bg-surface)", border: "1px solid var(--border)", color: "var(--text-secondary)" }}>
+                <span className="text-muted font-semibold">Notes: </span>{trade.notes}
+              </div>
+            )}
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Action bar */}
+      <div className="flex flex-wrap items-center gap-2 mt-3">
+        <button
+          data-testid={`analyze-trade-${trade.symbol}`}
+          onClick={() => onAnalyze(trade)}
+          disabled={analyzing}
+          className="btn-secondary btn-sm"
+        >
+          {analyzing ? <Loader2 size={13} className="animate-spin" /> : <Sparkles size={13} />}
+          Analyze
+        </button>
+        <button
+          data-testid={`modify-trade-${trade.symbol}`}
+          onClick={() => onModify(trade)}
+          className="btn-ghost btn-sm"
+        >
+          <Sliders size={13} /> Modify
+        </button>
+        <button
+          data-testid={`details-trade-${trade.symbol}`}
+          onClick={() => onToggleDetails(trade)}
+          className="btn-ghost btn-sm"
+        >
+          <ChevronDown size={13} className="transition-transform" style={{ transform: expanded ? "rotate(180deg)" : "none" }} /> Details
+        </button>
+        <Link data-testid={`chart-link-${trade.symbol}`} to={`/stock/${trade.symbol}`} className="btn-ghost btn-sm">
+          <BarChart3 size={13} /> Chart
+        </Link>
+        <Link data-testid={`news-link-${trade.symbol}`} to={`/news?symbol=${trade.symbol}`} className="btn-ghost btn-sm">
+          <Newspaper size={13} /> News
+        </Link>
+        <button
+          data-testid={`close-trade-${trade.symbol}`}
+          onClick={() => onClose(trade)}
+          className="btn-secondary btn-sm ml-auto"
+        >
+          {trade.type === "SELL" ? "Cover / Close" : "Sell / Close"}
+        </button>
+      </div>
+    </motion.div>
+  );
+});
+
 export default function TradeMonitor() {
   const { user } = useAuth();
-  const { tradeUpdates, engineEvents, connected } = useWebSocket(user?._id || user?.id || "");
+  const { engineEvents, connected, brokerOrders } = useWebSocket(user?._id || user?.id || "");
+  const tradeReviews = useRealtimeStore(selectTradeReviews);
   const [activeTrades, setActiveTrades] = useState([]);
   const [history, setHistory] = useState([]);
   const [pnl, setPnl] = useState(null);
@@ -107,6 +333,9 @@ export default function TradeMonitor() {
   const [modifyOrderId, setModifyOrderId] = useState(null);
   const [orderEdit, setOrderEdit] = useState({ price: "", quantity: "" });
 
+  // History tab: which closed trade's AI review is expanded
+  const [reviewOpenId, setReviewOpenId] = useState(null);
+
   // Stock search with debounce
   const searchStocks = useCallback(async (query) => {
     if (query.length < 1) { setSuggestions([]); return; }
@@ -142,40 +371,53 @@ export default function TradeMonitor() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [connected]);
 
-  // Live-patch open positions from the AI heartbeat's trade_update pushes so
-  // current price / unrealized P&L tick between the 15s polling fallback.
-  useEffect(() => {
-    if (!tradeUpdates?.length) return;
-    const latest = tradeUpdates[0];
-    setActiveTrades(prev => prev.map(t =>
-      (t._id === latest.trade_id || t.symbol === latest.symbol)
-        ? {
-            ...t,
-            current_price: latest.current_price ?? t.current_price,
-            unrealized_pnl: latest.unrealized_pnl ?? t.unrealized_pnl,
-            unrealized_pnl_pct: latest.unrealized_pnl_pct ?? t.unrealized_pnl_pct,
-          }
-        : t
-    ));
-  }, [tradeUpdates]);
+  // Per-row price/P&L now streams straight into each ActiveTradeRow from the
+  // store's `trade.updated` snapshots (Sprint R6) — no page-level patching.
 
-  // Trading Engine pushes (trailing SL moved / target hit / SL exit) change
-  // server-side state — refetch positions + risk usage when one arrives.
+  // Trading Engine pushes change server-side state. Granular R6 events
+  // (trailing ratchet, target hit) already patch rows live via `trade.updated`
+  // snapshots, so only a CLOSE — the row leaving this tab — needs a refetch;
+  // everything else just refreshes today's risk usage.
   useEffect(() => {
     if (!engineEvents?.length) return;
-    fetchActive();
-    tradeService.riskSummary().then(setRiskSummary).catch(() => {});
+    const ev = engineEvents[0];
+    const closed = ev.event === "trade.closed" || (ev.status && ev.status !== "OPEN");
+    if (closed) {
+      fetchAll();
+    } else {
+      if (!ev.event) fetchActive(); // legacy flat engine event — refetch as before
+      tradeService.riskSummary().then(setRiskSummary).catch(() => {});
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [engineEvents]);
 
-  // Live AI coaching tip per open trade, refreshed every 5 minutes.
+  // Live AI coaching tips: fetched when the set of open positions changes;
+  // while the socket is LIVE, refreshes are event-driven (below) — the 5-min
+  // timer runs only as a disconnected fallback (never poll when pushed).
   const activeIds = activeTrades.map((t) => t._id).join(",");
   useEffect(() => {
     if (!activeIds) return;
     fetchTips();
+    if (connected) return undefined;
     const tipInterval = setInterval(fetchTips, 5 * 60 * 1000);
     return () => clearInterval(tipInterval);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeIds]);
+  }, [activeIds, connected]);
+
+  // Event-triggered tip refresh: a granular engine event on a trade means its
+  // situation changed — refresh that ONE trade's tip (min 60s apart per trade).
+  const tipRefreshAt = useRef({});
+  useEffect(() => {
+    if (!engineEvents?.length) return;
+    const ev = engineEvents[0];
+    if (!ev.event || ev.event === "trade.closed" || !ev.trade_id) return;
+    const now = Date.now();
+    if (tipRefreshAt.current[ev.trade_id] && now - tipRefreshAt.current[ev.trade_id] < 60000) return;
+    tipRefreshAt.current[ev.trade_id] = now;
+    tradeService.liveTip(ev.trade_id)
+      .then(({ tip }) => setTips((prev) => ({ ...prev, [ev.trade_id]: tip })))
+      .catch(() => {});
+  }, [engineEvents]);
 
   const fetchTips = async () => {
     const entries = await Promise.all(
@@ -400,6 +642,34 @@ export default function TradeMonitor() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tab]);
 
+  // Live order status (Sprint R6): broker stream events upsert order rows in
+  // place — a fill/rejection updates without Refresh. Unknown orders (placed
+  // outside the app) are prepended; fetch-on-open stays the reconciliation.
+  useEffect(() => {
+    if (!brokerOrders?.length) return;
+    setOrders((prev) => {
+      if (prev === null) return prev; // tab never opened — nothing to patch
+      let changed = false;
+      const seen = new Set(prev.map((o) => `${o.broker}-${o.order_id}`));
+      const next = prev.map((o) => {
+        const live = brokerOrders.find(
+          (b) => b.order_id === o.order_id && (!b.broker || b.broker === o.broker));
+        if (!live) return o;
+        const merged = { ...o, ...live };
+        if (["status", "filled_quantity", "average_price", "pending_quantity", "status_message"]
+            .some((k) => merged[k] !== o[k])) {
+          changed = true;
+          return merged;
+        }
+        return o;
+      });
+      const fresh = brokerOrders.filter(
+        (b) => b.order_id && b.symbol && !seen.has(`${b.broker}-${b.order_id}`));
+      if (!changed && !fresh.length) return prev;
+      return [...fresh, ...next];
+    });
+  }, [brokerOrders]);
+
   const cancelOrder = async (order) => {
     setOrderBusyId(order.order_id);
     try {
@@ -427,10 +697,6 @@ export default function TradeMonitor() {
       setOrderBusyId(null);
     }
   };
-
-  const targetLevels = (t) =>
-    [1, 2, 3].filter((n) => t[`target${n}`] != null && t[`target${n}`] !== 0);
-  const hitLevels = (t) => new Set((t.targets_hit || []).map((h) => h.level));
 
   return (
     <div data-testid="trades-page" className="space-y-4">
@@ -510,20 +776,23 @@ export default function TradeMonitor() {
         </div>
       )}
 
-      {/* Tabs */}
-      <div className="tab-bar w-fit">
-        {["active", "orders", "history"].map((t) => (
-          <button
-            key={t}
-            data-testid={`tab-${t}`}
-            onClick={() => setTab(t)}
-            className={`tab-btn ${tab === t ? "active" : ""}`}
-          >
-            {t === "active" ? `Active (${activeTrades.length})`
-              : t === "orders" ? "Orders"
-              : `History (${history.length})`}
-          </button>
-        ))}
+      {/* Tabs + live snapshot badge */}
+      <div className="flex items-center gap-3 flex-wrap">
+        <div className="tab-bar w-fit">
+          {["active", "orders", "history"].map((t) => (
+            <button
+              key={t}
+              data-testid={`tab-${t}`}
+              onClick={() => setTab(t)}
+              className={`tab-btn ${tab === t ? "active" : ""}`}
+            >
+              {t === "active" ? `Active (${activeTrades.length})`
+                : t === "orders" ? "Orders"
+                : `History (${history.length})`}
+            </button>
+          ))}
+        </div>
+        <TradeLiveBadge />
       </div>
 
       {/* Active Trades */}
