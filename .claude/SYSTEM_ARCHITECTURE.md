@@ -1,6 +1,6 @@
 # StockAssist AI
 ## System Architecture
-Version: 1.0
+Version: 1.1
 Part 1 - Foundation Architecture
 
 ---

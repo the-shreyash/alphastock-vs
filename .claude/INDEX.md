@@ -1,7 +1,7 @@
 # StockAssist AI
 ## Documentation Index
 
-Version: 1.0
+Version: 1.1
 
 Status: Active Development
 
@@ -953,6 +953,27 @@ All market data should flow through the Market Gateway and Market Engine. Never 
 Every new feature must integrate with the Real-Time System if live updates are required.
 
 If implementing AI, Broker, Portfolio, Scanner, Dashboard, or Notifications, read REALTIME_SYSTEM.md before coding.
+
+---
+
+# Documentation Changelog
+
+## Version 1.1 — 2026-07-16
+
+Major Changes
+
+- Introduced MARKET_DATA_ARCHITECTURE.md.
+- Migrated from Yahoo-centric architecture to provider-independent architecture.
+- Added Market Gateway and Source Manager concepts.
+- Defined provider priority and failover strategy.
+- Separated Connected Broker experience from Premium AI features.
+- Updated all affected documentation for consistency.
+
+Recorded as ADR-026 in DECISIONS.md. MARKET_DATA_ARCHITECTURE.md is the authoritative source for all market data provider behavior.
+
+## Version 1.0
+
+- Initial documentation system.
 
 ---
 

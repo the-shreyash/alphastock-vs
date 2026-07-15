@@ -1,7 +1,7 @@
 # StockAssist AI
 # Real-Time System Architecture
 
-Version: 1.0
+Version: 1.1
 
 Status: Active Development
 

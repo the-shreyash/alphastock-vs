@@ -1,7 +1,7 @@
 # StockAssist AI
 ## Market Engine Documentation
 
-Version: 1.0
+Version: 1.1
 
 Status: Active Development
 

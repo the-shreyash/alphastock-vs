@@ -1,6 +1,6 @@
 # Claude Instructions
 ## StockAssist AI Engineering Handbook
-Version: 1.0
+Version: 1.1
 
 ---
 

@@ -1,7 +1,7 @@
 # StockAssist AI
 ## Architecture & Product Decisions
 
-Version: 1.0
+Version: 1.1
 
 Status: Active Development
 
