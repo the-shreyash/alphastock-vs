@@ -560,6 +560,12 @@ Risk Warnings
 
 Before market open every day.
 
+Transparency (Sprint R7): report generation streams a live AIRun step
+timeline (Collecting Market Data → Reading News → Scanning NSE → Analyzing
+Sector Flows → Generating Report → Saving Report) over the `ai` channel —
+per-user for on-demand requests, broadcast for the 8:30 scheduled run. See
+REALTIME_SYSTEM.md → "AI Thinking Process".
+
 ---
 
 # 10. Risk Manager

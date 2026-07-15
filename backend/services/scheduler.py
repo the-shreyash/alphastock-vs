@@ -11,67 +11,78 @@ scheduler = AsyncIOScheduler(timezone="Asia/Kolkata")
 
 async def morning_analysis_job(db, ai_func):
     """8:30 AM weekdays: Scan stocks, generate picks, create morning report.
-    All data comes live from services.real_market — no simulated fallbacks."""
+    All data comes live from services.real_market — no simulated fallbacks.
+
+    Sprint R7: the job streams a broadcast AIRun timeline (user_id=None → the
+    `ai` channel reaches every connected dashboard), so users watch the morning
+    pipeline run live instead of discovering the report after the fact."""
     logger.info("Running morning analysis job...")
+    from services.ai_activity import AIRun
+
+    run = AIRun(None, None, ["Scanning NSE", "Generating Morning Report", "Notifying Traders"])
+    await run.start()
     try:
-        from services.activity_logger import log_activity
         from services.real_market import fetch_real_top_picks, fetch_real_market_overview
-        log_activity("Scanning NSE top gainers", "scan", "done")
 
         # Use real live picks from Yahoo Finance + technical scoring
-        real_picks_result = await fetch_real_top_picks(3)
-        picks = real_picks_result.get("picks", [])
+        async with run.step():
+            real_picks_result = await fetch_real_top_picks(3)
+            picks = real_picks_result.get("picks", [])
 
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        if picks:
-            await db.market_analysis.update_one(
-                {"date": today},
-                {"$set": {"top_picks": picks, "generated_at": datetime.now(timezone.utc).isoformat(), "type": "morning"}},
-                upsert=True
-            )
-        else:
-            logger.warning("Morning analysis: live picks unavailable — skipping picks snapshot")
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            if picks:
+                await db.market_analysis.update_one(
+                    {"date": today},
+                    {"$set": {"top_picks": picks, "generated_at": datetime.now(timezone.utc).isoformat(), "type": "morning"}},
+                    upsert=True
+                )
+            else:
+                logger.warning("Morning analysis: live picks unavailable — skipping picks snapshot")
 
         # Real market overview for morning report
-        overview = await fetch_real_market_overview()
-        report = await ai_func()
-        await db.market_analysis.update_one(
-            {"date": today},
-            {"$set": {"morning_report": report, "overview_snapshot": overview}},
-        )
+        async with run.step():
+            overview = await fetch_real_market_overview()
+            report = await ai_func()
+            await db.market_analysis.update_one(
+                {"date": today},
+                {"$set": {"morning_report": report, "overview_snapshot": overview}},
+            )
 
         # Only notify users who have open trades or recently traded (personal relevance)
         pick_summary = (
             f"{len(picks)} AI picks generated. Top: {picks[0]['name']} ({picks[0]['confidence']}% confidence). Check AI Picks."
             if picks else "Morning report is ready. Live pick data was unavailable this morning."
         )
-        users_with_activity = await db.trades.distinct("user_id")
-        for uid in users_with_activity:
-            user_prefs = await db.users.find_one({"_id": uid if not isinstance(uid, str) else uid}, {"notification_prefs": 1})
-            prefs = (user_prefs or {}).get("notification_prefs", {})
-            if prefs.get("trade_alerts", True):
-                await db.notifications.insert_one({
-                    "user_id": uid if isinstance(uid, str) else str(uid),
-                    "type": "MORNING_REPORT",
-                    "title": "Morning Analysis Ready",
-                    "message": pick_summary,
-                    "read": False,
-                    "created_at": datetime.now(timezone.utc).isoformat(),
-                })
+        async with run.step():
+            users_with_activity = await db.trades.distinct("user_id")
+            for uid in users_with_activity:
+                user_prefs = await db.users.find_one({"_id": uid if not isinstance(uid, str) else uid}, {"notification_prefs": 1})
+                prefs = (user_prefs or {}).get("notification_prefs", {})
+                if prefs.get("trade_alerts", True):
+                    await db.notifications.insert_one({
+                        "user_id": uid if isinstance(uid, str) else str(uid),
+                        "type": "MORNING_REPORT",
+                        "title": "Morning Analysis Ready",
+                        "message": pick_summary,
+                        "read": False,
+                        "created_at": datetime.now(timezone.utc).isoformat(),
+                    })
 
-                # Send email if user has email_alerts enabled
-                if prefs.get("email_alerts", False):
-                    try:
-                        from services.email_service import send_notification as email_notify
-                        user_email = (user_prefs or {}).get("email", "")
-                        if user_email:
-                            await email_notify("MORNING_REPORT", user_email, content=pick_summary)
-                    except Exception as e:
-                        logger.error(f"Email notification failed for {uid}: {e}")
+                    # Send email if user has email_alerts enabled
+                    if prefs.get("email_alerts", False):
+                        try:
+                            from services.email_service import send_notification as email_notify
+                            user_email = (user_prefs or {}).get("email", "")
+                            if user_email:
+                                await email_notify("MORNING_REPORT", user_email, content=pick_summary)
+                        except Exception as e:
+                            logger.error(f"Email notification failed for {uid}: {e}")
 
+        await run.complete()
         logger.info(f"Morning analysis complete: {len(picks)} picks generated")
     except Exception as e:
         logger.error(f"Morning analysis job error: {e}")
+        await run.complete("warning")
 
 
 async def market_scanner_job(db, ws_broadcast):

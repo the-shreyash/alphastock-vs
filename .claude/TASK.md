@@ -1152,11 +1152,92 @@ Verification
 Notes / follow-ups
 
 - Chat runs three truthful stages (memory/history/model). Multi-tool pipelines
-  (Morning Report, Trade/Portfolio review) can adopt the same `AIRun` emitter to
-  surface their real *Collecting Market Data → Reading News → Scanning NSE →
-  Analyzing Portfolio → Generating Report* stages next.
-- `run_id` correlation is client-generated per send; a fresh chat run supersedes
-  any prior `aiRun`, so only one timeline is ever in flight.
+  (Morning Report, Trade/Portfolio review) adopted the same `AIRun` emitter in
+  Sprint R7 Phase 2 (below).
+- `run_id` correlation is client-generated per send. Since Phase 2 the store
+  keys runs by `runId`, so concurrent timelines coexist.
+
+---
+
+# Sprint R7 Phase 2 — AI Live Activity: Full-Surface Rollout
+
+Status
+
+COMPLETED (2026-07-16)
+
+Authority
+
+REALTIME_SYSTEM.md (§ "AI Thinking Process" / "AI Activity Timeline" / "Morning
+Report Flow" — "Never fake AI progress. All steps visible.")
+
+Objective
+
+Extend the R7 `AIRun` live-step system beyond chat to every AI surface: the
+Morning Report page shows the doc's *Collecting Market Data → Reading News →
+Scanning NSE → … → Completed* pipeline live; Portfolio/Trade review panels show
+their real stages; the 8:30 IST scheduler run broadcasts to every dashboard.
+
+Delivered — backend
+
+- **Morning report instrumented** (`server.py` → new `generate_morning_report`,
+  extracted from `morning_report_full`) — six truthful steps
+  (`MORNING_REPORT_STEPS`): *Collecting Market Data* (`real_overview`),
+  *Reading News* (NEW real phase — `news_service.get_market_sentiment()`, cached
+  RSS; result persisted as `report["news_sentiment"]` + a key-risks line; feed
+  failure → step `warning`, report still generated), *Scanning NSE* (top picks),
+  *Analyzing Sector Flows* (FII/DII + sectors + mood), *Generating Report*
+  (AI briefing), *Saving Report* (Mongo). Endpoint accepts `?run_id=` for
+  correlation. Cache hits return before the run starts — zero events. Overview
+  unavailable → run completes `warning`.
+- **Portfolio review** (`POST /api/ai/portfolio-review`) — optional
+  `PortfolioReviewRequest{run_id}` body (backward compatible); 3-step run:
+  *Reading your holdings → Scanning portfolio health → Consulting the AI*.
+- **Trade review** (`POST /api/ai/trade-review`) — `run_id` on
+  `TradeReviewRequest`; steps *Reviewing execution with AI* (+ *Saving review*
+  only when a `trade_id` save actually happens); cached reviews emit nothing.
+- **Scheduler broadcast** (`services/scheduler.py` → `morning_analysis_job`) —
+  wrapped in a `user_id=None` AIRun (*Scanning NSE → Generating Morning Report →
+  Notifying Traders*); the bridge broadcasts null-user events on the `ai`
+  channel, so every connected dashboard watches the 8:30 pipeline live. The
+  redundant `log_activity("Scanning NSE top gainers")` line was removed.
+
+Delivered — frontend
+
+- **Keyed run store** (`realtimeStore.js`) — single `aiRun` slot replaced by
+  `aiRuns` map keyed by `runId` (+ `aiRunOrder`, pruning oldest *completed*
+  runs beyond 6). Only the patched run's object identity changes. Broadcast
+  runs' `ai.step` events also mirror into `activityUpdates` (legacy
+  activity-feed shape) so the dashboard AI Activity timeline shows scheduler
+  runs. New actions: `resolveAIRun(runId, status)` (REST-settle reconciliation:
+  no step may stay stuck "running" after the request resolves/fails) and
+  `clearAIRun(runId)`. `selectAIRun` replaced by factory `selectAIRunById`.
+- **`AIPipelineProgress.jsx`** (new) — page-level pipeline card: progress bar,
+  animated "X of N" counter, step rows (shared `StepIcon`), GSAP entrance,
+  `fallback` prop (shown until `ai.run.started` arrives — covers cache hits)
+  and a `staleMs` guard (active run silent >45s degrades to fallback).
+- **Surfaces wired** — `MorningReport.jsx` sends `run_id` and replaces loading
+  skeletons with `AIPipelineProgress`; `PortfolioReviewPanel.jsx` /
+  `TradeReviewPanel.jsx` send `run_id` and replace skeleton bars with the
+  compact `AIStepTimeline`; `useAIWorkspace.js` (chat) now resolves + clears
+  its run on settle. All surfaces call `resolveAIRun`/`clearAIRun` in
+  catch/finally.
+
+Tests
+
+- `backend/tests/test_ai_live_activity.py` (new, 6 tests, hermetic): ordered
+  started→running/done→completed events with correct labels/indices; `run_id`
+  passthrough over HTTP; cache hit emits zero events; failing fetch → step +
+  run `warning`; unavailable overview → run `warning`; scheduler job events all
+  carry `user_id: None`. Full hermetic suite: 210 passed (1 pre-existing
+  `test_trading_engine.py` failure unrelated to R7, fails on clean tree too).
+
+Follow-ups
+
+- [ ] Migrate `heartbeat_engine` tasks off `activity_logger` onto AIRun
+      broadcast runs (single AI-activity system; retire `activity_feed`).
+- [ ] Extract `generate_morning_report` (and siblings) out of the `server.py`
+      monolith into a service module once its `db`/provider globals are
+      injectable.
 
 ---
 

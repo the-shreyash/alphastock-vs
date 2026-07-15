@@ -38,7 +38,7 @@ from models import (
     ChatMessage, ChatResponse,
     StockAnalysisRequest, SIPRequest,
     AdvisorRequest, AdvisorRecommendation, AdvisorEntryZone,
-    AIMemoryUpdate, LearnRequest, TradeReviewRequest,
+    AIMemoryUpdate, LearnRequest, TradeReviewRequest, PortfolioReviewRequest,
     BrokerOrderCreate, BrokerOrderModify,
 )
 from market_data import get_stock_meta, search_stocks, STOCK_UNIVERSE
@@ -1283,91 +1283,157 @@ Top Picks: {', '.join([f"{p['name']} (Confidence: {p['confidence']}%)" for p in 
     return {"available": True, "report": report, "picks": picks, "overview": overview, "generated_at": datetime.now(timezone.utc).isoformat()}
 
 
+# Sprint R7 — the morning report's live step plan. One label per real phase of
+# generate_morning_report(); labels stream to the client as ai.step events.
+MORNING_REPORT_STEPS = [
+    "Collecting Market Data",
+    "Reading News",
+    "Scanning NSE",
+    "Analyzing Sector Flows",
+    "Generating Report",
+    "Saving Report",
+]
+
+
 @analysis_router.get("/reports/morning")
-async def morning_report_full(user: dict = Depends(get_current_user)):
-    """Full structured morning report — cached in MongoDB by date."""
+async def morning_report_full(run_id: Optional[str] = None, user: dict = Depends(get_current_user)):
+    """Full structured morning report — cached in MongoDB by date.
+
+    `run_id` (optional, client-generated) correlates this request with the live
+    AI step timeline streamed over the `ai` WebSocket channel (Sprint R7)."""
+    return await generate_morning_report(user_id=user["_id"], run_id=run_id)
+
+
+async def generate_morning_report(user_id=None, run_id: Optional[str] = None) -> dict:
+    """Generate (and persist) today's structured morning report.
+
+    Sprint R7: publishes a truthful AIRun step timeline while it works — each
+    step below wraps the real fetch/compute it names. Delivery is per-user when
+    `user_id` is set; a cache hit returns before the run starts, so no fake
+    steps are ever shown. Telemetry is best-effort and never breaks the report.
+    """
+    from services.ai_activity import AIRun
+    from services.news_service import get_market_sentiment
+    from services.real_market import fetch_real_top_picks, fetch_real_sectors, fetch_real_fii_dii
+
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     cached = await db.reports.find_one({"date": today, "type": "morning"})
     if cached:
         cached.pop("_id", None)
         return cached
 
-    # Generate fresh report — live data only; explicit unavailable otherwise
-    from services.real_market import fetch_real_top_picks, fetch_real_sectors, fetch_real_fii_dii
-    overview = await real_overview()
-    if not overview:
-        return {
-            "date": today,
-            "type": "morning",
-            "available": False,
-            "note": "Live market data is temporarily unavailable — the morning report cannot be generated right now.",
-            "generated_at": datetime.now(timezone.utc).isoformat(),
-        }
-    picks_res = await fetch_real_top_picks(3)
-    picks = picks_res.get("picks", [])
-    fii_dii = await fetch_real_fii_dii()
-    sectors = await fetch_real_sectors() or []
+    run = AIRun(user_id, None, MORNING_REPORT_STEPS, run_id=run_id)
+    await run.start()
+    try:
+        # Step 1 — Collecting Market Data
+        async with run.step():
+            overview = await real_overview()
+        if not overview:
+            await run.complete("warning")
+            return {
+                "date": today,
+                "type": "morning",
+                "available": False,
+                "note": "Live market data is temporarily unavailable — the morning report cannot be generated right now.",
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+            }
 
-    nifty_chg = overview.get("nifty", {}).get("change_pct") or 0
-    banknifty_chg = overview.get("bank_nifty", {}).get("change_pct") or 0
-    nifty_val = overview.get("nifty", {}).get("value")
-    bnk_val = overview.get("bank_nifty", {}).get("value")
-    sensex_val = overview.get("sensex", {}).get("value")
-    sensex_chg = overview.get("sensex", {}).get("change_pct")
-    sentiment = overview.get("market_sentiment")
-    vix = overview.get("india_vix")
-    fii_net = fii_dii.get("fii", {}).get("net")
-
-    sentiment_component = (sentiment / 100 * 0.2) if sentiment is not None else 0.1  # neutral when unavailable
-    mood_score = round((nifty_chg * 0.5 + banknifty_chg * 0.3 + sentiment_component), 3)
-    if mood_score > 0.5: market_mood = "Bullish"
-    elif mood_score > 0: market_mood = "Cautious"
-    elif mood_score > -0.5: market_mood = "Neutral"
-    else: market_mood = "Bearish"
-
-    key_risks = [
-        (f"Nifty VIX at {vix} — {'elevated volatility risk' if vix > 15 else 'moderate volatility'}"
-         if vix is not None else "India VIX unavailable — volatility reading pending"),
-        (f"FII net flow: ₹{fii_net} Cr — {'selling pressure' if fii_net < 0 else 'supportive buying'}"
-         if fii_net is not None else "FII/DII flow data unavailable — NSE updates after market close"),
-        f"{'Weak' if banknifty_chg < -0.5 else 'Mixed'} Bank Nifty — watch banking sector for direction cues",
-    ]
-    top_sector_names = ', '.join([s['sector'] for s in sectors[:3]]) or "unavailable"
-    global_cues = f"US futures and Asian markets influencing early Indian session. Keep stop losses tight. Top sectors: {top_sector_names}."
-
-    nifty_str = f"{nifty_val:,.0f}" if nifty_val is not None else "unavailable"
-    bnk_str = f"{bnk_val:,.0f}" if bnk_val is not None else "unavailable"
-    ai_briefing = f"Good morning! Nifty at {nifty_str} ({nifty_chg:+.2f}%), Bank Nifty at {bnk_str}. Market mood: {market_mood}. {len(picks)} quality setups identified. Stay disciplined."
-    if claude_configured() or gemini_configured():
+        # Step 2 — Reading News (headline sentiment from real RSS feeds).
+        # Best-effort: a feed failure marks the step `warning` but the report
+        # is still generated with sentiment marked unavailable.
+        news_sentiment = None
         try:
-            engine = get_debate_engine()
-            ai_briefing = await engine.simple_chat(
-                "You are AlphaPartner morning briefing AI. Be concise, professional, data-driven. "
-                "If a data point is marked unavailable, do not invent it.",
-                f"Write a 3-sentence morning briefing for Indian traders:\nNifty: {nifty_str} ({nifty_chg:+.2f}%)\nBank Nifty: {bnk_str} ({banknifty_chg:+.2f}%)\nSensex: {sensex_val if sensex_val is not None else 'unavailable'}\nMood: {market_mood}\nFII: {f'₹{fii_net}Cr' if fii_net is not None else 'unavailable'}\nTop picks: {', '.join(p['name'] for p in picks[:3]) or 'unavailable'}",
-                prefer="gemini", max_tokens=200,
-            )
-        except Exception:
-            pass
+            async with run.step():
+                news_sentiment = await get_market_sentiment()
+        except Exception as e:
+            logging.warning(f"Morning report news step failed: {e}")
 
-    report = {
-        "date": today,
-        "type": "morning",
-        "available": True,
-        "market_mood": market_mood,
-        "mood_score": mood_score,
-        "nifty": {"value": nifty_val, "change_pct": nifty_chg},
-        "banknifty": {"value": bnk_val, "change_pct": banknifty_chg},
-        "sensex": {"value": sensex_val, "change_pct": sensex_chg},
-        "ai_briefing": ai_briefing,
-        "top_picks": picks,
-        "key_risks": key_risks,
-        "global_cues": global_cues,
-        "fii_dii": {"fii_net": fii_net, "dii_net": fii_dii.get("dii", {}).get("net")},
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-    }
-    await db.reports.insert_one({**report})
-    return report
+        # Step 3 — Scanning NSE
+        async with run.step():
+            picks_res = await fetch_real_top_picks(3)
+            picks = picks_res.get("picks", [])
+
+        # Step 4 — Analyzing Sector Flows (FII/DII, sectors, market mood)
+        async with run.step():
+            fii_dii = await fetch_real_fii_dii()
+            sectors = await fetch_real_sectors() or []
+
+            nifty_chg = overview.get("nifty", {}).get("change_pct") or 0
+            banknifty_chg = overview.get("bank_nifty", {}).get("change_pct") or 0
+            nifty_val = overview.get("nifty", {}).get("value")
+            bnk_val = overview.get("bank_nifty", {}).get("value")
+            sensex_val = overview.get("sensex", {}).get("value")
+            sensex_chg = overview.get("sensex", {}).get("change_pct")
+            sentiment = overview.get("market_sentiment")
+            vix = overview.get("india_vix")
+            fii_net = fii_dii.get("fii", {}).get("net")
+
+            sentiment_component = (sentiment / 100 * 0.2) if sentiment is not None else 0.1  # neutral when unavailable
+            mood_score = round((nifty_chg * 0.5 + banknifty_chg * 0.3 + sentiment_component), 3)
+            if mood_score > 0.5: market_mood = "Bullish"
+            elif mood_score > 0: market_mood = "Cautious"
+            elif mood_score > -0.5: market_mood = "Neutral"
+            else: market_mood = "Bearish"
+
+            key_risks = [
+                (f"Nifty VIX at {vix} — {'elevated volatility risk' if vix > 15 else 'moderate volatility'}"
+                 if vix is not None else "India VIX unavailable — volatility reading pending"),
+                (f"FII net flow: ₹{fii_net} Cr — {'selling pressure' if fii_net < 0 else 'supportive buying'}"
+                 if fii_net is not None else "FII/DII flow data unavailable — NSE updates after market close"),
+                f"{'Weak' if banknifty_chg < -0.5 else 'Mixed'} Bank Nifty — watch banking sector for direction cues",
+            ]
+            if news_sentiment and news_sentiment.get("available"):
+                key_risks.append(
+                    f"News sentiment: {news_sentiment['label']} ({news_sentiment['score']}/100 "
+                    f"across {news_sentiment['articles_analyzed']} headlines)")
+            else:
+                key_risks.append("News sentiment unavailable — feeds temporarily unreachable")
+            top_sector_names = ', '.join([s['sector'] for s in sectors[:3]]) or "unavailable"
+            global_cues = f"US futures and Asian markets influencing early Indian session. Keep stop losses tight. Top sectors: {top_sector_names}."
+
+        # Step 5 — Generating Report (AI briefing; data-grounded fallback)
+        async with run.step():
+            nifty_str = f"{nifty_val:,.0f}" if nifty_val is not None else "unavailable"
+            bnk_str = f"{bnk_val:,.0f}" if bnk_val is not None else "unavailable"
+            ai_briefing = f"Good morning! Nifty at {nifty_str} ({nifty_chg:+.2f}%), Bank Nifty at {bnk_str}. Market mood: {market_mood}. {len(picks)} quality setups identified. Stay disciplined."
+            if claude_configured() or gemini_configured():
+                try:
+                    engine = get_debate_engine()
+                    ai_briefing = await engine.simple_chat(
+                        "You are AlphaPartner morning briefing AI. Be concise, professional, data-driven. "
+                        "If a data point is marked unavailable, do not invent it.",
+                        f"Write a 3-sentence morning briefing for Indian traders:\nNifty: {nifty_str} ({nifty_chg:+.2f}%)\nBank Nifty: {bnk_str} ({banknifty_chg:+.2f}%)\nSensex: {sensex_val if sensex_val is not None else 'unavailable'}\nMood: {market_mood}\nFII: {f'₹{fii_net}Cr' if fii_net is not None else 'unavailable'}\nNews sentiment: {news_sentiment['label'] if news_sentiment and news_sentiment.get('available') else 'unavailable'}\nTop picks: {', '.join(p['name'] for p in picks[:3]) or 'unavailable'}",
+                        prefer="gemini", max_tokens=200,
+                    )
+                except Exception:
+                    pass
+
+            report = {
+                "date": today,
+                "type": "morning",
+                "available": True,
+                "market_mood": market_mood,
+                "mood_score": mood_score,
+                "nifty": {"value": nifty_val, "change_pct": nifty_chg},
+                "banknifty": {"value": bnk_val, "change_pct": banknifty_chg},
+                "sensex": {"value": sensex_val, "change_pct": sensex_chg},
+                "ai_briefing": ai_briefing,
+                "top_picks": picks,
+                "key_risks": key_risks,
+                "news_sentiment": news_sentiment,
+                "global_cues": global_cues,
+                "fii_dii": {"fii_net": fii_net, "dii_net": fii_dii.get("dii", {}).get("net")},
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+            }
+
+        # Step 6 — Saving Report
+        async with run.step():
+            await db.reports.insert_one({**report})
+        await run.complete()
+        return report
+    except Exception:
+        await run.complete("warning")
+        raise
 
 
 # ============ TRADES ROUTES (Sprint 9 — Trading Engine) ============
@@ -2175,9 +2241,14 @@ async def ai_trade_review(data: TradeReviewRequest, user: dict = Depends(get_cur
 
     Accepts either an existing `trade_id` (owned by the user) or a raw `trade`
     dict for ad-hoc review. Persists the review on the trade document when a
-    trade_id is supplied so it is not regenerated on every view."""
+    trade_id is supplied so it is not regenerated on every view.
+
+    Sprint R7: streams a live AIRun step timeline (correlated by the optional
+    client `run_id`). Cached reviews return before any run starts — no fake
+    steps. The "Saving review" step only exists when there is a save to do."""
     from services.model_router import get_model_router
     from services.activity_logger import log_activity
+    from services.ai_activity import AIRun
 
     trade = None
     if data.trade_id:
@@ -2193,62 +2264,91 @@ async def ai_trade_review(data: TradeReviewRequest, user: dict = Depends(get_cur
     else:
         raise HTTPException(status_code=400, detail="Provide trade_id or trade")
 
-    log_activity(f"Reviewing {trade.get('symbol')} trade", "monitor", "running")
-    router = get_model_router()
-    result = await router.run(
-        "trade_review",
-        _summarize_trade_for_review(trade),
-        max_tokens=600,
-    )
-    review = {"content": result["content"], "model_used": result["model_used"],
-              "symbol": trade.get("symbol")}
-    if data.trade_id:
-        await db.trades.update_one({"_id": ObjectId(data.trade_id)}, {"$set": {"ai_review": review}})
-    log_activity(f"Trade review ready for {trade.get('symbol')}", "monitor", "done")
-    return {"trade_id": data.trade_id, "cached": False, **review}
+    steps = ["Reviewing execution with AI"] + (["Saving review"] if data.trade_id else [])
+    run = AIRun(user["_id"], None, steps, run_id=data.run_id)
+    await run.start()
+    try:
+        log_activity(f"Reviewing {trade.get('symbol')} trade", "monitor", "running")
+        async with run.step():
+            router = get_model_router()
+            result = await router.run(
+                "trade_review",
+                _summarize_trade_for_review(trade),
+                max_tokens=600,
+            )
+        review = {"content": result["content"], "model_used": result["model_used"],
+                  "symbol": trade.get("symbol")}
+        if data.trade_id:
+            async with run.step():
+                await db.trades.update_one({"_id": ObjectId(data.trade_id)}, {"$set": {"ai_review": review}})
+        log_activity(f"Trade review ready for {trade.get('symbol')}", "monitor", "done")
+        await run.complete()
+        return {"trade_id": data.trade_id, "cached": False, **review}
+    except Exception:
+        await run.complete("warning")
+        raise
 
 
 @ai_router.post("/portfolio-review")
-async def ai_portfolio_review(user: dict = Depends(get_current_user)):
+async def ai_portfolio_review(data: Optional[PortfolioReviewRequest] = None,
+                              user: dict = Depends(get_current_user)):
     """Portfolio AI — narrative review of the user's holdings via the Portfolio
-    Manager prompt, grounded in live holdings + the deterministic health scan."""
+    Manager prompt, grounded in live holdings + the deterministic health scan.
+
+    Sprint R7: streams a live AIRun step timeline (correlated by the optional
+    client `run_id`). An empty portfolio completes the run after the first
+    (real) holdings read — every emitted step maps to work performed."""
     from services.portfolio_monitor import analyze_portfolio_health
     from services.model_router import get_model_router
     from services.activity_logger import log_activity
+    from services.ai_activity import AIRun
 
-    portfolio = await get_portfolio(user)
-    if not portfolio:
-        return {
-            "content": "Your portfolio is empty. Add holdings to receive an AI review.",
-            "empty": True,
-            "holdings_count": 0,
-        }
+    run = AIRun(user["_id"], None,
+                ["Reading your holdings", "Scanning portfolio health", "Consulting the AI"],
+                run_id=data.run_id if data else None)
+    await run.start()
+    try:
+        async with run.step():
+            portfolio = await get_portfolio(user)
+        if not portfolio:
+            await run.complete()
+            return {
+                "content": "Your portfolio is empty. Add holdings to receive an AI review.",
+                "empty": True,
+                "holdings_count": 0,
+            }
 
-    quote_func = await prefetch_quote_func(user["_id"])
-    health = await analyze_portfolio_health(db, user["_id"], None, quote_func)
+        async with run.step():
+            quote_func = await prefetch_quote_func(user["_id"])
+            health = await analyze_portfolio_health(db, user["_id"], None, quote_func)
 
-    lines = [f"Capital: ₹{user.get('capital', 100000):,.0f}",
-             f"Risk level: {user.get('risk_level', 'moderate')}",
-             f"Holdings ({len(portfolio)}):"]
-    for h in portfolio[:25]:
-        lines.append(
-            f"- {h.get('symbol')}: qty {h.get('quantity')}, invested "
-            f"₹{h.get('invested', 0):,.0f}, current ₹{h.get('current_value', 0):,.0f}, "
-            f"P&L {h.get('pnl_pct', 0)}%"
-        )
-    if health:
-        lines.append(
-            f"Health scan: score {health.get('health_score', 'n/a')}/100, "
-            f"{health.get('at_risk', 0)} position(s) at risk, "
-            f"unrealised P&L ₹{health.get('total_unrealized_pnl', 0):,.0f}."
-        )
-    summary = "\n".join(lines)
+            lines = [f"Capital: ₹{user.get('capital', 100000):,.0f}",
+                     f"Risk level: {user.get('risk_level', 'moderate')}",
+                     f"Holdings ({len(portfolio)}):"]
+            for h in portfolio[:25]:
+                lines.append(
+                    f"- {h.get('symbol')}: qty {h.get('quantity')}, invested "
+                    f"₹{h.get('invested', 0):,.0f}, current ₹{h.get('current_value', 0):,.0f}, "
+                    f"P&L {h.get('pnl_pct', 0)}%"
+                )
+            if health:
+                lines.append(
+                    f"Health scan: score {health.get('health_score', 'n/a')}/100, "
+                    f"{health.get('at_risk', 0)} position(s) at risk, "
+                    f"unrealised P&L ₹{health.get('total_unrealized_pnl', 0):,.0f}."
+                )
+            summary = "\n".join(lines)
 
-    log_activity("Reviewing portfolio allocation & risk", "monitor", "running")
-    router = get_model_router()
-    result = await router.run("portfolio_manager", summary, max_tokens=800)
-    log_activity("Portfolio AI review ready", "monitor", "done")
-    return {"holdings_count": len(portfolio), "health": health, **result}
+        log_activity("Reviewing portfolio allocation & risk", "monitor", "running")
+        async with run.step():
+            router = get_model_router()
+            result = await router.run("portfolio_manager", summary, max_tokens=800)
+        log_activity("Portfolio AI review ready", "monitor", "done")
+        await run.complete()
+        return {"holdings_count": len(portfolio), "health": health, **result}
+    except Exception:
+        await run.complete("warning")
+        raise
 
 
 @ai_router.post("/reflect")

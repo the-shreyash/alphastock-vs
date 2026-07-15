@@ -265,6 +265,14 @@ class TradeReviewRequest(BaseModel):
     a raw trade dict for ad-hoc review (e.g. a paper/manual trade)."""
     trade_id: Optional[str] = None
     trade: Optional[dict] = None
+    # Client-generated correlation id for the live AI step timeline (Sprint R7).
+    run_id: Optional[str] = None
+
+
+class PortfolioReviewRequest(BaseModel):
+    """Optional body for the Portfolio AI review — carries only the live-run
+    correlation id (Sprint R7). Requests without a body remain valid."""
+    run_id: Optional[str] = None
 
 
 # --- Settings Models ---

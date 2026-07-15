@@ -698,6 +698,43 @@ Completed
 
 Users should understand how AI reached its conclusion.
 
+## Implementation (Sprint R7)
+
+The live step timeline is emitted by `backend/services/ai_activity.py`
+(`AIRun`) on the `ai` domain and delivered over the event bridge:
+
+ai.run.started   { user_id, run_id, session_id, steps:[label…], total, started_at }
+
+ai.step          { user_id, run_id, session_id, index, total, label,
+                   status: running | done | warning }
+
+ai.run.completed { user_id, run_id, session_id, status, duration_ms }
+
+Producers (each step wraps the real work it names — never fake progress):
+
+• AI Chat (`ai_chat`) — memory / history / model stages
+
+• Morning Report (`generate_morning_report`) — Collecting Market Data →
+  Reading News → Scanning NSE → Analyzing Sector Flows → Generating Report →
+  Saving Report. Cache hits emit nothing.
+
+• Portfolio Review / Trade Review endpoints — their real 1–3 stages.
+
+• Scheduler morning job — a `user_id: null` run, broadcast on the `ai`
+  channel to every connected dashboard.
+
+Correlation: the client generates a `run_id` per request and sends it with the
+API call; events matching that id drive the UI for that request only.
+
+Frontend: `realtimeStore.js` keeps runs in an `aiRuns` map keyed by `run_id`
+(concurrent surfaces never clobber each other; completed runs are pruned).
+`AIStepTimeline` (compact, chat/panels) and `AIPipelineProgress` (page-level,
+progress bar + stages) render the run; both fall back to a neutral loading
+state until `ai.run.started` arrives. Reconciliation rules: when the REST call
+settles, the consumer calls `resolveAIRun` (no step may stay "running" after
+lost WS frames) then `clearAIRun`; an active run silent beyond ~45s degrades
+to the fallback. Broadcast runs also mirror into the AI Activity feed.
+
 ---
 
 # Morning Report Flow

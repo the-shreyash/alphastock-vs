@@ -1,6 +1,6 @@
 import { motion, AnimatePresence } from "framer-motion";
 import { Check, Loader2, AlertTriangle } from "lucide-react";
-import { useRealtimeStore, selectAIRun } from "../../store/realtimeStore";
+import { useRealtimeStore, selectAIRunById } from "../../store/realtimeStore";
 
 /**
  * AIStepTimeline — the live "AI Thinking Process" (Sprint R7).
@@ -27,7 +27,7 @@ const DOT_PULSE = (
   </div>
 );
 
-function StepIcon({ status }) {
+export function StepIcon({ status }) {
   if (status === "done") return <Check size={13} style={{ color: "var(--gain)" }} />;
   if (status === "warning") return <AlertTriangle size={13} style={{ color: "var(--loss)" }} />;
   if (status === "running") {
@@ -43,11 +43,12 @@ function StepIcon({ status }) {
 }
 
 export default function AIStepTimeline({ runId }) {
-  const aiRun = useRealtimeStore(selectAIRun);
+  const aiRun = useRealtimeStore(selectAIRunById(runId));
 
-  // Only show live steps when they belong to this request. If the id doesn't
-  // match (stale run, event not arrived, or socket offline), fall back to dots.
-  const live = aiRun && runId && aiRun.runId === runId && aiRun.steps.length > 0;
+  // Only show live steps once this request's run has arrived. Before that
+  // (first paint, socket offline, or a cache hit that never starts a run),
+  // fall back to dots.
+  const live = aiRun && aiRun.steps.length > 0;
 
   if (!live) return DOT_PULSE;
 

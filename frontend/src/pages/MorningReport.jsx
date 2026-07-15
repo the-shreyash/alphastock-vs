@@ -3,6 +3,8 @@ import { useNavigate, Link } from "react-router-dom";
 import { motion } from "framer-motion";
 import api from "../services/api";
 import { formatCurrency } from "../utils/formatters";
+import { useRealtimeStore } from "../store/realtimeStore";
+import AIPipelineProgress from "../components/ai/AIPipelineProgress";
 import {
   Sun, RefreshCw, TrendingUp, TrendingDown, Minus,
   AlertTriangle, Globe, BarChart3, ArrowUpRight, ArrowDownRight,
@@ -63,17 +65,29 @@ export default function MorningReport() {
   const [report, setReport] = useState(null);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
+  // Correlation id for the request in flight — matches the live AI pipeline
+  // events (ai.run.* / ai.step over WebSocket) to this fetch (Sprint R7).
+  const [activeRunId, setActiveRunId] = useState(null);
   const navigate = useNavigate();
 
   const load = useCallback(async (force = false) => {
+    const runId = (crypto?.randomUUID?.() || `run-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    setActiveRunId(runId);
     if (force) setRefreshing(true);
     else setLoading(true);
     try {
-      const { data } = await api.get("/analysis/reports/morning");
+      const { data } = await api.get("/analysis/reports/morning", { params: { run_id: runId } });
       setReport(data);
     } catch (e) {
+      // Settle the live pipeline as warning so no step stays "running".
+      useRealtimeStore.getState().resolveAIRun(runId, "warning");
       console.error(e);
     } finally {
+      // REST settled — reconcile lost WS frames, then drop the finished run.
+      const store = useRealtimeStore.getState();
+      store.resolveAIRun(runId);
+      store.clearAIRun(runId);
+      setActiveRunId(null);
       setLoading(false);
       setRefreshing(false);
     }
@@ -81,7 +95,7 @@ export default function MorningReport() {
 
   useEffect(() => { load(); }, [load]);
 
-  if (loading) return (
+  const loadingSkeleton = (
     <div className="space-y-4">
       <div className="h-20 rounded-2xl animate-pulse" style={{ background: "var(--bg-surface)" }} />
       <div className="grid grid-cols-3 gap-3">
@@ -89,6 +103,17 @@ export default function MorningReport() {
       </div>
       <div className="h-32 rounded-2xl animate-pulse" style={{ background: "var(--bg-surface)" }} />
     </div>
+  );
+
+  // While generating: the live AI pipeline (Collecting Market Data → Reading
+  // News → …) once ai.run.started arrives; the skeletons before that or on a
+  // cache hit, which never starts a run.
+  if (loading) return (
+    <AIPipelineProgress
+      runId={activeRunId}
+      title="Generating your morning briefing"
+      fallback={loadingSkeleton}
+    />
   );
 
   if (!report || report.available === false) return (

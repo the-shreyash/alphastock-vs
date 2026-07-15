@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { toast } from "sonner";
 import api from "../services/api";
+import { useRealtimeStore } from "../store/realtimeStore";
 
 const WELCOME = {
   role: "assistant",
@@ -108,10 +109,17 @@ export default function useAIWorkspace() {
       // First exchange creates the session server-side — refresh the sidebar.
       if (isFirstUserMessage) refreshConversations();
     } catch {
+      useRealtimeStore.getState().resolveAIRun(runId, "warning");
       setMessages((prev) => [...prev, { role: "assistant", content: "Sorry, I hit an error. Please try again." }]);
     } finally {
       setSending(false);
       setActiveRunId(null);
+      // Settle + drop the run: the reply has arrived, so any step still
+      // "running" (lost WS frames) must not stay animated, and the keyed
+      // aiRuns map must not accumulate finished chat runs.
+      const store = useRealtimeStore.getState();
+      store.resolveAIRun(runId);
+      store.clearAIRun(runId);
     }
   }, [sending, activeId, messages, refreshConversations]);
 

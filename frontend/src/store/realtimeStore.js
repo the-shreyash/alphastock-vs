@@ -22,6 +22,7 @@ const MAX_TRADE_UPDATES = 50;
 const MAX_ENGINE_EVENTS = 20;
 const MAX_ALERTS = 50;
 const MAX_BROKER_ORDERS = 50;
+const MAX_AI_RUNS = 6;
 
 const initialState = {
   // Connection state machine: offline | connecting | live | reconnecting
@@ -54,10 +55,13 @@ const initialState = {
 
   // AI
   activityUpdates: null,
-  // Live per-request "thinking" timeline (Sprint R7). Populated by ai.run.* /
-  // ai.step events; correlated to a chat request by runId. Shape:
-  //   { runId, sessionId, steps:[{ label, status }], active, startedAt, updatedAt }
-  aiRun: null,
+  // Live "thinking" timelines (Sprint R7), keyed by runId so concurrent runs
+  // (chat + morning report + review panels) never clobber each other. Shape:
+  //   { [runId]: { runId, userId, sessionId, steps:[{ label, status }],
+  //                active, status, startedAt, updatedAt } }
+  // userId === null marks a broadcast run (e.g. the 8:30 scheduler pipeline).
+  aiRuns: {},
+  aiRunOrder: [], // insertion order, used to prune old completed runs
 
   // Notifications / alerts
   alerts: [], // legacy `alert`
@@ -301,42 +305,82 @@ export const useRealtimeStore = create((set, get) => ({
         break;
       }
       case "ai": {
-        // Per-request "thinking" timeline (Sprint R7) — replaces the static
-        // "Thinking…" with the live stages the AI is actually running. Kept in
-        // its own slice so it never clobbers the background activity feed.
+        // Live "thinking" timelines (Sprint R7) — replaces the static
+        // "Thinking…" with the stages the AI is actually running. Runs are
+        // keyed by runId so concurrent surfaces (chat, morning report, review
+        // panels, scheduler broadcasts) each track their own run; only the
+        // patched run's object identity changes, so unrelated subscribers
+        // skip re-render.
         if (event === "ai.run.started") {
-          set({
-            aiRun: {
+          set((s) => {
+            const run = {
               runId: data.run_id,
+              userId: data.user_id ?? null,
               sessionId: data.session_id,
               steps: (Array.isArray(data.steps) ? data.steps : []).map((label) => ({
                 label,
                 status: "pending",
               })),
               active: true,
+              status: null,
               startedAt: data.started_at || envelope.timestamp || Date.now(),
               updatedAt: envelope.timestamp || Date.now(),
-            },
+            };
+            const aiRuns = { ...s.aiRuns, [run.runId]: run };
+            let aiRunOrder = s.aiRunOrder.includes(run.runId)
+              ? s.aiRunOrder
+              : [...s.aiRunOrder, run.runId];
+            // Prune oldest COMPLETED runs beyond the cap (never evict active).
+            while (aiRunOrder.length > MAX_AI_RUNS) {
+              const evictable = aiRunOrder.find((id) => aiRuns[id] && !aiRuns[id].active);
+              if (!evictable) break;
+              delete aiRuns[evictable];
+              aiRunOrder = aiRunOrder.filter((id) => id !== evictable);
+            }
+            return { aiRuns, aiRunOrder };
           });
         } else if (event === "ai.step") {
           set((s) => {
-            // Ignore steps for a stale/unknown run to avoid cross-talk.
-            if (!s.aiRun || s.aiRun.runId !== data.run_id) return {};
-            const steps = s.aiRun.steps.slice();
-            if (data.index >= 0 && data.index < steps.length) {
-              steps[data.index] = { ...steps[data.index], status: data.status };
+            const run = s.aiRuns[data.run_id];
+            const patch = {};
+            if (run) {
+              const steps = run.steps.slice();
+              if (data.index >= 0 && data.index < steps.length) {
+                steps[data.index] = { ...steps[data.index], status: data.status };
+              }
+              patch.aiRuns = {
+                ...s.aiRuns,
+                [data.run_id]: { ...run, steps, updatedAt: envelope.timestamp || Date.now() },
+              };
             }
-            return { aiRun: { ...s.aiRun, steps, updatedAt: envelope.timestamp || Date.now() } };
+            // Broadcast runs (no user_id — e.g. the 8:30 scheduler pipeline)
+            // also feed the dashboard's background activity timeline, matching
+            // the legacy activity_feed entry shape (UTC HH:MM:SS, like
+            // services/activity_logger.py).
+            if (data.user_id == null) {
+              const ts = envelope.timestamp ? new Date(envelope.timestamp) : new Date();
+              patch.activityUpdates = {
+                action: data.label,
+                category: "monitor",
+                status: data.status,
+                time: ts.toISOString().slice(11, 19),
+              };
+            }
+            return patch;
           });
         } else if (event === "ai.run.completed") {
           set((s) => {
-            if (!s.aiRun || s.aiRun.runId !== data.run_id) return {};
+            const run = s.aiRuns[data.run_id];
+            if (!run) return {};
             return {
-              aiRun: {
-                ...s.aiRun,
-                active: false,
-                status: data.status || "done",
-                updatedAt: envelope.timestamp || Date.now(),
+              aiRuns: {
+                ...s.aiRuns,
+                [data.run_id]: {
+                  ...run,
+                  active: false,
+                  status: data.status || "done",
+                  updatedAt: envelope.timestamp || Date.now(),
+                },
               },
             };
           });
@@ -370,6 +414,41 @@ export const useRealtimeStore = create((set, get) => ({
     }
   },
 
+  /**
+   * Force-settle a live AI run (Sprint R7 reconciliation). Called when the
+   * REST request that started the run resolves or fails: if WebSocket events
+   * were lost mid-run (disconnect, missed frames), no step may stay stuck on
+   * "running" and the run must stop animating.
+   */
+  resolveAIRun: (runId, status = "done") =>
+    set((s) => {
+      const run = runId ? s.aiRuns[runId] : null;
+      if (!run || (!run.active && !run.steps.some((st) => st.status === "running"))) return {};
+      return {
+        aiRuns: {
+          ...s.aiRuns,
+          [runId]: {
+            ...run,
+            active: false,
+            status: run.status || status,
+            steps: run.steps.map((st) =>
+              st.status === "running" ? { ...st, status } : st
+            ),
+            updatedAt: Date.now(),
+          },
+        },
+      };
+    }),
+
+  /** Drop a finished AI run from the map once its consumer unmounts. */
+  clearAIRun: (runId) =>
+    set((s) => {
+      if (!runId || !s.aiRuns[runId]) return {};
+      const aiRuns = { ...s.aiRuns };
+      delete aiRuns[runId];
+      return { aiRuns, aiRunOrder: s.aiRunOrder.filter((id) => id !== runId) };
+    }),
+
   reset: () => set({ ...initialState }),
 }));
 
@@ -379,7 +458,8 @@ export const selectConnectionStatus = (s) => s.connection.status;
 export const selectMarketData = (s) => s.marketData;
 export const selectPriceTicks = (s) => s.priceTicks;
 export const selectActivityUpdates = (s) => s.activityUpdates;
-export const selectAIRun = (s) => s.aiRun;
+// Factory selector: subscribe to one run only (stable per runId, null-safe).
+export const selectAIRunById = (runId) => (s) => (runId ? s.aiRuns[runId] || null : null);
 export const selectPortfolioUpdate = (s) => s.portfolioUpdate;
 export const selectPortfolioLive = (s) => s.portfolioLive;
 export const selectPortfolioSynced = (s) => s.portfolioSynced;
