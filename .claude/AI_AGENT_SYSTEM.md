@@ -74,6 +74,46 @@ Agents explain uncertainty.
 
 ---
 
+# Market Data Access
+
+AI agents never communicate with market data providers.
+
+Not directly. Not through helper utilities. Never.
+
+All market context reaches the AI through one path:
+
+AI request
+
+↓
+
+AI Context Builder
+
+↓
+
+Market Engine (normalized, provider-agnostic data)
+
+↓
+
+Normalized Market Context
+
+↓
+
+Claude
+
+↓
+
+Response
+
+The AI never knows which provider generated the data. Context carries only the source tier (streaming / delayed) and timestamps, so the AI can calibrate its language ("live price" vs "as of 10:42 AM").
+
+The AI must never say "I don't have live market data." It always reasons over the last known market state with its timestamp.
+
+When a user connects a broker, the AI's context automatically becomes fresher with zero prompt or pipeline changes.
+
+Authoritative reference: MARKET_DATA_ARCHITECTURE.md.
+
+---
+
 # Master Orchestrator
 
 The Master Orchestrator is the brain.
@@ -301,6 +341,8 @@ Monitor market breadth
 Generate opportunities
 
 Never stop scanning.
+
+Data source: normalized events from the Market Engine only — never providers directly.
 
 ---
 

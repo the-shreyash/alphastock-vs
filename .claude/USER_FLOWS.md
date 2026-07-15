@@ -250,6 +250,18 @@ Sync Portfolio
 
 Broker Connected
 
+↓
+
+Source Manager switches market data from Yahoo Finance to broker feed
+
+↓
+
+Dashboard upgrades automatically (live prices, portfolio, P&L)
+
+↓
+
+AI Context becomes live
+
 Errors
 
 Authentication Failed
@@ -263,6 +275,34 @@ Broker Offline
 Success
 
 Portfolio synchronized
+
+---
+
+# Flow 4a — Market Data Upgrade (Automatic)
+
+This flow requires no user action. See MARKET_DATA_ARCHITECTURE.md.
+
+User signs in
+
+↓
+
+User connects broker
+
+↓
+
+Source Manager switches from Yahoo Finance to broker feed
+
+↓
+
+Dashboard upgrades automatically
+
+↓
+
+AI Context becomes live
+
+The switch is invisible: no spinner, no reload. Prices simply begin updating tick-by-tick and the feed indicator flips from "Delayed" to "Live".
+
+If the broker feed later disconnects, the Source Manager falls back to Yahoo Finance automatically — the user never loses the market feed.
 
 ---
 

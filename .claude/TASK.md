@@ -1092,6 +1092,154 @@ Notes / follow-ups
 
 ---
 
+# Sprint R7 — AI Live Activity
+
+Status
+
+COMPLETED
+
+Authority
+
+REALTIME_SYSTEM.md (§ "AI Thinking Process" / "AI Activity Timeline" — "Never
+fake AI progress. Always display actual AI workflow.")
+
+Objective
+
+Convert the AI chat from a static "Thinking…" indicator into an event-driven,
+per-request step timeline — the doc's *Collecting Market Data → … → Completed*
+flow, but with truthful labels that map to the work the chat pipeline actually
+performs. Steps stream live over the existing event bus → WebSocket bridge and
+update only the assistant bubble (no page rerender, no polling).
+
+Delivered
+
+- **Reusable step emitter** (`backend/services/ai_activity.py`, new) — `AIRun`
+  publishes a run-correlated, per-user timeline on the `ai` domain:
+  `ai.run.started` (full step plan), `ai.step` (index + `running`/`done`/
+  `warning`), `ai.run.completed`. Every event carries `user_id` so the R2
+  bridge delivers only to that user's sockets, and a `run_id` so the client
+  correlates a step burst to the request that fired it. `step()` is an async
+  context manager (running on enter; done/warning on exit) and all emission is
+  best-effort — a bus/socket failure can never break the AI reply.
+- **Chat pipeline instrumented** (`server.py` → `ai_chat`) — genuine stages
+  wrapped as steps: *Recalling your context* (AI memory load), *Reviewing our
+  conversation* (session history), and a model step whose label follows the
+  provider that actually serves — *Consulting Claude* / *Consulting Gemini* /
+  *Composing your answer* — via `ModelRouter.resolve_provider()` (the existing
+  history-less fallback is nested inside that step). `run_id` added to
+  `ChatMessage` (`models.py`) and threaded through `chat_endpoint`.
+- **Store** (`frontend/src/store/realtimeStore.js`) — new `aiRun` slice; the
+  `ai` domain now branches: `ai.run.started`/`ai.step`/`ai.run.completed` drive
+  `aiRun` (stale-run guard by `runId`), all other `ai.*` still feed the
+  background `activityUpdates` feed. New selector `selectAIRun`.
+- **Live UI** (`frontend/src/components/ai/AIStepTimeline.jsx`, new) — renders
+  the correlated run's steps with per-status icons (pending/running-spinner/
+  done-check/warning) and a framer-motion staggered entrance; falls back to the
+  original three-dot pulse when no matching live run exists yet (first paint or
+  socket offline). Wired into `pages/AIAssistant.jsx` (replaces the inline dots
+  while `sending`); `hooks/useAIWorkspace.js` generates a `run_id` per send,
+  posts it to `/chat`, and exposes `activeRunId`.
+
+Verification
+
+- Backend `python3 -c "ast.parse(...)"` clean on all changed modules; frontend
+  babel (react-app preset) parses all four changed files clean.
+- Manual (needs running backend+frontend): open AI Workspace → send a message →
+  the assistant bubble shows the three stages advancing live (spinner → check)
+  instead of static dots, then the answer replaces the timeline. With the socket
+  offline the bubble falls back to the pulsing dots (no regression).
+
+Notes / follow-ups
+
+- Chat runs three truthful stages (memory/history/model). Multi-tool pipelines
+  (Morning Report, Trade/Portfolio review) can adopt the same `AIRun` emitter to
+  surface their real *Collecting Market Data → Reading News → Scanning NSE →
+  Analyzing Portfolio → Generating Report* stages next.
+- `run_id` correlation is client-generated per send; a fresh chat run supersedes
+  any prior `aiRun`, so only one timeline is ever in flight.
+
+---
+
+# Sprint R7.5 — AI Context Engine & Real-Time Audit
+
+Status
+
+COMPLETED
+
+Authority
+
+REALTIME_SYSTEM.md (source of truth) + AI_AGENT_SYSTEM.md ("Agents never
+guess"; the AI must reason from the Market Engine, never from model memory).
+
+Objective
+
+Audit the full real-time pipeline and fix the core AI defect: the chat
+assistant answered like a general-purpose LLM ("I don't have access to live
+market data") because the chat request injected only memory + conversation
+history — never live platform data. Combined with the Master Prompt's
+anti-fabrication rule, the model correctly but uselessly disclaimed live access.
+
+Audit findings
+
+- **Delivery layer is healthy** — event_bus → event_bridge → WebSocket is
+  event-driven and <100ms; one socket/user, heartbeat, reconnect, GSAP flashes
+  all work. `ai_activity`, `trade_stream`, `trade_review`, `AIStepTimeline` are
+  fully wired end-to-end (not stubs).
+- **Root cause of the AI bug** — `server.ai_chat()` fed only `{memory}` + last 10
+  turns; the `ai_chat` prompt had no live-data slot. Fixed this sprint.
+- **"Feels static" root cause** — the free Yahoo data SOURCE is polled on
+  30–180s cycles (indices 10–15s, trades 60s, portfolio 90s, scanner 120–180s).
+  This is a data-source limitation, not a pipeline bug; true sub-second ticks
+  need a broker websocket feed. Documented; cadence tuning deferred (see below).
+
+Delivered
+
+- **AI Context Builder** (`backend/services/ai_context_builder.py`, new) —
+  `build_chat_context(db, user, quotes_map_func)` assembles one compact, live,
+  token-budgeted (~500 tok) markdown snapshot before every chat request:
+  market snapshot (NIFTY/Bank Nifty/Sensex/VIX/breadth/sentiment/status),
+  gainers/losers, sectors, global markets, portfolio + P&L + risk, open trades,
+  watchlist, latest news + sentiment, broker status, user memory, recent
+  platform AI activity. Composes existing services only (`real_market`,
+  `portfolio_engine`, `news_service`, `ai_memory`, `activity_logger`) — no new
+  data source. Fully best-effort (per-section isolation), concurrent under one
+  4s budget, and per-user micro-cached (8s). `quotes_map_func` is injected
+  (`server.real_quotes_map`) to avoid a circular import, matching
+  `portfolio_engine`/`portfolio_stream`.
+- **Prompt Builder update** (`services/prompt_library.py`, `ai_chat` → 1.1.0) —
+  new `{live_context}` slot; the AI is told the context is live ground truth,
+  must NEVER mention knowledge cutoff / training data / "an AI model" / inability
+  to access live data, and — only when the market feed is truly unavailable —
+  must reply exactly "The live market feed is temporarily unavailable. Please
+  try again in a few moments."
+- **Chat pipeline wired** (`server.ai_chat`) — builds context as the first
+  timeline step ("Reading live market data") and renders it into the prompt;
+  best-effort so an empty context still yields a valid reply. No API-contract or
+  frontend change.
+
+Verification
+
+- Import/AST clean on all changed modules (project venv). `ai_chat` renders to
+  v1.1.0 with the live_context slot and the exact fallback sentence.
+- Async smoke test of `build_chat_context` with stub db + quotes: live Yahoo
+  overview fetched, portfolio/open-trades/watchlist/broker/news sections
+  rendered, ~475 tokens, micro-cache returns the same object, and a forced
+  section failure (missing memory collection) degraded gracefully without
+  breaking the build.
+
+Notes / follow-ups (out of scope this sprint)
+
+- Real-time cadence tuning (tighter heartbeat/broadcast for indices/watchlist/
+  portfolio) — needs a broker websocket feed for true Zerodha/TradingView-grade
+  sub-second ticks.
+- Proactive AI-model-generated alerts (trade opportunities, exit signals) — the
+  monitoring scaffolding already exists in `heartbeat_engine.py`.
+- Chat response streaming (SSE/WebSocket).
+- The other agent endpoints (advisor, portfolio-review) already inject their own
+  live data; they can adopt `build_chat_context` for a unified snapshot later.
+
+---
+
 # Technical Debt
 
 Every technical debt item must contain
@@ -1289,6 +1437,25 @@ summary strip. The engine runs inside the existing 60s trade_monitor cron.
 
 Next: admin portal and payments/subscriptions (Milestones 6+), then a
 dedicated Risk Dashboard page and Strategy Builder.
+
+---
+
+# Market Data Architecture (Provider Independence)
+
+Status: PLANNING
+
+Priority: Critical
+
+Design approved and documented in MARKET_DATA_ARCHITECTURE.md (2026-07-16); ADR-026 recorded in DECISIONS.md. Documentation system synchronized.
+
+Implementation phases (per MARKET_DATA_ARCHITECTURE.md):
+
+- [ ] Phase 1 — Formalize Provider Adapter contract; wrap Yahoo path as YahooPollingAdapter
+- [ ] Phase 2 — Source Manager + provider.status events + frontend tier indicator (Live/Delayed)
+- [ ] Phase 3 — Zerodha Kite WebSocket adapter; per-user switching; failover to Yahoo
+- [ ] Phase 4 — Remaining broker adapters (Upstox, Angel One, Fyers, Dhan)
+- [ ] Phase 5 — Hardening: latency scoring, flap suppression, probation, chaos tests
+- [ ] Phase 6 — Enterprise/licensed feeds (future)
 
 ---
 

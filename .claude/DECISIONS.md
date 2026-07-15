@@ -303,6 +303,10 @@ Testing
 
 Caching
 
+Status
+
+Extended by ADR-026 (Provider-Independent Market Data Architecture).
+
 ---
 
 # ADR-009
@@ -724,6 +728,51 @@ Reason
 Never expose administrative functionality to regular users.
 
 RBAC required.
+
+---
+
+# ADR-026
+
+Title
+
+Provider-Independent Market Data Architecture
+
+Date
+
+2026-07-16
+
+Decision
+
+StockAssist AI is provider-independent. All market data enters the platform through a Market Gateway abstraction with per-provider adapters, governed by a Source Manager that selects the best provider per user.
+
+Provider priority:
+
+1. Connected Broker WebSocket (Zerodha, Upstox, Angel One, Fyers, Dhan)
+
+2. Licensed Exchange Feed (future)
+
+3. Yahoo Finance (always-available baseline)
+
+Every provider produces one normalized market event model. The Market Engine, AI, and Frontend consume only normalized events and never know the provider — downstream provenance is limited to a source tier (streaming / delayed).
+
+Connecting a broker automatically upgrades the user's feed to the broker's streaming WebSocket at no subscription cost — the broker already owns the user's data entitlement.
+
+Premium never sells market data; it sells AI intelligence.
+
+Reason
+
+Yahoo Finance (polling) was the platform's real latency bottleneck, not the internal event-driven architecture. Depending on any single provider is a business and technical risk. Broker feeds give professional streaming data with zero data cost.
+
+Consequences
+
+• Adding a provider = one adapter + one normalizer + registry entry; nothing else changes.
+• Never bypass the Market Gateway or Source Manager.
+• Frontend and AI must never contain provider-specific logic.
+• Failover is automatic and silent (broker → licensed → Yahoo → cached data with banner).
+
+Authoritative document
+
+MARKET_DATA_ARCHITECTURE.md
 
 ---
 

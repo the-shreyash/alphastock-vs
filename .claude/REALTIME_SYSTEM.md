@@ -115,14 +115,17 @@ Animate Changes
 
 # High Level Architecture
 
-                NSE
-                BSE
-            Yahoo Finance
-            Broker APIs
-              News APIs
+        Market Data Providers
+   (Broker WebSockets · Licensed Feeds
+      · Yahoo Finance · News APIs)
                   │
                   ▼
-        Market Gateway Layer
+           Market Gateway
+     (Provider Adapters · Auth · Health)
+                  │
+                  ▼
+           Source Manager
+   (Provider Priority · Switching · Failover)
                   │
                   ▼
          Data Normalization
@@ -160,11 +163,11 @@ The Market Engine is always running.
 
 It should never stop while markets are open.
 
+The Market Engine never talks to providers directly. All real-time data originates from the Market Gateway, which normalizes every provider (broker WebSocket, licensed feed, Yahoo Finance) into one universal event model. See MARKET_DATA_ARCHITECTURE.md.
+
 Responsibilities
 
-Collect market data
-
-Normalize providers
+Consume normalized market events from the Market Gateway
 
 Validate prices
 
@@ -186,7 +189,8 @@ The Market Engine is the heartbeat of the platform.
 
 Suppose NIFTY changes.
 
-NSE Feed
+Active Provider (broker WebSocket, licensed feed, or Yahoo —
+selected automatically by the Source Manager)
 
 ↓
 
@@ -888,11 +892,19 @@ Reconnect automatically.
 
 # Error Recovery
 
-If Yahoo fails
+If the active market data provider fails
 
 ↓
 
-Fallback Provider
+Source Manager falls back automatically
+(Broker WebSocket → Licensed Feed → Yahoo Finance)
+
+↓
+
+If no provider is available, show last cached data with
+"Market feed temporarily unavailable."
+
+(Full failover design: MARKET_DATA_ARCHITECTURE.md)
 
 If Socket disconnects
 

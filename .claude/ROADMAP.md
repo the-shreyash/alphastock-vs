@@ -523,6 +523,46 @@ Interactive Brokers
 
 Global Brokers
 
+Every new broker also becomes a streaming market data provider for its connected users, via one new adapter behind the Market Gateway (see MARKET_DATA_ARCHITECTURE.md).
+
+---
+
+# Market Data Provider Expansion
+
+The market data layer is provider-independent (MARKET_DATA_ARCHITECTURE.md). Each stage below is one adapter — no changes to the Market Engine, AI, or Frontend.
+
+Current
+
+Yahoo Finance (polling baseline, free tier)
+
+Next
+
+Broker Streaming WebSockets
+
+Zerodha
+
+Upstox
+
+Angel One
+
+Fyers
+
+Dhan
+
+Future
+
+Licensed NSE Feed
+
+Licensed BSE Feed
+
+Institutional Market Vendors
+
+Crypto Exchanges
+
+Forex Providers
+
+US Market Providers
+
 ---
 
 # Business Milestones

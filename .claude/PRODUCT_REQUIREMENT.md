@@ -626,6 +626,8 @@ Cancel
 
 Trade Monitoring
 
+Live Market Data Upgrade — connecting a broker automatically switches the user's market data feed from Yahoo Finance to the broker's streaming WebSocket, at no subscription cost (see MARKET_DATA_ARCHITECTURE.md).
+
 Never simulate orders after broker connection.
 
 ---
@@ -1683,6 +1685,26 @@ Influencers
 # 34. Subscription Plans
 
 The platform supports three plans.
+
+---
+
+## Market Data Is Never a Paid Feature
+
+Market data quality is determined by the user's data tier, not their subscription plan (see MARKET_DATA_ARCHITECTURE.md):
+
+Free / Guest users
+
+Yahoo Finance — near real-time (delayed, push-delivered). Suitable for learning, paper trading, and market analysis.
+
+Connected broker users
+
+The broker's streaming WebSocket — live tick-level data, automatically activated when a broker is connected. No subscription required; the broker already owns the user's market data entitlement.
+
+Premium users
+
+Pay for AI intelligence, automation, and productivity — never for market data access.
+
+No plan may ever gate live market data behind payment.
 
 ---
 
@@ -3662,10 +3684,14 @@ The platform should remain transparent, educational, and user-controlled while c
 
 ## Supported Data Providers
 
-- Yahoo Finance
+All providers are consumed through the Market Gateway and Source Manager (see MARKET_DATA_ARCHITECTURE.md). The platform is provider-independent; business logic never depends on a specific provider.
+
+- Broker Streaming WebSockets (Zerodha, Upstox, Angel One, Fyers, Dhan) — live, for connected broker users
+- Yahoo Finance — near real-time baseline for free/guest users
 - NSE
-- TradingView
-- Future Market Data Providers
+- TradingView (charts/widgets)
+- Licensed Exchange Feeds (Future)
+- Crypto / Forex / US Market Providers (Future)
 
 ---
 

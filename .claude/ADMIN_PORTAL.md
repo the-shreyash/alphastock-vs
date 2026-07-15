@@ -415,6 +415,26 @@ Average Response Time
 
 ---
 
+# Market Data Provider Monitoring
+
+The admin portal is the only surface allowed to display provider-level detail (see MARKET_DATA_ARCHITECTURE.md — user-facing surfaces show only the tier: Live / Delayed).
+
+Display per provider (via Market Gateway health + Source Manager status):
+
+Connection State
+
+Active Users on Provider
+
+p50 / p95 Latency
+
+Message Rate
+
+Error / Reconnect Counts
+
+Failover Events
+
+---
+
 # API Monitoring
 
 Supported APIs

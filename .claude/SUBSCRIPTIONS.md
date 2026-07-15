@@ -44,6 +44,31 @@ No misleading pricing.
 
 ---
 
+# Premium Never Sells Market Data
+
+This is a permanent monetization rule (see MARKET_DATA_ARCHITECTURE.md).
+
+Market data is either free (Yahoo Finance for guests/free users) or already owned by the user (their broker's streaming feed, activated automatically on broker connection).
+
+Premium sells intelligence, automation, and productivity:
+
+• AI Portfolio Intelligence
+• Morning Report
+• Advanced Scanner
+• AI Coach
+• Strategy Builder
+• Backtesting
+• Trade Journal analytics
+• AI Trade Review
+• Risk Engine
+• Multi-Agent AI Debate
+• Smart Alerts
+• Automation
+
+Why: market data is a commodity with licensing risk; AI reasoning over the user's own portfolio and context is StockAssist's moat. Live data quality must never appear as a plan differentiator.
+
+---
+
 # Plans
 
 StockAssist AI has three primary plans.

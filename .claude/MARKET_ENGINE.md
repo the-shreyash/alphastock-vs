@@ -147,17 +147,17 @@ Global Indices
 
 # Data Providers
 
-Primary
+Provider selection, priority, switching, and failover are defined authoritatively in MARKET_DATA_ARCHITECTURE.md. The Market Engine never communicates with providers directly — it consumes normalized market events from the Market Gateway.
 
-Yahoo Finance
+Provider priority (resolved per user by the Source Manager):
 
-NSE Official Data
+1. Connected Broker WebSocket (Zerodha, Upstox, Angel One, Fyers, Dhan)
 
-Broker APIs
+2. Licensed Exchange Feed (future)
 
----
+3. Yahoo Finance (always-available polling baseline)
 
-Secondary
+Secondary / future
 
 Alpha Vantage
 
@@ -167,7 +167,9 @@ Finnhub
 
 TwelveData
 
-Future Premium Providers
+Crypto, Forex, US market providers
+
+Each provider is one adapter behind the Market Gateway. Adding a provider never changes the Market Engine.
 
 ---
 
@@ -183,6 +185,10 @@ Everything passes through:
 
 Market Gateway
 
+The Market Gateway owns provider connections, authentication, normalization, validation, health monitoring, and reconnection. The Source Manager decides which provider is active per user and orchestrates automatic switching and failover.
+
+Full design: MARKET_DATA_ARCHITECTURE.md.
+
 Benefits
 
 Centralized
@@ -194,6 +200,8 @@ Secure
 Observable
 
 Replaceable
+
+Provider-Independent
 
 ---
 
@@ -227,13 +235,19 @@ IPO Collector
 
 # Collection Frequency
 
+Frequency depends on the active provider tier (see MARKET_DATA_ARCHITECTURE.md):
+
 Live Prices
 
-1–5 Seconds
+Streaming tier: tick-level (broker WebSocket / licensed feed)
+
+Delayed tier: 15–60 seconds (Yahoo polling)
 
 Indices
 
-5 Seconds
+Streaming tier: tick-level
+
+Delayed tier: 15–60 seconds
 
 News
 
@@ -803,7 +817,9 @@ Recovery
 
 Retry
 
-Fallback Provider
+Automatic provider failover via the Source Manager
+(Broker WebSocket → Licensed Feed → Yahoo Finance;
+see MARKET_DATA_ARCHITECTURE.md)
 
 Cached Data
 

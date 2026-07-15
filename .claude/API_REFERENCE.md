@@ -303,6 +303,8 @@ GET
 
 All endpoints return live market data.
 
+Market data endpoints are provider-agnostic: data is served from the Market Engine's normalized cache, fed by the Market Gateway (broker WebSocket, licensed feed, or Yahoo Finance — selected automatically per user by the Source Manager). Responses never expose the underlying provider; freshness is indicated by the source tier (streaming / delayed) and timestamps. See MARKET_DATA_ARCHITECTURE.md.
+
 ---
 
 # Stock APIs

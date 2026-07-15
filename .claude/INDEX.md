@@ -94,6 +94,8 @@ SYSTEM_ARCHITECTURE.md
 
 REALTIME_SYSTEM.md
 
+MARKET_DATA_ARCHITECTURE.md
+
 DATABASE.md
 
 API_REFERENCE.md
@@ -289,6 +291,44 @@ Market
 News
 
 ---
+
+MARKET_DATA_ARCHITECTURE.md
+
+Purpose
+
+Authoritative source for all market data provider behavior.
+
+Defines:
+
+• Market Gateway
+
+• Source Manager
+
+• Provider Adapters (Yahoo, broker WebSockets, future licensed feeds)
+
+• Provider priority and automatic switching
+
+• Normalized market event model
+
+• Failover and recovery
+
+• Market data tiers (Free / Broker-Connected / Premium)
+
+Read When
+
+Market data
+
+Providers
+
+Broker feeds
+
+Scanner
+
+Market Engine
+
+Real-Time Features
+
+This document is mandatory for any work that touches how market data enters the platform.
 
 ---
 
@@ -616,6 +656,8 @@ Read
 
 MARKET_ENGINE.md
 
+MARKET_DATA_ARCHITECTURE.md
+
 REALTIME_SYSTEM.md
 
 DATABASE.md
@@ -686,6 +728,8 @@ Read
 
 BROKER_INTEGRATION.md
 
+MARKET_DATA_ARCHITECTURE.md
+
 REALTIME_SYSTEM.md
 
 DATABASE.md
@@ -735,6 +779,8 @@ API_REFERENCE.md
 Read
 
 REALTIME_SYSTEM.md
+
+MARKET_DATA_ARCHITECTURE.md
 
 SYSTEM_ARCHITECTURE.md
 
@@ -902,7 +948,7 @@ Always prefer Socket.IO for real-time updates.
 
 Only update affected components instead of re-rendering entire pages.
 
-All market data should flow through the Market Engine.
+All market data should flow through the Market Gateway and Market Engine. Never talk to a market data provider directly — see MARKET_DATA_ARCHITECTURE.md, the authoritative document for all provider behavior.
 
 Every new feature must integrate with the Real-Time System if live updates are required.
 

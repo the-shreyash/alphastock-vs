@@ -206,8 +206,12 @@ Never use development credentials.
        └───────────────┼────────────────┘
                        │
                  External Services
-       Claude • Gemini • Zerodha • Upstox
-       Yahoo Finance • NSE • Razorpay • Stripe
+          Claude • Gemini • Razorpay • Stripe
+                        │
+        Market Gateway → Provider Adapters
+   Broker WebSockets (Zerodha, Upstox, Angel One, Fyers, Dhan)
+     Yahoo Finance • NSE • Licensed Feeds (Future)
+           (see MARKET_DATA_ARCHITECTURE.md)
 
 ---
 
