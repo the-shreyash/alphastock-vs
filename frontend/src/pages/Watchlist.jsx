@@ -1,13 +1,22 @@
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef, memo, forwardRef } from "react";
 import { Link } from "react-router-dom";
 import api from "../services/api";
 import { formatNumber } from "../utils/formatters";
-import { useWebSocket } from "../hooks/useWebSocket";
 import { usePriceFlash } from "../hooks/usePriceFlash";
-import { useAuth } from "../context/AuthContext";
-import { useRealtimeStore, selectWatchlistEvent } from "../store/realtimeStore";
+import { useVirtualList } from "../hooks/useVirtualList";
+import {
+  useRealtimeStore,
+  selectConnected,
+  selectWatchlistEvent,
+  selectTickForSymbol,
+} from "../store/realtimeStore";
 import { Eye, Search, Plus, Trash2, ArrowUpRight, ArrowDownRight, Activity } from "lucide-react";
 import { motion } from "framer-motion";
+
+// Beyond this many rows the list windows itself (Sprint R9 virtualization);
+// smaller lists keep the staggered entrance animation.
+const VIRTUALIZE_AFTER = 60;
+const ROW_HEIGHT_ESTIMATE = 61;
 
 /* Scroll-reveal wrapper — fades/slides content in as it enters the viewport */
 function Reveal({ children, delay = 0, className }) {
@@ -96,13 +105,31 @@ function AddStockSearch({ onAdd, existing }) {
   );
 }
 
-function WatchlistRow({ item, onRemove }) {
-  const q = item.quote;
+/**
+ * One watchlist row (Sprint R9 selective rendering). Memoized and subscribed
+ * to ITS OWN symbol tick via the factory selector — combined with the store's
+ * tick identity preservation, a price burst re-renders only the rows whose
+ * symbols actually moved, instead of the page cloning the whole list.
+ */
+const WatchlistRow = memo(forwardRef(function WatchlistRow({ item, onRemove }, ref) {
+  const tick = useRealtimeStore(
+    useMemo(() => selectTickForSymbol(item.symbol), [item.symbol])
+  );
+  // Live tick fields overlay the REST quote (price/change from the 15s
+  // stream; RSI/volume ratio from the 120s watchlist.quotes stream).
+  const q = useMemo(() => {
+    if (!tick || tick.price == null) return item.quote;
+    return { ...(item.quote || {}), ...tick };
+  }, [item.quote, tick]);
+  // Since-added P&L recomputed from the streamed price when possible.
+  const sincePct = item.added_price && q?.price != null
+    ? Math.round(((q.price - item.added_price) / item.added_price) * 10000) / 100
+    : item.since_added_pct;
   const isPos = (q?.change_pct ?? 0) >= 0;
-  const sincePos = (item.since_added_pct ?? 0) >= 0;
+  const sincePos = (sincePct ?? 0) >= 0;
   const priceFlashRef = usePriceFlash(q?.price);
   return (
-    <div className="flex items-center gap-3 px-4 py-3 transition-all" style={{ borderBottom: "1px solid var(--border-subtle)" }}
+    <div ref={ref} className="flex items-center gap-3 px-4 py-3 transition-all" style={{ borderBottom: "1px solid var(--border-subtle)" }}
       onMouseEnter={e => e.currentTarget.style.background = "var(--hover)"}
       onMouseLeave={e => e.currentTarget.style.background = "transparent"}
     >
@@ -136,7 +163,7 @@ function WatchlistRow({ item, onRemove }) {
       <div className="text-right w-24 shrink-0 hidden lg:block">
         <span className="text-[9px] font-medium uppercase block" style={{ color: "var(--text-muted)" }}>Since Added</span>
         <span className="text-[12px] font-mono font-semibold" style={{ color: sincePos ? "var(--gain)" : "var(--loss)" }}>
-          {item.since_added_pct != null ? `${sincePos ? "+" : ""}${item.since_added_pct.toFixed(2)}%` : "—"}
+          {sincePct != null ? `${sincePos ? "+" : ""}${sincePct.toFixed(2)}%` : "—"}
         </span>
       </div>
 
@@ -153,11 +180,10 @@ function WatchlistRow({ item, onRemove }) {
       </button>
     </div>
   );
-}
+}));
 
 export default function Watchlist() {
-  const { user } = useAuth();
-  const { priceTicks, connected } = useWebSocket(user?._id || user?.id || "");
+  const connected = useRealtimeStore(selectConnected);
   const [items, setItems] = useState([]);
   const [loading, setLoading] = useState(true);
 
@@ -182,29 +208,9 @@ export default function Watchlist() {
     return () => clearInterval(i);
   }, [connected, fetchWatchlist]);
 
-  // Live-patch each row from the shared price store: the fast stream carries
-  // price/change, the watchlist.quotes stream (Sprint R8) adds RSI + volume
-  // ratio, and since-added P&L is recomputed from the streamed price.
-  useEffect(() => {
-    if (!priceTicks) return;
-    setItems(prev => prev.map(it => {
-      const tick = priceTicks[it.symbol];
-      if (!tick || tick.price == null) return it;
-      return {
-        ...it,
-        quote: {
-          ...(it.quote || {}),
-          price: tick.price,
-          change_pct: tick.change_pct,
-          ...(tick.rsi != null ? { rsi: tick.rsi } : {}),
-          ...(tick.volume_ratio != null ? { volume_ratio: tick.volume_ratio } : {}),
-        },
-        ...(it.added_price
-          ? { since_added_pct: Math.round((tick.price - it.added_price) / it.added_price * 10000) / 100 }
-          : {}),
-      };
-    }));
-  }, [priceTicks]);
+  // Live price/RSI/volume patching moved INTO each row (Sprint R9): every
+  // WatchlistRow subscribes to its own symbol tick, so a burst re-renders only
+  // the rows that moved — the page no longer clones the whole list per tick.
 
   // Cross-surface sync (Sprint R8): an add/remove made in another tab or the
   // dashboard widget lands here as a per-user watchlist.updated event.
@@ -227,12 +233,21 @@ export default function Watchlist() {
     } catch (err) { console.error(err); }
   };
 
-  const handleRemove = async (symbol) => {
+  // Stable reference so memoized rows never re-render because of the handler.
+  const handleRemove = useCallback(async (symbol) => {
     try {
       await api.delete(`/watchlist/${symbol}`);
       setItems(prev => prev.filter(i => i.symbol !== symbol));
     } catch (err) { console.error(err); }
-  };
+  }, []);
+
+  // Windowing (Sprint R9): long lists render only the rows near the viewport.
+  const virtualized = items.length > VIRTUALIZE_AFTER;
+  const vlist = useVirtualList({
+    count: items.length,
+    estimatedRowHeight: ROW_HEIGHT_ESTIMATE,
+    enabled: virtualized,
+  });
 
   if (loading) return (
     <div className="space-y-5 animate-fade-in-up">
@@ -278,17 +293,37 @@ export default function Watchlist() {
                 Tracking {items.length} {items.length === 1 ? "stock" : "stocks"}
               </span>
             </div>
-            {items.map((item, i) => (
-              <motion.div
-                key={item.symbol}
-                initial={{ opacity: 0, y: 12 }}
-                whileInView={{ opacity: 1, y: 0 }}
-                viewport={{ once: true, margin: "-40px" }}
-                transition={{ duration: 0.35, delay: Math.min(i, 8) * 0.04 }}
+            {virtualized ? (
+              <div
+                ref={vlist.containerRef}
+                onScroll={vlist.onScroll}
+                style={{ maxHeight: 640, overflowY: "auto" }}
+                data-testid="watchlist-virtual-scroll"
               >
-                <WatchlistRow item={item} onRemove={handleRemove} />
-              </motion.div>
-            ))}
+                <div style={{ paddingTop: vlist.padTop, paddingBottom: vlist.padBottom }}>
+                  {items.slice(vlist.start, vlist.end).map((item, i) => (
+                    <WatchlistRow
+                      key={item.symbol}
+                      ref={i === 0 ? vlist.measureRowRef : undefined}
+                      item={item}
+                      onRemove={handleRemove}
+                    />
+                  ))}
+                </div>
+              </div>
+            ) : (
+              items.map((item, i) => (
+                <motion.div
+                  key={item.symbol}
+                  initial={{ opacity: 0, y: 12 }}
+                  whileInView={{ opacity: 1, y: 0 }}
+                  viewport={{ once: true, margin: "-40px" }}
+                  transition={{ duration: 0.35, delay: Math.min(i, 8) * 0.04 }}
+                >
+                  <WatchlistRow item={item} onRemove={handleRemove} />
+                </motion.div>
+              ))
+            )}
           </div>
         </Reveal>
       )}

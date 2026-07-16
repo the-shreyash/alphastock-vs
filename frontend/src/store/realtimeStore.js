@@ -99,6 +99,41 @@ const TRADE_LIFECYCLE_EVENTS = new Set([
 // targets_hit levels) — keeps object identity stable across no-op snapshots.
 const sameRow = (a, b) => JSON.stringify(a) === JSON.stringify(b);
 
+// True when every field the incoming tick carries already matches the stored
+// tick — the merge can then keep the previous object identity so memoized
+// per-symbol subscribers skip re-render (Sprint R9 selective rendering).
+const tickUnchanged = (prev, tick) => {
+  if (!prev) return false;
+  for (const k in tick) {
+    if (tick[k] !== prev[k]) return false;
+  }
+  return true;
+};
+
+/**
+ * Extract the price map a message carries, or null when it isn't a price
+ * message. Used by the batched ingest path (Sprint R9) to coalesce every
+ * price-bearing message in a burst — the 15s `prices` broadcast, per-index
+ * `market.index.updated` events, `watchlist.quotes` — into ONE store write.
+ */
+const priceMapFromMessage = (msg) => {
+  if (!msg) return null;
+  if (msg.type === "prices") return msg.data || null;
+  if (msg.type === "price_tick") {
+    return msg.data?.symbol ? { [msg.data.symbol]: msg.data } : null;
+  }
+  if (msg.type !== "event") return null;
+  const data = msg.data || {};
+  if (msg.event === "market.index.updated") {
+    const sym = data.symbol || INDEX_SYMBOL[data.key] || data.key;
+    const mapped = INDEX_SYMBOL[sym] || sym;
+    if (!mapped || data.value == null) return {};
+    return { [String(mapped).toUpperCase()]: { price: data.value, change_pct: data.change_pct } };
+  }
+  if (msg.event === "watchlist.quotes") return data.quotes || null;
+  return null;
+};
+
 export const useRealtimeStore = create((set, get) => ({
   ...initialState,
 
@@ -115,9 +150,58 @@ export const useRealtimeStore = create((set, get) => ({
   decrementUnread: () =>
     set((s) => ({ unreadCount: Math.max(0, s.unreadCount - 1) })),
 
-  /** Merge a batch of live prices: { SYMBOL: { price, change_pct }, ... } */
+  /**
+   * Merge a batch of live prices: { SYMBOL: { price, change_pct }, ... }.
+   *
+   * Sprint R9 semantics:
+   *   - MERGE per symbol (never replace): the 15s price stream carries only
+   *     { price, change_pct } and must not wipe the RSI / volume_ratio fields
+   *     the 120s watchlist.quotes stream added to the same symbol.
+   *   - Preserve object identity when a tick carries no new values, and skip
+   *     the store write entirely when nothing changed, so subscribers only
+   *     re-render on real movement.
+   */
   _mergePrices: (map) =>
-    set((s) => ({ priceTicks: { ...s.priceTicks, ...map } })),
+    set((s) => {
+      if (!map) return {};
+      let changed = false;
+      const next = { ...s.priceTicks };
+      for (const [sym, tick] of Object.entries(map)) {
+        if (!tick) continue;
+        const prev = next[sym];
+        if (tickUnchanged(prev, tick)) continue;
+        next[sym] = prev ? { ...prev, ...tick } : tick;
+        changed = true;
+      }
+      return changed ? { priceTicks: next } : {};
+    }),
+
+  /**
+   * Batched ingest (Sprint R9 event batching). The provider queues inbound
+   * socket messages for a ~40ms window and hands the burst here: price-bearing
+   * messages are coalesced into one `_mergePrices` write, everything else is
+   * routed in arrival order. One heartbeat burst therefore produces one
+   * priceTicks update instead of one per message.
+   */
+  applyMessages: (msgs) => {
+    if (!Array.isArray(msgs) || msgs.length === 0) return;
+    const prices = {};
+    let havePrices = false;
+    for (const msg of msgs) {
+      const map = priceMapFromMessage(msg);
+      if (map) {
+        for (const [sym, tick] of Object.entries(map)) {
+          // Later ticks in the burst win field-by-field.
+          prices[sym] = prices[sym] ? { ...prices[sym], ...tick } : tick;
+          havePrices = true;
+        }
+        continue;
+      }
+      if (msg?.type === "event") get().applyEvent(msg);
+      else get().applyLegacy(msg);
+    }
+    if (havePrices) get()._mergePrices(prices);
+  },
 
   /**
    * Handle a legacy flat message. This is the pre-R2 `useWebSocket` switch,
@@ -504,6 +588,10 @@ export const selectConnected = (s) => s.connection.status === "live";
 export const selectConnectionStatus = (s) => s.connection.status;
 export const selectMarketData = (s) => s.marketData;
 export const selectPriceTicks = (s) => s.priceTicks;
+// Factory selector (Sprint R9): one symbol's tick only. Combined with
+// `_mergePrices` identity preservation, a memoized row subscribing through
+// this re-renders ONLY when its own symbol actually moves.
+export const selectTickForSymbol = (symbol) => (s) => (symbol ? s.priceTicks[symbol] || null : null);
 export const selectActivityUpdates = (s) => s.activityUpdates;
 // Factory selector: subscribe to one run only (stable per runId, null-safe).
 export const selectAIRunById = (runId) => (s) => (runId ? s.aiRuns[runId] || null : null);

@@ -44,6 +44,12 @@ const HEARTBEAT_MS = 30000; // send a ping every 30s
 const PONG_TIMEOUT_MS = 10000; // reconnect if no pong within 10s of a ping
 const BACKOFF_BASE_MS = 1000;
 const BACKOFF_MAX_MS = 30000;
+// Event batching (Sprint R9): inbound messages are queued for this window and
+// applied as one burst via `applyMessages`, so a heartbeat cycle that emits a
+// dozen events produces one coalesced store update instead of twelve.
+// setTimeout (not requestAnimationFrame) so batching keeps working in
+// background tabs. 40ms is imperceptible against 15s+ data cadences.
+const BATCH_WINDOW_MS = 40;
 
 function isAnon(id) {
   return !id || id === "anonymous" || id === "anon";
@@ -59,6 +65,8 @@ export function RealtimeProvider({ children }) {
   const pongTimerRef = useRef(null);
   const attemptRef = useRef(0);
   const closedByUsRef = useRef(false);
+  const batchRef = useRef([]); // queued inbound messages (Sprint R9 batching)
+  const batchTimerRef = useRef(null);
 
   useEffect(() => {
     const store = useRealtimeStore.getState();
@@ -68,10 +76,27 @@ export function RealtimeProvider({ children }) {
       return undefined;
     }
 
+    const flushBatch = () => {
+      batchTimerRef.current = null;
+      const batch = batchRef.current;
+      if (!batch.length) return;
+      batchRef.current = [];
+      useRealtimeStore.getState().applyMessages(batch);
+    };
+
+    const queueMessage = (msg) => {
+      batchRef.current.push(msg);
+      if (!batchTimerRef.current) {
+        batchTimerRef.current = setTimeout(flushBatch, BATCH_WINDOW_MS);
+      }
+    };
+
     const clearTimers = () => {
       if (reconnectRef.current) { clearTimeout(reconnectRef.current); reconnectRef.current = null; }
       if (heartbeatRef.current) { clearInterval(heartbeatRef.current); heartbeatRef.current = null; }
       if (pongTimerRef.current) { clearTimeout(pongTimerRef.current); pongTimerRef.current = null; }
+      if (batchTimerRef.current) { clearTimeout(batchTimerRef.current); batchTimerRef.current = null; }
+      batchRef.current = [];
     };
 
     const scheduleReconnect = () => {
@@ -125,17 +150,15 @@ export function RealtimeProvider({ children }) {
       ws.onmessage = (event) => {
         let msg;
         try { msg = JSON.parse(event.data); } catch { return; }
-        const st = useRealtimeStore.getState();
         if (msg.type === "pong") {
+          // Connection liveness is handled immediately — never batched.
           if (pongTimerRef.current) { clearTimeout(pongTimerRef.current); pongTimerRef.current = null; }
-          st.setConnection("live", { lastPongAt: Date.now() });
+          useRealtimeStore.getState().setConnection("live", { lastPongAt: Date.now() });
           return;
         }
-        if (msg.type === "event") {
-          st.applyEvent(msg);
-        } else {
-          st.applyLegacy(msg);
-        }
+        // Everything else joins the micro-batch window (Sprint R9): the store
+        // coalesces price-bearing messages and applies the rest in order.
+        queueMessage(msg);
       };
 
       ws.onclose = () => {

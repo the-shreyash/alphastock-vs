@@ -19,6 +19,11 @@ from typing import Awaitable, Callable, Optional
 logger = logging.getLogger(__name__)
 
 _memory: dict = {}
+# Bound for the in-memory fallback store (Sprint R9). Without Redis the
+# process would otherwise accumulate every key ever written (expired entries
+# are only dropped when re-read). When the bound is hit we sweep expired
+# entries first, then evict oldest-written entries if still over.
+_MEMORY_MAX_KEYS = 1024
 _redis_client = None
 _redis_failed = False
 
@@ -70,6 +75,29 @@ async def cache_get(key: str):
     return entry["data"]
 
 
+def _memory_store(key: str, value, ttl: int):
+    """Write to the bounded in-memory fallback store."""
+    if len(_memory) >= _MEMORY_MAX_KEYS and key not in _memory:
+        _prune_memory()
+    _memory[key] = {"data": value, "ts": datetime.now(timezone.utc), "ttl": ttl}
+
+
+def _prune_memory():
+    """Sweep expired entries; evict oldest-written if still at the bound."""
+    now = datetime.now(timezone.utc)
+    expired = [
+        k for k, e in _memory.items()
+        if (now - e["ts"]).total_seconds() >= e["ttl"]
+    ]
+    for k in expired:
+        _memory.pop(k, None)
+    overflow = len(_memory) - _MEMORY_MAX_KEYS + 1
+    if overflow > 0:
+        oldest = sorted(_memory.items(), key=lambda kv: kv[1]["ts"])[:overflow]
+        for k, _ in oldest:
+            _memory.pop(k, None)
+
+
 async def cache_set(key: str, value, ttl: int):
     """Store `value` under `key` for `ttl` seconds."""
     r = await _get_redis()
@@ -79,7 +107,7 @@ async def cache_set(key: str, value, ttl: int):
             return
         except Exception as e:
             logger.warning(f"Cache set failed for {key}: {e}")
-    _memory[key] = {"data": value, "ts": datetime.now(timezone.utc), "ttl": ttl}
+    _memory_store(key, value, ttl)
 
 
 async def cache_delete(key: str):
@@ -91,6 +119,67 @@ async def cache_delete(key: str):
         except Exception as e:
             logger.warning(f"Cache delete failed for {key}: {e}")
     _memory.pop(key, None)
+
+
+# ============ Batched operations (Sprint R9 — Redis optimization) ============
+
+async def cache_get_many(keys):
+    """Return {key: value} for every cached, unexpired key in `keys`.
+
+    Missing/expired keys are simply omitted. Against Redis this is ONE MGET
+    round-trip instead of len(keys) sequential GETs — the universe-quote
+    warm-up uses it to collapse ~50 round-trips into one."""
+    keys = [k for k in (keys or []) if k]
+    if not keys:
+        return {}
+    r = await _get_redis()
+    if r is not None:
+        try:
+            raw = await r.mget(keys)
+            out = {}
+            for key, val in zip(keys, raw):
+                if val is None:
+                    continue
+                try:
+                    out[key] = json.loads(val)
+                except Exception:
+                    continue
+            return out
+        except Exception as e:
+            logger.warning(f"Cache mget failed ({len(keys)} keys): {e}")
+    now = datetime.now(timezone.utc)
+    out = {}
+    for key in keys:
+        entry = _memory.get(key)
+        if not entry:
+            continue
+        if (now - entry["ts"]).total_seconds() >= entry["ttl"]:
+            _memory.pop(key, None)
+            continue
+        out[key] = entry["data"]
+    return out
+
+
+async def cache_set_many(mapping: dict, ttl: int):
+    """Store every {key: value} in `mapping` for `ttl` seconds.
+
+    Against Redis this is one pipelined round-trip instead of len(mapping)
+    sequential SETs."""
+    if not mapping:
+        return
+    r = await _get_redis()
+    if r is not None:
+        try:
+            pipe = r.pipeline(transaction=False)
+            ex = max(1, int(ttl))
+            for key, value in mapping.items():
+                pipe.set(key, json.dumps(value, default=str), ex=ex)
+            await pipe.execute()
+            return
+        except Exception as e:
+            logger.warning(f"Cache pipelined set failed ({len(mapping)} keys): {e}")
+    for key, value in mapping.items():
+        _memory_store(key, value, ttl)
 
 
 # ============ Redis Pub/Sub (cross-process event fan-out) ============

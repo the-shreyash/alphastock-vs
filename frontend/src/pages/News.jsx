@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo, memo } from "react";
 import { motion } from "framer-motion";
 import api from "../services/api";
 import { Newspaper, ExternalLink, RefreshCw, Search, TrendingUp, TrendingDown, Globe, AlertCircle, Tag, Building2 } from "lucide-react";
@@ -10,6 +10,56 @@ const IMPORTANCE_COLORS = {
   medium: { bg: "var(--hover)", color: "var(--text-muted)" },
   low: { bg: "var(--hover)", color: "var(--text-muted)" },
 };
+
+/**
+ * One news card (Sprint R9 memoization). The list holds up to 100 articles
+ * and re-renders on every streamed headline and search keystroke — memoizing
+ * the card limits that work to the rows that actually changed.
+ */
+const ArticleCard = memo(function ArticleCard({ article, index, onSelect }) {
+  return (
+    <motion.div data-testid={`news-article-${index}`}
+      className="glass-card p-4 cursor-pointer transition-all hover:-translate-y-px"
+      onClick={() => onSelect(article)}
+      initial={{ opacity: 0, y: 16 }} whileInView={{ opacity: 1, y: 0 }}
+      viewport={{ once: true, margin: "-40px" }} transition={{ duration: 0.35, delay: Math.min(index, 8) * 0.04 }}>
+      <div className="flex items-center gap-2 mb-2 flex-wrap">
+        <span className="badge-status" style={{ background: "var(--ai-accent-soft)", color: "var(--ai-accent)" }}>{article.source}</span>
+        <span className="text-[10px] font-mono" style={{ color: "var(--text-muted)" }}>
+          {article.published ? new Date(article.published).toLocaleString("en-IN", { hour: "2-digit", minute: "2-digit", day: "numeric", month: "short" }) : ""}
+        </span>
+        {article.sentiment && <SentimentBadge sentiment={article.sentiment} />}
+        {article.importance === "high" && (
+          <span className="text-[8px] font-bold px-1.5 py-0.5 rounded" style={{ background: "var(--loss-bg)", color: "var(--loss)" }}>
+            HIGH
+          </span>
+        )}
+        {article.is_breaking && (
+          <span className="text-[8px] font-bold px-1.5 py-0.5 rounded bg-red-500/20 text-red-400">
+            BREAKING
+          </span>
+        )}
+      </div>
+      <h3 className="text-[15px] font-semibold mb-1 font-display" style={{ color: "var(--text-primary)" }}>{article.title}</h3>
+      {article.summary && <p className="body-text line-clamp-2">{article.summary}</p>}
+      {/* Company/sector tags */}
+      {((article.companies?.length > 0) || (article.sectors?.length > 0)) && (
+        <div className="flex items-center gap-1.5 mt-2 flex-wrap">
+          {article.companies?.slice(0, 3).map(c => (
+            <span key={c} className="text-[9px] px-1.5 py-0.5 rounded-full flex items-center gap-0.5" style={{ background: "var(--hover)", color: "var(--text-secondary)" }}>
+              <Building2 size={8} /> {c}
+            </span>
+          ))}
+          {article.sectors?.slice(0, 2).map(s => (
+            <span key={s} className="text-[9px] px-1.5 py-0.5 rounded-full flex items-center gap-0.5" style={{ background: "var(--hover)", color: "var(--text-muted)" }}>
+              <Tag size={8} /> {s}
+            </span>
+          ))}
+        </div>
+      )}
+    </motion.div>
+  );
+});
 
 function SentimentBadge({ sentiment }) {
   if (!sentiment) return null;
@@ -74,13 +124,19 @@ export default function News() {
     } finally { setSentimentLoading(false); }
   };
 
-  const filtered = articles.filter(a => {
+  // Memoized derivations (Sprint R9): recompute only when their inputs change,
+  // not on every unrelated render (e.g. opening the article modal).
+  const filtered = useMemo(() => articles.filter(a => {
     const matchesSearch = !filter || (a.title + a.summary + a.source).toLowerCase().includes(filter.toLowerCase());
     const matchesTab = activeTab === "All" || (a.category || "market").toLowerCase() === activeTab.toLowerCase();
     return matchesSearch && matchesTab;
-  });
+  }), [articles, filter, activeTab]);
 
-  const sources = [...new Set(articles.map(a => a.source))];
+  const sourceCounts = useMemo(() => {
+    const counts = new Map();
+    for (const a of articles) counts.set(a.source, (counts.get(a.source) || 0) + 1);
+    return [...counts.entries()];
+  }, [articles]);
 
   return (
     <div data-testid="news-page" className="space-y-6">
@@ -136,46 +192,12 @@ export default function News() {
           ) : (
             <div className="space-y-2.5">
               {filtered.map((article, i) => (
-                <motion.div key={i} data-testid={`news-article-${i}`}
-                  className="glass-card p-4 cursor-pointer transition-all hover:-translate-y-px"
-                  onClick={() => setSelectedArticle(article)}
-                  initial={{ opacity: 0, y: 16 }} whileInView={{ opacity: 1, y: 0 }}
-                  viewport={{ once: true, margin: "-40px" }} transition={{ duration: 0.35, delay: Math.min(i, 8) * 0.04 }}>
-                  <div className="flex items-center gap-2 mb-2 flex-wrap">
-                    <span className="badge-status" style={{ background: "var(--ai-accent-soft)", color: "var(--ai-accent)" }}>{article.source}</span>
-                    <span className="text-[10px] font-mono" style={{ color: "var(--text-muted)" }}>
-                      {article.published ? new Date(article.published).toLocaleString("en-IN", { hour: "2-digit", minute: "2-digit", day: "numeric", month: "short" }) : ""}
-                    </span>
-                    {article.sentiment && <SentimentBadge sentiment={article.sentiment} />}
-                    {article.importance === "high" && (
-                      <span className="text-[8px] font-bold px-1.5 py-0.5 rounded" style={{ background: "var(--loss-bg)", color: "var(--loss)" }}>
-                        HIGH
-                      </span>
-                    )}
-                    {article.is_breaking && (
-                      <span className="text-[8px] font-bold px-1.5 py-0.5 rounded bg-red-500/20 text-red-400">
-                        BREAKING
-                      </span>
-                    )}
-                  </div>
-                  <h3 className="text-[15px] font-semibold mb-1 font-display" style={{ color: "var(--text-primary)" }}>{article.title}</h3>
-                  {article.summary && <p className="body-text line-clamp-2">{article.summary}</p>}
-                  {/* Company/sector tags */}
-                  {((article.companies?.length > 0) || (article.sectors?.length > 0)) && (
-                    <div className="flex items-center gap-1.5 mt-2 flex-wrap">
-                      {article.companies?.slice(0, 3).map(c => (
-                        <span key={c} className="text-[9px] px-1.5 py-0.5 rounded-full flex items-center gap-0.5" style={{ background: "var(--hover)", color: "var(--text-secondary)" }}>
-                          <Building2 size={8} /> {c}
-                        </span>
-                      ))}
-                      {article.sectors?.slice(0, 2).map(s => (
-                        <span key={s} className="text-[9px] px-1.5 py-0.5 rounded-full flex items-center gap-0.5" style={{ background: "var(--hover)", color: "var(--text-muted)" }}>
-                          <Tag size={8} /> {s}
-                        </span>
-                      ))}
-                    </div>
-                  )}
-                </motion.div>
+                <ArticleCard
+                  key={`${article.title}-${article.published || ""}`}
+                  article={article}
+                  index={i}
+                  onSelect={setSelectedArticle}
+                />
               ))}
             </div>
           )}
@@ -227,10 +249,10 @@ export default function News() {
             viewport={{ once: true, margin: "-60px" }} transition={{ duration: 0.4, delay: 0.06 }}>
             <h3 className="eyebrow mb-3">Sources</h3>
             <div className="space-y-1.5">
-              {sources.slice(0, 6).map(src => (
+              {sourceCounts.slice(0, 6).map(([src, count]) => (
                 <div key={src} className="flex items-center justify-between px-2.5 py-2 rounded-lg" style={{ background: "var(--hover)" }}>
                   <span className="text-[13px] font-medium" style={{ color: "var(--text-secondary)" }}>{src}</span>
-                  <span className="text-[11px] font-mono" style={{ color: "var(--text-muted)" }}>{articles.filter(a => a.source === src).length}</span>
+                  <span className="text-[11px] font-mono" style={{ color: "var(--text-muted)" }}>{count}</span>
                 </div>
               ))}
             </div>

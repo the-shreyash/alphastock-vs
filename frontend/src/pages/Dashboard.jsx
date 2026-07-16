@@ -753,7 +753,9 @@ export default function Dashboard() {
       const next = { ...prev };
       for (const [key, sym] of Object.entries(idxMap)) {
         const tick = priceTicks[sym];
-        if (tick?.price != null) {
+        // Skip no-op ticks (Sprint R9) — only real movement produces a render.
+        if (tick?.price != null &&
+            (prev[key]?.value !== tick.price || prev[key]?.change_pct !== tick.change_pct)) {
           next[key] = { ...(prev[key] || {}), value: tick.price, change_pct: tick.change_pct };
           changed = true;
         }
@@ -819,11 +821,18 @@ export default function Dashboard() {
   // Watchlist widget: live price patch + cross-surface add/remove sync.
   useEffect(() => {
     if (!priceTicks) return;
-    setWatchlist(prev => prev.map(w => {
-      const tick = priceTicks[w.symbol];
-      if (!tick || tick.price == null) return w;
-      return { ...w, quote: { ...(w.quote || {}), price: tick.price, change_pct: tick.change_pct } };
-    }));
+    setWatchlist(prev => {
+      let changed = false;
+      const next = prev.map(w => {
+        const tick = priceTicks[w.symbol];
+        if (!tick || tick.price == null) return w;
+        // Keep row identity when the tick carries no new values (Sprint R9).
+        if (w.quote?.price === tick.price && w.quote?.change_pct === tick.change_pct) return w;
+        changed = true;
+        return { ...w, quote: { ...(w.quote || {}), price: tick.price, change_pct: tick.change_pct } };
+      });
+      return changed ? next : prev;
+    });
   }, [priceTicks]);
 
   useEffect(() => {

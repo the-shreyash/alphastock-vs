@@ -1028,6 +1028,37 @@ One socket connection.
 
 No unnecessary polling.
 
+## Implementation (Sprint R9)
+
+Event batching — `RealtimeProvider` queues inbound socket messages for a 40ms
+window and hands the burst to `realtimeStore.applyMessages`, which coalesces
+every price-bearing message (`prices`, `market.index.updated`,
+`watchlist.quotes`) into ONE `priceTicks` write; other events apply in arrival
+order. `pong` bypasses the batch (connection liveness is immediate).
+
+Selective rendering — `_mergePrices` MERGES per symbol (the 15s price stream
+no longer wipes the RSI/volume fields the 120s watchlist stream added),
+preserves tick object identity on no-op updates, and skips the store write
+when nothing moved. `selectTickForSymbol(symbol)` lets a memoized row
+subscribe to its own symbol only — Watchlist rows re-render individually.
+
+Virtualization — `hooks/useVirtualList.js` (dependency-free windowing with
+measured row height); the Watchlist windows itself beyond 60 rows.
+
+Lazy loading — every routed page is `React.lazy` (route-level code splitting);
+`App.js` holds the outer Suspense, `Layout` a nested one so navigation swaps
+only the content region, never the shell.
+
+Memoization — memoized `WatchlistRow` / News `ArticleCard`; News filtering and
+source counts are `useMemo`d; Dashboard tick-patch effects keep previous state
+identity on no-op ticks.
+
+Redis optimization — `cache_get_many` (MGET) / `cache_set_many` (pipeline) in
+`services/cache.py`; the in-memory fallback is bounded (expired sweep + oldest
+eviction at 1024 keys); `fetch_all_universe_quotes` warms every per-symbol
+quote key in one MGET; `ConnectionManager` serializes each fan-out message
+once (`send_text`) instead of `json.dumps` per socket.
+
 ---
 
 # Developer Rules

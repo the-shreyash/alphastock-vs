@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, Suspense } from "react";
 import { Outlet, useLocation } from "react-router-dom";
 import { motion, AnimatePresence } from "framer-motion";
 import Sidebar, { SIDEBAR_COLLAPSED_W, SIDEBAR_EXPANDED_W, SIDEBAR_MOBILE_W } from "./Sidebar";
@@ -82,7 +82,18 @@ export default function Layout() {
               exit={{ opacity: 0, y: -8 }}
               transition={{ duration: 0.25, ease: "easeOut" }}
             >
-              <Outlet />
+              {/* Nested Suspense (Sprint R9 lazy loading): a lazily loaded
+                  page chunk suspends only the content region — the sidebar,
+                  navbar and toast host never unmount during navigation. */}
+              <Suspense
+                fallback={
+                  <div className="min-h-[50vh] flex items-center justify-center">
+                    <div className="w-8 h-8 border-2 rounded-full animate-spin" style={{ borderColor: "var(--border)", borderTopColor: "var(--ai-accent)" }} />
+                  </div>
+                }
+              >
+                <Outlet />
+              </Suspense>
             </motion.div>
           </AnimatePresence>
         </main>

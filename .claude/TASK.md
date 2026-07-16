@@ -1400,6 +1400,98 @@ Verification
 
 ---
 
+# Sprint R9 — Performance Optimization
+
+Status
+
+COMPLETED
+
+Authority
+
+REALTIME_SYSTEM.md (§ "Performance Rules" — batch updates, virtualize long
+lists, lazy load, memoize, only changed components rerender) + the
+performance skill targets (fast initial load, minimal re-renders, efficient
+Redis usage).
+
+Objective
+
+Land the doc's performance rules as concrete infrastructure: batch the event
+firehose on the client, stop no-op re-renders at the store, window long
+lists, split the bundle per route, and cut Redis round-trips + per-socket
+serialization on the backend.
+
+Delivered — Frontend
+
+- [x] Event batching (`context/RealtimeProvider.jsx`) — inbound socket
+  messages queue for a 40ms window (setTimeout, so batching survives
+  background tabs) and apply as one burst via the store's new
+  `applyMessages`; `pong` bypasses the batch. A heartbeat cycle that emits a
+  dozen events now produces one coalesced store update.
+- [x] Store coalescing + selective rendering (`store/realtimeStore.js`) —
+  `applyMessages` folds every price-bearing message in a burst (`prices`,
+  `price_tick`, `market.index.updated`, `watchlist.quotes`) into ONE
+  `_mergePrices` write. `_mergePrices` now MERGES per symbol — fixing a real
+  bug where the 15s price stream replaced tick objects and wiped the
+  RSI/volume_ratio fields the 120s watchlist stream had added — preserves
+  object identity on no-op ticks, and skips the write entirely when nothing
+  moved. New factory selector `selectTickForSymbol`.
+- [x] Memoization — `WatchlistRow` is `memo`ized and subscribes to its own
+  symbol tick (a burst re-renders only rows whose symbols moved; the page no
+  longer clones the whole list per tick); News page gains a memoized
+  `ArticleCard` (stable title+published keys, was index-keyed), `useMemo`d
+  filtering and source counts; Dashboard's index/watchlist tick-patch effects
+  keep previous state identity on no-op ticks.
+- [x] Virtualization (`hooks/useVirtualList.js`, new) — dependency-free list
+  windowing (scroll-window + spacer paddings, row height corrected from the
+  first rendered row). Watchlist windows itself beyond 60 rows; smaller lists
+  keep the staggered entrance animation.
+- [x] Lazy loading (`App.js`, `components/layout/Layout.jsx`) — all 21 routed
+  pages converted to `React.lazy` route-level code splitting; outer Suspense
+  in App.js for public pages, nested Suspense around Layout's `<Outlet/>` so
+  in-app navigation suspends only the content region (sidebar/navbar/toast
+  host never unmount). Main bundle drops to ~160 kB gz with page chunks
+  (86/55/27 kB…) loading on demand.
+
+Delivered — Backend (Redis optimization)
+
+- [x] `services/cache.py` — `cache_get_many` (one MGET round-trip) and
+  `cache_set_many` (one non-transactional pipeline); the in-memory fallback
+  store is now bounded (1024 keys: expired-entry sweep first, oldest-written
+  eviction only if still over) instead of growing forever.
+- [x] `services/real_market.fetch_all_universe_quotes` — when the 30s bundle
+  key misses, every per-symbol quote key is warmed in ONE `cache_get_many`
+  call (~50 sequential Redis GETs → 1 MGET); only true misses fall through to
+  the Yahoo fetch.
+- [x] `server.py` `ConnectionManager` — every fan-out path (`broadcast`,
+  `broadcast_to_channel`, `send_to_user`) serializes the message ONCE and
+  sends text; previously `ws.send_json` re-ran `json.dumps` per socket.
+  `send_to_user` also short-circuits when the user has no sockets.
+
+Verification
+
+- `tests/test_sprint_r9.py` (new, 7 hermetic tests): get_many/set_many
+  roundtrip + expired/missing key omission + empty-input safety, memory bound
+  under overflow, expired-sweep-before-eviction, universe warm-hit skips the
+  HTTP fetch (metadata still applied), broadcast sends one identical
+  pre-serialized payload to every subscribed socket + reaps dead sockets,
+  datetime-safe serialization. `test_event_bridge.py`'s FakeWS extended with
+  `send_text`.
+- Full hermetic backend suite: 227 passed (the single `test_trading_engine`
+  failure is pre-existing — fails on the clean tree too, noted since R7).
+- Frontend `CI=false yarn build` (craco) compiles clean; only the 3
+  pre-existing eslint warnings in untouched files remain. Bundle is now
+  route-split (main ~160 kB gz + ~30 on-demand chunks).
+
+Notes / follow-ups
+
+- News list stays memoized-but-unvirtualized (100-article cap, variable card
+  heights); revisit with `useVirtualList` if the cap ever grows.
+- The batching window is client-side only; backend producers already batch
+  (15s `prices` map, 120s `watchlist.quotes`). If per-tick broker feeds ever
+  broadcast publicly, add server-side coalescing at the bridge.
+
+---
+
 # Technical Debt
 
 Every technical debt item must contain

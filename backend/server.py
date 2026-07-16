@@ -2522,32 +2522,44 @@ class ConnectionManager:
         for ch in channels or []:
             subs.discard(str(ch))
 
+    @staticmethod
+    def _serialize(message: dict) -> str:
+        """Serialize a fan-out message ONCE (Sprint R9). `ws.send_json` runs
+        json.dumps per socket, so a broadcast to N sockets paid N serializations
+        of the same payload; every fan-out path now dumps once and sends text."""
+        return json.dumps(message, default=str)
+
     async def broadcast(self, message: dict):
+        payload = self._serialize(message)
         dead = set()
         for ws in self.active:
             try:
-                await ws.send_json(message)
+                await ws.send_text(payload)
             except Exception:
                 dead.add(ws)
         self._reap(dead)
 
     async def broadcast_to_channel(self, channel: str, message: dict):
         """Send to sockets subscribed to `channel` (or the "*" wildcard channel)."""
+        payload = self._serialize(message)
         dead = set()
         for ws, subs in list(self.channels.items()):
             if channel in subs or "*" in subs:
                 try:
-                    await ws.send_json(message)
+                    await ws.send_text(payload)
                 except Exception:
                     dead.add(ws)
         self._reap(dead)
 
     async def send_to_user(self, user_id: str, message: dict):
         conns = self.user_connections.get(user_id, set())
+        if not conns:
+            return
+        payload = self._serialize(message)
         dead = set()
         for ws in conns:
             try:
-                await ws.send_json(message)
+                await ws.send_text(payload)
             except Exception:
                 dead.add(ws)
         self._reap(dead)
