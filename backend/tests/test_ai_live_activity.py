@@ -2,12 +2,13 @@
 
 Locks the ai.run.* event contract for the instrumented pipelines:
 
-  • Morning report (server.generate_morning_report): ordered, truthful step
-    events — started → running/done pairs in label order → completed.
+  • Morning report (services.morning_report.get_morning_report): ordered,
+    truthful step events — started → running/done pairs in label order →
+    completed.
   • run_id passthrough: the client-supplied correlation id is echoed on every
     event of the run (HTTP query param → AIRun).
-  • Cache hit: a cached report returns before the run starts — zero ai.* events
-    (REALTIME_SYSTEM.md: never fake AI progress).
+  • Cache hit: a cached report returns before the run starts — zero market-layer
+    events (REALTIME_SYSTEM.md: never fake AI progress).
   • Failure honesty: a failing fetch marks its step `warning` and the run
     completes `warning`.
   • Scheduler job (morning_analysis_job): broadcast run — user_id is None on
@@ -32,6 +33,14 @@ REAL_OVERVIEW = {
 TOP_PICKS = {"picks": [{"symbol": "RELIANCE", "name": "Reliance", "confidence": 82}]}
 SECTORS = [{"sector": "IT", "change_pct": 1.2}]
 NEWS_SENTIMENT = {"available": True, "score": 62, "label": "Bullish", "articles_analyzed": 40}
+GLOBAL_MARKETS = [
+    {"name": "Dow Jones", "region": "US", "value": 44000.0, "change_pct": 0.4, "available": True},
+    {"name": "Nikkei 225", "region": "Asia", "value": 39000.0, "change_pct": -0.2, "available": True},
+]
+NEWS_ARTICLES = [
+    {"title": "Nifty eyes record high", "source": "ET", "link": "http://e.x/1",
+     "sentiment": "positive", "importance": "high", "published": "2026-07-16T01:00:00"},
+]
 
 
 def _run(coro):
@@ -39,13 +48,20 @@ def _run(coro):
 
 
 def _patches(**overrides):
-    """Patches for every external fetch the morning-report pipeline performs."""
+    """Patches for every external fetch the morning-report pipeline performs.
+
+    Patched at the provider layer (services.real_market / services.news_service)
+    rather than at the gateway, so the gateway's own normalize/validate path
+    stays under test.
+    """
     targets = {
         "services.real_market.fetch_real_market_overview": REAL_OVERVIEW,
         "services.real_market.fetch_real_top_picks": TOP_PICKS,
         "services.real_market.fetch_real_sectors": SECTORS,
         "services.real_market.fetch_real_fii_dii": {"fii": {"net": -1200}, "dii": {"net": 900}},
+        "services.real_market.fetch_real_global_markets": GLOBAL_MARKETS,
         "services.news_service.get_market_sentiment": NEWS_SENTIMENT,
+        "services.news_service.fetch_news": NEWS_ARTICLES,
     }
     targets.update(overrides)
     return [
@@ -53,6 +69,10 @@ def _patches(**overrides):
             {"side_effect": value} if isinstance(value, Exception) else {"return_value": value}))
         for target, value in targets.items()
     ]
+
+
+def _user(uid="u1"):
+    return {"_id": uid, "email": "t@example.com"}
 
 
 class _Spy:
@@ -85,7 +105,7 @@ def _steps_of(events, status=None):
 # ---------------------------------------------------------------------------
 
 def test_morning_report_emits_ordered_run_events(fake_db, no_ai):
-    import server
+    from services import morning_report as mr
 
     async def run():
         with _Spy() as spy:
@@ -93,7 +113,7 @@ def test_morning_report_emits_ordered_run_events(fake_db, no_ai):
             for p in patches:
                 p.start()
             try:
-                report = await server.generate_morning_report(user_id="u1", run_id="r1")
+                report = await mr.get_morning_report(fake_db, user=_user(), run_id="r1")
             finally:
                 for p in patches:
                     p.stop()
@@ -101,19 +121,22 @@ def test_morning_report_emits_ordered_run_events(fake_db, no_ai):
 
     report, events = _run(run())
 
+    # A signed-in request plans the shared market steps plus the personal one.
+    expected_steps = mr.MARKET_STEPS + [mr.PERSONAL_STEP]
+
     assert report["available"] is True
     assert events[0]["type"] == "ai.run.started"
     started = events[0]["data"]
     assert started["run_id"] == "r1"
     assert started["user_id"] == "u1"
-    assert started["steps"] == server.MORNING_REPORT_STEPS
+    assert started["steps"] == expected_steps
 
     # Every step runs then finishes, in plan order, with matching indices.
     running = _steps_of(events, "running")
     done = _steps_of(events, "done")
-    assert [s["data"]["label"] for s in running] == server.MORNING_REPORT_STEPS
-    assert [s["data"]["label"] for s in done] == server.MORNING_REPORT_STEPS
-    assert [s["data"]["index"] for s in running] == list(range(len(server.MORNING_REPORT_STEPS)))
+    assert [s["data"]["label"] for s in running] == expected_steps
+    assert [s["data"]["label"] for s in done] == expected_steps
+    assert [s["data"]["index"] for s in running] == list(range(len(expected_steps)))
 
     assert events[-1]["type"] == "ai.run.completed"
     assert events[-1]["data"]["status"] == "done"
@@ -143,7 +166,16 @@ def test_run_id_passthrough_via_http(client, fake_db, auth_headers, no_ai):
     assert completed and completed[0]["data"]["run_id"] == "abc-123"
 
 
-def test_cached_report_emits_no_run_events(client, fake_db, auth_headers, no_ai):
+def test_cached_report_skips_market_layer_steps(client, fake_db, auth_headers, no_ai):
+    """A cached market layer is never re-announced as work.
+
+    The personal layer still runs on a cache hit — the user's portfolio is
+    reviewed fresh every request — so its step is truthful and expected. What
+    must NOT appear is any market-layer step, which would be fabricated progress
+    for fetches that never happened.
+    """
+    from services import morning_report as mr
+
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     fake_db.reports.docs.append({
         "date": today, "type": "morning", "available": True,
@@ -156,11 +188,17 @@ def test_cached_report_emits_no_run_events(client, fake_db, auth_headers, no_ai)
 
     assert response.status_code == 200, response.text
     assert response.json()["ai_briefing"] == "cached"
-    assert spy.events == [], "a cache hit must not fake an AI run"
+
+    labels = [e["data"]["label"] for e in _steps_of(spy.events)]
+    assert not (set(labels) & set(mr.MARKET_STEPS)), (
+        f"cache hit must not fake market-layer progress, got {labels}")
+    assert set(labels) == {mr.PERSONAL_STEP}
 
 
-def test_failed_fetch_marks_step_and_run_warning(fake_db, no_ai):
-    import server
+def test_failed_section_degrades_honestly(fake_db, no_ai):
+    """A dead scanner costs the picks section — not the whole briefing — and the
+    timeline says `warning` rather than claiming the step succeeded."""
+    from services import morning_report as mr
 
     async def run():
         with _Spy() as spy:
@@ -170,24 +208,28 @@ def test_failed_fetch_marks_step_and_run_warning(fake_db, no_ai):
             for p in patches:
                 p.start()
             try:
-                with pytest.raises(RuntimeError):
-                    await server.generate_morning_report(user_id="u1", run_id="r2")
+                report = await mr.get_morning_report(fake_db, user=_user(), run_id="r2")
             finally:
                 for p in patches:
                     p.stop()
-        return spy.events
+        return report, spy.events
 
-    events = _run(run())
+    report, events = _run(run())
 
+    # The rest of the report still reached the user.
+    assert report["available"] is True
+    assert report["top_picks"] == []
+    assert report["nifty"]["value"] == 24500.0
+
+    # ...but the failure is reported, never papered over.
     warnings = _steps_of(events, "warning")
-    assert len(warnings) == 1
-    assert warnings[0]["data"]["label"] == "Scanning NSE"
+    assert [w["data"]["label"] for w in warnings] == ["Scanning NSE"]
     assert events[-1]["type"] == "ai.run.completed"
     assert events[-1]["data"]["status"] == "warning"
 
 
 def test_unavailable_overview_completes_run_with_warning(fake_db, no_ai):
-    import server
+    from services import morning_report as mr
 
     async def run():
         with _Spy() as spy:
@@ -197,7 +239,7 @@ def test_unavailable_overview_completes_run_with_warning(fake_db, no_ai):
             for p in patches:
                 p.start()
             try:
-                report = await server.generate_morning_report(user_id="u1")
+                report = await mr.get_morning_report(fake_db, user=_user())
             finally:
                 for p in patches:
                     p.stop()

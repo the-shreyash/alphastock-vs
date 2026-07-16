@@ -60,19 +60,39 @@ class _Step:
     On enter it marks the stage ``running``; on a clean exit ``done``; on an
     exception ``warning`` (and the exception is re-raised so the caller's own
     error handling still runs). All emission is best-effort.
+
+    A stage that handles its own failure — degrading a section rather than
+    aborting the pipeline — must call :meth:`warn`, so the timeline reports the
+    partial result honestly instead of a ``done`` for work that did not succeed::
+
+        async with run.step() as step:
+            try:
+                data = await fetch()
+            except Exception:
+                step.warn()      # section degrades; run continues
+                data = []
     """
 
     def __init__(self, run: "AIRun", index: int) -> None:
         self._run = run
         self._index = index
+        self._degraded = False
+
+    def warn(self) -> None:
+        """Mark this stage as degraded — it finishes ``warning``, not ``done``."""
+        self._degraded = True
+        self._run._degraded = True
 
     async def __aenter__(self) -> "_Step":
         await self._run._emit_step(self._index, STATUS_RUNNING)
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> bool:
+        degraded = bool(exc_type) or self._degraded
+        if exc_type:
+            self._run._degraded = True
         await self._run._emit_step(
-            self._index, STATUS_WARNING if exc_type else STATUS_DONE
+            self._index, STATUS_WARNING if degraded else STATUS_DONE
         )
         return False  # never suppress the caller's exception
 
@@ -112,6 +132,9 @@ class AIRun:
         self._cursor = -1
         self._t0 = time.monotonic()
         self._completed = False
+        # Set when any step failed or degraded, so complete() can default the
+        # run's status to `warning` rather than claiming an unqualified success.
+        self._degraded = False
 
     # ---- internal emission (best-effort) ----
     async def _publish(self, event_type: str, data: dict) -> None:
@@ -163,10 +186,17 @@ class AIRun:
         return _Step(self, self._cursor)
 
     async def complete(self, status: str = STATUS_DONE) -> None:
-        """Close the run. Safe to call once; further calls are ignored."""
+        """Close the run. Safe to call once; further calls are ignored.
+
+        A run in which any step degraded completes ``warning`` even when the
+        caller asks for ``done`` — the pipeline produced a partial result and
+        the timeline must say so.
+        """
         if self._completed or not self.total:
             return
         self._completed = True
+        if status == STATUS_DONE and self._degraded:
+            status = STATUS_WARNING
         await self._publish(
             EVENT_RUN_COMPLETED,
             {

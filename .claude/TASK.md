@@ -1492,6 +1492,139 @@ Notes / follow-ups
 
 ---
 
+# Sprint 10 — Morning Report
+
+Status
+
+COMPLETED
+
+Authority
+
+AI_AGENT_SYSTEM.md (§9 "Morning Report Agent"), MARKET_ENGINE.md (§ "Morning
+Report Builder"), PROMPT.md (§ "Morning Report Prompt"), DATABASE.md,
+MARKET_DATA_ARCHITECTURE.md (all market reads via the Market Gateway).
+
+Objective
+
+Complete the automated Morning Report: every market day before the open,
+covering Global Markets, Gift Nifty, News, Economic Calendar, Scanner, Top
+Picks, Risk Warnings and Portfolio Alerts, with notifications sent
+automatically.
+
+Starting state — the report existed (mood, indices, picks, key risks, AI
+briefing, FII/DII) but was missing most of the doc's sections, and its
+"Global Cues" line was a **hardcoded sentence** asserting the same claim
+every morning regardless of what global markets did.
+
+Architecture — two layers
+
+The report is now split, because its halves have different identities and
+lifetimes. The shared **market layer** (global markets, Gift Nifty, news,
+calendar, scanner, picks, risks) costs tens of provider calls, so it is built
+once per day and persisted to `db.reports`. The per-user **personal layer**
+(portfolio alerts) is computed fresh on every request and never written into
+the shared document — a correctness requirement, not an optimization: the
+shared doc is cached by *date alone*, so any per-user field stored in it
+would be served to the next user who asked. Merged at read time by
+`get_morning_report()`.
+
+Delivered — Backend
+
+- [x] `services/morning_report.py` (new) — owns the whole pipeline; the 8:30
+  job and the on-demand API route both call it, so a scheduled briefing and a
+  user-requested one can never drift apart. Extracted ~130 lines of business
+  logic out of `server.py` (routes now only wire).
+- [x] Global Markets — real, via `market_gateway.get_global_markets()`.
+  Replaces the fabricated "US futures and Asian markets influencing early
+  Indian session…" string with a summary derived from the actual quotes
+  ("Overnight global cues are broadly positive — 4 of 6 tracked indices closed
+  higher. Hang Seng +2.80% led; Nikkei 225 -2.79% lagged."). `global_cues` is
+  retained as a field for the Dashboard card and existing API consumers, now
+  carrying that real text.
+- [x] Gift Nifty — `services/market_engine/gift_nifty.py` (new): a collector
+  behind the gateway with a priority-ordered adapter chain, normalization,
+  validation and caching. No free feed carries Gift Nifty (probed Yahoo, NSE
+  IX, Alpha Vantage; it is an NSE IX instrument needing a data subscription),
+  so it ships reporting `available: false` with the reason the UI shows
+  verbatim — never a derived guess. A licensed feed registers one adapter and
+  every consumer picks it up unchanged.
+- [x] News — top headlines (high-importance first, then newest) alongside the
+  existing sentiment score.
+- [x] Economic Calendar — today's events + nearest high-importance ones, via
+  the previously-unused `economic_calendar.get_calendar()`.
+- [x] Risk Warnings — now also fold in today's high-importance calendar events
+  and an indicated Gift Nifty gap; every line still names its evidence.
+- [x] Portfolio Alerts — cross-references holdings against this morning's
+  market state (risk factors from the portfolio engine, holdings in weak
+  sectors, headlines naming a stock the user owns, critical monitor flags).
+  Every alert carries a `why`.
+- [x] Prompt — the AI briefing now loads from `prompt_library` (`morning_report`)
+  instead of a hardcoded string, per PROMPT.md ("never hardcode prompts").
+- [x] Notifications — **two bugs fixed**: the job checked the `trade_alerts`
+  preference instead of the `morning_report` preference `models.py` defines,
+  and only swept `db.trades.distinct("user_id")` — so a user who subscribed to
+  the morning report but had never placed a trade was silently never notified.
+  Now honors `morning_report`, reaches every subscriber, dedupes (180 min), and
+  sends the branded HTML email via `build_morning_report_email`.
+- [x] Honest degradation — `services/ai_activity.py` gained `step.warn()`:
+  a section that fails and degrades marks its step `warning` and the run
+  completes `warning`, instead of reporting `done` for work that didn't
+  succeed. A dead scanner now costs the picks section, not the whole briefing.
+
+Delivered — Frontend
+
+- [x] `components/morning/` (new) — `GiftNiftyCard`, `GlobalMarketsCard`,
+  `NewsHeadlines`, `EconomicCalendarCard`, `PortfolioAlertsCard`, and a shared
+  `SectionUnavailable` that renders the backend's own reason verbatim.
+- [x] `pages/MorningReport.jsx` — composes the new sections; portfolio alerts
+  lead (the payoff), then overnight (global + Gift Nifty + FII/DII), then news
+  + calendar, then risks.
+- [x] Unavailable states are honest end-to-end — the FII/DII card previously
+  rendered `₹0 Cr` when the value was missing ("institutions were flat" is a
+  materially different claim from "NSE hasn't published yet"); it and
+  `IndexCard` now say so.
+
+Verification
+
+- `tests/test_sprint10_morning_report.py` (new, 20 hermetic tests): every
+  section present; global summary reflects real quotes and degrades honestly;
+  headlines rank high-importance first; risks grounded in the collected VIX /
+  FII numbers; unavailable inputs reported not invented; Gift Nifty
+  unavailable without a feed, uses a registered adapter, falls through a
+  failing one, rejects a nonsense quote, and surfaces a gap as a risk;
+  portfolio alerts connect market events to holdings, are severity-ordered,
+  carry reasoning, degrade alone, and **never enter the shared cache**;
+  notifications honor the preference and reach a never-traded user.
+- `tests/test_ai_live_activity.py` updated to the service and the new
+  contracts (a cache hit must still not fake *market-layer* progress; a failed
+  section degrades honestly rather than failing the report).
+- `tests/_fakedb.py` — `_Cursor.__aiter__` added so the double speaks the
+  Motor cursor protocol the notification sweep uses (`async for` instead of
+  loading every user into memory).
+- Full hermetic backend suite: 247 passed, up from 227. The 48 failures are
+  pre-existing and identical on a clean tree (verified by stashing) — they
+  need a live server on :8000.
+- Driven end-to-end against live providers: real global markets, headlines,
+  calendar and picks populate; Gift Nifty reports unavailable; the personal
+  layer does not leak into the shared document.
+- Frontend `CI=false npx craco build` compiles clean; no new warnings.
+
+Notes / follow-ups
+
+- **Claude is 404ing platform-wide** (out of this sprint's scope, filed under
+  Technical Debt): `services/claude_provider.py` pins
+  `claude-3-haiku-20240307` (retired 2026-04-19) and
+  `services/ai_debate_engine.py` pins `claude-3-5-sonnet-20241022` (retired
+  2025-10-28). Every Claude call fails and silently falls back to Gemini —
+  including this report, whose prompt prefers Claude.
+- Gift Nifty stays unavailable until an NSE IX subscription or licensed vendor
+  feed exists; the adapter seam is ready.
+- The economic calendar is still the curated static generator (its own Phase 2
+  note); the report consumes it through the gateway, so a live source is a
+  drop-in.
+
+---
+
 # Technical Debt
 
 Every technical debt item must contain
@@ -1509,6 +1642,60 @@ Target Version
 Owner
 
 Status
+
+---
+
+## TD-001 — Claude models are retired; every Claude call 404s
+
+Description
+
+`services/claude_provider.py` pins `claude-3-haiku-20240307` for both
+`CLAUDE_DEFAULT_MODEL` and `CLAUDE_FAST_MODEL`; `services/ai_debate_engine.py`
+pins `claude-3-5-sonnet-20241022`. Both model IDs have passed their retirement
+dates (2026-04-19 and 2025-10-28) and now return HTTP 404 `not_found_error`.
+
+Reason
+
+Model IDs were pinned at build time and never revisited. The failure is silent:
+`get_debate_engine()` catches the error and falls through to Gemini, so the
+platform stays up and no alarm fires.
+
+Impact
+
+Claude is effectively absent from the product despite being the documented
+primary reasoning model (INDEX.md, AI_AGENT_SYSTEM.md → "Claude & Gemini
+Collaboration"). Every prompt the library routes with `prefer="claude"` —
+morning report, portfolio review, risk analysis, complex reports — is served by
+Gemini instead. The AI Debate System cannot produce two viewpoints, because one
+participant always errors. Observed live: `Claude provider error: Error code:
+404 - model: claude-3-haiku-20240307`.
+
+Fix
+
+Repoint to current models — `claude-opus-4-8` for reasoning-heavy work,
+`claude-haiku-4-5` where the fast model is wanted. Note the API surface has
+moved on since these IDs: `budget_tokens` is removed in favor of
+`thinking={"type": "adaptive"}`, sampling params (`temperature`/`top_p`/`top_k`)
+are rejected on Opus 4.7+, and assistant-turn prefills 400. Audit the provider
+call sites against those before switching, and add a startup health check so a
+retired model surfaces loudly instead of silently degrading.
+
+Priority
+
+High — the platform's primary AI provider is entirely non-functional.
+
+Target Version
+
+1.2
+
+Owner
+
+Unassigned
+
+Status
+
+Open — found during Sprint 10 verification (2026-07-16), not fixed there
+because it is platform-wide scope rather than Morning Report scope.
 
 ---
 

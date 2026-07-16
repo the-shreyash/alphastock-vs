@@ -715,6 +715,32 @@ Store
 
 Notify Users
 
+Implemented in services/morning_report.py (Sprint 10). Every market read goes
+through the Market Gateway — the builder never touches a provider.
+
+Sections degrade independently: an unreachable feed costs its own section and
+nothing else. Any section that cannot be sourced is marked `available: false`
+with a reason and is never filled with a substitute value.
+
+## Gift Nifty
+
+Gift Nifty is a Nifty 50 futures contract on NSE International Exchange. It
+trades while the NSE cash market is closed, which makes it the best pre-market
+read on the open — and it is carried by no free feed (not Yahoo, Alpha
+Vantage, or a broker's NSE/BSE instrument list). It requires an NSE IX data
+subscription or a licensed vendor.
+
+services/market_engine/gift_nifty.py is therefore a collector with a
+priority-ordered adapter chain and no adapter registered by default: it
+reports the quote as explicitly unavailable rather than deriving one. Register
+an adapter and every consumer — Morning Report, AI context, frontend — picks
+it up with no further change:
+
+    gift_nifty.register_adapter("nse_ix", fetch_fn, tier="streaming")
+
+Adapters are tried in order; the first non-None result wins; one that raises
+is logged and skipped.
+
 ---
 
 # Real-Time Streaming

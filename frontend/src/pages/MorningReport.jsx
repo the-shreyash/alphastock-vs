@@ -1,13 +1,17 @@
 import { useState, useEffect, useCallback } from "react";
-import { useNavigate, Link } from "react-router-dom";
+import { Link } from "react-router-dom";
 import { motion } from "framer-motion";
 import api from "../services/api";
-import { formatCurrency } from "../utils/formatters";
 import { useRealtimeStore } from "../store/realtimeStore";
 import AIPipelineProgress from "../components/ai/AIPipelineProgress";
+import GiftNiftyCard from "../components/morning/GiftNiftyCard";
+import GlobalMarketsCard from "../components/morning/GlobalMarketsCard";
+import NewsHeadlines from "../components/morning/NewsHeadlines";
+import EconomicCalendarCard from "../components/morning/EconomicCalendarCard";
+import PortfolioAlertsCard from "../components/morning/PortfolioAlertsCard";
 import {
   Sun, RefreshCw, TrendingUp, TrendingDown, Minus,
-  AlertTriangle, Globe, BarChart3, ArrowUpRight, ArrowDownRight,
+  AlertTriangle, BarChart3, ArrowUpRight, ArrowDownRight,
 } from "lucide-react";
 
 const MOOD_CONFIG = {
@@ -19,17 +23,61 @@ const MOOD_CONFIG = {
 
 function IndexCard({ label, value, change_pct }) {
   const isPos = change_pct >= 0;
+  const available = value !== null && value !== undefined;
   return (
     <div className="stat-card flex flex-col gap-1.5">
       <span className="stat-label">{label}</span>
-      <span className="stat-value">
-        {value?.toLocaleString("en-IN")}
-      </span>
-      <span className="text-[13px] font-mono font-medium flex items-center gap-1" style={{ color: isPos ? "var(--gain)" : "var(--loss)" }}>
-        {isPos ? <ArrowUpRight size={12} /> : <ArrowDownRight size={12} />}
-        {isPos ? "+" : ""}{change_pct?.toFixed(2)}%
-      </span>
+      {available ? (
+        <>
+          <span className="stat-value">{value.toLocaleString("en-IN")}</span>
+          <span className="text-[13px] font-mono font-medium flex items-center gap-1" style={{ color: isPos ? "var(--gain)" : "var(--loss)" }}>
+            {isPos ? <ArrowUpRight size={12} /> : <ArrowDownRight size={12} />}
+            {isPos ? "+" : ""}{change_pct?.toFixed(2)}%
+          </span>
+        </>
+      ) : (
+        <span className="text-[13px] font-mono" style={{ color: "var(--text-muted)" }}>unavailable</span>
+      )}
     </div>
+  );
+}
+
+/**
+ * FII / DII net institutional flow.
+ *
+ * NSE publishes these only after market close, so an absent value is routine
+ * and is labelled as such — rendering it as ₹0 Cr would read as "institutions
+ * were flat", which is a materially different claim from "not published yet".
+ */
+function FiiDiiCard({ fiiDii }) {
+  const flows = [
+    { label: "FII Net", value: fiiDii?.fii_net },
+    { label: "DII Net", value: fiiDii?.dii_net },
+  ];
+  return (
+    <motion.div className="glass-card p-4"
+      initial={{ opacity: 0, y: 16 }} whileInView={{ opacity: 1, y: 0 }}
+      viewport={{ once: true, margin: "-60px" }} transition={{ duration: 0.4, delay: 0.05 }}>
+      <h3 className="eyebrow mb-3">FII / DII Flow</h3>
+      <div className="grid grid-cols-2 gap-3">
+        {flows.map(f => {
+          const available = f.value !== null && f.value !== undefined;
+          const isPos = available && f.value >= 0;
+          return (
+            <div key={f.label} className="text-center">
+              <p className="stat-label mb-1">{f.label}</p>
+              {available ? (
+                <p className="text-sm font-mono font-semibold" style={{ color: isPos ? "var(--gain)" : "var(--loss)" }}>
+                  {isPos ? "+" : "−"}₹{Math.abs(f.value).toLocaleString("en-IN")} Cr
+                </p>
+              ) : (
+                <p className="text-[12px] font-mono" style={{ color: "var(--text-muted)" }}>not published</p>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </motion.div>
   );
 }
 
@@ -68,7 +116,6 @@ export default function MorningReport() {
   // Correlation id for the request in flight — matches the live AI pipeline
   // events (ai.run.* / ai.step over WebSocket) to this fetch (Sprint R7).
   const [activeRunId, setActiveRunId] = useState(null);
-  const navigate = useNavigate();
 
   const load = useCallback(async (force = false) => {
     const runId = (crypto?.randomUUID?.() || `run-${Date.now()}-${Math.random().toString(36).slice(2)}`);
@@ -226,55 +273,39 @@ export default function MorningReport() {
         )}
       </motion.div>
 
-      {/* Risk + Global + FII in a 2-column grid */}
+      {/* Your holdings, read against everything above — the report's payoff. */}
+      <PortfolioAlertsCard portfolio={report.portfolio} />
+
+      {/* Overnight: where the world closed, and where Nifty is likely to open. */}
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-        {/* Key Risks */}
-        <motion.div className="rounded-2xl p-5" style={{ background: "rgba(244,63,94,0.07)", border: "1px solid rgba(244,63,94,0.2)" }}
-          initial={{ opacity: 0, y: 16 }} whileInView={{ opacity: 1, y: 0 }}
-          viewport={{ once: true, margin: "-60px" }} transition={{ duration: 0.4 }}>
-          <h3 className="eyebrow mb-3 flex items-center gap-2" style={{ color: "var(--loss)" }}>
-            <AlertTriangle size={13} /> Key Risks Today
-          </h3>
-          <ul className="space-y-2">
-            {report.key_risks?.map((r, i) => (
-              <li key={i} className="flex items-start gap-2 text-[13px]" style={{ color: "var(--text-secondary)" }}>
-                <span className="mt-0.5 shrink-0" style={{ color: "var(--loss)" }}>▸</span> {r}
-              </li>
-            ))}
-          </ul>
-        </motion.div>
-
-        {/* Global Cues + FII/DII */}
-        <div className="space-y-3">
-          <motion.div className="rounded-2xl p-5" style={{ background: "rgba(99,102,241,0.08)", border: "1px solid rgba(99,102,241,0.2)" }}
-            initial={{ opacity: 0, y: 16 }} whileInView={{ opacity: 1, y: 0 }}
-            viewport={{ once: true, margin: "-60px" }} transition={{ duration: 0.4, delay: 0.05 }}>
-            <h3 className="eyebrow mb-2 flex items-center gap-2" style={{ color: "#818cf8" }}>
-              <Globe size={13} /> Global Cues
-            </h3>
-            <p className="body-text">{report.global_cues}</p>
-          </motion.div>
-
-          <motion.div className="glass-card p-4"
-            initial={{ opacity: 0, y: 16 }} whileInView={{ opacity: 1, y: 0 }}
-            viewport={{ once: true, margin: "-60px" }} transition={{ duration: 0.4, delay: 0.1 }}>
-            <h3 className="eyebrow mb-3">FII / DII Flow</h3>
-            <div className="grid grid-cols-2 gap-3">
-              {[
-                { label: "FII Net", value: report.fii_dii?.fii_net, color: (report.fii_dii?.fii_net || 0) >= 0 ? "var(--gain)" : "var(--loss)" },
-                { label: "DII Net", value: report.fii_dii?.dii_net, color: (report.fii_dii?.dii_net || 0) >= 0 ? "var(--gain)" : "var(--loss)" },
-              ].map(f => (
-                <div key={f.label} className="text-center">
-                  <p className="stat-label mb-1">{f.label}</p>
-                  <p className="text-sm font-mono font-semibold" style={{ color: f.color }}>
-                    {(f.value || 0) >= 0 ? "+" : ""}₹{Math.abs(f.value || 0).toLocaleString("en-IN")} Cr
-                  </p>
-                </div>
-              ))}
-            </div>
-          </motion.div>
+        <GlobalMarketsCard globalMarkets={report.global_markets} />
+        <div className="space-y-4">
+          <GiftNiftyCard giftNifty={report.gift_nifty} />
+          <FiiDiiCard fiiDii={report.fii_dii} />
         </div>
       </div>
+
+      {/* What happened, and what is scheduled to happen. */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+        <NewsHeadlines news={report.news} sentiment={report.news_sentiment} />
+        <EconomicCalendarCard calendar={report.economic_calendar} />
+      </div>
+
+      {/* Key Risks */}
+      <motion.div className="rounded-2xl p-5" style={{ background: "rgba(244,63,94,0.07)", border: "1px solid rgba(244,63,94,0.2)" }}
+        initial={{ opacity: 0, y: 16 }} whileInView={{ opacity: 1, y: 0 }}
+        viewport={{ once: true, margin: "-60px" }} transition={{ duration: 0.4 }}>
+        <h3 className="eyebrow mb-3 flex items-center gap-2" style={{ color: "var(--loss)" }}>
+          <AlertTriangle size={13} /> Key Risks Today
+        </h3>
+        <ul className="space-y-2">
+          {report.key_risks?.map((r, i) => (
+            <li key={i} className="flex items-start gap-2 text-[13px]" style={{ color: "var(--text-secondary)" }}>
+              <span className="mt-0.5 shrink-0" style={{ color: "var(--loss)" }}>▸</span> {r}
+            </li>
+          ))}
+        </ul>
+      </motion.div>
 
       {/* Footer link */}
       <div className="text-center pt-2">

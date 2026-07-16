@@ -194,6 +194,20 @@ class MarketGateway:
         from services.real_market import fetch_real_global_markets
         return await fetch_real_global_markets()
 
+    # ── Gift Nifty ───────────────────────────────────────
+
+    async def get_gift_nifty(self) -> Dict[str, Any]:
+        """Pre-market Nifty futures read. Always returns a payload; check
+        `available` — no licensed NSE IX feed is connected by default."""
+        from services.market_engine.gift_nifty import get_gift_nifty
+        return await get_gift_nifty()
+
+    # ── Economic calendar ────────────────────────────────
+
+    async def get_calendar(self, days_ahead: int = 30, days_behind: int = 7) -> Dict[str, Any]:
+        from services.market_engine.economic_calendar import get_calendar
+        return await get_calendar(days_ahead=days_ahead, days_behind=days_behind)
+
     # ── Commodities ──────────────────────────────────────
 
     async def get_commodities(self) -> List[Dict[str, Any]]:
