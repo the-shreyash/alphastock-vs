@@ -95,6 +95,14 @@ export default function MorningReport() {
 
   useEffect(() => { load(); }, [load]);
 
+  // Sprint R8: the 8:30 pipeline broadcasts morningreport.generated when the
+  // fresh report lands — refetch in place (refresh spinner, not a skeleton
+  // wipe) so an open page shows the new briefing without a reload.
+  const reportReadyAt = useRealtimeStore((s) => s.morningReportReadyAt);
+  useEffect(() => {
+    if (reportReadyAt) load(true);
+  }, [reportReadyAt, load]);
+
   const loadingSkeleton = (
     <div className="space-y-4">
       <div className="h-20 rounded-2xl animate-pulse" style={{ background: "var(--bg-surface)" }} />

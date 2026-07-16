@@ -78,8 +78,13 @@ const initialState = {
   // Scanner (Sprint R4): live hit feed + worker-driven refresh signal.
   scanner: [], // [{ id, kind, event, candidates, count, timestamp }, ...] newest first
   scannerRefreshedAt: null, // bumped only by worker-origin scanner events
-  // Bucket stored for future UI (no consumer yet); keeps the contract complete.
+  // News (Sprint R8): latest streamed headlines + the last breaking batch.
   news: [],
+  breakingNews: null, // { articles, timestamp } — toast host consumes this
+  // Watchlist (Sprint R8): per-user add/remove signal for cross-surface sync.
+  watchlistEvent: null, // { action: "added"|"removed", symbol, updatedAt }
+  // Morning report ready-signal (Sprint R8) — pages refetch when this bumps.
+  morningReportReadyAt: null,
 };
 
 // Index symbol aliases used when folding index events into the price store.
@@ -105,6 +110,10 @@ export const useRealtimeStore = create((set, get) => ({
   seedUnreadCount: (count) => set({ unreadCount: Number(count) || 0 }),
 
   markNotificationsRead: () => set({ unreadCount: 0 }),
+
+  /** Single notification marked read in the panel — keep the badge in sync. */
+  decrementUnread: () =>
+    set((s) => ({ unreadCount: Math.max(0, s.unreadCount - 1) })),
 
   /** Merge a batch of live prices: { SYMBOL: { price, change_pct }, ... } */
   _mergePrices: (map) =>
@@ -238,9 +247,47 @@ export const useRealtimeStore = create((set, get) => ({
         }
         break;
       }
-      case "news":
-        // news.received carries { articles, count } — keep the latest list.
-        set({ news: Array.isArray(data.articles) ? data.articles : (Array.isArray(data) ? data : []) });
+      case "news": {
+        if (event === "news.breaking") {
+          // Novelty-gated server-side, so every article here is genuinely new
+          // — prepend to the live list and surface the batch for the toast.
+          const incoming = Array.isArray(data.articles) ? data.articles : [];
+          set((s) => {
+            const seen = new Set(incoming.map((a) => (a.title || "").toLowerCase()));
+            return {
+              news: [...incoming, ...s.news.filter((a) => !seen.has((a.title || "").toLowerCase()))].slice(0, MAX_ALERTS),
+              breakingNews: { articles: incoming, timestamp: envelope.timestamp || Date.now() },
+            };
+          });
+        } else {
+          // news.received carries { articles, count } — keep the latest list.
+          set({ news: Array.isArray(data.articles) ? data.articles : (Array.isArray(data) ? data : []) });
+        }
+        break;
+      }
+      case "watchlist": {
+        if (event === "watchlist.quotes") {
+          // Broadcast enriched quotes (price + RSI + volume ratio) for every
+          // watchlisted symbol — folded into the shared price store so any
+          // row already subscribed to its symbol re-renders with the new tick.
+          if (data.quotes) get()._mergePrices(data.quotes);
+        } else if (event === "watchlist.updated") {
+          // Per-user add/remove — lets every open surface for this user
+          // (page, dashboard widget, second tab) sync without a poll.
+          set({
+            watchlistEvent: {
+              action: data.action,
+              symbol: data.symbol,
+              updatedAt: envelope.timestamp || Date.now(),
+            },
+          });
+        }
+        break;
+      }
+      case "morningreport":
+        // morningreport.generated — the 8:30 pipeline finished; consumers
+        // refetch the report when this timestamp bumps.
+        set({ morningReportReadyAt: envelope.timestamp || Date.now() });
         break;
       case "notification": {
         // notification.created — per-user push. Increment the unread badge and
@@ -476,3 +523,8 @@ export const selectBreadth = (s) => s.breadth;
 export const selectEngineStatus = (s) => s.engineStatus;
 export const selectScannerFeed = (s) => s.scanner;
 export const selectScannerRefreshedAt = (s) => s.scannerRefreshedAt;
+export const selectNews = (s) => s.news;
+export const selectBreakingNews = (s) => s.breakingNews;
+export const selectLatestNotification = (s) => s.latestNotification;
+export const selectWatchlistEvent = (s) => s.watchlistEvent;
+export const selectMorningReportReadyAt = (s) => s.morningReportReadyAt;

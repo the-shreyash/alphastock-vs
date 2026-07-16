@@ -2,6 +2,7 @@ import { useState, useEffect } from "react";
 import { motion } from "framer-motion";
 import api from "../services/api";
 import { Newspaper, ExternalLink, RefreshCw, Search, TrendingUp, TrendingDown, Globe, AlertCircle, Tag, Building2 } from "lucide-react";
+import { useRealtimeStore, selectNews, selectConnected } from "../store/realtimeStore";
 
 const NEWS_TABS = ["All", "Market", "Economy", "FOSS", "Global"];
 const IMPORTANCE_COLORS = {
@@ -33,7 +34,27 @@ export default function News() {
   const [sentiment, setSentiment] = useState(null);
   const [sentimentLoading, setSentimentLoading] = useState(true);
 
+  const liveNews = useRealtimeStore(selectNews);
+  const connected = useRealtimeStore(selectConnected);
+
   useEffect(() => { fetchNews(); }, []);
+
+  // Live stream (Sprint R8): headlines pushed by news.received / news.breaking
+  // merge into the list as they arrive — breaking items land on top, the rest
+  // keep their published order. No refresh needed while connected.
+  useEffect(() => {
+    if (!liveNews?.length) return;
+    setArticles((prev) => {
+      const seen = new Set(prev.map((a) => (a.title || "").toLowerCase()));
+      const fresh = liveNews.filter((a) => !seen.has((a.title || "").toLowerCase()));
+      if (!fresh.length) return prev;
+      // Newest first within the fresh batch; breaking items lead it.
+      fresh.sort((a, b) =>
+        (b.is_breaking ? 1 : 0) - (a.is_breaking ? 1 : 0) ||
+        (b.published || "").localeCompare(a.published || ""));
+      return [...fresh, ...prev].slice(0, 100);
+    });
+  }, [liveNews]);
 
   const fetchNews = async (force = false) => {
     setLoading(true);
@@ -67,8 +88,17 @@ export default function News() {
       <motion.div className="flex items-center justify-between"
         initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.4 }}>
         <div>
-          <h1 className="page-title">Market Intelligence</h1>
-          <p className="page-subtitle mt-1">Stay updated with real-time market events</p>
+          <div className="flex items-center gap-2.5">
+            <h1 className="page-title">Market Intelligence</h1>
+            {connected && (
+              <span className="flex items-center gap-1.5 text-[10px] font-semibold px-2 py-1 rounded-full"
+                style={{ background: "var(--gain-bg)", color: "var(--gain)" }} data-testid="news-live-badge">
+                <span className="w-1.5 h-1.5 rounded-full animate-pulse" style={{ background: "var(--gain)" }} />
+                LIVE
+              </span>
+            )}
+          </div>
+          <p className="page-subtitle mt-1">Breaking headlines stream in as they happen</p>
         </div>
         <button data-testid="refresh-news-btn" onClick={() => fetchNews(true)}
           className="btn-ghost btn-sm" style={{ color: "var(--text-muted)" }}>

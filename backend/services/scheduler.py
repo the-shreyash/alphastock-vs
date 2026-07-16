@@ -53,20 +53,30 @@ async def morning_analysis_job(db, ai_func):
             f"{len(picks)} AI picks generated. Top: {picks[0]['name']} ({picks[0]['confidence']}% confidence). Check AI Picks."
             if picks else "Morning report is ready. Live pick data was unavailable this morning."
         )
+        # Broadcast the ready-signal so every open Dashboard / Morning Report
+        # page refreshes itself the moment the report lands (Sprint R8).
+        try:
+            from services.market_engine.event_bus import event_bus
+            await event_bus.publish("morningreport.generated", {
+                "date": today,
+                "picks": len(picks),
+            })
+        except Exception as e:
+            logger.warning(f"morningreport.generated publish failed: {e}")
+
         async with run.step():
+            from services.notification_service import create_notification
             users_with_activity = await db.trades.distinct("user_id")
             for uid in users_with_activity:
                 user_prefs = await db.users.find_one({"_id": uid if not isinstance(uid, str) else uid}, {"notification_prefs": 1})
                 prefs = (user_prefs or {}).get("notification_prefs", {})
                 if prefs.get("trade_alerts", True):
-                    await db.notifications.insert_one({
-                        "user_id": uid if isinstance(uid, str) else str(uid),
-                        "type": "MORNING_REPORT",
-                        "title": "Morning Analysis Ready",
-                        "message": pick_summary,
-                        "read": False,
-                        "created_at": datetime.now(timezone.utc).isoformat(),
-                    })
+                    await create_notification(
+                        db, uid if isinstance(uid, str) else str(uid),
+                        type="MORNING_REPORT",
+                        title="Morning Analysis Ready",
+                        message=pick_summary,
+                    )
 
                     # Send email if user has email_alerts enabled
                     if prefs.get("email_alerts", False):
@@ -194,17 +204,17 @@ async def exit_reminder_job(db):
             uid = t["user_id"]
             user_trades.setdefault(uid, []).append(t)
 
+        from services.notification_service import create_notification
         for uid, trades in user_trades.items():
             # Only notify users with their own open trades
             symbols = ", ".join([t["symbol"] for t in trades[:3]])
-            await db.notifications.insert_one({
-                "user_id": uid,
-                "type": "EXIT_REMINDER",
-                "title": "Close Your Positions",
-                "message": f"3:15 PM approaching! You have {len(trades)} open position(s): {symbols}. Close intraday trades now.",
-                "read": False,
-                "created_at": datetime.now(timezone.utc).isoformat(),
-            })
+            await create_notification(
+                db, uid,
+                type="EXIT_REMINDER",
+                title="Close Your Positions",
+                message=f"3:15 PM approaching! You have {len(trades)} open position(s): {symbols}. Close intraday trades now.",
+                severity="warning",
+            )
         logger.info(f"Exit reminders sent to {len(user_trades)} users with open trades")
     except Exception as e:
         logger.error(f"Exit reminder error: {e}")
@@ -238,16 +248,15 @@ async def eod_report_job(db):
         )
 
         # Notify all users
+        from services.notification_service import create_notification
         users = await db.users.find({}, {"_id": 1}).to_list(1000)
         for u in users:
-            await db.notifications.insert_one({
-                "user_id": str(u["_id"]),
-                "type": "EOD_REPORT",
-                "title": "End of Day Report",
-                "message": f"Market closed. Today's P&L: INR {'+' if total_pnl >= 0 else ''}{total_pnl:.2f}. Trades: {wins}W / {losses}L.",
-                "read": False,
-                "created_at": datetime.now(timezone.utc).isoformat(),
-            })
+            await create_notification(
+                db, str(u["_id"]),
+                type="EOD_REPORT",
+                title="End of Day Report",
+                message=f"Market closed. Today's P&L: INR {'+' if total_pnl >= 0 else ''}{total_pnl:.2f}. Trades: {wins}W / {losses}L.",
+            )
 
             # Send email EOD report if user has email_alerts
             user_full = await db.users.find_one({"_id": u["_id"]}, {"email": 1, "notification_prefs": 1})

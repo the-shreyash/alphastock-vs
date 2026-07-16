@@ -1321,6 +1321,85 @@ Notes / follow-ups (out of scope this sprint)
 
 ---
 
+# Sprint R8 — Notifications & Watchlist Live Migration
+
+Status
+
+COMPLETED
+
+Authority
+
+REALTIME_SYSTEM.md (source of truth for all real-time behavior); closes
+migration-plan gaps §4.6 (Breaking News), §4.10 (Watchlist), §4.11
+(Notifications), §4.13 (Morning Report).
+
+Objective
+
+Make every alerting surface push-driven: notifications toast in live and the
+badge increments without polling; the watchlist streams price + RSI + volume
+ratio per row; breaking headlines interrupt with a live toast; the morning
+report announces itself the moment the 8:30 pipeline finishes.
+
+Delivered — Backend
+
+- [x] Breaking-news pipeline: `news_service` now classifies every article's
+  `importance`/`is_breaking` deterministically (`_BREAKING_TERMS`) and
+  `filter_breaking_novel()` cooldown-gates headlines (2h, process-local,
+  mirrors `scanner_worker.filter_novel`); heartbeat `task_scan_news` publishes
+  `news.breaking {articles, count}` for novel breaking items only.
+- [x] Notification unification: every remaining direct
+  `db.notifications.insert_one` migrated to
+  `notification_service.create_notification` so ALL alerts push
+  `notification.created` live — morning report, exit reminder, EOD report
+  (scheduler), portfolio-monitor AI alerts, TRADE_ENTRY (manual + Zerodha),
+  EMERGENCY_STOP, monitor/run alerts, WEEKLY_REVIEW (server.py). The helper's
+  single insert is now the only write path.
+- [x] Watchlist stream: new heartbeat `task_watchlist_stream` (120s) enriches
+  every watchlisted symbol (RSI, volume ratio via `fetch_real_stock_quote`)
+  and broadcasts `watchlist.quotes`; watchlist add/remove REST endpoints
+  publish per-user `watchlist.updated {action, symbol}` for cross-surface
+  sync. Bridge maps `watchlist.*` → `watchlist` channel.
+- [x] Morning report ready-signal: `morning_analysis_job` publishes broadcast
+  `morningreport.generated {date, picks}` after the report is saved; bridge
+  maps the domain onto the `ai` channel every dashboard already subscribes to.
+
+Delivered — Frontend
+
+- [x] Store: `news.breaking` (prepend + `breakingNews` slice),
+  `watchlist.quotes` (folded into the shared `priceTicks` store),
+  `watchlist.updated` (`watchlistEvent` slice), `morningreport.generated`
+  (`morningReportReadyAt`), `decrementUnread`; new selectors (`selectNews`,
+  `selectBreakingNews`, `selectLatestNotification`, `selectWatchlistEvent`,
+  `selectMorningReportReadyAt`); provider subscribes to the `watchlist`
+  channel.
+- [x] `NotificationToast.jsx` (new, mounted in Layout): global toast host —
+  notification.created and breaking-news pushes slide down (severity-styled,
+  auto-dismiss, click-through to the owning surface, max 3 stacked).
+- [x] NotificationPanel: live prepend while open; mark-read/mark-all-read now
+  sync the store badge (`decrementUnread` / `markNotificationsRead`).
+- [x] Watchlist page: rows patch price, change, RSI, volume ratio AND
+  since-added P&L from the live tick store; add/remove in another tab syncs
+  via `watchlist.updated`; 30s poll remains disconnected-only.
+- [x] News page: streamed headlines merge in live (breaking first, deduped by
+  title) with a LIVE badge; BREAKING article badge now driven by real data.
+- [x] Dashboard: news, notifications and watchlist widgets all patch from the
+  store (no new fetches while connected); morning-report card refetches on the
+  ready-signal.
+- [x] Morning Report page: auto-refreshes in place when
+  `morningreport.generated` arrives.
+
+Verification
+
+- `tests/test_sprint_r8.py` (9 tests: importance classification, breaking
+  novelty gate incl. cooldown expiry + untitled skip, bridge routing for
+  watchlist/morningreport/news.breaking) — all pass alongside the existing
+  event-bridge/scanner/portfolio/AI suites (210+ passing; only pre-existing
+  live-server integration tests and one pre-existing trading-engine assertion
+  fail, unrelated to R8).
+- Frontend production build compiles clean (craco build).
+
+---
+
 # Technical Debt
 
 Every technical debt item must contain

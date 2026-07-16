@@ -1549,16 +1549,17 @@ async def create_trade(data: TradeCreate, user: dict = Depends(get_current_user)
     result = await db.trades.insert_one(trade_doc)
     trade_doc["_id"] = str(result.inserted_id)
 
-    await db.notifications.insert_one({
-        "user_id": user["_id"],
-        "type": "TRADE_ENTRY",
-        "title": "Trade Executed",
-        "message": f"{side_word} {data.quantity} {data.symbol} @ INR {data.entry_price}. "
-                   f"SL: INR {data.stop_loss} | Target: INR {data.target1}"
-                   + (f" | Broker: {data.broker}" if data.broker else ""),
-        "read": False,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    })
+    from services.notification_service import create_notification
+    await create_notification(
+        db, user["_id"],
+        type="TRADE_ENTRY",
+        title="Trade Executed",
+        message=f"{side_word} {data.quantity} {data.symbol} @ INR {data.entry_price}. "
+                f"SL: INR {data.stop_loss} | Target: INR {data.target1}"
+                + (f" | Broker: {data.broker}" if data.broker else ""),
+        symbol=data.symbol,
+        data={"trade_id": trade_doc["_id"]},
+    )
     return trade_doc
 
 
@@ -3265,15 +3266,16 @@ async def zerodha_quick_trade(request: Request, user: dict = Depends(get_current
     result = await db.trades.insert_one(trade_doc)
     trade_doc["_id"] = str(result.inserted_id)
 
-    # Create notification
-    await db.notifications.insert_one({
-        "user_id": user["_id"],
-        "type": "TRADE_ENTRY",
-        "title": "Trade Executed",
-        "message": f"[LIVE] Bought {qty} {symbol} @ INR {entry}. SL: INR {sl} | Target: INR {t1}. Order: {order_result.get('order_id', 'N/A')}",
-        "read": False,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    })
+    # Create notification (pushes notification.created live)
+    from services.notification_service import create_notification
+    await create_notification(
+        db, user["_id"],
+        type="TRADE_ENTRY",
+        title="Trade Executed",
+        message=f"[LIVE] Bought {qty} {symbol} @ INR {entry}. SL: INR {sl} | Target: INR {t1}. Order: {order_result.get('order_id', 'N/A')}",
+        symbol=symbol,
+        data={"trade_id": trade_doc["_id"]},
+    )
 
     return {
         "trade": trade_doc,
@@ -3350,16 +3352,15 @@ async def zerodha_emergency_stop(user: dict = Depends(get_current_user)):
             f"AI trading halted. Review your Zerodha terminal."
         )
 
-        # A. Save push notification in DB
-        await db.notifications.insert_one({
-            "user_id": user["_id"],
-            "type": "EMERGENCY_STOP",
-            "title": "🚨 Emergency Stop Triggered",
-            "message": alert_msg,
-            "severity": "critical",
-            "read": False,
-            "created_at": now_str,
-        })
+        # A. Save push notification in DB (pushes notification.created live)
+        from services.notification_service import create_notification
+        await create_notification(
+            db, user["_id"],
+            type="EMERGENCY_STOP",
+            title="🚨 Emergency Stop Triggered",
+            message=alert_msg,
+            severity="critical",
+        )
 
         # B. Send WhatsApp
         if wa_configured():
@@ -3480,18 +3481,18 @@ async def trigger_monitoring(user: dict = Depends(get_current_user)):
     # Prefetched LIVE quotes → sync quote_func (see prefetch_quote_func).
     quote_func = await prefetch_quote_func(user["_id"])
     result = await analyze_portfolio_health(db, user["_id"], None, quote_func)
-    # Save alerts as notifications
+    # Save alerts as notifications (each pushes notification.created live)
+    from services.notification_service import create_notification
     for alert in result.get("alerts", []):
         if alert["severity"] in ("critical", "positive"):
-            await db.notifications.insert_one({
-                "user_id": user["_id"],
-                "type": alert["type"],
-                "title": f"AI Alert: {alert['symbol']}",
-                "message": alert["message"],
-                "severity": alert["severity"],
-                "read": False,
-                "created_at": datetime.now(timezone.utc).isoformat(),
-            })
+            await create_notification(
+                db, user["_id"],
+                type=alert["type"],
+                title=f"AI Alert: {alert['symbol']}",
+                message=alert["message"],
+                severity=alert["severity"],
+                symbol=alert["symbol"],
+            )
     return result
 
 
@@ -3755,14 +3756,13 @@ async def webhook_weekly_review(_: bool = Depends(verify_webhook_key)):
             async def ai_review(prompt, _ctx=u):
                 return await ai_chat(prompt, "weekly-review", _ctx)
             result = await generate_weekly_review(db, uid, ai_review)
-            await db.notifications.insert_one({
-                "user_id": uid,
-                "type": "WEEKLY_REVIEW",
-                "title": "Weekly Performance Review",
-                "message": result.get("review", "Your weekly trading review is ready."),
-                "read": False,
-                "created_at": datetime.now(timezone.utc).isoformat(),
-            })
+            from services.notification_service import create_notification
+            await create_notification(
+                db, uid,
+                type="WEEKLY_REVIEW",
+                title="Weekly Performance Review",
+                message=result.get("review", "Your weekly trading review is ready."),
+            )
             reviewed += 1
         await _log_webhook("weekly_review", "success")
         return {"status": "success", "workflow": "weekly_review", "users_reviewed": reviewed}
@@ -3852,6 +3852,7 @@ async def add_to_watchlist(data: WatchlistAdd, user: dict = Depends(get_current_
     }
     result = await db.watchlist.insert_one(doc)
     doc["_id"] = str(result.inserted_id)
+    await _publish_watchlist_updated(user["_id"], "added", symbol)
     return doc
 
 @watchlist_router.delete("/{symbol}")
@@ -3860,7 +3861,23 @@ async def remove_from_watchlist(symbol: str, user: dict = Depends(get_current_us
     result = await db.watchlist.delete_one({"user_id": user["_id"], "symbol": symbol.upper().strip()})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Not in watchlist")
+    await _publish_watchlist_updated(user["_id"], "removed", symbol.upper().strip())
     return {"message": f"{symbol.upper()} removed from watchlist"}
+
+
+async def _publish_watchlist_updated(user_id: str, action: str, symbol: str):
+    """Publish a per-user ``watchlist.updated`` event (Sprint R8) so every open
+    surface for this user (Watchlist page, Dashboard widget, other tabs) syncs
+    an add/remove instantly. Best-effort — never breaks the REST mutation."""
+    try:
+        from services.market_engine.event_bus import event_bus
+        await event_bus.publish("watchlist.updated", {
+            "user_id": str(user_id),
+            "action": action,
+            "symbol": symbol,
+        })
+    except Exception as e:
+        logging.warning(f"watchlist.updated publish failed: {e}")
 
 
 # ============ ENHANCED AI EXPLAIN ============

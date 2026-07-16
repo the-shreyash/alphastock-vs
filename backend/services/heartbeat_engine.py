@@ -183,7 +183,7 @@ async def task_fii_dii():
 
 async def task_scan_news():
     from services.activity_logger import log_activity
-    from services.news_service import fetch_news
+    from services.news_service import fetch_news, filter_breaking_novel
     log_activity("Scanning News", "news", "running")
     try:
         news = await fetch_news()
@@ -193,6 +193,18 @@ async def task_scan_news():
         log_activity(f"Scanned {len(news)} market headlines", "news", "done")
         # Stream the latest headlines live to the News/Dashboard surfaces.
         await _publish("news.received", {"articles": news[:10], "count": len(news)})
+        # Breaking headlines (Sprint R8): novelty-gated so each event carries
+        # only headlines never streamed before — the frontend toasts these.
+        breaking = filter_breaking_novel(news)
+        if breaking:
+            log_activity(
+                f"{len(breaking)} breaking headline(s): {breaking[0]['title'][:60]}",
+                "news", "warning",
+            )
+            await _publish("news.breaking", {
+                "articles": breaking[:5],
+                "count": len(breaking),
+            })
     except Exception as e:
         logger.error(f"task_scan_news error: {e}")
         log_activity("Scanning News failed", "news", "warning")
@@ -573,6 +585,49 @@ async def task_earnings():
         log_activity("Checking Earnings failed", "news", "warning")
 
 
+WATCHLIST_STREAM_CAP = 40  # max distinct symbols enriched per cycle
+
+
+async def task_watchlist_stream():
+    """Stream enriched quotes (RSI, volume ratio) for every watchlisted symbol
+    as a broadcast ``watchlist.quotes`` event (Sprint R8). The fast 15s price
+    loop already covers price/change; this slower task covers the technical
+    fields the Watchlist UI shows, so the page needs no fallback poll while
+    connected."""
+    from services.activity_logger import log_activity
+    from services.real_market import fetch_real_stock_quote
+    log_activity("Refreshing Watchlists", "monitor", "running")
+    try:
+        symbols = await _db.watchlist.distinct("symbol")
+        symbols = sorted(s for s in symbols if s)[:WATCHLIST_STREAM_CAP]
+        if not symbols:
+            log_activity("No watchlisted stocks to refresh", "monitor", "done")
+            return
+        results = await asyncio.gather(
+            *[fetch_real_stock_quote(s) for s in symbols], return_exceptions=True
+        )
+        quotes = {}
+        for sym, res in zip(symbols, results):
+            if isinstance(res, dict) and res and res.get("price") is not None:
+                quotes[sym] = {
+                    "price": res["price"],
+                    "change_pct": res.get("change_pct", 0),
+                    "rsi": res.get("rsi"),
+                    "volume_ratio": res.get("volume_ratio"),
+                }
+        if not quotes:
+            log_activity("Watchlist quotes unavailable", "monitor", "warning")
+            return
+        await _publish("watchlist.quotes", {"quotes": quotes, "count": len(quotes)})
+        log_activity(
+            f"Watchlist refreshed — {len(quotes)}/{len(symbols)} live quotes",
+            "monitor", "done",
+        )
+    except Exception as e:
+        logger.error(f"task_watchlist_stream error: {e}")
+        log_activity("Refreshing Watchlists failed", "monitor", "warning")
+
+
 async def task_morning_report():
     from services.activity_logger import log_activity
     from services.real_market import fetch_real_market_overview
@@ -609,6 +664,7 @@ TASKS = [
     (task_scan_momentum, 150),
     (task_scan_news, 150),
     (task_scanner_sweep, 180),
+    (task_watchlist_stream, 120),
     (task_sector_rotation, 160),
     (task_global_markets, 180),
     (task_us_markets, 200),

@@ -4,6 +4,7 @@ import { motion, AnimatePresence } from "framer-motion";
 import Sidebar, { SIDEBAR_COLLAPSED_W, SIDEBAR_EXPANDED_W, SIDEBAR_MOBILE_W } from "./Sidebar";
 import Navbar from "./Navbar";
 import NotificationPanel from "../notifications/NotificationPanel";
+import NotificationToast from "../notifications/NotificationToast";
 import AIQuickAction from "../AIQuickAction";
 
 export default function Layout() {
@@ -87,6 +88,10 @@ export default function Layout() {
         </main>
       </div>
       {showNotifs && <NotificationPanel onClose={() => setShowNotifs(false)} />}
+
+      {/* Live toast host (Sprint R8): notification.created + news.breaking
+          pushes slide in on every authenticated page. */}
+      <NotificationToast />
 
       {/* Context-aware floating AI companion — rendered once so it appears
           on every authenticated page (never on Login/Register/Landing, which

@@ -564,6 +564,22 @@ Resistance
 
 No refresh required.
 
+## Implementation (Sprint R8)
+
+Two streams feed watchlist rows through the shared price store:
+
+price stream (15s)   { SYMBOL: { price, change_pct } }        — broadcast "prices"
+
+watchlist.quotes (120s) { quotes: { SYMBOL: { price, change_pct,
+                          rsi, volume_ratio } } }              — watchlist channel
+
+Rows patch every streamed field (including recomputed since-added P&L) from
+`priceTicks`; the REST refetch survives only as a disconnected fallback.
+
+watchlist.updated { user_id, action: added|removed, symbol } — published by
+the add/remove REST endpoints, delivered per-user, syncs every open surface
+(Watchlist page, Dashboard widget, other tabs) without a poll.
+
 ---
 
 # Live News
@@ -599,6 +615,29 @@ News Card Appears
 ↓
 
 Notification
+
+## Implementation (Sprint R8)
+
+`news_service` tags every article with deterministic `sentiment`,
+`importance` ("high" | "normal") and `is_breaking` (keyword classifier —
+crashes, RBI/rate decisions, record highs, SEBI actions, M&A, …). The
+heartbeat news scan publishes:
+
+news.received { articles, count }   — latest headlines, replaces the live list
+
+news.breaking { articles, count }   — novelty-gated (2h cooldown per headline
+                                      via filter_breaking_novel); every event
+                                      is genuinely new
+
+The frontend merges both into the News page and Dashboard widget live;
+`news.breaking` additionally fires the global toast (NotificationToast).
+
+Per-user alerts follow the same push contract: ALL notification writes go
+through `notification_service.create_notification`, which persists the
+document AND publishes `notification.created` — toast slides in, the navbar
+badge increments, and the panel prepends, with zero polling. The morning
+pipeline also broadcasts `morningreport.generated` (ai channel) so report
+surfaces refetch the moment the 8:30 job finishes.
 
 ---
 

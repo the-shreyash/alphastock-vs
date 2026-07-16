@@ -18,6 +18,10 @@ import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer } from "rec
 import { motion } from "framer-motion";
 import MarketEngineStatus from "../components/market/MarketEngineStatus";
 import RankingTable from "../components/market/RankingTable";
+import {
+  useRealtimeStore, selectNews, selectLatestNotification,
+  selectWatchlistEvent, selectMorningReportReadyAt,
+} from "../store/realtimeStore";
 import EconomicCalendar from "../components/market/EconomicCalendar";
 
 /* ====== Constants ====== */
@@ -779,6 +783,68 @@ export default function Dashboard() {
       });
     }
   }, [activityUpdates]);
+
+  // ── Sprint R8: live widget feeds ─────────────────────────────────────────
+  const liveNews = useRealtimeStore(selectNews);
+  const latestNotification = useRealtimeStore(selectLatestNotification);
+  const watchlistEvent = useRealtimeStore(selectWatchlistEvent);
+  const morningReportReadyAt = useRealtimeStore(selectMorningReportReadyAt);
+
+  // News widget: merge streamed headlines (news.received / news.breaking).
+  useEffect(() => {
+    if (!liveNews?.length) return;
+    setNews(prev => {
+      const seen = new Set(prev.map(a => (a.title || "").toLowerCase()));
+      const fresh = liveNews.filter(a => !seen.has((a.title || "").toLowerCase()));
+      return fresh.length ? [...fresh, ...prev].slice(0, 30) : prev;
+    });
+  }, [liveNews]);
+
+  // Notifications widget: a live push lands at the top instantly.
+  useEffect(() => {
+    if (!latestNotification?.notification_id) return;
+    setNotifications(prev => {
+      if (prev.some(n => n._id === latestNotification.notification_id)) return prev;
+      return [{
+        _id: latestNotification.notification_id,
+        type: latestNotification.type,
+        title: latestNotification.title,
+        message: latestNotification.message,
+        read: false,
+        created_at: latestNotification.timestamp,
+      }, ...prev].slice(0, 10);
+    });
+  }, [latestNotification]);
+
+  // Watchlist widget: live price patch + cross-surface add/remove sync.
+  useEffect(() => {
+    if (!priceTicks) return;
+    setWatchlist(prev => prev.map(w => {
+      const tick = priceTicks[w.symbol];
+      if (!tick || tick.price == null) return w;
+      return { ...w, quote: { ...(w.quote || {}), price: tick.price, change_pct: tick.change_pct } };
+    }));
+  }, [priceTicks]);
+
+  useEffect(() => {
+    if (!watchlistEvent?.symbol) return;
+    const { action, symbol } = watchlistEvent;
+    if (action === "removed") {
+      setWatchlist(prev => prev.filter(w => w.symbol !== symbol));
+    } else if (action === "added") {
+      api.get("/watchlist")
+        .then(({ data }) => setWatchlist(Array.isArray(data) ? data : []))
+        .catch(() => {});
+    }
+  }, [watchlistEvent]);
+
+  // Morning report card: refresh when the 8:30 pipeline broadcasts ready.
+  useEffect(() => {
+    if (!morningReportReadyAt) return;
+    api.get("/analysis/reports/morning")
+      .then(({ data }) => setMorningReport(data))
+      .catch(() => {});
+  }, [morningReportReadyAt]);
 
   // Fallback polling for AI activity when WS is disconnected
   useEffect(() => {

@@ -5,6 +5,7 @@ import { formatNumber } from "../utils/formatters";
 import { useWebSocket } from "../hooks/useWebSocket";
 import { usePriceFlash } from "../hooks/usePriceFlash";
 import { useAuth } from "../context/AuthContext";
+import { useRealtimeStore, selectWatchlistEvent } from "../store/realtimeStore";
 import { Eye, Search, Plus, Trash2, ArrowUpRight, ArrowDownRight, Activity } from "lucide-react";
 import { motion } from "framer-motion";
 
@@ -172,24 +173,52 @@ export default function Watchlist() {
     fetchWatchlist();
   }, [fetchWatchlist]);
 
-  // Live prices patch each row via the WS "prices" stream. The full refetch
-  // (RSI, since-added — not streamed) is kept only as a disconnected fallback.
+  // Every field is streamed while connected (prices every 15s, RSI/volume via
+  // watchlist.quotes) — the refetch poll survives only as a disconnected
+  // fallback, per the no-polling architecture.
   useEffect(() => {
     if (connected) return undefined;
     const i = setInterval(fetchWatchlist, 30000);
     return () => clearInterval(i);
   }, [connected, fetchWatchlist]);
 
-  // Live-patch each row's price/change from the WS "prices" stream, keeping the
-  // 30s poll as a fallback for the fields (RSI, since-added) not streamed.
+  // Live-patch each row from the shared price store: the fast stream carries
+  // price/change, the watchlist.quotes stream (Sprint R8) adds RSI + volume
+  // ratio, and since-added P&L is recomputed from the streamed price.
   useEffect(() => {
     if (!priceTicks) return;
     setItems(prev => prev.map(it => {
       const tick = priceTicks[it.symbol];
       if (!tick || tick.price == null) return it;
-      return { ...it, quote: { ...(it.quote || {}), price: tick.price, change_pct: tick.change_pct } };
+      return {
+        ...it,
+        quote: {
+          ...(it.quote || {}),
+          price: tick.price,
+          change_pct: tick.change_pct,
+          ...(tick.rsi != null ? { rsi: tick.rsi } : {}),
+          ...(tick.volume_ratio != null ? { volume_ratio: tick.volume_ratio } : {}),
+        },
+        ...(it.added_price
+          ? { since_added_pct: Math.round((tick.price - it.added_price) / it.added_price * 10000) / 100 }
+          : {}),
+      };
     }));
   }, [priceTicks]);
+
+  // Cross-surface sync (Sprint R8): an add/remove made in another tab or the
+  // dashboard widget lands here as a per-user watchlist.updated event.
+  const watchlistEvent = useRealtimeStore(selectWatchlistEvent);
+  useEffect(() => {
+    if (!watchlistEvent?.symbol) return;
+    const { action, symbol } = watchlistEvent;
+    setItems(prev => {
+      const present = prev.some(i => i.symbol === symbol);
+      if (action === "removed" && present) return prev.filter(i => i.symbol !== symbol);
+      if (action === "added" && !present) fetchWatchlist(); // need the full row
+      return prev;
+    });
+  }, [watchlistEvent, fetchWatchlist]);
 
   const handleAdd = async (symbol) => {
     try {
@@ -222,7 +251,7 @@ export default function Watchlist() {
           <div>
             <h1 className="page-title">Watchlist</h1>
             <p className="page-subtitle mt-1">
-              Stocks you're tracking — live prices refresh every 30 seconds
+              Stocks you're tracking — prices, RSI and signals stream in live
             </p>
           </div>
           <AddStockSearch onAdd={handleAdd} existing={items.map(i => i.symbol)} />
