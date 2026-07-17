@@ -18,18 +18,13 @@ export default function AuthCallback() {
       const searchParams = new URLSearchParams(window.location.search);
       const code = searchParams.get("code");
 
-      const hash = window.location.hash;
-      const match = hash.match(/session_id=([^&]+)/);
-      const sessionId = match ? match[1] : null;
-
-      if (!code && !sessionId) {
+      if (!code) {
         navigate("/login", { replace: true });
         return;
       }
 
       try {
         const { data } = await api.post("/auth/google/session", {
-          session_id: sessionId,
           code: code,
           redirect_uri: window.location.origin + "/auth/google/callback"
         });

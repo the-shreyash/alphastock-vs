@@ -1870,9 +1870,14 @@ cookies, broken Docker packaging, no CI/CD, no rate limiting, mock data in
 admin analytics, no frontend tests. No new product features ship until
 Production Certification.
 
-Next Recommended Sprint: **PH1.1 — Authentication Backdoor Removal**
-(remove `GET /api/auth/auto-login` and the Google OAuth demo/mock fallbacks).
-PH3.1 (Backend Test Suite Repair) may run in parallel.
+PH1.1 (Authentication Backdoor Removal) is COMPLETE (2026-07-17): the
+auto-login endpoint, the Google OAuth demo/mock/legacy fallbacks, and the
+startup admin seeding (default password + plaintext credentials file) are
+removed; dev admin creation now lives in `backend/scripts/seed_dev_admin.py`
+(refuses to run in production); guarded by `backend/tests/test_auth_hardening.py`.
+
+Next Recommended Sprint: **PH1.2 — Google OAuth Production Flow** (awaiting
+review/approval of PH1.1). PH3.1 (Backend Test Suite Repair) may run in parallel.
 
 Authoritative documents: PRODUCTION_HARDENING.md and PRODUCTION_ROADMAP.md.
 Task tracking below under "Production Hardening Program".
@@ -1881,7 +1886,7 @@ Task tracking below under "Production Hardening Program".
 
 # Production Hardening Program (PH1–PH3)
 
-Status: NOT_STARTED (awaiting PH1 implementation approval)
+Status: IN_PROGRESS (PH1.1 complete 2026-07-17; awaiting review before PH1.2)
 
 Priority: Critical — blocks all other work
 
@@ -1890,7 +1895,7 @@ rollback, estimates) live in PRODUCTION_ROADMAP.md. Status tracker:
 
 ## PH1 — Production Security Hardening
 
-- [ ] PH1.1 Authentication Backdoor Removal — NOT_STARTED — Critical
+- [x] PH1.1 Authentication Backdoor Removal — COMPLETE (2026-07-17) — Critical
 - [ ] PH1.2 Google OAuth Production Flow — NOT_STARTED — Critical
 - [ ] PH1.3 Cookie & Session Security — NOT_STARTED — Critical
 - [ ] PH1.4 CORS & Security Headers — NOT_STARTED — Critical

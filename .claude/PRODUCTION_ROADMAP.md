@@ -3,7 +3,7 @@
 
 Version: 1.2
 
-Status: Approved Plan — Awaiting PH1 Implementation Approval
+Status: PH1 In Progress — PH1.1 complete (2026-07-17), awaiting review before PH1.2
 
 Date: 2026-07-17
 
@@ -43,6 +43,7 @@ Goal: eliminate every finding in PRODUCTION_HARDENING.md §2 marked CRITICAL/HIG
 
 ## PH1.1 — Authentication Backdoor Removal
 
+- **Status:** ✅ COMPLETE (2026-07-17). B1 and B2 removed; startup admin seeding (default `admin123` password, boot-time password reset, plaintext `memory/test_credentials.md` write) also removed as the same finding class. Dev seeding moved to `backend/scripts/seed_dev_admin.py`; guarded by `backend/tests/test_auth_hardening.py` (11 hermetic tests).
 - **Objective:** Remove both authentication backdoors (B1, B2) so no unauthenticated caller can obtain any session.
 - **Scope:** Delete `GET /api/auth/auto-login` (`backend/server.py:3860`) and the `ENABLE_AUTO_LOGIN` switch. Delete the OAuth mock-code path, the demo-user fallback, and the legacy `session_id` exchange against `demobackend.emergentagent.com` (`backend/server.py:2672`). Replace dev convenience with a `scripts/seed_dev_admin.py` script guarded on `APP_ENV != production`.
 - **Deliverables:** Endpoints removed; dev seeding script; tests asserting 404/401 on removed paths.

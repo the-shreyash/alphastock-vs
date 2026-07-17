@@ -2645,101 +2645,65 @@ async def ai_monitoring_loop():
 
 google_auth_router = APIRouter(prefix="/api/auth", tags=["Google Auth"])
 
-# REMINDER: DO NOT HARDCODE THE URL, OR ADD ANY FALLBACKS OR REDIRECT URLS, THIS BREAKS THE AUTH
+# Fail-closed policy (PH1.1): a session is issued only after a successful
+# server-side authorization-code exchange with Google. There are no demo users,
+# no simulation fallbacks, and no third-party session exchanges.
 
 @google_auth_router.post("/google/session")
 async def google_auth_session(request: Request, response: Response):
-    """Exchange Google OAuth code or legacy session_id for user session."""
+    """Exchange a Google OAuth authorization code for a user session."""
     body = await request.json()
-    session_id = body.get("session_id")
     code = body.get("code")
     redirect_uri = body.get("redirect_uri")
 
-    if not session_id and not code:
-        raise HTTPException(status_code=400, detail="session_id or code required")
+    if not code:
+        raise HTTPException(status_code=400, detail="code required")
 
-    email = ""
-    name = ""
-    picture = ""
-    import secrets
-    session_token = secrets.token_hex(16)
+    client_id = os.environ.get("GOOGLE_CLIENT_ID", "").strip()
+    client_secret = os.environ.get("GOOGLE_CLIENT_SECRET", "").strip()
+    if not client_id or not client_secret:
+        raise HTTPException(status_code=401, detail="Google sign-in is not configured")
 
-    if code:
-        client_id = os.environ.get("GOOGLE_CLIENT_ID", "").strip()
-        client_secret = os.environ.get("GOOGLE_CLIENT_SECRET", "").strip()
+    try:
+        # Exchange code for tokens via direct Google OAuth
+        async with httpx.AsyncClient(timeout=10) as client:
+            token_resp = await client.post(
+                "https://oauth2.googleapis.com/token",
+                data={
+                    "code": code,
+                    "client_id": client_id,
+                    "client_secret": client_secret,
+                    "redirect_uri": redirect_uri or "http://localhost:3000/auth/google/callback",
+                    "grant_type": "authorization_code",
+                }
+            )
+            if token_resp.status_code != 200:
+                raise HTTPException(status_code=401, detail="Google token exchange failed")
 
-        # Development / Simulation Fallback
-        if not client_id or not client_secret or code == "mock-code-for-testing":
-            email = "demo-user@alphapartner.com"
-            name = "Demo User"
-            picture = ""
-        else:
-            try:
-                # Exchange code for tokens via direct Google OAuth
-                async with httpx.AsyncClient(timeout=10) as client:
-                    token_resp = await client.post(
-                        "https://oauth2.googleapis.com/token",
-                        data={
-                            "code": code,
-                            "client_id": client_id,
-                            "client_secret": client_secret,
-                            "redirect_uri": redirect_uri or "http://localhost:3000/auth/google/callback",
-                            "grant_type": "authorization_code",
-                        }
-                    )
-                    if token_resp.status_code != 200:
-                        raise HTTPException(status_code=401, detail=f"Google token exchange failed: {token_resp.text}")
-                    
-                    token_data = token_resp.json()
-                    access_token = token_data.get("access_token")
-                    
-                    # Fetch user details
-                    info_resp = await client.get(
-                        "https://www.googleapis.com/oauth2/v3/userinfo",
-                        headers={"Authorization": f"Bearer {access_token}"}
-                    )
-                    if info_resp.status_code != 200:
-                        raise HTTPException(status_code=401, detail="Failed to fetch user info from Google")
-                    
-                    user_info = info_resp.json()
-                    email = user_info.get("email", "").lower().strip()
-                    name = user_info.get("name", "")
-                    picture = user_info.get("picture", "")
-            except httpx.RequestError as e:
-                raise HTTPException(status_code=502, detail=f"Google Auth service error: {str(e)}")
-    else:
-        # Legacy/testing session exchange
-        if session_id == "invalid-xyz-nonexistent":
-            raise HTTPException(status_code=401, detail="Invalid session")
-        
-        try:
-            async with httpx.AsyncClient(timeout=10) as client:
-                resp = await client.get(
-                    "https://demobackend.emergentagent.com/auth/v1/env/oauth/session-data",
-                    headers={"X-Session-ID": session_id},
-                )
-                if resp.status_code == 200:
-                    google_data = resp.json()
-                    email = google_data.get("email", "").lower().strip()
-                    name = google_data.get("name", "")
-                    picture = google_data.get("picture", "")
-                    session_token = google_data.get("session_token", session_token)
-                else:
-                    # Simulation mode fallback for other session_ids
-                    email = "demo-user@alphapartner.com"
-                    name = "Demo User"
-                    picture = ""
-        except Exception as e:
-            # Fallback to simulated demo user if backend request fails/timeouts, preserving test requirements
-            email = "demo-user@alphapartner.com"
-            name = "Demo User"
-            picture = ""
+            token_data = token_resp.json()
+            access_token = token_data.get("access_token")
+
+            # Fetch user details
+            info_resp = await client.get(
+                "https://www.googleapis.com/oauth2/v3/userinfo",
+                headers={"Authorization": f"Bearer {access_token}"}
+            )
+            if info_resp.status_code != 200:
+                raise HTTPException(status_code=401, detail="Failed to fetch user info from Google")
+
+            user_info = info_resp.json()
+            email = user_info.get("email", "").lower().strip()
+            name = user_info.get("name", "")
+            picture = user_info.get("picture", "")
+    except httpx.RequestError:
+        raise HTTPException(status_code=502, detail="Google Auth service unavailable")
 
     if not email:
-        raise HTTPException(status_code=400, detail="No email from Google")
+        raise HTTPException(status_code=401, detail="No email from Google")
 
     # Find or create user
     user = await db.users.find_one({"email": email})
+    role = "user"
     if not user:
         user_doc = {
             "name": name,
@@ -2760,31 +2724,17 @@ async def google_auth_session(request: Request, response: Response):
         user_id = str(result.inserted_id)
     else:
         user_id = str(user["_id"])
+        role = user.get("role", "user")
         # Update Google profile info
         await db.users.update_one({"_id": user["_id"]}, {"$set": {"picture": picture, "name": name or user.get("name", "")}})
-
-    # Store session token
-    await db.user_sessions.update_one(
-        {"user_id": user_id},
-        {"$set": {
-            "user_id": user_id,
-            "session_token": session_token,
-            "expires_at": (datetime.now(timezone.utc) + timedelta(days=7)).isoformat(),
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        }},
-        upsert=True,
-    )
 
     # Create JWT token for the user
     access = create_access_token(user_id, email)
     refresh = create_refresh_token(user_id)
     set_auth_cookies(response, access, refresh)
 
-    # Also set session_token cookie
-    response.set_cookie(key="session_token", value=session_token, httponly=True, secure=False, samesite="lax", max_age=604800, path="/")
-
     return {
-        "id": user_id, "name": name, "email": email, "role": "user",
+        "id": user_id, "name": name, "email": email, "role": role,
         "picture": picture, "capital": 100000, "token": access,
         "auth_provider": "google",
     }
@@ -3852,28 +3802,6 @@ Provide detailed analysis: entry strategy, risk factors, key support/resistance 
     }
 
 
-# ============ AUTO-LOGIN (SKIP AUTH FOR MAIN USER) ============
-
-@auth_router.get("/auto-login")
-async def auto_login(response: Response):
-    """Auto-login as the main admin user (development mode)."""
-    if not os.environ.get("ENABLE_AUTO_LOGIN", "true").lower() in ("true", "1", "yes"):
-        raise HTTPException(status_code=403, detail="Auto-login disabled")
-    admin_email = os.environ.get("ADMIN_EMAIL", "admin@alphapartner.com")
-    user = await db.users.find_one({"email": admin_email})
-    if not user:
-        raise HTTPException(status_code=404, detail="Admin user not found")
-    user_id = str(user["_id"])
-    access = create_access_token(user_id, admin_email)
-    refresh = create_refresh_token(user_id)
-    set_auth_cookies(response, access, refresh)
-    return {
-        "id": user_id, "name": user["name"], "email": admin_email,
-        "role": user.get("role", "admin"), "capital": user.get("capital", 100000),
-        "risk_level": user.get("risk_level", "moderate"), "token": access,
-    }
-
-
 # ============ GEMINI DIRECT ROUTES ============
 
 gemini_router = APIRouter(prefix="/api/gemini", tags=["Gemini"])
@@ -4715,54 +4643,9 @@ async def startup():
     # a backend restart doesn't force re-login. Encrypts legacy plaintext tokens.
     await broker_engine.load_sessions()
 
-    # Seed admin
-    admin_email = os.environ.get("ADMIN_EMAIL", "admin@alphapartner.com")
-    admin_password = os.environ.get("ADMIN_PASSWORD", "admin123")
-    existing = await db.users.find_one({"email": admin_email})
-    if not existing:
-        await db.users.insert_one({
-            "name": "Admin",
-            "email": admin_email,
-            "password_hash": hash_password(admin_password),
-            "role": "admin",
-            "capital": 500000,
-            "risk_level": "aggressive",
-            "max_daily_loss": 25000,
-            "max_trades_per_day": 10,
-            "telegram_chat_id": None,
-            "notification_prefs": {"push": True, "email": True, "morning_report": True, "trade_alerts": True, "exit_reminder": True, "portfolio_alerts": True, "email_alerts": True, "telegram_alerts": False},
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        })
-        logger.info(f"Admin user seeded: {admin_email}")
-    elif not verify_password(admin_password, existing["password_hash"]):
-        await db.users.update_one({"email": admin_email}, {"$set": {"password_hash": hash_password(admin_password)}})
-        logger.info("Admin password updated")
-
-    # Write test credentials
-    cred_path = Path(__file__).parent.parent / "memory" / "test_credentials.md"
-    cred_path.parent.mkdir(parents=True, exist_ok=True)
-    cred_path.write_text(f"""# Test Credentials
-## Admin
-- Email: {admin_email}
-- Password: {admin_password}
-- Role: admin
-
-## Auth Endpoints
-- POST /api/auth/register
-- POST /api/auth/login
-- POST /api/auth/google/session (Google OAuth)
-- GET /api/auth/me
-- POST /api/auth/logout
-- POST /api/auth/refresh
-
-## Zerodha
-- GET /api/zerodha/status
-- GET /api/zerodha/login-url
-- POST /api/zerodha/order
-
-## Data Sources
-- GET /api/data-sources
-""")
+    # Admin accounts are never seeded by the API server (PH1.1). For local
+    # development, run `python scripts/seed_dev_admin.py` — it refuses to run
+    # when APP_ENV=production.
 
     # Initialize Market Engine gateway
     try:

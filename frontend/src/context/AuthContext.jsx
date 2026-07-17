@@ -19,14 +19,6 @@ export function AuthProvider({ children }) {
     }
   }, []);
 
-  const autoLogin = async () => {
-    resetRefreshState();
-    const { data } = await api.get("/auth/auto-login");
-    if (data.token) localStorage.setItem("token", data.token);
-    setUser(data);
-    return data;
-  };
-
   useEffect(() => {
     // CRITICAL: If returning from OAuth callback, skip the /me check.
     // AuthCallback will exchange the session_id and establish the session first.
@@ -65,7 +57,7 @@ export function AuthProvider({ children }) {
   };
 
   return (
-    <AuthContext.Provider value={{ user, loading, login, register, logout, checkAuth, autoLogin }}>
+    <AuthContext.Provider value={{ user, loading, login, register, logout, checkAuth }}>
       {children}
     </AuthContext.Provider>
   );

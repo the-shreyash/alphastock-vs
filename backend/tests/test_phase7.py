@@ -5,13 +5,16 @@ import requests
 
 BASE_URL = os.environ.get("REACT_APP_BACKEND_URL", "").rstrip("/")
 assert BASE_URL, "REACT_APP_BACKEND_URL must be set"
+ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "admin@alphapartner.com")
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin123")
 
 
 @pytest.fixture(scope="module")
 def session():
     s = requests.Session()
-    r = s.get(f"{BASE_URL}/api/auth/auto-login", timeout=20)
-    assert r.status_code == 200, f"auto-login failed: {r.status_code} {r.text}"
+    r = s.post(f"{BASE_URL}/api/auth/login",
+               json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD}, timeout=20)
+    assert r.status_code == 200, f"admin login failed: {r.status_code} {r.text}"
     token = r.json().get("token")
     s.headers.update({"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
     return s
@@ -104,8 +107,9 @@ class TestWhatsAppLive:
 
 # ---- Regression on prior features ----
 class TestRegression:
-    def test_auto_login_still_works(self, session):
-        r = session.get(f"{BASE_URL}/api/auth/auto-login", timeout=10)
+    def test_admin_login_still_works(self):
+        r = requests.post(f"{BASE_URL}/api/auth/login",
+                          json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD}, timeout=10)
         assert r.status_code == 200
         assert r.json().get("token")
 

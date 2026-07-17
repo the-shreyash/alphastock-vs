@@ -18,21 +18,8 @@ export default function Login() {
   const [showPw, setShowPw] = useState(false);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
-  const { login, autoLogin } = useAuth();
+  const { login } = useAuth();
   const navigate = useNavigate();
-
-  const handleDemoLogin = async () => {
-    setError("");
-    setLoading(true);
-    try {
-      await autoLogin();
-      navigate("/dashboard");
-    } catch (err) {
-      setError(formatApiError(err.response?.data?.detail) || err.message);
-    } finally {
-      setLoading(false);
-    }
-  };
 
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -112,9 +99,6 @@ export default function Login() {
             </div>
             <button data-testid="login-submit-btn" type="submit" disabled={loading} className="btn-primary btn-lg btn-block">
               {loading ? "Signing in..." : "Sign In"} {!loading && <ArrowRight size={16} />}
-            </button>
-            <button data-testid="demo-login-btn" type="button" onClick={handleDemoLogin} disabled={loading} className="btn-secondary btn-lg btn-block">
-              {loading ? "Signing in..." : "Quick Demo Login (Dev Mode)"}
             </button>
           </form>
 

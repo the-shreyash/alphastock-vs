@@ -3,7 +3,7 @@
 
 Version: 1.2
 
-Status: Approved Baseline — Awaiting PH1 Implementation Approval
+Status: PH1 In Progress — PH1.1 complete (2026-07-17): findings B1/B2 closed, risks R-01/R-02 closed; startup admin seeding (default password + plaintext credentials file) also removed under PH1.1
 
 Date: 2026-07-17
 
