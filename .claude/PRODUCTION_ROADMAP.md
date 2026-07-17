@@ -70,6 +70,7 @@ Goal: eliminate every finding in PRODUCTION_HARDENING.md §2 marked CRITICAL/HIG
 
 ## PH1.3 — Cookie & Session Security
 
+- **Status:** ✅ **COMPLETE (2026-07-18).** Cookie policy centralized in `backend/security/cookies.py`; all auth cookies (`access_token`, `refresh_token`, `g_oauth_state`) carry `HttpOnly; SameSite` always and `Secure` forced in production; logout clears every cookie with matching attributes; refresh remains functional; session fixation mitigated; 24 hermetic tests in `backend/tests/test_cookie_security.py`. Risk R-04 / finding B4 closed. **Deferred to a follow-up:** CSRF **token** middleware (SameSite=Lax delivers the cookie-layer CSRF baseline now); the dedicated `backend/security/csrf.py` token layer is carried forward as the next security item. Refresh-token rotation stays in PH1.6.
 - **Objective:** Auth cookies unusable over plain HTTP and resistant to CSRF.
 - **Scope:** `secure=True` on all four `set_cookie` call sites (env-driven `COOKIE_SECURE`, forced true when `APP_ENV=production`); confirm `httponly` + `samesite` strategy; CSRF token middleware for state-changing cookie-authenticated routes; central cookie helper so policy lives in one place.
 - **Deliverables:** Cookie helper module; CSRF protection; tests.
@@ -81,18 +82,30 @@ Goal: eliminate every finding in PRODUCTION_HARDENING.md §2 marked CRITICAL/HIG
 - **Estimated Difficulty:** Medium. **Estimated Time:** 1 day.
 - **Success Metrics:** Risk R-04 closed; no token ever sent over HTTP.
 
-## PH1.4 — CORS & Security Headers
+## PH1.4 — CORS Hardening
 
-- **Objective:** Only trusted origins may make credentialed requests; browsers receive the full defensive header set.
-- **Scope:** Require explicit `CORS_ORIGINS` in production (boot fails on `*` or unset); security-header middleware: HSTS, X-Frame-Options, X-Content-Type-Options, Referrer-Policy, Permissions-Policy, and a CSP compatible with the CRA build.
-- **Deliverables:** CORS boot validation; header middleware; tests asserting headers on responses.
-- **Files Expected:** `backend/security/headers.py`, `backend/server.py`, `backend/tests/test_security_headers.py`.
+- **Status:** ✅ **COMPLETE (2026-07-18).** CORS policy centralized in `backend/security/cors.py`; the wildcard-with-credentials default is gone. Origins now resolve from an environment-driven, exact-match allowlist (`CORS_ALLOWED_ORIGINS`, canonical; legacy `CORS_ORIGINS`/`FRONTEND_URL` still honored). A literal `*` is stripped from every source, so a wildcard can never pair with credentials. Development falls back to `http://localhost:3000` / `http://localhost:5173`; production assumes nothing (empty allowlist → all cross-origin rejected, fail closed). Methods and request headers are restricted to what the API and frontend actually use (no `*`); no response headers are exposed. 30 hermetic tests in `backend/tests/test_cors_hardening.py`. Risk R-03 / finding B3 closed. **Security headers (HSTS, X-Frame-Options, X-Content-Type-Options, Referrer-Policy, Permissions-Policy, CSP) were de-scoped from this sprint and are carried forward** as PH1.4b below.
+- **Objective:** Only trusted origins may make credentialed requests.
+- **Scope:** Replace the wildcard default with an environment-driven exact-match origin allowlist; never allow `Access-Control-Allow-Origin: *` with credentials; restrict methods, request headers, and exposed response headers; centralize the policy in one module.
+- **Deliverables:** `backend/security/cors.py`; `apply_cors(app)` wiring in `server.py`; `backend/tests/test_cors_hardening.py`.
+- **Files Delivered:** `backend/security/cors.py`, `backend/server.py`, `backend/tests/test_cors_hardening.py`.
 - **Dependencies:** PH1.1 (and coordinates with PH1.8 env validation).
-- **Acceptance Criteria:** Prod boot with wildcard/missing CORS → startup error; disallowed origin gets no CORS grant; all headers present on API responses.
-- **Validation Steps:** curl with foreign Origin header; securityheaders.com scan against staging.
+- **Acceptance Criteria:** No wildcard origin remains; disallowed origin gets no CORS grant; credentials only for approved origins; local development still functions. ✅ Met.
+- **Validation Steps:** curl / TestClient with foreign Origin header → no ACAO; allowed origin → reflected ACAO + `Allow-Credentials: true`.
+- **Success Metrics:** Risk R-03 closed.
+
+## PH1.4b — Security Headers (carried forward)
+
+- **Objective:** Browsers receive the full defensive header set.
+- **Scope:** Security-header middleware: HSTS, X-Frame-Options, X-Content-Type-Options, Referrer-Policy, Permissions-Policy, and a CSP compatible with the CRA build. (Split out of PH1.4, which delivered CORS only.)
+- **Deliverables:** Header middleware; tests asserting headers on responses.
+- **Files Expected:** `backend/security/headers.py`, `backend/server.py`, `backend/tests/test_security_headers.py`.
+- **Dependencies:** PH1.4.
+- **Acceptance Criteria:** All headers present on API responses.
+- **Validation Steps:** securityheaders.com scan against staging.
 - **Rollback Plan:** Revert middleware PR; CSP can be report-only first if it breaks the frontend.
 - **Estimated Difficulty:** Medium. **Estimated Time:** 1 day.
-- **Success Metrics:** Risk R-03 closed; A grade on header scan.
+- **Success Metrics:** A grade on header scan.
 
 ## PH1.5 — Password Policy, Input Validation & Email Verification
 

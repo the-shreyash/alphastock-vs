@@ -1876,8 +1876,48 @@ startup admin seeding (default password + plaintext credentials file) are
 removed; dev admin creation now lives in `backend/scripts/seed_dev_admin.py`
 (refuses to run in production); guarded by `backend/tests/test_auth_hardening.py`.
 
-Next Recommended Sprint: **PH1.2 — Google OAuth Production Flow** (awaiting
-review/approval of PH1.1). PH3.1 (Backend Test Suite Repair) may run in parallel.
+PH1.2 (Google OAuth Production Hardening) is COMPLETE (2026-07-17): the OAuth
+flow now enforces a CSRF `state` (backend-issued httponly cookie double-submit
+**plus a single-use server-side record for replay protection and authoritative
+TTL expiry, via Redis/in-memory `services/cache.py`**), cryptographically
+verifies the Google id_token (signature + issuer + audience) and requires
+`email_verified`, allowlists and binds the redirect_uri (no hardcoded dev
+fallback), uses the Google **`sub` as the primary identity** (verified email for
+safe linking; `sub_conflict` rejected) without creating duplicates, and writes
+**immutable OAuth security-audit events** (`security_audit_logs`). Guarded by 26
+hermetic tests in `backend/tests/test_oauth_hardening.py`. Risk R-02 fully
+closed. See CHANGELOG.md.
+
+PH1.3 (Cookie & Session Security) is COMPLETE (2026-07-18): every authentication
+cookie is production-hardened and centralized in `backend/security/cookies.py` —
+`Secure` forced when `APP_ENV=production` (env-driven `COOKIE_SECURE` in dev),
+`HttpOnly` + `SameSite` on all cookies, `Path`/`Domain`/`Max-Age` from one policy,
+and clearing that matches the set attributes so logout reliably removes every
+cookie. The Google OAuth-state cookie now shares this unified posture (never
+`Strict`; burned after use). Session fixation is mitigated (login/register/OAuth
+mint fresh tokens that overwrite in place). Guarded by 24 hermetic tests in
+`backend/tests/test_cookie_security.py`. Finding B4 and risk R-04 closed. CSRF
+**token** middleware and refresh-token rotation are intentionally deferred
+(SameSite=Lax provides the cookie-layer CSRF baseline now; rotation is PH1.6).
+See CHANGELOG.md.
+
+PH1.4 (CORS Hardening) is COMPLETE (2026-07-18): the wildcard-with-credentials
+CORS default is removed and the policy is centralized in
+`backend/security/cors.py`. Origins resolve from an environment-driven,
+exact-match allowlist (`CORS_ALLOWED_ORIGINS` canonical; legacy `CORS_ORIGINS`/
+`FRONTEND_URL` still honored), with `*` stripped from every source so a wildcard
+can never pair with credentials. Development falls back to `localhost:3000`/
+`localhost:5173`; production assumes nothing (fail closed). Methods and request
+headers are restricted; no response headers are exposed. `server.py` wires it in
+via `apply_cors(app)`. Guarded by 30 hermetic tests in
+`backend/tests/test_cors_hardening.py`. Finding B3 and risk R-03 closed.
+Security **headers** (HSTS/CSP/etc.) were de-scoped from this CORS-only sprint
+and are carried forward as PH1.4b. See CHANGELOG.md.
+
+Next Recommended Sprint: **PH1.4b — Security Headers** (HSTS, X-Frame-Options,
+X-Content-Type-Options, Referrer-Policy, Permissions-Policy, CSP), awaiting
+review/approval of PH1.4. Alternatively **PH1.5 — Password Policy, Validation &
+Email Verification**. PH3.1 (Backend Test Suite Repair) may run in parallel.
 
 Authoritative documents: PRODUCTION_HARDENING.md and PRODUCTION_ROADMAP.md.
 Task tracking below under "Production Hardening Program".
@@ -1886,7 +1926,7 @@ Task tracking below under "Production Hardening Program".
 
 # Production Hardening Program (PH1–PH3)
 
-Status: IN_PROGRESS (PH1.1 complete 2026-07-17; awaiting review before PH1.2)
+Status: IN_PROGRESS (PH1.1 + PH1.2 complete 2026-07-17; PH1.3 + PH1.4 complete 2026-07-18; SI1.1 Repository Audit complete 2026-07-17)
 
 Priority: Critical — blocks all other work
 
@@ -1896,9 +1936,10 @@ rollback, estimates) live in PRODUCTION_ROADMAP.md. Status tracker:
 ## PH1 — Production Security Hardening
 
 - [x] PH1.1 Authentication Backdoor Removal — COMPLETE (2026-07-17) — Critical
-- [ ] PH1.2 Google OAuth Production Flow — NOT_STARTED — Critical
-- [ ] PH1.3 Cookie & Session Security — NOT_STARTED — Critical
-- [ ] PH1.4 CORS & Security Headers — NOT_STARTED — Critical
+- [x] PH1.2 Google OAuth Production Hardening — COMPLETE (2026-07-17) — Critical
+- [x] PH1.3 Cookie & Session Security — COMPLETE (2026-07-18) — Critical
+- [x] PH1.4 CORS Hardening — COMPLETE (2026-07-18) — Critical
+- [ ] PH1.4b Security Headers (HSTS/CSP/etc., split from PH1.4) — NOT_STARTED — Critical
 - [ ] PH1.5 Password Policy, Validation & Email Verification — NOT_STARTED — High
 - [ ] PH1.6 JWT Lifecycle & Refresh Rotation — NOT_STARTED — High
 - [ ] PH1.7 Rate Limiting & Brute-Force Protection — NOT_STARTED — High

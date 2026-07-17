@@ -17,8 +17,9 @@ export default function AuthCallback() {
     const processSession = async () => {
       const searchParams = new URLSearchParams(window.location.search);
       const code = searchParams.get("code");
+      const state = searchParams.get("state");
 
-      if (!code) {
+      if (!code || !state) {
         navigate("/login", { replace: true });
         return;
       }
@@ -26,8 +27,9 @@ export default function AuthCallback() {
       try {
         const { data } = await api.post("/auth/google/session", {
           code: code,
+          state: state,
           redirect_uri: window.location.origin + "/auth/google/callback"
-        });
+        }, { withCredentials: true });
         if (data.token) {
           localStorage.setItem("token", data.token);
         }

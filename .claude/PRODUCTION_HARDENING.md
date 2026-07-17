@@ -3,7 +3,7 @@
 
 Version: 1.2
 
-Status: PH1 In Progress — PH1.1 complete (2026-07-17): findings B1/B2 closed, risks R-01/R-02 closed; startup admin seeding (default password + plaintext credentials file) also removed under PH1.1
+Status: PH1 In Progress — PH1.1 complete (2026-07-17): findings B1/B2 closed, risks R-01/R-02 closed; startup admin seeding (default password + plaintext credentials file) also removed under PH1.1. PH1.2 complete (2026-07-17): Google OAuth hardened — CSRF `state`, id_token verification, `email_verified` gate, redirect_uri allowlist, safe account linking; risk R-02 fully closed. PH1.3 complete (2026-07-18): authentication cookies production-hardened and centralized in `backend/security/cookies.py` — `Secure` forced in production, `HttpOnly`+`SameSite` on all cookies, matched-attribute clearing, unified OAuth-state cookie posture; finding B4 closed, risk R-04 closed. PH1.4 complete (2026-07-18): CORS production-hardened and centralized in `backend/security/cors.py` — wildcard-with-credentials default removed, environment-driven exact-match origin allowlist (`CORS_ALLOWED_ORIGINS`), restricted methods/headers, fail-closed in production; finding B3 closed, risk R-03 closed. Security headers de-scoped to PH1.4b.
 
 Date: 2026-07-17
 
@@ -64,8 +64,8 @@ Verified in code on branch `sprint-r3-frontend-realtime`:
 |---|---|---|---|
 | B1 | Admin auto-login backdoor, **enabled by default** (`ENABLE_AUTO_LOGIN` defaults to `"true"`) | `backend/server.py:3860` | CRITICAL |
 | B2 | Google OAuth demo-user bypass + legacy third-party session exchange (`demobackend.emergentagent.com`) that fails open | `backend/server.py:2672` | CRITICAL |
-| B3 | CORS `allow_origins` defaults to `*` with `allow_credentials=True` | `backend/server.py:4668` | CRITICAL |
-| B4 | Auth cookies set with `secure=False` (all four call sites) | `backend/server.py:193` | CRITICAL |
+| B3 | ~~CORS `allow_origins` defaults to `*` with `allow_credentials=True`~~ **CLOSED (PH1.4)** — centralized in `backend/security/cors.py`; environment-driven exact-match allowlist (`CORS_ALLOWED_ORIGINS`), wildcard stripped from every source, methods/headers restricted | `backend/security/cors.py` | ~~CRITICAL~~ CLOSED |
+| B4 | ~~Auth cookies set with `secure=False` (all four call sites)~~ **CLOSED (PH1.3)** — centralized in `backend/security/cookies.py`; `Secure` forced when `APP_ENV=production`, `HttpOnly`+`SameSite` on all cookies | `backend/security/cookies.py` | ~~CRITICAL~~ CLOSED |
 | B5 | `docker-compose.yml` references `backend/Dockerfile` and `frontend/Dockerfile` — **neither exists**; dev-mode uvicorn `--reload` + bind mount; weak secret fallbacks in compose | `docker-compose.yml` | CRITICAL |
 | B6 | No CI/CD — `.github/workflows/` does not exist | repo root | CRITICAL |
 | H7 | Fabricated admin analytics (revenue series, `revenue_today = total_payments * 499`, hardcoded feature usage) — violates ADR-021 | `backend/server.py:4357, 4059, 4374` | HIGH |
@@ -88,9 +88,9 @@ Verified in code on branch `sprint-r3-frontend-realtime`:
 | ID | Risk | Likelihood | Impact | Exposure | Owner Phase |
 |---|---|---|---|---|---|
 | R-01 | Anyone on the internet obtains an admin session via `GET /api/auth/auto-login` | Certain (default-on) | Catastrophic | **CRITICAL** | PH1.1 |
-| R-02 | Arbitrary login as demo user via OAuth mock-code / fail-open session exchange | High | Catastrophic | **CRITICAL** | PH1.1–1.2 |
-| R-03 | Credentialed CSRF-style requests from any origin (wildcard CORS + cookies) | High | Severe | **CRITICAL** | PH1.4 |
-| R-04 | Auth tokens transmitted over plain HTTP (`secure=False`) | Medium | Severe | **HIGH** | PH1.3 |
+| R-02 | ~~Arbitrary login as demo user via OAuth mock-code / fail-open session exchange~~ **CLOSED** (PH1.1 removed the bypasses; PH1.2 added state/CSRF, id_token verification, `email_verified` gate, redirect_uri allowlist, safe linking) | — | — | **CLOSED** | PH1.1–1.2 |
+| R-03 | ~~Credentialed CSRF-style requests from any origin (wildcard CORS + cookies)~~ **CLOSED** (PH1.4: environment-driven exact-match origin allowlist, wildcard never paired with credentials, centralized in `backend/security/cors.py`) | — | — | **CLOSED** | PH1.4 |
+| R-04 | ~~Auth tokens transmitted over plain HTTP (`secure=False`)~~ **CLOSED** (PH1.3: `Secure` forced in production, `HttpOnly`+`SameSite` everywhere, centralized cookie policy) | — | — | **CLOSED** | PH1.3 |
 | R-05 | Credential stuffing / brute force succeeds (no rate limiting, no password policy) | High | Severe | **HIGH** | PH1.5, PH1.7 |
 | R-06 | Stolen access token valid for 24 h; refresh tokens never rotate or revoke | Medium | High | **HIGH** | PH1.6 |
 | R-07 | Deployment impossible or hand-rolled (broken Docker, no CI/CD) → unreproducible prod, config drift | Certain today | High | **HIGH** | PH2.1–2.7 |

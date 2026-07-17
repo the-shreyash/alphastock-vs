@@ -7,7 +7,6 @@ load_dotenv(ROOT_DIR / '.env', override=True)
 
 from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Depends, Header, WebSocket, WebSocketDisconnect, BackgroundTasks
 from pydantic import BaseModel
-from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
 import os
@@ -21,6 +20,7 @@ import asyncio
 import uuid
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Set
+from urllib.parse import urlencode
 
 from services.alpha_vantage import get_global_quote as av_get_quote, get_intraday_data as av_intraday, is_configured as av_configured
 # Legacy single-session Zerodha shim (data-sources status + startup log only).
@@ -30,6 +30,18 @@ from services.broker_engine import broker_engine
 from services.brokers.base import BrokerAuthError, BrokerError
 from services.brokers.stream import stream_manager
 from services.scheduler import setup_scheduler
+
+# Centralized authentication-cookie policy (PH1.3). Every auth cookie is set or
+# cleared through this module so the Secure/HttpOnly/SameSite/Path/Max-Age
+# posture stays consistent across login, register, refresh, logout and OAuth.
+from security.cookies import (
+    set_auth_cookies,
+    set_access_cookie,
+    clear_auth_cookies,
+    set_oauth_state_cookie,
+    clear_oauth_state_cookie,
+)
+from security.cors import apply_cors
 
 from models import (
     UserCreate, UserLogin, UserResponse, UserSettingsUpdate,
@@ -189,9 +201,9 @@ async def get_current_user(request: Request) -> dict:
     except pyjwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Invalid token")
 
-def set_auth_cookies(response: Response, access_token: str, refresh_token: str):
-    response.set_cookie(key="access_token", value=access_token, httponly=True, secure=False, samesite="lax", max_age=86400, path="/")
-    response.set_cookie(key="refresh_token", value=refresh_token, httponly=True, secure=False, samesite="lax", max_age=604800, path="/")
+# NOTE: authentication cookies are set/cleared exclusively via
+# security.cookies (imported above) — set_auth_cookies / set_access_cookie /
+# clear_auth_cookies. This keeps the hardened cookie policy in one place.
 
 # --- AI Service (Modular Multi-Provider Architecture) ---
 # Uses AIDebateEngine: Claude + Gemini as equal intelligence partners.
@@ -849,8 +861,9 @@ async def get_me(user: dict = Depends(get_current_user)):
 
 @auth_router.post("/logout")
 async def logout(response: Response):
-    response.delete_cookie("access_token", path="/")
-    response.delete_cookie("refresh_token", path="/")
+    # Clear every authentication cookie via the central policy so the delete
+    # attributes (path/domain/secure/samesite) match how they were set.
+    clear_auth_cookies(response)
     return {"message": "Logged out"}
 
 @auth_router.post("/refresh")
@@ -866,7 +879,8 @@ async def refresh_token(request: Request, response: Response):
         if not user:
             raise HTTPException(status_code=401, detail="User not found")
         access = create_access_token(str(user["_id"]), user["email"])
-        response.set_cookie(key="access_token", value=access, httponly=True, secure=False, samesite="lax", max_age=86400, path="/")
+        # Re-issue the access cookie through the central hardened policy.
+        set_access_cookie(response, access)
         return {"message": "Token refreshed"}
     except pyjwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Invalid refresh token")
@@ -2645,97 +2659,346 @@ async def ai_monitoring_loop():
 
 google_auth_router = APIRouter(prefix="/api/auth", tags=["Google Auth"])
 
-# Fail-closed policy (PH1.1): a session is issued only after a successful
-# server-side authorization-code exchange with Google. There are no demo users,
-# no simulation fallbacks, and no third-party session exchanges.
+# Fail-closed policy: a session is issued only after a successful server-side
+# authorization-code exchange with Google AND cryptographic verification of the
+# returned OpenID Connect id_token. There are no demo users, no simulation
+# fallbacks, and no third-party session exchanges (PH1.1). PH1.2 adds:
+#   - OAuth `state` CSRF protection (double-submit against the g_oauth_state cookie)
+#     PLUS a single-use server-side state record (replay protection + authoritative
+#     TTL expiry, shared across processes via Redis when configured)
+#   - id_token signature/issuer/audience verification via google-auth
+#   - mandatory `email_verified` gate before any account is created or linked
+#   - redirect_uri allowlisting (no hardcoded dev fallback) + binding the callback
+#     redirect_uri to the one issued at flow start
+#   - Google `sub` as the primary external identity; verified email for safe linking
+#   - immutable security-audit logging of every OAuth outcome
+
+GOOGLE_OAUTH_STATE_COOKIE = "g_oauth_state"
+GOOGLE_OAUTH_STATE_TTL = 600  # seconds — the state is single-use and short-lived
+GOOGLE_OAUTH_STATE_PREFIX = "oauth_state:"  # server-side store key namespace
+GOOGLE_AUTH_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth"
+GOOGLE_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
+GOOGLE_VALID_ISSUERS = ("accounts.google.com", "https://accounts.google.com")
+
+
+def _google_oauth_config() -> tuple[str, str]:
+    """Return (client_id, client_secret) from the environment, stripped."""
+    return (
+        os.environ.get("GOOGLE_CLIENT_ID", "").strip(),
+        os.environ.get("GOOGLE_CLIENT_SECRET", "").strip(),
+    )
+
+
+def _allowed_google_redirect_uris() -> Set[str]:
+    """Allowlist of acceptable OAuth redirect URIs, derived from configured
+    frontend origins. The callback path is fixed to `/auth/google/callback`.
+    A localhost origin is permitted only outside production so local dev works
+    without weakening the production allowlist."""
+    origins: list[str] = []
+    frontend_url = os.environ.get("FRONTEND_URL", "").strip()
+    if frontend_url:
+        origins.append(frontend_url)
+    cors = os.environ.get("CORS_ORIGINS", "").strip()
+    if cors and cors != "*":
+        origins.extend(cors.split(","))
+    if not origins and os.environ.get("APP_ENV", "development") != "production":
+        origins.append("http://localhost:3000")
+    uris: Set[str] = set()
+    for origin in origins:
+        origin = origin.strip().rstrip("/")
+        if origin:
+            uris.add(f"{origin}/auth/google/callback")
+    return uris
+
+
+def _set_oauth_state_cookie(response: Response, state: str) -> None:
+    # Delegated to the central PH1.3 cookie policy (security.cookies): the OAuth
+    # state cookie now shares the unified Secure/SameSite/Domain posture with the
+    # session cookies. It stays scoped to /api/auth and is never SameSite=Strict
+    # so it survives the top-level redirect back from Google.
+    set_oauth_state_cookie(response, state)
+
+
+def _clear_oauth_state_cookie(response: Response) -> None:
+    clear_oauth_state_cookie(response)
+
+
+async def _store_oauth_state(state: str, redirect_uri: str) -> None:
+    """Persist a single-use OAuth state record server-side. Uses Redis when
+    REDIS_URL is configured and an in-memory fallback otherwise (services/cache.py)
+    — the same graceful-degradation the rest of the app relies on. The record's
+    TTL is the authoritative expiry (the cookie max-age is client-controlled)."""
+    from services.cache import cache_set
+    await cache_set(
+        f"{GOOGLE_OAUTH_STATE_PREFIX}{state}",
+        {"redirect_uri": redirect_uri, "created": datetime.now(timezone.utc).isoformat()},
+        GOOGLE_OAUTH_STATE_TTL,
+    )
+
+
+async def _consume_oauth_state(state: str) -> Optional[dict]:
+    """Atomically fetch-and-delete the server-side state record. Returns the
+    record on first use, or None when it is missing, expired, or already used
+    (replay). Single-use is what defeats authorization-code/state replay."""
+    from services.cache import cache_get, cache_delete
+    key = f"{GOOGLE_OAUTH_STATE_PREFIX}{state}"
+    record = await cache_get(key)
+    if record is None:
+        return None
+    await cache_delete(key)
+    return record
+
+
+async def log_auth_event(event: str, request: Request, *, email: Optional[str] = None,
+                         user_id: Optional[str] = None, reason: Optional[str] = None,
+                         detail: Optional[dict] = None) -> None:
+    """Append an immutable authentication security-audit record (mirrors
+    log_admin_action). Records the actor context (ip, user-agent) and outcome,
+    but NEVER tokens, authorization codes, or state values (SECURITY.md logging
+    rule). Best-effort: a logging failure must never break the auth flow."""
+    try:
+        ip = request.client.host if request.client else None
+        await db.security_audit_logs.insert_one({
+            "event": event,
+            "email": email,
+            "user_id": user_id,
+            "reason": reason,
+            "ip": ip,
+            "user_agent": request.headers.get("user-agent"),
+            "details": detail or {},
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        })
+    except Exception as e:
+        logger.warning(f"auth audit log failed for {event}: {e}")
+
+
+async def _exchange_google_code(code: str, redirect_uri: str,
+                                client_id: str, client_secret: str) -> dict:
+    """Server-side authorization-code exchange. Raises HTTPException(401) on a
+    non-200 response and lets httpx.RequestError propagate for the caller to
+    map to a 502."""
+    async with httpx.AsyncClient(timeout=10) as client:
+        token_resp = await client.post(
+            GOOGLE_TOKEN_ENDPOINT,
+            data={
+                "code": code,
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "redirect_uri": redirect_uri,
+                "grant_type": "authorization_code",
+            },
+        )
+    if token_resp.status_code != 200:
+        raise HTTPException(status_code=401, detail="Google token exchange failed")
+    return token_resp.json()
+
+
+def _verify_google_id_token(id_tok: str, client_id: str) -> dict:
+    """Cryptographically verify a Google-issued OIDC id_token: signature (against
+    Google's public keys), audience (our client_id) and expiry. Raises ValueError
+    on any failure. Isolated as a module-level function so it can be substituted
+    in hermetic tests."""
+    from google.oauth2 import id_token as google_id_token
+    from google.auth.transport import requests as google_requests
+
+    return google_id_token.verify_oauth2_token(
+        id_tok, google_requests.Request(), client_id
+    )
+
+
+@google_auth_router.get("/google/login-url")
+async def google_login_url(response: Response, redirect_uri: Optional[str] = None):
+    """Start the Google OAuth flow. Generates a CSRF `state`, binds it to the
+    browser via a short-lived httponly cookie, and returns the Google
+    authorization URL to redirect to. Fail-closed when OAuth is not configured."""
+    client_id, client_secret = _google_oauth_config()
+    if not client_id or not client_secret:
+        raise HTTPException(status_code=401, detail="Google sign-in is not configured")
+
+    allowed = _allowed_google_redirect_uris()
+    if redirect_uri:
+        if redirect_uri.rstrip("/") not in allowed:
+            raise HTTPException(status_code=400, detail="Invalid redirect_uri")
+        chosen = redirect_uri
+    elif allowed:
+        chosen = sorted(allowed)[0]
+    else:
+        raise HTTPException(status_code=401, detail="Google sign-in is not configured")
+
+    state = secrets.token_urlsafe(32)
+    params = {
+        "client_id": client_id,
+        "redirect_uri": chosen,
+        "response_type": "code",
+        "scope": "openid email profile",
+        "state": state,
+        "prompt": "select_account",
+        "access_type": "online",
+    }
+    # Server-side single-use record (replay + authoritative expiry) bound to the
+    # redirect_uri, plus the httponly cookie (per-browser CSRF binding).
+    await _store_oauth_state(state, chosen)
+    _set_oauth_state_cookie(response, state)
+    return {"url": f"{GOOGLE_AUTH_ENDPOINT}?{urlencode(params)}", "redirect_uri": chosen}
+
 
 @google_auth_router.post("/google/session")
 async def google_auth_session(request: Request, response: Response):
-    """Exchange a Google OAuth authorization code for a user session."""
+    """Complete the Google OAuth flow: validate the CSRF state, exchange the
+    authorization code, verify the id_token, and issue a session."""
     body = await request.json()
     code = body.get("code")
+    state = body.get("state")
     redirect_uri = body.get("redirect_uri")
 
     if not code:
         raise HTTPException(status_code=400, detail="code required")
+    if not state:
+        raise HTTPException(status_code=400, detail="state required")
 
-    client_id = os.environ.get("GOOGLE_CLIENT_ID", "").strip()
-    client_secret = os.environ.get("GOOGLE_CLIENT_SECRET", "").strip()
+    # CSRF protection: the callback must present the same state we planted in the
+    # httponly cookie when the flow started (double-submit). Constant-time compare.
+    cookie_state = request.cookies.get(GOOGLE_OAUTH_STATE_COOKIE)
+    if not cookie_state or not secrets.compare_digest(state, cookie_state):
+        await log_auth_event("oauth_login_failure", request, reason="invalid_state")
+        raise HTTPException(status_code=400, detail="Invalid OAuth state")
+
+    # Single-use server-side record: consume it (fetch-and-delete). A missing
+    # record means the state is expired or has already been used (replay).
+    state_record = await _consume_oauth_state(state)
+    _clear_oauth_state_cookie(response)  # burn the cookie regardless of outcome
+    if state_record is None:
+        await log_auth_event("oauth_login_failure", request, reason="replayed_or_expired_state")
+        raise HTTPException(status_code=400, detail="Invalid OAuth state")
+
+    client_id, client_secret = _google_oauth_config()
     if not client_id or not client_secret:
         raise HTTPException(status_code=401, detail="Google sign-in is not configured")
 
+    # The redirect_uri must be allowlisted AND must match the one bound to this
+    # state at flow start (defense in depth against redirect substitution).
+    allowed = _allowed_google_redirect_uris()
+    if (not redirect_uri or redirect_uri.rstrip("/") not in allowed
+            or redirect_uri != state_record.get("redirect_uri")):
+        await log_auth_event("oauth_login_failure", request, reason="invalid_redirect_uri")
+        raise HTTPException(status_code=400, detail="Invalid redirect_uri")
+
     try:
-        # Exchange code for tokens via direct Google OAuth
-        async with httpx.AsyncClient(timeout=10) as client:
-            token_resp = await client.post(
-                "https://oauth2.googleapis.com/token",
-                data={
-                    "code": code,
-                    "client_id": client_id,
-                    "client_secret": client_secret,
-                    "redirect_uri": redirect_uri or "http://localhost:3000/auth/google/callback",
-                    "grant_type": "authorization_code",
-                }
-            )
-            if token_resp.status_code != 200:
-                raise HTTPException(status_code=401, detail="Google token exchange failed")
-
-            token_data = token_resp.json()
-            access_token = token_data.get("access_token")
-
-            # Fetch user details
-            info_resp = await client.get(
-                "https://www.googleapis.com/oauth2/v3/userinfo",
-                headers={"Authorization": f"Bearer {access_token}"}
-            )
-            if info_resp.status_code != 200:
-                raise HTTPException(status_code=401, detail="Failed to fetch user info from Google")
-
-            user_info = info_resp.json()
-            email = user_info.get("email", "").lower().strip()
-            name = user_info.get("name", "")
-            picture = user_info.get("picture", "")
+        token_data = await _exchange_google_code(code, redirect_uri, client_id, client_secret)
     except httpx.RequestError:
+        await log_auth_event("oauth_login_failure", request, reason="google_unavailable")
         raise HTTPException(status_code=502, detail="Google Auth service unavailable")
+    except HTTPException:
+        await log_auth_event("oauth_login_failure", request, reason="token_exchange_failed")
+        raise
 
-    if not email:
-        raise HTTPException(status_code=401, detail="No email from Google")
+    id_tok = token_data.get("id_token")
+    if not id_tok:
+        await log_auth_event("oauth_login_failure", request, reason="missing_id_token")
+        raise HTTPException(status_code=401, detail="Google did not return an identity token")
 
-    # Find or create user
-    user = await db.users.find_one({"email": email})
-    role = "user"
-    if not user:
-        user_doc = {
-            "name": name,
-            "email": email,
-            "picture": picture,
-            "password_hash": "",  # No password for Google users
-            "auth_provider": "google",
-            "role": "user",
-            "capital": 100000,
-            "risk_level": "moderate",
-            "max_daily_loss": 5000,
-            "max_trades_per_day": 3,
-            "telegram_chat_id": None,
-            "notification_prefs": {"push": True, "email": True, "morning_report": True, "trade_alerts": True, "exit_reminder": True, "portfolio_alerts": True, "email_alerts": True, "telegram_alerts": False},
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        }
-        result = await db.users.insert_one(user_doc)
-        user_id = str(result.inserted_id)
-    else:
+    try:
+        # Passing client_id as the audience makes verify_oauth2_token reject any
+        # token not minted for this application (wrong `aud`).
+        claims = _verify_google_id_token(id_tok, client_id)
+    except ValueError:
+        await log_auth_event("oauth_login_failure", request, reason="invalid_id_token")
+        raise HTTPException(status_code=401, detail="Invalid Google identity token")
+
+    if claims.get("iss") not in GOOGLE_VALID_ISSUERS:
+        await log_auth_event("oauth_login_failure", request, reason="bad_issuer")
+        raise HTTPException(status_code=401, detail="Invalid Google token issuer")
+
+    email = (claims.get("email") or "").lower().strip()
+    google_sub = claims.get("sub")
+    name = claims.get("name", "")
+    picture = claims.get("picture", "")
+    email_verified = claims.get("email_verified")
+    if isinstance(email_verified, str):
+        email_verified = email_verified.strip().lower() == "true"
+
+    if not email or not google_sub:
+        await log_auth_event("oauth_login_failure", request, email=email or None, reason="incomplete_identity")
+        raise HTTPException(status_code=401, detail="Google identity incomplete")
+    # Fail closed on unverified emails: an unverified Google email must never
+    # create a new account nor link to an existing one (account-takeover guard).
+    if email_verified is not True:
+        await log_auth_event("oauth_login_failure", request, email=email, reason="unverified_email")
+        raise HTTPException(status_code=401, detail="Google email is not verified")
+
+    # Account resolution. The Google `sub` is the PRIMARY external identity —
+    # stable even if the user's Google display name changes — so we resolve by
+    # it first. Verified email is the secondary key used only to safely link a
+    # pre-existing email/password account. Email remains the unique key, so no
+    # duplicate accounts are ever created.
+    new_account = False
+    linked = False
+    user = await db.users.find_one({"google_sub": google_sub})
+    if user:
         user_id = str(user["_id"])
         role = user.get("role", "user")
-        # Update Google profile info
-        await db.users.update_one({"_id": user["_id"]}, {"$set": {"picture": picture, "name": name or user.get("name", "")}})
+        capital = user.get("capital", 100000)
+        # Refresh profile only — never mutate the email off a sub match.
+        await db.users.update_one(
+            {"_id": user["_id"]},
+            {"$set": {"picture": picture, "name": name or user.get("name", "")}},
+        )
+    else:
+        user = await db.users.find_one({"email": email})
+        if user:
+            existing_sub = user.get("google_sub")
+            if existing_sub and existing_sub != google_sub:
+                # This email is already bound to a different Google identity —
+                # anomalous (Google emails are unique). Never silently re-link.
+                await log_auth_event("oauth_login_failure", request, email=email,
+                                     user_id=str(user["_id"]), reason="sub_conflict")
+                raise HTTPException(status_code=401, detail="Account cannot be linked")
+            user_id = str(user["_id"])
+            role = user.get("role", "user")
+            capital = user.get("capital", 100000)
+            linked = user.get("auth_provider") != "google"
+            # Link: attach the Google identity; preserve password_hash/auth_provider
+            # so email/password login keeps working alongside Google.
+            await db.users.update_one(
+                {"_id": user["_id"]},
+                {"$set": {
+                    "picture": picture,
+                    "name": name or user.get("name", ""),
+                    "google_sub": google_sub,
+                }},
+            )
+        else:
+            user_doc = {
+                "name": name,
+                "email": email,
+                "picture": picture,
+                "password_hash": "",  # No password for Google-native users
+                "auth_provider": "google",
+                "google_sub": google_sub,
+                "role": "user",
+                "capital": 100000,
+                "risk_level": "moderate",
+                "max_daily_loss": 5000,
+                "max_trades_per_day": 3,
+                "telegram_chat_id": None,
+                "notification_prefs": {"push": True, "email": True, "morning_report": True, "trade_alerts": True, "exit_reminder": True, "portfolio_alerts": True, "email_alerts": True, "telegram_alerts": False},
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }
+            result = await db.users.insert_one(user_doc)
+            user_id = str(result.inserted_id)
+            role = "user"
+            capital = 100000
+            new_account = True
 
-    # Create JWT token for the user
     access = create_access_token(user_id, email)
     refresh = create_refresh_token(user_id)
     set_auth_cookies(response, access, refresh)
+    await log_auth_event("oauth_login_success", request, email=email, user_id=user_id,
+                         detail={"new_account": new_account, "linked": linked})
 
     return {
         "id": user_id, "name": name, "email": email, "role": role,
-        "picture": picture, "capital": 100000, "token": access,
+        "picture": picture, "capital": capital, "token": access,
         "auth_provider": "google",
     }
 
@@ -4591,13 +4854,10 @@ async def get_recent_ai_activity():
     return get_recent_activity()
 
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=os.environ.get('CORS_ORIGINS', '*').split(','),
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# CORS is centralized in security.cors (PH1.4): environment-driven, exact-match
+# origin allowlist with credentials — never a wildcard. See that module for the
+# full policy and rationale.
+apply_cors(app)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -4616,6 +4876,11 @@ async def startup():
     await db.admin_audit_logs.create_index("timestamp")
     await db.admin_audit_logs.create_index("admin_id")
     await db.admin_audit_logs.create_index("action")
+
+    # Security audit log (PH1.2) — immutable OAuth/auth security events
+    await db.security_audit_logs.create_index("timestamp")
+    await db.security_audit_logs.create_index("event")
+    await db.security_audit_logs.create_index("email")
     await db.feature_flags.create_index("key", unique=True)
     await db.announcements.create_index("created_at")
     await db.support_tickets.create_index("status")

@@ -32,14 +32,19 @@ class TestOAuthFailsClosed:
         monkeypatch.delenv("GOOGLE_CLIENT_SECRET", raising=False)
 
     def test_mock_code_rejected(self, client, fake_db):
+        # PH1.2: `state` is now mandatory and validated first, so a lone forged
+        # code is rejected (400) before any exchange. Still fail-closed, still no user.
         r = client.post("/api/auth/google/session", json={"code": "mock-code-for-testing"})
-        assert r.status_code == 401
+        assert r.status_code == 400
         assert len(fake_db.users.docs) == 0
 
     def test_unconfigured_oauth_rejected(self, client, fake_db):
+        # PH1.2: with no valid state cookie the CSRF guard rejects the request
+        # (400) before the config check. The "not configured" 401 contract now
+        # lives on GET /api/auth/google/login-url (see test_oauth_hardening.py).
         r = client.post("/api/auth/google/session", json={"code": "any-real-looking-code"})
-        assert r.status_code == 401
-        assert "not configured" in r.json()["detail"]
+        assert r.status_code == 400
+        assert len(fake_db.users.docs) == 0
 
     def test_legacy_session_id_rejected(self, client, fake_db):
         r = client.post("/api/auth/google/session", json={"session_id": "legacy-session-abc"})
