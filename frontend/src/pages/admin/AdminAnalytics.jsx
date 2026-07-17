@@ -1,0 +1,102 @@
+import { useState, useEffect } from "react";
+import { motion } from "framer-motion";
+import { BarChart3, Users, TrendingUp, Target, ArrowUpRight } from "lucide-react";
+import { AreaChart, Area, BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer } from "recharts";
+import adminService from "../../services/adminService";
+
+export default function AdminAnalytics() {
+  const [userStats, setUserStats] = useState(null);
+  const [revenue, setRevenue] = useState([]);
+  const [features, setFeatures] = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    Promise.all([adminService.getUserAnalytics(), adminService.getRevenueAnalytics(), adminService.getFeatureAnalytics()])
+      .then(([u, r, f]) => { setUserStats(u.data); setRevenue(r.data.daily_revenue || []); setFeatures(f.data.features || []); setLoading(false); })
+      .catch(() => setLoading(false));
+  }, []);
+
+  if (loading) return <div className="space-y-6"><div className="h-8 w-48 rounded-lg animate-pulse" style={{ background: "var(--border)" }} /></div>;
+
+  return (
+    <div className="space-y-6">
+      <div>
+        <h1 className="page-title">Analytics</h1>
+        <p className="page-subtitle mt-1">User engagement, revenue, and feature usage</p>
+      </div>
+
+      {/* User Metrics */}
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+        <MetricCard label="DAU" value={userStats?.dau || 0} icon={Users} color="#6366F1" delta="+8%" />
+        <MetricCard label="Total Users" value={userStats?.total_users || 0} icon={Users} color="#8B5CF6" delta={`+${userStats?.growth_rate || 0}%`} />
+        <MetricCard label="Retention" value={`${userStats?.retention_rate || 0}%`} icon={Target} color="#00D68F" />
+        <MetricCard label="Conversion" value={`${userStats?.conversion_rate || 0}%`} icon={TrendingUp} color="#F59E0B" />
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        {/* Revenue Chart */}
+        <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className="p-5 rounded-2xl" style={{ background: "var(--bg-card-glass)", backdropFilter: "blur(24px)", border: "1px solid var(--border)" }}>
+          <h3 className="card-title mb-4">Revenue Trend</h3>
+          <div className="h-56">
+            <ResponsiveContainer width="100%" height="100%">
+              <AreaChart data={revenue}>
+                <defs><linearGradient id="anaRevGrad" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="#00D68F" stopOpacity={0.3} /><stop offset="100%" stopColor="#00D68F" stopOpacity={0} /></linearGradient></defs>
+                <XAxis dataKey="date" tick={{ fontSize: 10, fill: "var(--text-muted)" }} tickFormatter={d => d.split("-")[2]} />
+                <YAxis tick={{ fontSize: 10, fill: "var(--text-muted)" }} />
+                <Tooltip contentStyle={{ background: "var(--bg-elevated)", border: "1px solid var(--border)", borderRadius: 12, fontSize: 12 }} />
+                <Area type="monotone" dataKey="revenue" stroke="#00D68F" strokeWidth={2} fill="url(#anaRevGrad)" />
+              </AreaChart>
+            </ResponsiveContainer>
+          </div>
+        </motion.div>
+
+        {/* Feature Usage */}
+        <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.1 }} className="p-5 rounded-2xl" style={{ background: "var(--bg-card-glass)", backdropFilter: "blur(24px)", border: "1px solid var(--border)" }}>
+          <h3 className="card-title mb-4">Feature Usage</h3>
+          <div className="space-y-3">
+            {features.map((f, i) => (
+              <div key={f.name} className="flex items-center gap-3">
+                <span className="text-xs w-28 truncate" style={{ color: "var(--text-secondary)" }}>{f.name}</span>
+                <div className="flex-1 h-2 rounded-full overflow-hidden" style={{ background: "var(--border)" }}>
+                  <motion.div
+                    initial={{ width: 0 }} animate={{ width: `${f.percentage}%` }} transition={{ delay: i * 0.05, duration: 0.6 }}
+                    className="h-full rounded-full"
+                    style={{ background: `hsl(${240 + i * 15}, 70%, 60%)` }}
+                  />
+                </div>
+                <span className="text-xs font-mono font-semibold w-10 text-right" style={{ color: "var(--text-primary)" }}>{f.percentage}%</span>
+              </div>
+            ))}
+          </div>
+        </motion.div>
+      </div>
+
+      {/* Additional Stats */}
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+        <SmallStat label="Churn Rate" value={`${userStats?.churn_rate || 0}%`} negative />
+        <SmallStat label="Growth Rate" value={`${userStats?.growth_rate || 0}%`} />
+        <SmallStat label="Today Signups" value={userStats?.today_signups || 0} />
+        <SmallStat label="MAU" value={userStats?.mau || 0} />
+      </div>
+    </div>
+  );
+}
+
+function MetricCard({ label, value, icon: Icon, color, delta }) {
+  return (
+    <motion.div initial={{ opacity: 0, y: 15 }} animate={{ opacity: 1, y: 0 }} className="p-4 rounded-2xl" style={{ background: "var(--bg-card-glass)", backdropFilter: "blur(24px)", border: "1px solid var(--border)" }}>
+      <div className="flex items-center justify-between mb-2"><div className="w-8 h-8 rounded-xl flex items-center justify-center" style={{ background: `${color}15` }}><Icon size={16} style={{ color }} /></div>{delta && <div className="flex items-center gap-0.5"><ArrowUpRight size={12} style={{ color: "var(--gain)" }} /><span className="text-[10px] font-semibold" style={{ color: "var(--gain)" }}>{delta}</span></div>}</div>
+      <div className="stat-value !text-lg">{typeof value === "number" ? value.toLocaleString() : value}</div>
+      <div className="text-[10px] uppercase tracking-wider font-semibold mt-1" style={{ color: "var(--text-muted)" }}>{label}</div>
+    </motion.div>
+  );
+}
+
+function SmallStat({ label, value, negative }) {
+  return (
+    <div className="p-4 rounded-2xl text-center" style={{ background: "var(--bg-card-glass)", backdropFilter: "blur(24px)", border: "1px solid var(--border)" }}>
+      <div className="stat-value !text-lg" style={negative ? { color: "var(--loss)" } : {}}>{typeof value === "number" ? value.toLocaleString() : value}</div>
+      <div className="text-[10px] uppercase tracking-wider font-semibold mt-1" style={{ color: "var(--text-muted)" }}>{label}</div>
+    </div>
+  );
+}

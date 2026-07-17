@@ -1,9 +1,9 @@
 # StockAssist AI
 ## Documentation Index
 
-Version: 1.1
+Version: 1.2
 
-Status: Active Development
+Status: Feature Freeze — Production Hardening (PH1–PH3)
 
 ---
 
@@ -155,6 +155,18 @@ CODING_STANDARDS.md
 TESTING.md
 
 TASKS.md
+
+---
+
+7. Production Hardening Documents
+
+These govern the current phase of work. Mandatory reading until v1.0 launch.
+
+PRODUCTION_HARDENING.md
+
+PRODUCTION_ROADMAP.md
+
+CHANGELOG.md
 
 ---
 
@@ -604,7 +616,71 @@ Changing architecture.
 
 ---
 
+PRODUCTION_HARDENING.md
+
+Purpose
+
+Master architecture document for the Production Hardening program: audit baseline, risk matrix, readiness score, security/infrastructure/deployment/testing/monitoring/recovery strategies, certification checklists, and the Definition of Production Ready.
+
+Read When
+
+Any PH1/PH2/PH3 work.
+
+Any security, deployment, or launch-related task.
+
+Mandatory until v1.0 launch.
+
+---
+
+PRODUCTION_ROADMAP.md
+
+Purpose
+
+Sprint-level plan for the three Production Hardening phases (PH1 Security, PH2 Infrastructure & DevOps, PH3 Quality Assurance) — 36 sprints with objectives, acceptance criteria, validation, rollback, and the implementation dependency graph.
+
+Read When
+
+Starting any PH sprint.
+
+Planning hardening work.
+
+---
+
+CHANGELOG.md
+
+Purpose
+
+Documentation and release change history.
+
+Read When
+
+Releasing.
+
+Bumping documentation versions.
+
+---
+
 # Phase-Based Reading Guide
+
+## Production Hardening (Current Phase)
+
+PRODUCTION_HARDENING.md
+
+PRODUCTION_ROADMAP.md
+
+SECURITY.md
+
+DEPLOYMENT.md
+
+TESTING.md
+
+TASKS.md
+
+Objective
+
+Take the feature-complete MVP to a certified production launch. No new product features until Production Certification (PH3.12).
+
+---
 
 ## Project Audit
 
@@ -957,6 +1033,19 @@ If implementing AI, Broker, Portfolio, Scanner, Dashboard, or Notifications, rea
 ---
 
 # Documentation Changelog
+
+## Version 1.2 — 2026-07-17
+
+Major Changes
+
+- MVP declared feature complete (Phase 1 Sprints 1–12; Phase 2 Releases R1–R9). Feature freeze in effect.
+- Introduced the Production Hardening program: PH1 (Security), PH2 (Infrastructure & DevOps), PH3 (Quality Assurance), 12 sprints each.
+- Created PRODUCTION_HARDENING.md — master hardening architecture document (audit baseline, risk matrix, readiness score 4.2/10, strategies, certification checklists, Definition of Production Ready).
+- Created PRODUCTION_ROADMAP.md — 36-sprint implementation roadmap with sequencing and dependency graph.
+- Created CHANGELOG.md — standalone change history.
+- Updated ROADMAP.md, TASKS.md, DECISIONS.md to reflect the hardening interlude before product Phases 3–9.
+- Recorded ADR-027 (Feature Freeze & Production Hardening Program) in DECISIONS.md.
+- Baseline input: PRODUCTION_READINESS_REPORT.md (Sprint 12 audit, verdict NOT READY).
 
 ## Version 1.1 — 2026-07-16
 

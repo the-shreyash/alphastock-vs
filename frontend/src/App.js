@@ -35,6 +35,21 @@ const MorningReport = lazy(() => import("./pages/MorningReport"));
 const Markets = lazy(() => import("./pages/Markets"));
 const Watchlist = lazy(() => import("./pages/Watchlist"));
 
+/* Admin Portal (Sprint 11) — lazy-loaded, never shipped to non-admin users. */
+const AdminLayout = lazy(() => import("./components/admin/AdminLayout"));
+const AdminRoute = lazy(() => import("./components/admin/AdminRoute"));
+const AdminDashboard = lazy(() => import("./pages/admin/AdminDashboard"));
+const AdminUsers = lazy(() => import("./pages/admin/AdminUsers"));
+const AdminPayments = lazy(() => import("./pages/admin/AdminPayments"));
+const AdminAI = lazy(() => import("./pages/admin/AdminAI"));
+const AdminAPIs = lazy(() => import("./pages/admin/AdminAPIs"));
+const AdminAnalytics = lazy(() => import("./pages/admin/AdminAnalytics"));
+const AdminLogs = lazy(() => import("./pages/admin/AdminLogs"));
+const AdminSupport = lazy(() => import("./pages/admin/AdminSupport"));
+const AdminFeatureFlags = lazy(() => import("./pages/admin/AdminFeatureFlags"));
+const AdminAnnouncements = lazy(() => import("./pages/admin/AdminAnnouncements"));
+const AdminSystemHealth = lazy(() => import("./pages/admin/AdminSystemHealth"));
+
 /* Suspense fallback matching the app's existing loading language. */
 function PageFallback() {
   return (
@@ -100,6 +115,21 @@ function AppRouter() {
         <Route path="paper-trading" element={<PaperTrading />} />
         <Route path="backtesting" element={<Backtesting />} />
         <Route path="morning-report" element={<MorningReport />} />
+      </Route>
+      {/* Admin Portal (Sprint 11) — isolated layout with its own sidebar */}
+      <Route path="/admin" element={<ProtectedRoute><AdminRoute><AdminLayout /></AdminRoute></ProtectedRoute>}>
+        <Route index element={<Navigate to="/admin/dashboard" replace />} />
+        <Route path="dashboard" element={<AdminDashboard />} />
+        <Route path="users" element={<AdminUsers />} />
+        <Route path="payments" element={<AdminPayments />} />
+        <Route path="ai" element={<AdminAI />} />
+        <Route path="apis" element={<AdminAPIs />} />
+        <Route path="analytics" element={<AdminAnalytics />} />
+        <Route path="logs" element={<AdminLogs />} />
+        <Route path="support" element={<AdminSupport />} />
+        <Route path="feature-flags" element={<AdminFeatureFlags />} />
+        <Route path="announcements" element={<AdminAnnouncements />} />
+        <Route path="system-health" element={<AdminSystemHealth />} />
       </Route>
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>

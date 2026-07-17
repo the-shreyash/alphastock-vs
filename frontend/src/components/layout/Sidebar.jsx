@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { NavLink, useLocation } from "react-router-dom";
 import { motion, AnimatePresence } from "framer-motion";
-import { LayoutDashboard, Target, TrendingUp, Briefcase, Settings, LogOut, Newspaper, BookOpen, X, FlaskConical, Sun, Search, Globe, Brain, LineChart, Eye, Sparkles, PanelLeftClose, PanelLeftOpen } from "lucide-react";
+import { LayoutDashboard, Target, TrendingUp, Briefcase, Settings, LogOut, Newspaper, BookOpen, X, FlaskConical, Sun, Search, Globe, Brain, LineChart, Eye, Sparkles, PanelLeftClose, PanelLeftOpen, Shield } from "lucide-react";
 import { useAuth } from "../../context/AuthContext";
 import APLogo from "../APLogo";
 
@@ -32,8 +32,8 @@ const NAV_ITEMS = [
   { to: "/paper-trading", icon: FlaskConical, label: "Paper Trading", sub: true },
   { to: "/journal", icon: BookOpen, label: "Journal" },
   { type: "divider" },
-  // — More —
   { to: "/news", icon: Newspaper, label: "News" },
+  { to: "/admin", icon: Shield, label: "Admin Portal", adminOnly: true },
   { to: "/settings", icon: Settings, label: "Settings" },
 ];
 
@@ -136,6 +136,8 @@ export default function Sidebar({ collapsed, setCollapsed, onClose, isMobile }) 
       <nav className="flex-1 py-2 px-2.5 overflow-y-auto overflow-x-hidden">
         <div className="space-y-1">
           {NAV_ITEMS.map((item, idx) => {
+            // Hide admin-only items from non-admin users
+            if (item.adminOnly && !["admin", "super_admin"].includes(user?.role)) return null;
             if (item.type === "divider") {
               return <div key={`div-${idx}`} className="my-2 mx-2" style={{ borderBottom: "1px solid var(--border)" }} />;
             }

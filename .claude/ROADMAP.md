@@ -1,9 +1,9 @@
 # StockAssist AI
 ## Product Roadmap
 
-Version: 1.1
+Version: 1.2
 
-Status: Active Development
+Status: Feature Freeze — Production Hardening (PH1–PH3)
 
 ---
 
@@ -113,7 +113,7 @@ Backend foundation
 
 Status
 
-In Progress
+COMPLETE — Sprints 1–12 delivered (2026-07-17)
 
 ---
 
@@ -155,7 +155,49 @@ First public beta
 
 Status
 
-Planned
+COMPLETE — Releases R1–R9 delivered (2026-07-17). MVP feature set frozen.
+
+---
+
+# Production Hardening Interlude — PH1 / PH2 / PH3 (CURRENT)
+
+Objective
+
+Take the feature-complete MVP to a certified, publicly launchable Version 1.0.
+
+**No new product features ship during this interlude.** Product Phases 3–9 below are blocked until Production Certification (PH3.12).
+
+Baseline: the Sprint 12 Production Readiness Audit (verdict: NOT READY — readiness score 4.2/10).
+
+Authoritative documents
+
+PRODUCTION_HARDENING.md — strategy, risk matrix, certification checklists, Definition of Production Ready.
+
+PRODUCTION_ROADMAP.md — all 36 sprint definitions, sequencing, dependency graph.
+
+## PH1 — Production Security Hardening (12 sprints)
+
+PH1.1 Authentication Backdoor Removal · PH1.2 Google OAuth Production Flow · PH1.3 Cookie & Session Security · PH1.4 CORS & Security Headers · PH1.5 Password Policy, Validation & Email Verification · PH1.6 JWT Lifecycle & Refresh Rotation · PH1.7 Rate Limiting & Brute-Force Protection · PH1.8 Secrets & Environment Hardening · PH1.9 Real-Time & WebSocket Security · PH1.10 Admin Hardening & Session Management · PH1.11 Dependency & Vulnerability Scanning · PH1.12 Security Certification
+
+Deliverable: Security sign-off. No authentication path bypasses credential verification; SECURITY.md compliance.
+
+Status: NOT_STARTED — first sprint of the program (PH1.1)
+
+## PH2 — Production Infrastructure & DevOps (12 sprints)
+
+PH2.1 Backend Dockerfile · PH2.2 Frontend Dockerfile · PH2.3 Compose Split Dev/Prod · PH2.4 Environment & Configuration Framework · PH2.5 CI Pipeline Foundation · PH2.6 CI Extended (Docker/Security/Integration) · PH2.7 CD & Release Automation · PH2.8 Database & Redis Production Config · PH2.9 Structured Logging · PH2.10 Monitoring, Metrics & Alerting · PH2.11 Backup & Disaster Recovery · PH2.12 Infrastructure Certification & Staging Sign-off
+
+Deliverable: Infrastructure sign-off. Mechanical, reversible, observable deployments; 7-day clean staging soak.
+
+Status: NOT_STARTED — partially parallel with PH1
+
+## PH3 — Production Quality Assurance (12 sprints)
+
+PH3.1 Backend Test Suite Repair & Hermeticity · PH3.2 Mock Data Eradication · PH3.3 Frontend Test Foundation & Smoke Suite · PH3.4 Frontend Service & Hook Coverage · PH3.5 API Contract & Error-State Testing · PH3.6 Backend Decomposition (server.py → Routers) · PH3.7 Performance Benchmarking & Load Testing · PH3.8 Accessibility & Responsive Audit · PH3.9 End-to-End Critical Journeys · PH3.10 Documentation Synchronization · PH3.11 Regression & Release Test Protocol · PH3.12 Production Certification & Launch Readiness
+
+Deliverable: Quality sign-off and v1.0 Production Certification (readiness score ≥ 9.0, no category < 8.0).
+
+Status: NOT_STARTED — PH3.1/PH3.2 may start immediately in parallel
 
 ---
 

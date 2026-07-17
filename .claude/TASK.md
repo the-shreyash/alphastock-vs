@@ -1,9 +1,9 @@
 # StockAssist AI
 ## Master Tasks
 
-Version: 1.1
+Version: 1.2
 
-Status: Active Development
+Status: Feature Freeze — Production Hardening (PH1–PH3)
 
 ---
 
@@ -1860,6 +1860,82 @@ Current Priorities
 This section should always contain the next highest-priority work.
 
 Current Objective
+
+**FEATURE FREEZE — Production Hardening program (2026-07-17).**
+
+The MVP is feature complete (Phase 1 Sprints 1–12; Phase 2 Releases R1–R9). The
+Sprint 12 Production Readiness Audit returned NOT READY (score 4.2/10): two
+critical authentication backdoors, wildcard CORS with credentials, insecure
+cookies, broken Docker packaging, no CI/CD, no rate limiting, mock data in
+admin analytics, no frontend tests. No new product features ship until
+Production Certification.
+
+Next Recommended Sprint: **PH1.1 — Authentication Backdoor Removal**
+(remove `GET /api/auth/auto-login` and the Google OAuth demo/mock fallbacks).
+PH3.1 (Backend Test Suite Repair) may run in parallel.
+
+Authoritative documents: PRODUCTION_HARDENING.md and PRODUCTION_ROADMAP.md.
+Task tracking below under "Production Hardening Program".
+
+---
+
+# Production Hardening Program (PH1–PH3)
+
+Status: NOT_STARTED (awaiting PH1 implementation approval)
+
+Priority: Critical — blocks all other work
+
+Full sprint definitions (objective, scope, acceptance criteria, validation,
+rollback, estimates) live in PRODUCTION_ROADMAP.md. Status tracker:
+
+## PH1 — Production Security Hardening
+
+- [ ] PH1.1 Authentication Backdoor Removal — NOT_STARTED — Critical
+- [ ] PH1.2 Google OAuth Production Flow — NOT_STARTED — Critical
+- [ ] PH1.3 Cookie & Session Security — NOT_STARTED — Critical
+- [ ] PH1.4 CORS & Security Headers — NOT_STARTED — Critical
+- [ ] PH1.5 Password Policy, Validation & Email Verification — NOT_STARTED — High
+- [ ] PH1.6 JWT Lifecycle & Refresh Rotation — NOT_STARTED — High
+- [ ] PH1.7 Rate Limiting & Brute-Force Protection — NOT_STARTED — High
+- [ ] PH1.8 Secrets & Environment Hardening — NOT_STARTED — High
+- [ ] PH1.9 Real-Time & WebSocket Security — NOT_STARTED — High
+- [ ] PH1.10 Admin Hardening & Session Management — NOT_STARTED — Medium
+- [ ] PH1.11 Dependency & Vulnerability Scanning — NOT_STARTED — Medium
+- [ ] PH1.12 Security Certification — NOT_STARTED — Critical (gate)
+
+## PH2 — Production Infrastructure & DevOps
+
+- [ ] PH2.1 Backend Production Dockerfile — NOT_STARTED — Critical
+- [ ] PH2.2 Frontend Production Dockerfile — NOT_STARTED — Critical
+- [ ] PH2.3 Compose Split: Dev vs Prod — NOT_STARTED — Critical
+- [ ] PH2.4 Environment & Configuration Framework — NOT_STARTED — High
+- [ ] PH2.5 CI Pipeline Foundation — NOT_STARTED — Critical
+- [ ] PH2.6 CI Extended: Docker, Security & Integration — NOT_STARTED — High
+- [ ] PH2.7 CD & Release Automation — NOT_STARTED — High
+- [ ] PH2.8 Database & Redis Production Configuration — NOT_STARTED — High
+- [ ] PH2.9 Structured Logging — NOT_STARTED — High
+- [ ] PH2.10 Monitoring, Metrics & Alerting — NOT_STARTED — High
+- [ ] PH2.11 Backup & Disaster Recovery — NOT_STARTED — High
+- [ ] PH2.12 Infrastructure Certification & Staging Sign-off — NOT_STARTED — Critical (gate)
+
+## PH3 — Production Quality Assurance
+
+- [ ] PH3.1 Backend Test Suite Repair & Hermeticity — NOT_STARTED — Critical (parallel-safe now)
+- [ ] PH3.2 Mock Data Eradication (ADR-021) — NOT_STARTED — High (parallel-safe now)
+- [ ] PH3.3 Frontend Test Foundation & Smoke Suite — NOT_STARTED — Critical
+- [ ] PH3.4 Frontend Service & Hook Coverage — NOT_STARTED — Medium
+- [ ] PH3.5 API Contract & Error-State Testing — NOT_STARTED — High
+- [ ] PH3.6 Backend Decomposition (server.py → Routers) — NOT_STARTED — Medium
+- [ ] PH3.7 Performance Benchmarking & Load Testing — NOT_STARTED — Medium
+- [ ] PH3.8 Accessibility & Responsive Audit — NOT_STARTED — Medium
+- [ ] PH3.9 End-to-End Critical Journeys — NOT_STARTED — High
+- [ ] PH3.10 Documentation Synchronization — NOT_STARTED — High
+- [ ] PH3.11 Regression & Release Test Protocol — NOT_STARTED — High
+- [ ] PH3.12 Production Certification & Launch Readiness — NOT_STARTED — Critical (final gate)
+
+---
+
+# Previous Focus (superseded 2026-07-17)
 
 Sprint 9 (Trading Engine) is COMPLETE — `services/trading_engine.py` closes
 the trade lifecycle on top of the Broker Engine: a pre-trade Risk Manager
