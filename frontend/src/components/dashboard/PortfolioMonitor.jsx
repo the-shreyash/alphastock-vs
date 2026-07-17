@@ -1,6 +1,7 @@
 import { useState, useEffect } from "react";
 import api from "../../services/api";
 import { Shield, AlertTriangle, TrendingUp, Activity, RefreshCw, Heart } from "lucide-react";
+import { useRealtimeStore, selectConnected, selectPortfolioUpdate } from "../../store/realtimeStore";
 
 const SEVERITY_STYLES = {
   critical: { color: "var(--loss)", bg: "rgba(244,63,94,0.08)", icon: AlertTriangle },
@@ -13,12 +14,24 @@ export default function PortfolioMonitor() {
   const [health, setHealth] = useState(null);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
+  const connected = useRealtimeStore(selectConnected);
+  const portfolioUpdate = useRealtimeStore(selectPortfolioUpdate);
 
   useEffect(() => {
-    fetchHealth();
-    const interval = setInterval(fetchHealth, 60000); // Auto-refresh every 60s
+    fetchHealth(); // seed on mount
+    // While connected, we recompute on real portfolio_update pushes instead of
+    // a fixed timer; keep the 60s poll only as a disconnected fallback.
+    if (connected) return undefined;
+    const interval = setInterval(fetchHealth, 60000);
     return () => clearInterval(interval);
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [connected]);
+
+  // Recompute health when the live portfolio changes (event-triggered refetch).
+  useEffect(() => {
+    if (portfolioUpdate) fetchHealth();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [portfolioUpdate]);
 
   const fetchHealth = async () => {
     try {

@@ -1,7 +1,7 @@
 # StockAssist AI
 ## Market Engine Documentation
 
-Version: 1.0
+Version: 1.1
 
 Status: Active Development
 
@@ -147,17 +147,17 @@ Global Indices
 
 # Data Providers
 
-Primary
+Provider selection, priority, switching, and failover are defined authoritatively in MARKET_DATA_ARCHITECTURE.md. The Market Engine never communicates with providers directly — it consumes normalized market events from the Market Gateway.
 
-Yahoo Finance
+Provider priority (resolved per user by the Source Manager):
 
-NSE Official Data
+1. Connected Broker WebSocket (Zerodha, Upstox, Angel One, Fyers, Dhan)
 
-Broker APIs
+2. Licensed Exchange Feed (future)
 
----
+3. Yahoo Finance (always-available polling baseline)
 
-Secondary
+Secondary / future
 
 Alpha Vantage
 
@@ -167,7 +167,9 @@ Finnhub
 
 TwelveData
 
-Future Premium Providers
+Crypto, Forex, US market providers
+
+Each provider is one adapter behind the Market Gateway. Adding a provider never changes the Market Engine.
 
 ---
 
@@ -183,6 +185,10 @@ Everything passes through:
 
 Market Gateway
 
+The Market Gateway owns provider connections, authentication, normalization, validation, health monitoring, and reconnection. The Source Manager decides which provider is active per user and orchestrates automatic switching and failover.
+
+Full design: MARKET_DATA_ARCHITECTURE.md.
+
 Benefits
 
 Centralized
@@ -194,6 +200,8 @@ Secure
 Observable
 
 Replaceable
+
+Provider-Independent
 
 ---
 
@@ -227,13 +235,19 @@ IPO Collector
 
 # Collection Frequency
 
+Frequency depends on the active provider tier (see MARKET_DATA_ARCHITECTURE.md):
+
 Live Prices
 
-1–5 Seconds
+Streaming tier: tick-level (broker WebSocket / licensed feed)
+
+Delayed tier: 15–60 seconds (Yahoo polling)
 
 Indices
 
-5 Seconds
+Streaming tier: tick-level
+
+Delayed tier: 15–60 seconds
 
 News
 
@@ -701,6 +715,32 @@ Store
 
 Notify Users
 
+Implemented in services/morning_report.py (Sprint 10). Every market read goes
+through the Market Gateway — the builder never touches a provider.
+
+Sections degrade independently: an unreachable feed costs its own section and
+nothing else. Any section that cannot be sourced is marked `available: false`
+with a reason and is never filled with a substitute value.
+
+## Gift Nifty
+
+Gift Nifty is a Nifty 50 futures contract on NSE International Exchange. It
+trades while the NSE cash market is closed, which makes it the best pre-market
+read on the open — and it is carried by no free feed (not Yahoo, Alpha
+Vantage, or a broker's NSE/BSE instrument list). It requires an NSE IX data
+subscription or a licensed vendor.
+
+services/market_engine/gift_nifty.py is therefore a collector with a
+priority-ordered adapter chain and no adapter registered by default: it
+reports the quote as explicitly unavailable rather than deriving one. Register
+an adapter and every consumer — Morning Report, AI context, frontend — picks
+it up with no further change:
+
+    gift_nifty.register_adapter("nse_ix", fetch_fn, tier="streaming")
+
+Adapters are tried in order; the first non-None result wins; one that raises
+is logged and skipped.
+
 ---
 
 # Real-Time Streaming
@@ -803,7 +843,9 @@ Recovery
 
 Retry
 
-Fallback Provider
+Automatic provider failover via the Source Manager
+(Broker WebSocket → Licensed Feed → Yahoo Finance;
+see MARKET_DATA_ARCHITECTURE.md)
 
 Cached Data
 

@@ -50,8 +50,12 @@ DOMAIN_CHANNEL: Dict[str, str] = {
     "notification": "notifications",
     "portfolio": "portfolio",
     "trade": "trades",
+    "watchlist": "watchlist",
     "ai": "ai",
     "broker": "broker",
+    # The morning report is an AI product — its ready-signal rides the ai
+    # channel every dashboard already subscribes to (Sprint R8).
+    "morningreport": "ai",
 }
 
 

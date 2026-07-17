@@ -1,7 +1,7 @@
 # StockAssist AI
 ## API Reference
 
-Version: 1.0
+Version: 1.1
 
 Status: Active Development
 
@@ -303,6 +303,8 @@ GET
 
 All endpoints return live market data.
 
+Market data endpoints are provider-agnostic: data is served from the Market Engine's normalized cache, fed by the Market Gateway (broker WebSocket, licensed feed, or Yahoo Finance — selected automatically per user by the Source Manager). Responses never expose the underlying provider; freshness is indicated by the source tier (streaming / delayed) and timestamps. See MARKET_DATA_ARCHITECTURE.md.
+
 ---
 
 # Stock APIs
@@ -415,9 +417,47 @@ POST
 
 ---
 
-POST
+GET
 
-/ai/morning-report
+/analysis/reports/morning
+
+Query
+
+run_id (optional) — client-generated id correlating this request with the
+live AI step timeline on the `ai` WebSocket channel.
+
+Returns
+
+The full morning report (Sprint 10). Market sections are shared and cached by
+date; `portfolio` is computed per request for the caller and is never cached.
+
+market_mood, mood_score
+
+nifty, banknifty, sensex
+
+gift_nifty — { available, value, change, change_pct, source_tier, note }
+
+global_markets — { available, summary, markets[], advancing, declining }
+
+global_cues — the global_markets summary text (kept for existing consumers)
+
+news — { available, headlines[], note }
+
+news_sentiment
+
+economic_calendar — { available, today[], upcoming[], note }
+
+sectors, top_picks, key_risks
+
+portfolio — { available, alerts[], holdings_count, risk, pnl, note }
+
+fii_dii, ai_briefing, generated_at
+
+Any section that cannot be sourced returns available: false with a note
+explaining why. Values are never substituted or estimated.
+
+When live market data is unreachable the report itself returns
+{ available: false, note }.
 
 ---
 

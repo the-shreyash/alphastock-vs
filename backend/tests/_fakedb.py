@@ -59,6 +59,16 @@ class _Cursor:
     async def to_list(self, length=None):
         return [dict(d) for d in (self._docs[:length] if length else self._docs)]
 
+    async def __aiter__(self):
+        """Async iteration, as Motor cursors support.
+
+        Services that fan out over a large collection (e.g. the morning-report
+        notification sweep) stream with `async for` rather than loading every
+        document into memory, so the double has to speak the same protocol.
+        """
+        for d in self._docs:
+            yield dict(d)
+
 
 class FakeCollection:
     def __init__(self, docs=None):

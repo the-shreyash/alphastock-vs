@@ -1,9 +1,9 @@
 # StockAssist AI
 ## Documentation Index
 
-Version: 1.0
+Version: 1.2
 
-Status: Active Development
+Status: Feature Freeze — Production Hardening (PH1–PH3)
 
 ---
 
@@ -94,6 +94,8 @@ SYSTEM_ARCHITECTURE.md
 
 REALTIME_SYSTEM.md
 
+MARKET_DATA_ARCHITECTURE.md
+
 DATABASE.md
 
 API_REFERENCE.md
@@ -153,6 +155,18 @@ CODING_STANDARDS.md
 TESTING.md
 
 TASKS.md
+
+---
+
+7. Production Hardening Documents
+
+These govern the current phase of work. Mandatory reading until v1.0 launch.
+
+PRODUCTION_HARDENING.md
+
+PRODUCTION_ROADMAP.md
+
+CHANGELOG.md
 
 ---
 
@@ -289,6 +303,44 @@ Market
 News
 
 ---
+
+MARKET_DATA_ARCHITECTURE.md
+
+Purpose
+
+Authoritative source for all market data provider behavior.
+
+Defines:
+
+• Market Gateway
+
+• Source Manager
+
+• Provider Adapters (Yahoo, broker WebSockets, future licensed feeds)
+
+• Provider priority and automatic switching
+
+• Normalized market event model
+
+• Failover and recovery
+
+• Market data tiers (Free / Broker-Connected / Premium)
+
+Read When
+
+Market data
+
+Providers
+
+Broker feeds
+
+Scanner
+
+Market Engine
+
+Real-Time Features
+
+This document is mandatory for any work that touches how market data enters the platform.
 
 ---
 
@@ -564,7 +616,71 @@ Changing architecture.
 
 ---
 
+PRODUCTION_HARDENING.md
+
+Purpose
+
+Master architecture document for the Production Hardening program: audit baseline, risk matrix, readiness score, security/infrastructure/deployment/testing/monitoring/recovery strategies, certification checklists, and the Definition of Production Ready.
+
+Read When
+
+Any PH1/PH2/PH3 work.
+
+Any security, deployment, or launch-related task.
+
+Mandatory until v1.0 launch.
+
+---
+
+PRODUCTION_ROADMAP.md
+
+Purpose
+
+Sprint-level plan for the three Production Hardening phases (PH1 Security, PH2 Infrastructure & DevOps, PH3 Quality Assurance) — 36 sprints with objectives, acceptance criteria, validation, rollback, and the implementation dependency graph.
+
+Read When
+
+Starting any PH sprint.
+
+Planning hardening work.
+
+---
+
+CHANGELOG.md
+
+Purpose
+
+Documentation and release change history.
+
+Read When
+
+Releasing.
+
+Bumping documentation versions.
+
+---
+
 # Phase-Based Reading Guide
+
+## Production Hardening (Current Phase)
+
+PRODUCTION_HARDENING.md
+
+PRODUCTION_ROADMAP.md
+
+SECURITY.md
+
+DEPLOYMENT.md
+
+TESTING.md
+
+TASKS.md
+
+Objective
+
+Take the feature-complete MVP to a certified production launch. No new product features until Production Certification (PH3.12).
+
+---
 
 ## Project Audit
 
@@ -615,6 +731,8 @@ TASKS.md
 Read
 
 MARKET_ENGINE.md
+
+MARKET_DATA_ARCHITECTURE.md
 
 REALTIME_SYSTEM.md
 
@@ -686,6 +804,8 @@ Read
 
 BROKER_INTEGRATION.md
 
+MARKET_DATA_ARCHITECTURE.md
+
 REALTIME_SYSTEM.md
 
 DATABASE.md
@@ -735,6 +855,8 @@ API_REFERENCE.md
 Read
 
 REALTIME_SYSTEM.md
+
+MARKET_DATA_ARCHITECTURE.md
 
 SYSTEM_ARCHITECTURE.md
 
@@ -902,11 +1024,45 @@ Always prefer Socket.IO for real-time updates.
 
 Only update affected components instead of re-rendering entire pages.
 
-All market data should flow through the Market Engine.
+All market data should flow through the Market Gateway and Market Engine. Never talk to a market data provider directly — see MARKET_DATA_ARCHITECTURE.md, the authoritative document for all provider behavior.
 
 Every new feature must integrate with the Real-Time System if live updates are required.
 
 If implementing AI, Broker, Portfolio, Scanner, Dashboard, or Notifications, read REALTIME_SYSTEM.md before coding.
+
+---
+
+# Documentation Changelog
+
+## Version 1.2 — 2026-07-17
+
+Major Changes
+
+- MVP declared feature complete (Phase 1 Sprints 1–12; Phase 2 Releases R1–R9). Feature freeze in effect.
+- Introduced the Production Hardening program: PH1 (Security), PH2 (Infrastructure & DevOps), PH3 (Quality Assurance), 12 sprints each.
+- Created PRODUCTION_HARDENING.md — master hardening architecture document (audit baseline, risk matrix, readiness score 4.2/10, strategies, certification checklists, Definition of Production Ready).
+- Created PRODUCTION_ROADMAP.md — 36-sprint implementation roadmap with sequencing and dependency graph.
+- Created CHANGELOG.md — standalone change history.
+- Updated ROADMAP.md, TASKS.md, DECISIONS.md to reflect the hardening interlude before product Phases 3–9.
+- Recorded ADR-027 (Feature Freeze & Production Hardening Program) in DECISIONS.md.
+- Baseline input: PRODUCTION_READINESS_REPORT.md (Sprint 12 audit, verdict NOT READY).
+
+## Version 1.1 — 2026-07-16
+
+Major Changes
+
+- Introduced MARKET_DATA_ARCHITECTURE.md.
+- Migrated from Yahoo-centric architecture to provider-independent architecture.
+- Added Market Gateway and Source Manager concepts.
+- Defined provider priority and failover strategy.
+- Separated Connected Broker experience from Premium AI features.
+- Updated all affected documentation for consistency.
+
+Recorded as ADR-026 in DECISIONS.md. MARKET_DATA_ARCHITECTURE.md is the authoritative source for all market data provider behavior.
+
+## Version 1.0
+
+- Initial documentation system.
 
 ---
 

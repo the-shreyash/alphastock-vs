@@ -1,7 +1,7 @@
 # StockAssist AI
 ## Security Documentation
 
-Version: 1.0
+Version: 1.1
 
 Status: Active Development
 
@@ -418,6 +418,16 @@ Security Questions
 Only store encrypted access tokens where supported.
 
 Reconnect users when tokens expire.
+
+Market data entitlement (see MARKET_DATA_ARCHITECTURE.md):
+
+Broker tokens used for the streaming market data feed are strictly per-user.
+
+One user's broker feed must never be shared with, multiplexed to, or cached for another user.
+
+StockAssist consumes the broker feed only on behalf of the authenticated user who owns the entitlement — never redistributes it.
+
+On token revocation or expiry, the Source Manager silently falls back to Yahoo Finance and the user is prompted to reconnect — never shown a raw provider error.
 
 ---
 

@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from "react";
 import api from "../../services/api";
 import { X, Bell, CheckCheck, TrendingUp, TrendingDown, AlertTriangle, Info, CheckCircle2, Zap } from "lucide-react";
+import { useRealtimeStore, selectLatestNotification } from "../../store/realtimeStore";
 
 const TYPE_CONFIG = {
   TRADE_ENTRY: { icon: TrendingUp, color: "var(--ai-accent)", bg: "rgba(99,102,241,0.12)" },
@@ -25,20 +26,44 @@ export default function NotificationPanel({ onClose }) {
   const [notifications, setNotifications] = useState([]);
   const [loading, setLoading] = useState(true);
 
+  const latestNotification = useRealtimeStore(selectLatestNotification);
+
   const load = useCallback(() => {
     api.get("/notifications").then(({ data }) => setNotifications(data)).catch(() => {}).finally(() => setLoading(false));
   }, []);
 
   useEffect(() => { load(); }, [load]);
 
+  // Live prepend (Sprint R8): a notification.created push arriving while the
+  // panel is open appears at the top instantly — no reopen/refetch needed.
+  useEffect(() => {
+    if (!latestNotification?.notification_id) return;
+    setNotifications((prev) => {
+      if (prev.some((n) => n._id === latestNotification.notification_id)) return prev;
+      return [{
+        _id: latestNotification.notification_id,
+        type: latestNotification.type,
+        title: latestNotification.title,
+        message: latestNotification.message,
+        severity: latestNotification.severity,
+        read: false,
+        created_at: latestNotification.timestamp,
+      }, ...prev];
+    });
+  }, [latestNotification]);
+
   const markRead = async (id) => {
+    const target = notifications.find((n) => n._id === id);
     await api.put(`/notifications/${id}/read`).catch(() => {});
     setNotifications((prev) => prev.map((n) => (n._id === id ? { ...n, read: true } : n)));
+    // Keep the navbar badge honest without waiting for a refetch.
+    if (target && !target.read) useRealtimeStore.getState().decrementUnread();
   };
 
   const markAllRead = async () => {
     await api.put("/notifications/read-all").catch(() => {});
     setNotifications((prev) => prev.map((n) => ({ ...n, read: true })));
+    useRealtimeStore.getState().markNotificationsRead();
   };
 
   const unreadCount = notifications.filter(n => !n.read).length;

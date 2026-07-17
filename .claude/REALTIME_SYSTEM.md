@@ -1,7 +1,7 @@
 # StockAssist AI
 # Real-Time System Architecture
 
-Version: 1.0
+Version: 1.1
 
 Status: Active Development
 
@@ -115,14 +115,17 @@ Animate Changes
 
 # High Level Architecture
 
-                NSE
-                BSE
-            Yahoo Finance
-            Broker APIs
-              News APIs
+        Market Data Providers
+   (Broker WebSockets · Licensed Feeds
+      · Yahoo Finance · News APIs)
                   │
                   ▼
-        Market Gateway Layer
+           Market Gateway
+     (Provider Adapters · Auth · Health)
+                  │
+                  ▼
+           Source Manager
+   (Provider Priority · Switching · Failover)
                   │
                   ▼
          Data Normalization
@@ -160,11 +163,11 @@ The Market Engine is always running.
 
 It should never stop while markets are open.
 
+The Market Engine never talks to providers directly. All real-time data originates from the Market Gateway, which normalizes every provider (broker WebSocket, licensed feed, Yahoo Finance) into one universal event model. See MARKET_DATA_ARCHITECTURE.md.
+
 Responsibilities
 
-Collect market data
-
-Normalize providers
+Consume normalized market events from the Market Gateway
 
 Validate prices
 
@@ -186,7 +189,8 @@ The Market Engine is the heartbeat of the platform.
 
 Suppose NIFTY changes.
 
-NSE Feed
+Active Provider (broker WebSocket, licensed feed, or Yahoo —
+selected automatically by the Source Manager)
 
 ↓
 
@@ -560,6 +564,22 @@ Resistance
 
 No refresh required.
 
+## Implementation (Sprint R8)
+
+Two streams feed watchlist rows through the shared price store:
+
+price stream (15s)   { SYMBOL: { price, change_pct } }        — broadcast "prices"
+
+watchlist.quotes (120s) { quotes: { SYMBOL: { price, change_pct,
+                          rsi, volume_ratio } } }              — watchlist channel
+
+Rows patch every streamed field (including recomputed since-added P&L) from
+`priceTicks`; the REST refetch survives only as a disconnected fallback.
+
+watchlist.updated { user_id, action: added|removed, symbol } — published by
+the add/remove REST endpoints, delivered per-user, syncs every open surface
+(Watchlist page, Dashboard widget, other tabs) without a poll.
+
 ---
 
 # Live News
@@ -595,6 +615,29 @@ News Card Appears
 ↓
 
 Notification
+
+## Implementation (Sprint R8)
+
+`news_service` tags every article with deterministic `sentiment`,
+`importance` ("high" | "normal") and `is_breaking` (keyword classifier —
+crashes, RBI/rate decisions, record highs, SEBI actions, M&A, …). The
+heartbeat news scan publishes:
+
+news.received { articles, count }   — latest headlines, replaces the live list
+
+news.breaking { articles, count }   — novelty-gated (2h cooldown per headline
+                                      via filter_breaking_novel); every event
+                                      is genuinely new
+
+The frontend merges both into the News page and Dashboard widget live;
+`news.breaking` additionally fires the global toast (NotificationToast).
+
+Per-user alerts follow the same push contract: ALL notification writes go
+through `notification_service.create_notification`, which persists the
+document AND publishes `notification.created` — toast slides in, the navbar
+badge increments, and the panel prepends, with zero polling. The morning
+pipeline also broadcasts `morningreport.generated` (ai channel) so report
+surfaces refetch the moment the 8:30 job finishes.
 
 ---
 
@@ -693,6 +736,43 @@ Generating Recommendation
 Completed
 
 Users should understand how AI reached its conclusion.
+
+## Implementation (Sprint R7)
+
+The live step timeline is emitted by `backend/services/ai_activity.py`
+(`AIRun`) on the `ai` domain and delivered over the event bridge:
+
+ai.run.started   { user_id, run_id, session_id, steps:[label…], total, started_at }
+
+ai.step          { user_id, run_id, session_id, index, total, label,
+                   status: running | done | warning }
+
+ai.run.completed { user_id, run_id, session_id, status, duration_ms }
+
+Producers (each step wraps the real work it names — never fake progress):
+
+• AI Chat (`ai_chat`) — memory / history / model stages
+
+• Morning Report (`generate_morning_report`) — Collecting Market Data →
+  Reading News → Scanning NSE → Analyzing Sector Flows → Generating Report →
+  Saving Report. Cache hits emit nothing.
+
+• Portfolio Review / Trade Review endpoints — their real 1–3 stages.
+
+• Scheduler morning job — a `user_id: null` run, broadcast on the `ai`
+  channel to every connected dashboard.
+
+Correlation: the client generates a `run_id` per request and sends it with the
+API call; events matching that id drive the UI for that request only.
+
+Frontend: `realtimeStore.js` keeps runs in an `aiRuns` map keyed by `run_id`
+(concurrent surfaces never clobber each other; completed runs are pruned).
+`AIStepTimeline` (compact, chat/panels) and `AIPipelineProgress` (page-level,
+progress bar + stages) render the run; both fall back to a neutral loading
+state until `ai.run.started` arrives. Reconciliation rules: when the REST call
+settles, the consumer calls `resolveAIRun` (no step may stay "running" after
+lost WS frames) then `clearAIRun`; an active run silent beyond ~45s degrades
+to the fallback. Broadcast runs also mirror into the AI Activity feed.
 
 ---
 
@@ -888,11 +968,19 @@ Reconnect automatically.
 
 # Error Recovery
 
-If Yahoo fails
+If the active market data provider fails
 
 ↓
 
-Fallback Provider
+Source Manager falls back automatically
+(Broker WebSocket → Licensed Feed → Yahoo Finance)
+
+↓
+
+If no provider is available, show last cached data with
+"Market feed temporarily unavailable."
+
+(Full failover design: MARKET_DATA_ARCHITECTURE.md)
 
 If Socket disconnects
 
@@ -939,6 +1027,37 @@ Memoize expensive calculations.
 One socket connection.
 
 No unnecessary polling.
+
+## Implementation (Sprint R9)
+
+Event batching — `RealtimeProvider` queues inbound socket messages for a 40ms
+window and hands the burst to `realtimeStore.applyMessages`, which coalesces
+every price-bearing message (`prices`, `market.index.updated`,
+`watchlist.quotes`) into ONE `priceTicks` write; other events apply in arrival
+order. `pong` bypasses the batch (connection liveness is immediate).
+
+Selective rendering — `_mergePrices` MERGES per symbol (the 15s price stream
+no longer wipes the RSI/volume fields the 120s watchlist stream added),
+preserves tick object identity on no-op updates, and skips the store write
+when nothing moved. `selectTickForSymbol(symbol)` lets a memoized row
+subscribe to its own symbol only — Watchlist rows re-render individually.
+
+Virtualization — `hooks/useVirtualList.js` (dependency-free windowing with
+measured row height); the Watchlist windows itself beyond 60 rows.
+
+Lazy loading — every routed page is `React.lazy` (route-level code splitting);
+`App.js` holds the outer Suspense, `Layout` a nested one so navigation swaps
+only the content region, never the shell.
+
+Memoization — memoized `WatchlistRow` / News `ArticleCard`; News filtering and
+source counts are `useMemo`d; Dashboard tick-patch effects keep previous state
+identity on no-op ticks.
+
+Redis optimization — `cache_get_many` (MGET) / `cache_set_many` (pipeline) in
+`services/cache.py`; the in-memory fallback is bounded (expired sweep + oldest
+eviction at 1024 keys); `fetch_all_universe_quotes` warms every per-symbol
+quote key in one MGET; `ConnectionManager` serializes each fan-out message
+once (`send_text`) instead of `json.dumps` per socket.
 
 ---
 

@@ -1,9 +1,17 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import api from "../services/api";
 import { formatNumber } from "../utils/formatters";
 import { Wallet, RefreshCw, Download, ArrowUpRight, ArrowDownRight, Brain, Shield, AlertTriangle, Layers, Scale, Award, TrendingDown, Coins, Sparkles, Loader2, Activity, LineChart as LineChartIcon } from "lucide-react";
 import { PieChart as RechartsPie, Pie, Cell, ResponsiveContainer, Tooltip, AreaChart, Area, XAxis, YAxis, CartesianGrid } from "recharts";
 import { motion } from "framer-motion";
+import AnimatedNumber from "../components/ui/AnimatedNumber";
+import { usePriceFlash } from "../hooks/usePriceFlash";
+import {
+  useRealtimeStore,
+  selectConnected,
+  selectPortfolioLive,
+  selectPortfolioSynced,
+} from "../store/realtimeStore";
 
 const COLORS = ["#6366F1", "#10B981", "#F59E0B", "#F43F5E", "#06B6D4", "#8B5CF6", "#EC4899", "#14B8A6"];
 const TABS = ["Overview", "Holdings", "Performance", "Allocation", "AI Review", "Transactions"];
@@ -56,6 +64,56 @@ function DimensionCard({ icon: Icon, label, value, valueColor, note, testid }) {
       <div className="text-[17px] font-semibold font-mono leading-tight" style={{ color: valueColor || "var(--text-primary)" }}>{value}</div>
       {note && <p className="text-[11px] leading-snug mt-1" style={{ color: "var(--text-muted)" }}>{note}</p>}
     </div>
+  );
+}
+
+// Minimum ms between event-triggered silent refetches of the intelligence
+// bundle (risk / suggestions / health / AI summary). Live marks stream in via
+// the socket; this only keeps the AI layer in step without hammering the API.
+const INTEL_REFRESH_MIN_MS = 60000;
+
+/* Live indicator — pulsing dot + last snapshot time while streaming. */
+function LiveBadge({ live }) {
+  if (!live) return null;
+  const at = live.updatedAt ? new Date(live.updatedAt) : null;
+  return (
+    <span data-testid="portfolio-live-badge" className="badge-status inline-flex items-center gap-1.5" style={{ background: "var(--gain-bg)", color: "var(--gain)" }}>
+      <span className="w-1.5 h-1.5 rounded-full animate-pulse" style={{ background: "var(--gain)" }} />
+      LIVE{at ? ` · ${at.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}` : ""}
+    </span>
+  );
+}
+
+/* One holdings-table row. Isolated so a live tick re-renders and flashes ONLY
+   the affected row (the event-driven "update only what changed" mandate). */
+function HoldingRow({ holding: h }) {
+  const isPosH = (h.pnl ?? 0) >= 0;
+  const priceRef = usePriceFlash(h.current_price);
+  return (
+    <tr>
+      <td>
+        <span className="text-[13px] font-semibold" style={{ color: "var(--text-primary)" }}>{h.symbol}</span>
+        <SourceBadge source={h.source} />
+      </td>
+      <td className="font-mono text-[13px]">{h.quantity}</td>
+      <td className="font-mono text-[13px]">₹{formatNumber(h.avg_price)}</td>
+      <td>
+        <span ref={priceRef} className="font-mono text-[13px] inline-block rounded px-1 -mx-1">
+          {h.current_price != null ? `₹${formatNumber(h.current_price)}` : "--"}
+        </span>
+      </td>
+      <td className="font-mono text-[13px]">₹{formatNumber(h.invested)}</td>
+      <td className="font-mono text-[13px]">₹{formatNumber(h.current_value)}</td>
+      <td className="font-mono text-[13px] font-semibold" style={{ color: isPosH ? "var(--gain)" : "var(--loss)" }}>
+        {isPosH ? "+" : ""}₹{formatNumber(Math.abs(h.pnl ?? 0))}
+      </td>
+      <td className="font-mono text-[13px] font-semibold" style={{ color: isPosH ? "var(--gain)" : "var(--loss)" }}>
+        {isPosH ? "+" : ""}{(h.pnl_pct ?? 0).toFixed(2)}%
+      </td>
+      <td className="font-mono text-[13px]" style={{ color: (h.day_change_pct ?? 0) >= 0 ? "var(--gain)" : "var(--loss)" }}>
+        {h.day_change_pct != null ? `${h.day_change_pct >= 0 ? "+" : ""}${h.day_change_pct.toFixed(2)}%` : "--"}
+      </td>
+    </tr>
   );
 }
 
@@ -128,7 +186,14 @@ export default function Portfolio() {
   const [transactions, setTransactions] = useState(null);
   const [txLoading, setTxLoading] = useState(false);
 
+  // ─── Real-time (Sprint R5): one shared socket → global store → this page ──
+  const connected = useRealtimeStore(selectConnected);
+  const live = useRealtimeStore(selectPortfolioLive); // portfolio.updated snapshot
+  const synced = useRealtimeStore(selectPortfolioSynced); // portfolio.synced trigger
+  const lastIntelFetchRef = useRef(0);
+
   const fetchPortfolio = useCallback(async () => {
+    lastIntelFetchRef.current = Date.now();
     try {
       const [i, p, z] = await Promise.all([
         api.get("/portfolio/intelligence"),
@@ -141,6 +206,37 @@ export default function Portfolio() {
   }, []);
 
   useEffect(() => { fetchPortfolio(); }, [fetchPortfolio]);
+
+  // Broker sync completed → the holdings set itself changed; refresh the full
+  // intelligence bundle silently (no skeleton — fetchPortfolio only gates the
+  // initial skeleton via `loading`).
+  useEffect(() => {
+    if (!synced) return;
+    if (Date.now() - lastIntelFetchRef.current < 2000) return; // dedupe burst
+    fetchPortfolio();
+  }, [synced, fetchPortfolio]);
+
+  // AI portfolio refresh: live marks stream in via the socket, but risk score,
+  // suggestions and the health scan are computed server-side — refetch them at
+  // most once a minute, TRIGGERED by real portfolio events (never a timer).
+  useEffect(() => {
+    if (!live) return;
+    if (Date.now() - lastIntelFetchRef.current < INTEL_REFRESH_MIN_MS) return;
+    fetchPortfolio();
+  }, [live, fetchPortfolio]);
+
+  // Merge the live snapshot's per-symbol marks over the intelligence holdings
+  // so table rows / movers stay current between bundle refetches.
+  const liveMarks = useMemo(() => {
+    const map = {};
+    for (const h of live?.holdings ?? []) if (h?.symbol) map[h.symbol] = h;
+    return map;
+  }, [live]);
+
+  // GSAP green/red flash on the headline value + P&L when a snapshot moves them
+  // (hooks stay above the loading early-return; they track live values only).
+  const valueFlashRef = usePriceFlash(live?.pnl?.current_value);
+  const pnlFlashRef = usePriceFlash(live?.pnl?.unrealized);
 
   // Lazy-load transactions the first time the tab is opened.
   useEffect(() => {
@@ -191,10 +287,30 @@ export default function Portfolio() {
     </div>
   );
 
-  // ─── Server-computed intelligence (single source of truth) ───────────────
-  const holdings = intel?.holdings ?? [];
-  const pnl = intel?.pnl ?? {};
-  const allocation = intel?.allocation ?? { by_holding: [], by_sector: [] };
+  // ─── Server-computed intelligence + live stream overlay ──────────────────
+  // The intelligence bundle stays the single source of truth for analytics;
+  // `portfolio.updated` snapshots overlay only the live marks (price/value/
+  // P&L/allocation) so the page moves with the market between refetches.
+  const holdings = (intel?.holdings ?? []).map(h => {
+    const mark = liveMarks[h.symbol];
+    if (!mark) return h;
+    const merged = { ...h };
+    for (const key of ["current_price", "current_value", "pnl", "pnl_pct", "day_change_pct"]) {
+      if (mark[key] != null) merged[key] = mark[key];
+    }
+    return merged;
+  });
+  const pnl = { ...(intel?.pnl ?? {}), ...(live?.pnl ?? {}) };
+  const allocation = live?.allocation?.by_holding?.length
+    ? live.allocation
+    : (intel?.allocation ?? { by_holding: [], by_sector: [] });
+  // Equity curve = real EOD snapshots + one streaming "Live" point, so the
+  // chart's last segment moves with the market (doc: "Chart Animation").
+  const equityCurve = performance?.available
+    ? (live?.pnl?.current_value != null
+        ? [...performance.curve, { date: "Live", value: live.pnl.current_value, invested: live.pnl.invested, pnl: live.pnl.unrealized }]
+        : performance.curve)
+    : [];
   const diversification = intel?.diversification ?? {};
   const risk = intel?.risk ?? {};
   const movers = intel?.movers ?? { strong: [], weak: [] };
@@ -252,12 +368,18 @@ export default function Portfolio() {
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
         <Reveal delay={0} className="lg:col-span-2">
           <div className="glass-card p-5 h-full">
-            <span className="stat-label block mb-1.5">Total Portfolio Value</span>
+            <div className="flex items-center gap-2 mb-1.5">
+              <span className="stat-label">Total Portfolio Value</span>
+              {connected && <LiveBadge live={live} />}
+            </div>
             <div className="flex items-baseline gap-3 flex-wrap">
-              <span className="stat-value">₹{formatNumber(pnl.current_value ?? 0)}</span>
-              <span className="text-sm font-mono font-semibold flex items-center gap-1" style={{ color: isPos ? "var(--gain)" : "var(--loss)" }}>
+              <span ref={valueFlashRef} className="stat-value inline-block rounded-lg px-1 -mx-1" data-testid="portfolio-total-value">
+                ₹<AnimatedNumber value={pnl.current_value ?? 0} format={(v) => formatNumber(v)} />
+              </span>
+              <span ref={pnlFlashRef} className="text-sm font-mono font-semibold flex items-center gap-1 rounded px-1 -mx-1" style={{ color: isPos ? "var(--gain)" : "var(--loss)" }}>
                 {isPos ? <ArrowUpRight size={14} /> : <ArrowDownRight size={14} />}
-                {isPos ? "+" : ""}₹{formatNumber(Math.abs(totalPnl))} ({isPos ? "+" : ""}{totalPnlPct.toFixed(2)}%)
+                {isPos ? "+" : ""}₹<AnimatedNumber value={Math.abs(totalPnl)} format={(v) => formatNumber(v)} />
+                {" ("}{isPos ? "+" : ""}<AnimatedNumber value={totalPnlPct} format={(v) => v.toFixed(2)} />%)
               </span>
             </div>
             <div className="flex items-center gap-4 mt-2 flex-wrap">
@@ -449,31 +571,7 @@ export default function Portfolio() {
                   </tr>
                 </thead>
                 <tbody>
-                  {holdings.map(h => {
-                    const isPosH = (h.pnl ?? 0) >= 0;
-                    return (
-                      <tr key={h.symbol}>
-                        <td>
-                          <span className="text-[13px] font-semibold" style={{ color: "var(--text-primary)" }}>{h.symbol}</span>
-                          <SourceBadge source={h.source} />
-                        </td>
-                        <td className="font-mono text-[13px]">{h.quantity}</td>
-                        <td className="font-mono text-[13px]">₹{formatNumber(h.avg_price)}</td>
-                        <td className="font-mono text-[13px]">{h.current_price != null ? `₹${formatNumber(h.current_price)}` : "--"}</td>
-                        <td className="font-mono text-[13px]">₹{formatNumber(h.invested)}</td>
-                        <td className="font-mono text-[13px]">₹{formatNumber(h.current_value)}</td>
-                        <td className="font-mono text-[13px] font-semibold" style={{ color: isPosH ? "var(--gain)" : "var(--loss)" }}>
-                          {isPosH ? "+" : ""}₹{formatNumber(Math.abs(h.pnl ?? 0))}
-                        </td>
-                        <td className="font-mono text-[13px] font-semibold" style={{ color: isPosH ? "var(--gain)" : "var(--loss)" }}>
-                          {isPosH ? "+" : ""}{(h.pnl_pct ?? 0).toFixed(2)}%
-                        </td>
-                        <td className="font-mono text-[13px]" style={{ color: (h.day_change_pct ?? 0) >= 0 ? "var(--gain)" : "var(--loss)" }}>
-                          {h.day_change_pct != null ? `${h.day_change_pct >= 0 ? "+" : ""}${h.day_change_pct.toFixed(2)}%` : "--"}
-                        </td>
-                      </tr>
-                    );
-                  })}
+                  {holdings.map(h => <HoldingRow key={h.symbol} holding={h} />)}
                   {holdings.length === 0 && (
                     <tr><td colSpan={9} className="text-center py-8 text-[13px]" style={{ color: "var(--text-muted)" }}>No holdings found. Connect a broker or log a trade to build your portfolio.</td></tr>
                   )}
@@ -498,7 +596,7 @@ export default function Portfolio() {
                   <DimensionCard icon={ArrowDownRight} label="Worst Day" value={performance.worst_day ? `${performance.worst_day.pct.toFixed(2)}%` : "--"} valueColor="var(--loss)" note={performance.worst_day?.date} />
                 </div>
                 <ResponsiveContainer width="100%" height={260}>
-                  <AreaChart data={performance.curve} margin={{ top: 4, right: 8, left: 8, bottom: 0 }}>
+                  <AreaChart data={equityCurve} margin={{ top: 4, right: 8, left: 8, bottom: 0 }}>
                     <defs>
                       <linearGradient id="eqGrad" x1="0" y1="0" x2="0" y2="1">
                         <stop offset="0%" stopColor="#6366F1" stopOpacity={0.35} />

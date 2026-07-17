@@ -177,6 +177,8 @@ async def scan(
     filters: Optional[Dict[str, Any]] = None,
     sector: Optional[str] = None,
     limit: int = 15,
+    source: str = "api",
+    publish: bool = True,
 ) -> Dict[str, Any]:
     """Run the scanner with optional strategy preset and/or custom filters.
 
@@ -247,11 +249,16 @@ async def scan(
 
     strategy_label = preset["label"] if preset else "Custom Scan"
 
-    await event_bus.publish("scanner.updated", {
-        "strategy": strategy or "custom",
-        "matched": len(matched),
-        "top": results[0]["symbol"] if results else None,
-    })
+    # `source` lets consumers tell worker-driven refreshes apart from
+    # API-triggered scans — the frontend refetches only on "worker" events,
+    # otherwise its own fetch would emit this event and loop (Sprint R4).
+    if publish:
+        await event_bus.publish("scanner.updated", {
+            "source": source,
+            "strategy": strategy or "custom",
+            "matched": len(matched),
+            "top": results[0]["symbol"] if results else None,
+        })
 
     return {
         "strategy": strategy or "custom",

@@ -8,6 +8,7 @@ import ModelStatusPill from "../components/ai/ModelStatusPill";
 import ConversationSidebar from "../components/ai/ConversationSidebar";
 import MemoryPanel from "../components/ai/MemoryPanel";
 import ActivityTimeline from "../components/ai/ActivityTimeline";
+import AIStepTimeline from "../components/ai/AIStepTimeline";
 import LearningPanel from "../components/ai/LearningPanel";
 import TradeReviewPanel from "../components/ai/TradeReviewPanel";
 import PortfolioReviewPanel from "../components/ai/PortfolioReviewPanel";
@@ -24,7 +25,7 @@ const QUICK_ACTIONS = [
 export default function AIAssistant() {
   const [tab, setTab] = useState("AI Chat");
   const {
-    conversations, loadingConvos, activeId, messages, sending,
+    conversations, loadingConvos, activeId, messages, sending, activeRunId,
     send, newChat, selectConversation, deleteConversation,
   } = useAIWorkspace();
   const [input, setInput] = useState("");
@@ -108,11 +109,7 @@ export default function AIAssistant() {
                     <Bot size={16} style={{ color: "var(--ai-accent)" }} />
                   </div>
                   <div className="p-3.5 rounded-2xl rounded-bl-md" style={{ background: "var(--bg-surface)", border: "1px solid var(--border)" }}>
-                    <div className="flex gap-1.5">
-                      {[0, 1, 2].map((i) => (
-                        <div key={i} className="w-2 h-2 rounded-full animate-pulse" style={{ background: "var(--ai-accent)", animationDelay: `${i * 0.15}s` }} />
-                      ))}
-                    </div>
+                    <AIStepTimeline runId={activeRunId} />
                   </div>
                 </div>
               )}

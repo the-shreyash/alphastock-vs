@@ -1,7 +1,7 @@
 # StockAssist AI
 ## Broker Integration Documentation
 
-Version: 1.0
+Version: 1.1
 
 Status: Active Development
 
@@ -30,6 +30,8 @@ Broker integration enables users to:
 • Track execution
 
 • Receive real-time updates
+
+• Automatically upgrade their market data feed to the broker's streaming WebSocket (see MARKET_DATA_ARCHITECTURE.md)
 
 The platform never stores user credentials directly.
 
@@ -510,6 +512,35 @@ Holdings
 Margins
 
 Trade Executions
+
+---
+
+# Market Data Upgrade
+
+Connecting a broker does more than enable trading.
+
+The moment a broker connection becomes active, the Source Manager automatically switches the user's market data source from Yahoo Finance to the broker's streaming WebSocket.
+
+broker.connected
+
+↓
+
+Source Manager re-resolves the user's best provider
+
+↓
+
+Market Gateway opens the broker WebSocket (make-before-break)
+
+↓
+
+User's entire experience upgrades to live streaming:
+prices, portfolio, orders, P&L, watchlist, scanner, AI context
+
+The user does NOT need a StockAssist subscription for this. The broker already owns the user's market data entitlement — StockAssist simply consumes the feed on behalf of the authenticated user.
+
+On broker disconnect, the Source Manager falls back to Yahoo Finance automatically. The frontend never notices the switch.
+
+Full design, priority algorithm, and failover rules: MARKET_DATA_ARCHITECTURE.md (authoritative).
 
 ---
 

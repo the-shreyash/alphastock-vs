@@ -2,9 +2,12 @@ import { useState, useEffect } from "react";
 import { motion } from "framer-motion";
 import { Cpu, Activity, Clock, Wifi, WifiOff } from "lucide-react";
 import api from "../../services/api";
+import { useRealtimeStore, selectConnected, selectEngineStatus } from "../../store/realtimeStore";
 
 export default function MarketEngineStatus({ compact = true }) {
   const [status, setStatus] = useState(null);
+  const connected = useRealtimeStore(selectConnected);
+  const liveStatus = useRealtimeStore(selectEngineStatus);
 
   useEffect(() => {
     const fetch = () => {
@@ -12,10 +15,15 @@ export default function MarketEngineStatus({ compact = true }) {
         .then((r) => setStatus(r.data))
         .catch(() => setStatus(null));
     };
-    fetch();
+    fetch(); // seed on mount
+    // Live pushes (market.engine.status) cover updates while connected.
+    if (connected) return undefined;
     const interval = setInterval(fetch, 30000);
     return () => clearInterval(interval);
-  }, []);
+  }, [connected]);
+
+  // Prefer the live-pushed status when available.
+  useEffect(() => { if (liveStatus) setStatus(liveStatus); }, [liveStatus]);
 
   if (!status) return null;
 

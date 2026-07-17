@@ -1,6 +1,6 @@
 # StockAssist AI
 ## Project Vision & Product Philosophy
-Version: 1.0
+Version: 1.1
 
 ---
 
@@ -588,6 +588,8 @@ Receive AI suggestions.
 
 Orders should execute through official broker APIs.
 
+Connecting a broker also automatically upgrades the user's market data from Yahoo Finance to the broker's live streaming WebSocket, free of charge (see MARKET_DATA_ARCHITECTURE.md).
+
 ---
 
 # Admin Portal
@@ -629,6 +631,8 @@ Everything required to operate a SaaS.
 ---
 
 # Subscription Model
+
+Subscriptions sell AI intelligence — never market data. Live streaming data comes free with any connected broker; free users get near real-time Yahoo Finance data (see MARKET_DATA_ARCHITECTURE.md).
 
 Free
 

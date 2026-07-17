@@ -3,22 +3,35 @@ import { Briefcase, Cpu, ShieldCheck, RefreshCw } from "lucide-react";
 import { Link } from "react-router-dom";
 import api from "../../services/api";
 import AIText from "./AIText";
+import AIStepTimeline from "./AIStepTimeline";
+import { useRealtimeStore } from "../../store/realtimeStore";
 
 /**
  * PortfolioReviewPanel — Portfolio AI. On demand, generates a narrative review
  * of the user's holdings via POST /api/ai/portfolio-review, grounded in live
  * holdings + the deterministic health scan. Empty portfolios get a clear CTA.
+ *
+ * Sprint R7: while the review generates, the panel shows the live AI step
+ * timeline (Reading your holdings → Scanning portfolio health → Consulting
+ * the AI) instead of static skeletons, correlated by a client run_id.
  */
 export default function PortfolioReviewPanel() {
-  const [state, setState] = useState({ loading: false, data: null, error: null });
+  const [state, setState] = useState({ loading: false, data: null, error: null, runId: null });
 
   const run = async () => {
-    setState({ loading: true, data: null, error: null });
+    const runId = (crypto?.randomUUID?.() || `run-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    setState({ loading: true, data: null, error: null, runId });
     try {
-      const { data } = await api.post("/ai/portfolio-review");
-      setState({ loading: false, data, error: null });
+      const { data } = await api.post("/ai/portfolio-review", { run_id: runId });
+      setState({ loading: false, data, error: null, runId: null });
     } catch {
-      setState({ loading: false, data: null, error: "Could not generate a portfolio review. Please try again." });
+      useRealtimeStore.getState().resolveAIRun(runId, "warning");
+      setState({ loading: false, data: null, error: "Could not generate a portfolio review. Please try again.", runId: null });
+    } finally {
+      // REST settled — reconcile lost WS frames, then drop the finished run.
+      const store = useRealtimeStore.getState();
+      store.resolveAIRun(runId);
+      store.clearAIRun(runId);
     }
   };
 
@@ -40,7 +53,9 @@ export default function PortfolioReviewPanel() {
       </div>
 
       {loading && (
-        <div className="glass-card p-5 space-y-2">{[1, 2, 3, 4, 5, 6].map((i) => <div key={i} className="h-4 rounded skeleton" />)}</div>
+        <div className="glass-card p-5">
+          <AIStepTimeline runId={state.runId} />
+        </div>
       )}
 
       {error && <div className="glass-card p-5"><p className="text-[13px]" style={{ color: "var(--loss)" }}>{error}</p></div>}

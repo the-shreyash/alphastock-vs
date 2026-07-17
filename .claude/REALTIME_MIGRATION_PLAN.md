@@ -104,6 +104,146 @@ G7 (GSAP), G8 (connection states + heartbeat + backoff), G9 (retire polling).
 
 ---
 
+# 2.6 Sprint R3 Status — Frontend Real-Time Client (DONE, full scope)
+
+Sprint R3 consumed the R2 backbone from the client on **Path A**, added the
+real-data backend emissions the last pollers needed, and landed the GSAP
+animation layer — closing every remaining gap.
+
+- **G3 — RESOLVED.** `context/RealtimeProvider.jsx` owns the ONE
+  `WebSocket(/api/ws?user_id=)` for the app (mounted in `App.js` inside
+  `AuthProvider`). `hooks/useWebSocket.js` is now a store-selector shim (no
+  socket), so the three former per-page sockets collapse to one.
+- **G4 — RESOLVED.** `store/realtimeStore.js` (Zustand) is the global store; the
+  provider writes, components read via narrow selectors. Consumes the R2 `event`
+  envelope (`applyEvent`) **and** the legacy flat types (`applyLegacy`).
+- **G8 — RESOLVED.** Connection state machine (connecting→live→reconnecting→
+  offline) surfaced by `components/layout/ConnectionStatus.jsx` in the Navbar;
+  30s heartbeat (`ping`/`pong`, reconnect on missed pong); exponential backoff
+  with jitter (1s→30s, reset on clean open).
+- **G9 — RESOLVED.** Every poll with a push path is gated on `!connected`
+  (fallback only): Dashboard core/activity, TradeMonitor active-trades,
+  Watchlist, Navbar unread-count (live via `notification.created`),
+  ActivityTimeline (streams `activity_feed`), Markets (indices/sectors/global/
+  movers pushed), MarketEngineStatus (`market.engine.status`), PortfolioMonitor
+  (event-triggered refetch on `portfolio_update`).
+- **G7 — RESOLVED.** `hooks/usePriceFlash.js` (green/red flash + scale) on the
+  Dashboard index cards and Watchlist row prices; `components/ui/AnimatedNumber.jsx`
+  (count-up) on the Dashboard portfolio value + P&L.
+- **New backend emissions (real data):** `news.received`, `scanner.breakout`,
+  `scanner.volume`, `sector.updated`, `market.global.updated`,
+  `market.movers.updated`, `breadth.updated` (heartbeat tasks), and
+  `market.engine.status` (`market_broadcast_loop`). These are what let the last
+  three pollers drop to fallback-only.
+
+**All nine cross-cutting gaps (G1–G9) are now closed** across R2 (backbone) and
+R3 (frontend client + emissions). Remaining work is per-feature polish, not
+architectural.
+
+---
+
+# 2.7 Sprint R4 Status — Scanner Live Migration (DONE)
+
+Sprint R4 closed §4.5 (Scanner) on **Path A**, converting the scanner from
+fetch-only to a continuous push-driven surface.
+
+- **Continuous worker:** heartbeat tasks are the worker. Existing breakout/
+  volume scans now gate publishes through
+  `services/market_engine/scanner_worker.py` (new) — a per-(kind, symbol)
+  30-min novelty cooldown so every `scanner.*` hit event is a NEW opportunity.
+  New `task_scan_momentum` (150s, `scanner.momentum`: ≥2% day-change, new or
+  accelerating ≥0.3% vs the previous cycle) and `task_scanner_sweep` (180s,
+  rotates 2 of the 8 presets per tick over the 30s-cached universe).
+- **Event names (doc-aligned):** `scanner.volume` → **`scanner.volume_spike`**;
+  final set: `scanner.breakout`, `scanner.volume_spike`, `scanner.momentum`
+  (hits) + `scanner.updated` (refresh signal).
+- **Loop guard:** `scanner_engine.scan()` gains `source`/`publish`; only
+  worker-tagged `scanner.updated` (`source:"worker"`) triggers a frontend
+  refetch — the REST scan's own event (`source:"api"`) is ignored, preventing
+  a fetch→event→fetch loop (it also has two other producers: ranking_engine).
+- **Frontend:** store scanner slice is event-aware (hit feed entries +
+  `scannerRefreshedAt`); `components/market/ScannerLiveFeed.jsx` (new) renders
+  the push-only hit feed beside `MarketScanner` on the Markets Scanner tab;
+  `hooks/useCardEntrance.js` (new) plays the doc's card entrance (Slide Right →
+  Fade → Glow → Settle, GSAP) on newly inserted cards only; `MarketScanner`
+  auto-refetches silently (1.5s debounce) on `scannerRefreshedAt` with a 60s
+  poll only while disconnected (R3 gating).
+- **Tests:** `tests/test_scanner_worker.py` (11 hermetic tests: cooldown,
+  momentum semantics, task contracts via bus spies, publish gating);
+  bridge-mapping test extended for the new event names.
+
+---
+
+# 2.8 Sprint R5 Status — Portfolio Live Migration (DONE)
+
+Sprint R5 closed §4.8 (Portfolio) on **Path A**, realizing the doc's flow
+*Broker WebSocket → Portfolio Service → Redis → Socket → Portfolio Card →
+PnL Updated → Number Animation → Allocation Chart Updates*.
+
+- **Live snapshot service:** `services/portfolio_stream.py` (new) recomputes a
+  user's full portfolio via `portfolio_engine` (single source of truth) and
+  publishes a per-user **`portfolio.updated`** bus event (`data.user_id` →
+  bridge delivers to that user's sockets only) carrying
+  `{pnl, allocation, holdings (light marks), open_positions, reason}` plus the
+  legacy-compat flat `total_pnl`/`total_unrealized_pnl` fields.
+- **Producers:** heartbeat `task_monitor_portfolio` (90s) now covers broker
+  holdings + manual trades with ONE shared quote prefetch and emits
+  `portfolio.updated` per user (`reason:"monitor"`; replaces the manual-only
+  legacy `portfolio_update` send); `broker_engine._on_stream_tick` maps ticks
+  (instrument_token → symbol via db.holdings), persists fresh
+  `last_price`/`market_value` marks, and emits a **throttled** (3s/user)
+  `reason:"broker_tick"` snapshot — broker streaming now drives live P&L;
+  `sync_portfolio` publishes **`portfolio.synced`** + a `reason:"broker_sync"`
+  snapshot.
+- **Store:** `portfolio.updated` → `portfolioLive` slice (+ `portfolioUpdate`
+  for legacy consumers); `portfolio.synced` → `portfolioSynced`. New selectors
+  `selectPortfolioLive`, `selectPortfolioSynced`.
+- **Portfolio page (live):** value strip animates (GSAP `AnimatedNumber`
+  count-up + `usePriceFlash` green/red flash on value and P&L, LIVE badge with
+  snapshot time); holdings rows extracted into `HoldingRow` (per-row price
+  flash; only the affected row re-renders); allocation pie + sector bars read
+  the live allocation; equity curve appends a streaming "Live" point;
+  **AI portfolio refresh** = silent intelligence-bundle refetch triggered by
+  `portfolio.synced` (immediate) and `portfolio.updated` (≥60s apart) — never
+  a timer. Dashboard summary card now also merges live
+  `current_value`/`invested` from the snapshot.
+- **Tests:** `tests/test_portfolio_stream.py` (8 hermetic tests: payload
+  shape/compat fields, per-user publish, no-holdings silence, tick override,
+  tick persistence, throttle + re-arm, unmatched tokens, heartbeat task
+  contract); bridge-mapping test extended for `portfolio.*` → `portfolio`.
+
+---
+
+# 2.9 Sprint R8 Status — Notifications & Watchlist Live Migration (DONE)
+
+Sprint R8 closed §4.6 (Breaking News), §4.10 (Watchlist), §4.11
+(Notifications) and §4.13 (Morning Report) on **Path A**.
+
+- **Notifications:** every remaining direct `db.notifications.insert_one`
+  (scheduler morning/exit/EOD jobs, portfolio monitor, TRADE_ENTRY ×2,
+  EMERGENCY_STOP, monitor/run alerts, WEEKLY_REVIEW) migrated to
+  `create_notification` → all alerts now publish `notification.created` and
+  push per-user in real time. New `NotificationToast.jsx` host in Layout
+  realizes *toast slides in + badge increments live*; the panel prepends live
+  pushes and keeps the badge in sync on mark-read.
+- **Breaking news:** `news_service` classifies `importance`/`is_breaking`
+  deterministically and cooldown-gates novel breaking headlines
+  (`filter_breaking_novel`, 2h); heartbeat publishes `news.breaking` →
+  breaking toast + live merge into News page / Dashboard widget.
+- **Watchlist:** heartbeat `task_watchlist_stream` (120s) broadcasts
+  `watchlist.quotes` (price/change/RSI/volume-ratio per watchlisted symbol,
+  folded into the shared price store) so rows patch every field live;
+  REST add/remove publishes per-user `watchlist.updated` for cross-tab sync;
+  the 30s refetch poll is disconnected-only.
+- **Morning report:** `morning_analysis_job` publishes broadcast
+  `morningreport.generated` (bridged onto the `ai` channel) — the Morning
+  Report page and the Dashboard card refetch the instant the report lands,
+  and the per-user MORNING_REPORT notification pushes live.
+- **Tests:** `tests/test_sprint_r8.py` (importance classification, novelty
+  gate incl. cooldown expiry, bridge routing for the new domains).
+
+---
+
 # 3. Cross-Cutting Infrastructure Gaps
 
 These affect every feature and should be fixed before per-feature polish.
@@ -209,7 +349,7 @@ Effort is T-shirt sized (S ≈ ≤1d, M ≈ 2–3d, L ≈ 4–6d, XL ≈ >1wk) f
 - **Required changes:** publish `breadth.updated`; bind breadth bar to it.
 - **Effort:** S
 
-### 4.5 Scanner (Breakout / Volume / Momentum / Technical)
+### 4.5 Scanner (Breakout / Volume / Momentum / Technical) — RESOLVED (Sprint R4, see §2.7)
 - **Current:** **fetch-only** via `/api/market/scanner`,
   `/api/market/ranking` (server.py:890-947). `scanner_engine`/`ranking_engine`
   publish `scanner.updated` to the event bus, but nothing streams it. No
@@ -223,7 +363,7 @@ Effort is T-shirt sized (S ≈ ≤1d, M ≈ 2–3d, L ≈ 4–6d, XL ≈ >1wk) f
   animation; subscribe consumers.
 - **Effort:** L
 
-### 4.6 News (Breaking)
+### 4.6 News (Breaking) — RESOLVED (Sprint R8, see §2.9)
 - **Current:** `/api/news`, `/api/news/sentiment` fetched on mount and by the 30s
   poll. `news_service` does dedupe + sentiment but publishes no event.
 - **Target:** news worker → `news.breaking` event → news card streams in +
@@ -246,7 +386,7 @@ Effort is T-shirt sized (S ≈ ≤1d, M ≈ 2–3d, L ≈ 4–6d, XL ≈ >1wk) f
   `activity_feed` stream; delete its 15s poll.
 - **Effort:** S
 
-### 4.8 Portfolio (Value / P&L / Allocation)
+### 4.8 Portfolio (Value / P&L / Allocation) — RESOLVED (Sprint R5, see §2.8)
 - **Current:** `portfolio_update` pushed by heartbeat + on broker sync
   (heartbeat_engine.py:351, broker_engine `portfolio_synced`); Dashboard/Portfolio
   also fetch/poll (`/portfolio/summary`, PortfolioMonitor 60s). Allocation/risk are
@@ -273,7 +413,7 @@ Effort is T-shirt sized (S ≈ ≤1d, M ≈ 2–3d, L ≈ 4–6d, XL ≈ >1wk) f
   P&L; move tips to an `ai.*` event.
 - **Effort:** S
 
-### 4.10 Watchlist (Price / Volume / Change)
+### 4.10 Watchlist (Price / Volume / Change) — RESOLVED (Sprint R8, see §2.9)
 - **Current:** `prices` batch pushed every 15s by heartbeat; Watchlist patches
   rows from `priceTicks` (Watchlist.jsx:157,179) **and** re-fetches `/watchlist`
   every 30s (:171) for RSI / since-added.
@@ -283,7 +423,7 @@ Effort is T-shirt sized (S ≈ ≤1d, M ≈ 2–3d, L ≈ 4–6d, XL ≈ >1wk) f
   can be removed (or gate on `!connected`); row flash animation.
 - **Effort:** M
 
-### 4.11 Notifications
+### 4.11 Notifications — RESOLVED (Sprint R8, see §2.9)
 - **Current:** market alerts written to `db.notifications` and broadcast as
   `ai_alert` (server.py:2466-2484) — **but the client only handles `alert`, so the
   toast never fires (G6)**. Navbar polls `/notifications/unread-count` every 30s
@@ -307,7 +447,7 @@ Effort is T-shirt sized (S ≈ ≤1d, M ≈ 2–3d, L ≈ 4–6d, XL ≈ >1wk) f
   price store, `broker_status` into a broker badge.
 - **Effort:** M
 
-### 4.13 Morning Report
+### 4.13 Morning Report — RESOLVED (Sprint R8, see §2.9)
 - **Current:** generated by 8:30 cron + heartbeat task; page fetches
   `/api/analysis/morning-report` on mount only.
 - **Target:** `morningreport.generated` event → card appears + notification when

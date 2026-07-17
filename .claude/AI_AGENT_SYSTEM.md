@@ -1,6 +1,6 @@
 # StockAssist AI
 ## AI Agent System
-Version: 1.0
+Version: 1.1
 
 ---
 
@@ -71,6 +71,46 @@ Agents share context.
 Agents never guess.
 
 Agents explain uncertainty.
+
+---
+
+# Market Data Access
+
+AI agents never communicate with market data providers.
+
+Not directly. Not through helper utilities. Never.
+
+All market context reaches the AI through one path:
+
+AI request
+
+↓
+
+AI Context Builder
+
+↓
+
+Market Engine (normalized, provider-agnostic data)
+
+↓
+
+Normalized Market Context
+
+↓
+
+Claude
+
+↓
+
+Response
+
+The AI never knows which provider generated the data. Context carries only the source tier (streaming / delayed) and timestamps, so the AI can calibrate its language ("live price" vs "as of 10:42 AM").
+
+The AI must never say "I don't have live market data." It always reasons over the last known market state with its timestamp.
+
+When a user connects a broker, the AI's context automatically becomes fresher with zero prompt or pipeline changes.
+
+Authoritative reference: MARKET_DATA_ARCHITECTURE.md.
 
 ---
 
@@ -302,6 +342,8 @@ Generate opportunities
 
 Never stop scanning.
 
+Data source: normalized events from the Market Engine only — never providers directly.
+
 ---
 
 # 2. Technical Analyst
@@ -517,6 +559,30 @@ Sector Analysis
 Risk Warnings
 
 Before market open every day.
+
+Transparency (Sprint R7): report generation streams a live AIRun step
+timeline over the `ai` channel — per-user for on-demand requests, broadcast
+for the 8:30 scheduled run. See REALTIME_SYSTEM.md → "AI Thinking Process".
+
+Step plan (Sprint 10):
+
+Collecting Market Data → Reading Global Markets → Reading News → Checking
+Economic Calendar → Scanning NSE → Analyzing Sector Flows → Generating Report
+→ Saving Report
+
+plus Reviewing Your Portfolio when the report is generated for a signed-in
+user. A cached market layer skips the market steps entirely — only the
+personal step runs, because only it does real work.
+
+A section that fails and degrades marks its own step `warning` and completes
+the run `warning`. The timeline never reports `done` for work that did not
+succeed.
+
+Structure (Sprint 10): the report is two layers. The market layer is shared
+by every user and generated once per day; the personal layer (portfolio
+alerts) is computed per request and never persisted into the shared document
+— it is keyed by date alone, so a per-user field stored there would reach the
+wrong user. Implementation: services/morning_report.py.
 
 ---
 

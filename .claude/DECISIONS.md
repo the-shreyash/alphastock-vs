@@ -1,7 +1,7 @@
 # StockAssist AI
 ## Architecture & Product Decisions
 
-Version: 1.0
+Version: 1.2
 
 Status: Active Development
 
@@ -302,6 +302,10 @@ Fallback providers
 Testing
 
 Caching
+
+Status
+
+Extended by ADR-026 (Provider-Independent Market Data Architecture).
 
 ---
 
@@ -724,6 +728,105 @@ Reason
 Never expose administrative functionality to regular users.
 
 RBAC required.
+
+---
+
+# ADR-026
+
+Title
+
+Provider-Independent Market Data Architecture
+
+Date
+
+2026-07-16
+
+Decision
+
+StockAssist AI is provider-independent. All market data enters the platform through a Market Gateway abstraction with per-provider adapters, governed by a Source Manager that selects the best provider per user.
+
+Provider priority:
+
+1. Connected Broker WebSocket (Zerodha, Upstox, Angel One, Fyers, Dhan)
+
+2. Licensed Exchange Feed (future)
+
+3. Yahoo Finance (always-available baseline)
+
+Every provider produces one normalized market event model. The Market Engine, AI, and Frontend consume only normalized events and never know the provider — downstream provenance is limited to a source tier (streaming / delayed).
+
+Connecting a broker automatically upgrades the user's feed to the broker's streaming WebSocket at no subscription cost — the broker already owns the user's data entitlement.
+
+Premium never sells market data; it sells AI intelligence.
+
+Reason
+
+Yahoo Finance (polling) was the platform's real latency bottleneck, not the internal event-driven architecture. Depending on any single provider is a business and technical risk. Broker feeds give professional streaming data with zero data cost.
+
+Consequences
+
+• Adding a provider = one adapter + one normalizer + registry entry; nothing else changes.
+• Never bypass the Market Gateway or Source Manager.
+• Frontend and AI must never contain provider-specific logic.
+• Failover is automatic and silent (broker → licensed → Yahoo → cached data with banner).
+
+Authoritative document
+
+MARKET_DATA_ARCHITECTURE.md
+
+---
+
+# ADR-027
+
+Title
+
+Feature Freeze & Production Hardening Program (PH1–PH3)
+
+Date
+
+2026-07-17
+
+Status
+
+Accepted
+
+Context
+
+The MVP is feature complete (Phase 1 Sprints 1–12; Phase 2 Releases R1–R9). The Sprint 12 Production Readiness Audit (PRODUCTION_READINESS_REPORT.md) returned a verdict of NOT READY FOR PRODUCTION: two critical authentication backdoors enabled by default, wildcard CORS with credentialed requests, insecure auth cookies, broken Docker packaging, no CI/CD, no rate limiting, fabricated admin analytics data (ADR-021 violation), a non-hermetic backend test suite, and zero frontend tests. The audit also confirmed a structural documentation/code mismatch: DEPLOYMENT.md and ADR-002 describe a Node.js + Express + TypeScript backend and Vite frontend, while the actual system is Python + FastAPI (`backend/server.py`) with a CRA/craco JavaScript frontend.
+
+Decision
+
+1. Immediate feature freeze. No new product features merge until Production Certification.
+
+2. A three-phase Production Hardening program is inserted between the completed MVP and product Phases 3–9:
+   • PH1 — Production Security Hardening (12 sprints)
+   • PH2 — Production Infrastructure & DevOps (12 sprints)
+   • PH3 — Production Quality Assurance (12 sprints)
+
+3. Two permanent documents govern the program: PRODUCTION_HARDENING.md (strategy, risk, certification, Definition of Production Ready) and PRODUCTION_ROADMAP.md (36 sprint definitions, sequencing, dependency graph).
+
+4. Security removals (auth backdoors, OAuth fallbacks) are permanent — never rolled back; broken flows are fixed forward.
+
+5. The FastAPI + CRA stack is acknowledged as the as-built system of record. ADR-002 is superseded in practice; DEPLOYMENT.md and related documents will be reconciled to the actual stack in sprint PH3.10 (either documenting the FastAPI stack as final or recording an explicit migration ADR — one of the two must be chosen there).
+
+6. Launch requires the three phase certifications (PH1.12, PH2.12, PH3.12) and a re-scored production readiness of ≥ 9.0 with no category below 8.0.
+
+Alternatives Considered
+
+• Fix only the six critical blockers and launch — rejected: leaves no pipeline to keep them fixed, no tests to catch regressions, and unmeasured recovery capability.
+
+• Continue feature development in parallel with hardening — rejected: every new feature widens the attack/regression surface being certified.
+
+Consequences
+
+• Product Phases 3–9 in ROADMAP.md are blocked until PH3.12.
+• All PH work is tracked in TASKS.md under "Production Hardening Program".
+• Documentation version bumped to 1.2; standalone CHANGELOG.md introduced.
+• Estimated program duration: ~5–6 calendar weeks with parallel tracks.
+
+Review Date
+
+At PH3.12 (Production Certification go/no-go).
 
 ---
 

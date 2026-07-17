@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   Search,
@@ -17,6 +17,11 @@ import {
   X,
 } from "lucide-react";
 import api from "../../services/api";
+import {
+  useRealtimeStore,
+  selectConnected,
+  selectScannerRefreshedAt,
+} from "../../store/realtimeStore";
 
 const STRATEGY_ICONS = {
   intraday: Zap,
@@ -37,6 +42,10 @@ export default function MarketScanner() {
   const [showFilters, setShowFilters] = useState(false);
   const [sector, setSector] = useState("");
   const [customFilters, setCustomFilters] = useState({});
+  const [lastLiveUpdate, setLastLiveUpdate] = useState(null);
+  const connected = useRealtimeStore(selectConnected);
+  const refreshedAt = useRealtimeStore(selectScannerRefreshedAt);
+  const loadingRef = useRef(false);
 
   const SECTORS = [
     "Banking", "IT", "Pharma", "Auto", "FMCG", "Oil & Gas",
@@ -49,8 +58,11 @@ export default function MarketScanner() {
       .catch(() => {});
   }, []);
 
-  const runScan = useCallback(async (strategy) => {
-    setLoading(true);
+  const runScan = useCallback(async (strategy, { silent = false } = {}) => {
+    // Silent refreshes (event-driven or fallback poll) update the table
+    // in place — no spinner flicker, rows just re-render with fresh data.
+    if (!silent) setLoading(true);
+    loadingRef.current = true;
     setActiveStrategy(strategy);
     try {
       const params = { limit: 15 };
@@ -61,16 +73,39 @@ export default function MarketScanner() {
       });
       const { data } = await api.get("/market/scanner", { params });
       setResults(data);
+      if (silent) setLastLiveUpdate(new Date());
     } catch {
-      setResults(null);
+      if (!silent) setResults(null);
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
+      loadingRef.current = false;
     }
   }, [sector, customFilters]);
 
   useEffect(() => {
     runScan(null);
   }, [runScan]);
+
+  // Auto-refresh via events (Sprint R4): the store bumps scannerRefreshedAt
+  // only on worker-origin scanner events (sweeps + new hits), never on the
+  // event our own REST scan emits — so this cannot loop. Debounced so a burst
+  // of hits triggers one refetch.
+  useEffect(() => {
+    if (!connected || !refreshedAt) return undefined;
+    const t = setTimeout(() => {
+      if (!loadingRef.current) runScan(activeStrategy, { silent: true });
+    }, 1500);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [refreshedAt, connected, activeStrategy]);
+
+  // Fallback only (R3 pattern): poll while the socket is down.
+  useEffect(() => {
+    if (connected) return undefined;
+    const t = setInterval(() => runScan(activeStrategy, { silent: true }), 60000);
+    return () => clearInterval(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [connected, activeStrategy]);
 
   return (
     <div className="space-y-4">
@@ -204,6 +239,12 @@ export default function MarketScanner() {
             {results && (
               <span className="text-[10px] text-[var(--text-muted)] bg-[var(--bg-tertiary)] px-2 py-0.5 rounded-full">
                 {results.total_matched}/{results.total_scanned} matched
+              </span>
+            )}
+            {connected && lastLiveUpdate && (
+              <span className="text-[10px] text-[var(--gain)] flex items-center gap-1">
+                <span className="w-1 h-1 rounded-full bg-[var(--gain)] animate-pulse" />
+                Live · updated {lastLiveUpdate.toLocaleTimeString()}
               </span>
             )}
           </div>

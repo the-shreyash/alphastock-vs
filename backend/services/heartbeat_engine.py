@@ -21,6 +21,8 @@ import logging
 import os
 from datetime import datetime, timezone, timedelta
 
+from services.market_engine import scanner_worker
+
 logger = logging.getLogger(__name__)
 
 # ── Tunables ──────────────────────────────────────────────────────────────
@@ -62,6 +64,21 @@ async def _broadcast(message):
         await _ws.broadcast(message)
     except Exception as e:
         logger.error(f"Heartbeat broadcast error: {e}")
+
+
+async def _publish(event_type, data):
+    """Publish a real domain event onto the market event bus (Sprint R3).
+
+    The R2 event bridge forwards every bus event to the matching socket channel,
+    so these publishes are what let the Scanner / News / Sectors / Markets
+    surfaces update live without polling. Data here is always the REAL result
+    the calling task already computed — never fabricated. Best-effort: a publish
+    failure must never break the task's core work."""
+    try:
+        from services.market_engine.event_bus import event_bus
+        await event_bus.publish(event_type, data or {})
+    except Exception as e:
+        logger.warning(f"Heartbeat publish '{event_type}' failed: {e}")
 
 
 async def _price_map(symbols):
@@ -114,6 +131,8 @@ async def task_global_markets():
             f"Read {len(valid)} global indices — {leader['name']} {leader['change_pct']:+.2f}%",
             "scan", "done",
         )
+        # Stream live global indices to the Markets page.
+        await _publish("market.global.updated", {"markets": valid})
     except Exception as e:
         logger.error(f"task_global_markets error: {e}")
         log_activity("Reading Global Markets failed", "scan", "warning")
@@ -164,7 +183,7 @@ async def task_fii_dii():
 
 async def task_scan_news():
     from services.activity_logger import log_activity
-    from services.news_service import fetch_news
+    from services.news_service import fetch_news, filter_breaking_novel
     log_activity("Scanning News", "news", "running")
     try:
         news = await fetch_news()
@@ -172,6 +191,20 @@ async def task_scan_news():
             log_activity("No fresh market headlines available", "news", "warning")
             return
         log_activity(f"Scanned {len(news)} market headlines", "news", "done")
+        # Stream the latest headlines live to the News/Dashboard surfaces.
+        await _publish("news.received", {"articles": news[:10], "count": len(news)})
+        # Breaking headlines (Sprint R8): novelty-gated so each event carries
+        # only headlines never streamed before — the frontend toasts these.
+        breaking = filter_breaking_novel(news)
+        if breaking:
+            log_activity(
+                f"{len(breaking)} breaking headline(s): {breaking[0]['title'][:60]}",
+                "news", "warning",
+            )
+            await _publish("news.breaking", {
+                "articles": breaking[:5],
+                "count": len(breaking),
+            })
     except Exception as e:
         logger.error(f"task_scan_news error: {e}")
         log_activity("Scanning News failed", "news", "warning")
@@ -195,6 +228,16 @@ async def task_find_breakouts():
             log_activity(
                 f"Found {len(candidates)} breakout candidate(s): {names}", "scan", "done"
             )
+            # Stream only NEW hits to the live Scanner feed (Sprint R4): the
+            # scan re-detects the same breakout every cycle, so novelty gating
+            # keeps the feed from flooding with repeats.
+            novel = scanner_worker.filter_novel("breakout", candidates)
+            if novel:
+                await _publish("scanner.breakout", {
+                    "kind": "breakout",
+                    "candidates": novel[:10],
+                    "count": len(novel),
+                })
         else:
             log_activity("No breakouts right now — market consolidating", "scan", "done")
     except Exception as e:
@@ -221,11 +264,90 @@ async def task_check_volume():
                 f"{len(surges)}/{len(batch)} stocks with unusual volume: {names}",
                 "scan", "done",
             )
+            surges.sort(key=lambda r: r.get("volume_ratio") or 0, reverse=True)
+            # Stream only NEW volume spikes (Sprint R4; event name per
+            # REALTIME_SYSTEM.md — was `scanner.volume` before R4).
+            novel = scanner_worker.filter_novel("volume_spike", surges)
+            if novel:
+                await _publish("scanner.volume_spike", {
+                    "kind": "volume_spike",
+                    "candidates": novel[:10],
+                    "count": len(novel),
+                })
         else:
             log_activity(f"Volume normal across {len(batch)} stocks scanned", "scan", "done")
     except Exception as e:
         logger.error(f"task_check_volume error: {e}")
         log_activity("Checking Volume failed", "scan", "warning")
+
+
+async def task_scan_momentum():
+    from services.activity_logger import log_activity
+    from services.real_market import fetch_all_universe_quotes
+    log_activity("Scanning Momentum", "scan", "running")
+    try:
+        quotes = await fetch_all_universe_quotes()
+        if not quotes:
+            log_activity("Momentum scan skipped — live data unavailable", "scan", "warning")
+            return
+        candidates = scanner_worker.momentum_pass(quotes)
+        if candidates:
+            names = ", ".join(q["symbol"] for q in candidates[:3])
+            log_activity(
+                f"Found {len(candidates)} momentum mover(s): {names}", "scan", "done"
+            )
+            novel = scanner_worker.filter_novel("momentum", candidates)
+            if novel:
+                await _publish("scanner.momentum", {
+                    "kind": "momentum",
+                    "candidates": novel[:10],
+                    "count": len(novel),
+                })
+        else:
+            log_activity(f"No fresh momentum across {len(quotes)} stocks", "scan", "done")
+    except Exception as e:
+        logger.error(f"task_scan_momentum error: {e}")
+        log_activity("Scanning Momentum failed", "scan", "warning")
+
+
+_sweep_ptr = 0
+
+
+async def task_scanner_sweep():
+    """Continuously re-run the preset scanners (2 per tick, rotating) and emit
+    ONE worker-tagged `scanner.updated` — the frontend's signal to refresh the
+    scanner results table without polling (Sprint R4). Preset scans reuse the
+    30s-cached universe quotes, so a sweep costs ~zero extra upstream calls."""
+    global _sweep_ptr
+    from services.activity_logger import log_activity
+    from services.market_engine import scanner_engine
+    log_activity("Sweeping Scanner Strategies", "scan", "running")
+    try:
+        keys = list(scanner_engine.STRATEGY_PRESETS.keys())
+        picked = [keys[(_sweep_ptr + i) % len(keys)] for i in range(2)]
+        _sweep_ptr = (_sweep_ptr + 2) % len(keys)
+
+        strategies = {}
+        for key in picked:
+            result = await scanner_engine.scan(strategy=key, limit=5, publish=False)
+            if not result.get("available", True):
+                log_activity("Scanner sweep skipped — live data unavailable", "scan", "warning")
+                return
+            top = result["results"][0]["symbol"] if result.get("results") else None
+            strategies[key] = {"matched": result.get("total_matched", 0), "top": top}
+
+        summary = ", ".join(
+            f"{k}: {v['matched']}" for k, v in strategies.items()
+        )
+        log_activity(f"Scanner sweep complete — {summary}", "scan", "done")
+        await _publish("scanner.updated", {
+            "source": "worker",
+            "strategies": strategies,
+            "scanned_at": _now_iso(),
+        })
+    except Exception as e:
+        logger.error(f"task_scanner_sweep error: {e}")
+        log_activity("Scanner sweep failed", "scan", "warning")
 
 
 async def _recent_alert_exists(user_id, ntype, symbol):
@@ -240,6 +362,13 @@ async def _recent_alert_exists(user_id, ntype, symbol):
 
 
 async def task_monitor_trades():
+    """Stream per-user ``trade.updated`` snapshots for every open trade
+    (Sprint R6 — replaces the pre-R6 per-user legacy ``trade_update`` push,
+    whose P&L ignored partial exits and short direction, plus its duplicate
+    SL/target alerts: the trading engine owns real-trade lifecycle alerts,
+    correctly). Paper trades keep a side-aware crossing alert here — the
+    engine never touches them, so this is their only watchdog."""
+    from services import trade_stream
     from services.activity_logger import log_activity
     log_activity("Monitoring Open Trades", "monitor", "running")
     try:
@@ -250,74 +379,42 @@ async def task_monitor_trades():
 
         symbols = list({t["symbol"] for t in open_trades})
         quotes = await _price_map(symbols)
-        alerts_sent = 0
+        users = await trade_stream.publish_all(_db, quotes, reason="monitor")
 
+        # Paper-trade SL/target crossing alerts (side-aware, deduped).
+        alerts_sent = 0
         for trade in open_trades:
+            if not trade.get("is_paper"):
+                continue
             quote = quotes.get(trade["symbol"])
-            if not quote:
+            if not quote or quote.get("price") is None:
                 continue
             price = quote["price"]
-            entry = trade["entry_price"]
-            qty = trade["quantity"]
-            pnl = round((price - entry) * qty, 2)
-            pnl_pct = round(((price - entry) / entry) * 100, 2) if entry else 0
-            user_id = trade["user_id"]
-
-            await _send_user(user_id, {
-                "type": "trade_update",
-                "user_id": user_id,
-                "data": {
-                    "trade_id": str(trade["_id"]),
-                    "symbol": trade["symbol"],
-                    "current_price": price,
-                    "entry_price": entry,
-                    "unrealized_pnl": pnl,
-                    "unrealized_pnl_pct": pnl_pct,
-                },
-                "timestamp": _now_iso(),
-            })
-
-            # Target / stop-loss crossing → notification + alert push (deduped)
-            crossed = None
+            short = (trade.get("type") or "BUY").upper() == "SELL"
             sl = trade.get("stop_loss")
             t1 = trade.get("target1")
-            if sl and price <= sl:
+            crossed = None
+            if sl and (price <= sl if not short else price >= sl):
                 crossed = ("STOP_LOSS_HIT", "critical",
-                           f"{trade['symbol']} hit stop-loss ₹{sl}. Current ₹{price}, P&L ₹{pnl}.")
-            elif t1 and price >= t1:
+                           f"Paper trade {trade['symbol']} hit stop-loss ₹{sl}. Current ₹{price}.")
+            elif t1 and (price >= t1 if not short else price <= t1):
                 crossed = ("TARGET_HIT", "positive",
-                           f"{trade['symbol']} hit target ₹{t1}! Current ₹{price}, profit ₹{pnl}.")
+                           f"Paper trade {trade['symbol']} hit target ₹{t1}! Current ₹{price}.")
 
-            if crossed and not await _recent_alert_exists(user_id, crossed[0], trade["symbol"]):
+            if crossed and not await _recent_alert_exists(
+                    trade["user_id"], crossed[0], trade["symbol"]):
                 ntype, severity, message = crossed
-                await _db.notifications.insert_one({
-                    "user_id": user_id,
-                    "type": ntype,
-                    "symbol": trade["symbol"],
-                    "title": f"AI Alert: {trade['symbol']}",
-                    "message": message,
-                    "severity": severity,
-                    "read": False,
-                    "created_at": _now_iso(),
-                })
-                await _send_user(user_id, {
-                    "type": "alert",
-                    "data": {
-                        "type": ntype,
-                        "severity": severity,
-                        "symbol": trade["symbol"],
-                        "message": message,
-                        "trade_id": str(trade["_id"]),
-                        "price": price,
-                        "pnl": pnl,
-                    },
-                    "timestamp": _now_iso(),
-                })
+                from services.notification_service import create_notification
+                await create_notification(
+                    _db, trade["user_id"], type=ntype,
+                    title=f"AI Alert: {trade['symbol']}", message=message,
+                    severity=severity, symbol=trade["symbol"],
+                    data={"trade_id": str(trade["_id"]), "price": price})
                 alerts_sent += 1
 
-        summary = f"Monitored {len(open_trades)} open position(s)"
+        summary = f"Monitored {len(open_trades)} open position(s) across {users} trader(s)"
         if alerts_sent:
-            summary += f" — {alerts_sent} alert(s) fired"
+            summary += f" — {alerts_sent} paper alert(s) fired"
         log_activity(summary, "monitor", "warning" if alerts_sent else "done")
     except Exception as e:
         logger.error(f"task_monitor_trades error: {e}")
@@ -325,41 +422,40 @@ async def task_monitor_trades():
 
 
 async def task_monitor_portfolio():
+    """Recompute every trader's FULL portfolio (broker holdings + manual open
+    trades, via portfolio_engine) and stream a per-user `portfolio.updated`
+    event through the bus/bridge (Sprint R5 — replaces the pre-R5 legacy
+    `portfolio_update` push that covered manual trades only)."""
+    from services import portfolio_stream
     from services.activity_logger import log_activity
     log_activity("Monitoring Portfolio", "monitor", "running")
     try:
         open_trades = await _db.trades.find({"status": "OPEN"}).to_list(200)
-        if not open_trades:
+        broker_holdings = await _db.holdings.find({}).to_list(500)
+        manual = [t for t in open_trades if not t.get("is_paper")]
+        user_ids = {t["user_id"] for t in manual} | {h["user_id"] for h in broker_holdings}
+        if not user_ids:
             log_activity("No portfolios with open positions", "monitor", "done")
             return
 
-        symbols = list({t["symbol"] for t in open_trades})
-        quotes = await _price_map(symbols)
+        # One shared quote fetch for every symbol held by anyone this cycle —
+        # each user's snapshot then reads from the prefetched map (no N× fetch).
+        symbols = {t["symbol"] for t in manual} | {
+            h["symbol"] for h in broker_holdings if h.get("symbol")}
+        prefetched = await portfolio_stream.quotes_map(list(symbols))
 
-        by_user = {}
-        for trade in open_trades:
-            quote = quotes.get(trade["symbol"])
-            if not quote:
-                continue
-            pnl = round((quote["price"] - trade["entry_price"]) * trade["quantity"], 2)
-            agg = by_user.setdefault(trade["user_id"], {"pnl": 0.0, "positions": 0})
-            agg["pnl"] += pnl
-            agg["positions"] += 1
+        async def shared_quotes(syms):
+            return {(s or "").upper(): prefetched.get((s or "").upper()) for s in syms}
 
-        for user_id, agg in by_user.items():
-            await _send_user(user_id, {
-                "type": "portfolio_update",
-                "user_id": user_id,
-                "data": {
-                    "total_unrealized_pnl": round(agg["pnl"], 2),
-                    "total_pnl": round(agg["pnl"], 2),
-                    "open_positions": agg["positions"],
-                },
-                "timestamp": _now_iso(),
-            })
+        streamed = 0
+        for user_id in user_ids:
+            snapshot = await portfolio_stream.publish_snapshot(
+                _db, user_id, quotes_map_func=shared_quotes, reason="monitor")
+            if snapshot:
+                streamed += 1
 
         log_activity(
-            f"Portfolio health checked for {len(by_user)} trader(s)", "monitor", "done"
+            f"Portfolio P&L streamed for {streamed} trader(s)", "monitor", "done"
         )
     except Exception as e:
         logger.error(f"task_monitor_portfolio error: {e}")
@@ -408,6 +504,16 @@ async def task_sentiment():
         log_activity(
             f"Market sentiment {mood} — {up}/{total} stocks advancing", "rank", "done"
         )
+        # Stream live breadth + top movers to the Markets heatmap / breadth bar.
+        ranked = sorted(quotes, key=lambda q: q.get("change_pct", 0), reverse=True)
+        await _publish("market.movers.updated", {
+            "gainers": ranked[:5],
+            "losers": list(reversed(ranked[-5:])) if len(ranked) >= 5 else [],
+        })
+        await _publish("breadth.updated", {
+            "advances": up, "declines": total - up, "total": total,
+            "sentiment": mood, "advance_ratio": round(ratio, 3),
+        })
     except Exception as e:
         logger.error(f"task_sentiment error: {e}")
         log_activity("Analyzing Sentiment failed", "rank", "warning")
@@ -429,6 +535,8 @@ async def task_sector_rotation():
             f"{lag['sector']} lagging ({lag['change_pct']:+.2f}%)",
             "scan", "done",
         )
+        # Stream live sector performance to the Markets/Dashboard heatmap.
+        await _publish("sector.updated", {"sectors": sectors})
     except Exception as e:
         logger.error(f"task_sector_rotation error: {e}")
         log_activity("Checking Sector Rotation failed", "scan", "warning")
@@ -477,6 +585,49 @@ async def task_earnings():
         log_activity("Checking Earnings failed", "news", "warning")
 
 
+WATCHLIST_STREAM_CAP = 40  # max distinct symbols enriched per cycle
+
+
+async def task_watchlist_stream():
+    """Stream enriched quotes (RSI, volume ratio) for every watchlisted symbol
+    as a broadcast ``watchlist.quotes`` event (Sprint R8). The fast 15s price
+    loop already covers price/change; this slower task covers the technical
+    fields the Watchlist UI shows, so the page needs no fallback poll while
+    connected."""
+    from services.activity_logger import log_activity
+    from services.real_market import fetch_real_stock_quote
+    log_activity("Refreshing Watchlists", "monitor", "running")
+    try:
+        symbols = await _db.watchlist.distinct("symbol")
+        symbols = sorted(s for s in symbols if s)[:WATCHLIST_STREAM_CAP]
+        if not symbols:
+            log_activity("No watchlisted stocks to refresh", "monitor", "done")
+            return
+        results = await asyncio.gather(
+            *[fetch_real_stock_quote(s) for s in symbols], return_exceptions=True
+        )
+        quotes = {}
+        for sym, res in zip(symbols, results):
+            if isinstance(res, dict) and res and res.get("price") is not None:
+                quotes[sym] = {
+                    "price": res["price"],
+                    "change_pct": res.get("change_pct", 0),
+                    "rsi": res.get("rsi"),
+                    "volume_ratio": res.get("volume_ratio"),
+                }
+        if not quotes:
+            log_activity("Watchlist quotes unavailable", "monitor", "warning")
+            return
+        await _publish("watchlist.quotes", {"quotes": quotes, "count": len(quotes)})
+        log_activity(
+            f"Watchlist refreshed — {len(quotes)}/{len(symbols)} live quotes",
+            "monitor", "done",
+        )
+    except Exception as e:
+        logger.error(f"task_watchlist_stream error: {e}")
+        log_activity("Refreshing Watchlists failed", "monitor", "warning")
+
+
 async def task_morning_report():
     from services.activity_logger import log_activity
     from services.real_market import fetch_real_market_overview
@@ -510,7 +661,10 @@ TASKS = [
     (task_sentiment, 100),
     (task_find_breakouts, 120),
     (task_check_volume, 140),
+    (task_scan_momentum, 150),
     (task_scan_news, 150),
+    (task_scanner_sweep, 180),
+    (task_watchlist_stream, 120),
     (task_sector_rotation, 160),
     (task_global_markets, 180),
     (task_us_markets, 200),

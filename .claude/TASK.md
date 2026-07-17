@@ -1,9 +1,9 @@
 # StockAssist AI
 ## Master Tasks
 
-Version: 1.0
+Version: 1.2
 
-Status: Active Development
+Status: Feature Freeze — Production Hardening (PH1–PH3)
 
 ---
 
@@ -216,6 +216,7 @@ Tasks
 - Long-Term Scanner
 - [x] Momentum Scanner — live day-change + volume shortlist (advisor)
 - [x] AI Ranking — fetch_real_top_picks scores live technicals; unavailable when no live data
+- [x] Live Scanner Feed — continuous worker + push events + animated cards (Sprint R4)
 
 ---
 
@@ -818,6 +819,812 @@ Notes / follow-ups
 
 ---
 
+# Sprint R3 — Frontend Real-Time Client
+
+Status
+
+COMPLETED
+
+Authority
+
+REALTIME_SYSTEM.md (Path A — evolve FastAPI native WebSocket; continues the
+Sprint R1 audit / R2 backbone in REALTIME_MIGRATION_PLAN.md)
+
+Objective
+
+Consume the R2 backbone from the frontend: collapse to one socket per user,
+introduce a global real-time store, consume the new `event` envelope, add a
+real connection state machine with heartbeat + backoff, and retire the polling
+timers that now have a push path. GSAP price animations (G7) are intentionally
+deferred.
+
+Delivered
+
+- **Zustand global store** (`frontend/src/store/realtimeStore.js`, new) — a
+  single store fed by one socket. `applyLegacy(msg)` folds the pre-R2 flat
+  message switch (`market_update`, `prices`, `trade_update`, `ai_alert`,
+  `broker_*`, …); `applyEvent(envelope)` routes the R2 `{type:"event",…}`
+  envelope by domain into slices (`market.index.updated`→price store,
+  `notification.created`→unread badge + latest, `portfolio.updated`, scanner/
+  news/sector buckets). Narrow selectors so a tick re-renders only the
+  components reading that slice (G4).
+- **Single socket provider** (`frontend/src/context/RealtimeProvider.jsx`, new)
+  — owns the ONE `WebSocket(/api/ws?user_id=)`, mounted in `App.js` inside
+  `AuthProvider`. No anonymous socket. On open it subscribes to the app's
+  channels (`market`, `sectors`, `scanner`, `news`, `notifications`,
+  `portfolio`, `trades`, `ai`, `broker`) and exposes an imperative `send`.
+  **Connection state machine** connecting→live→reconnecting→offline (G8),
+  **30s heartbeat** (`ping`/`pong`, reconnect on missed pong), **exponential
+  backoff** with jitter (1s→30s cap, reset on clean open) (G3, G8).
+- **`useWebSocket` → store shim** (`frontend/src/hooks/useWebSocket.js`) — no
+  longer opens a socket; returns the same interface (plus `connectionStatus`)
+  read from the store, so Dashboard/TradeMonitor/Watchlist work unchanged while
+  the app uses exactly one socket (G3).
+- **Connection pill** (`frontend/src/components/layout/ConnectionStatus.jsx`,
+  new) — Live/Connecting/Reconnecting/Offline, rendered app-wide in `Navbar`
+  (replaces the Dashboard-only LIVE/OFFLINE badge).
+- **New backend emissions (real data only)** — the always-on heartbeat tasks
+  already computed real results but never published; they now emit onto the bus
+  (the R2 bridge forwards to channels): `news.received` (scan_news),
+  `scanner.breakout` (find_breakouts), `scanner.volume` (check_volume),
+  `sector.updated` (sector_rotation), `market.global.updated` (global_markets),
+  `market.movers.updated` + `breadth.updated` (sentiment). `market_broadcast_loop`
+  additionally publishes `market.engine.status` ~every 30s. All guarded; a
+  publish failure never breaks the task.
+- **De-poll (G9, fully resolved)** — every poll with a push path is gated on
+  `!connected` (fallback only), initial fetch retained: Dashboard core 30s +
+  activity 10s, TradeMonitor active-trades 15s, Watchlist 30s, Navbar
+  unread-count (badge live via `notification.created`), ActivityTimeline 15s
+  (streams `activity_feed`), Markets 30s (indices/sectors/global/movers now
+  pushed), MarketEngineStatus 30s (`market.engine.status`), PortfolioMonitor 60s
+  (event-triggered refetch on `portfolio_update`).
+- **GSAP animations (G7)** — `hooks/usePriceFlash.js` (green flash + scale-up on
+  rise, red flash + scale-down on fall) on the Dashboard index cards and
+  Watchlist row prices; `components/ui/AnimatedNumber.jsx` (smooth count-up) on
+  the Dashboard portfolio value + Today's P&L — the doc's animation spec.
+
+Verification
+
+- `frontend` `yarn add zustand` + `CI=false yarn build` (craco) passes clean;
+  only pre-existing eslint warnings remain (RankingTable/Settings/TradeJournal,
+  untouched). Bundle +2.6 kB gz total.
+- Backend: `python3 -m py_compile services/heartbeat_engine.py server.py` OK
+  (deps not installed in the dev session, so the pytest suite was not run here).
+- Manual (needs a running backend+frontend): one `/api/ws` connection across
+  pages in DevTools; pill Live→(kill backend)→Reconnecting→Offline→(restart)→
+  Live; polls silent while live; index cards flash on tick; portfolio value
+  counts up; notification badge increments on a `notification.created` push.
+
+Notes / follow-ups
+
+- The R2 `event` envelope + channel names are consumed verbatim from
+  `services/realtime/event_bridge.py`; new emissions route via the existing
+  `DOMAIN_CHANNEL` map with no bridge change.
+
+---
+
+# Sprint R4 — Scanner Live Migration
+
+Status
+
+COMPLETED
+
+Authority
+
+REALTIME_SYSTEM.md (Path A — continues the R1 audit / R2 backbone / R3 client
+in REALTIME_MIGRATION_PLAN.md; closes the audit's §4.5 Scanner gap)
+
+Objective
+
+Convert the scanner from fetch-only to a continuous, push-driven surface:
+a continuous scanner worker emitting live breakout / volume-spike / momentum
+events, auto-refresh of the results table via events, and animated card
+insertion per the doc's scanner-card spec.
+
+Delivered
+
+- **Scanner worker** (`backend/services/market_engine/scanner_worker.py`, new)
+  — pure novelty/detection layer for the continuous scanner:
+  `filter_novel()` keeps a per-(kind, symbol) 30-min cooldown so every
+  published `scanner.*` hit is a NEW opportunity (continuous rescans no longer
+  flood the feed with repeats); `detect_momentum()`/`momentum_pass()` compare
+  each cycle's day-change against the previous cycle's snapshot, so
+  `scanner.momentum` fires only for stocks ≥2% up that are new or still
+  accelerating (≥0.3% since last cycle). Process-local state; `reset_state()`
+  for tests.
+- **Heartbeat scanner tasks** (`services/heartbeat_engine.py`) — the existing
+  breakout/volume tasks now gate their publishes through `filter_novel`;
+  `scanner.volume` **renamed to `scanner.volume_spike`** (doc-aligned; single
+  producer, no name-specific consumer). New `task_scan_momentum` (150s)
+  publishes `scanner.momentum`. New `task_scanner_sweep` (180s) re-runs the
+  preset scanners (2 per tick, rotating through all 8; reuses the 30s-cached
+  universe quotes) and emits ONE worker-tagged `scanner.updated` — the
+  frontend's auto-refresh signal.
+- **Loop-safe refresh contract** (`services/market_engine/scanner_engine.py`)
+  — `scan()` gains `source="api"` / `publish=True`; the REST scan's
+  `scanner.updated` now carries `source:"api"` and the frontend refetches ONLY
+  on `source:"worker"`, so an API scan can never trigger a refetch loop.
+  Scanner events documented in `event_bus.py`'s contract docstring.
+- **Store** (`frontend/src/store/realtimeStore.js`) — scanner slice is now
+  event-aware: hit events become feed entries `{id, kind, event, candidates,
+  count, timestamp}` (cap 50) and bump `scannerRefreshedAt`; worker-origin
+  `scanner.updated` bumps `scannerRefreshedAt` only. New selectors
+  `selectScannerFeed`, `selectScannerRefreshedAt`.
+- **Live feed UI** (`components/market/ScannerLiveFeed.jsx`, new) — pure
+  push-driven hit feed (no fetching) beside the scanner on the Markets Scanner
+  tab (320px rail, stacks on mobile): kind badges (Breakout / Volume Spike /
+  Momentum), top-3 candidates with price/change/vol-ratio, relative time,
+  live/offline dot, honest empty + offline states.
+- **Card entrance animation** (`hooks/useCardEntrance.js`, new) — the doc's
+  scanner-card spec (Slide Right → Fade → Glow → Settle) as a GSAP mount
+  animation mirroring `usePriceFlash`; only newly inserted cards animate.
+- **Auto-refresh via events** (`components/market/MarketScanner.jsx`) — the
+  results table refetches silently (no spinner flicker) ~1.5s-debounced on
+  `scannerRefreshedAt`, shows a "Live · updated hh:mm:ss" caption, and falls
+  back to a 60s poll ONLY while the socket is down (R3 gating pattern);
+  initial fetch retained.
+
+Verification
+
+- `tests/test_scanner_worker.py` (new): 11 hermetic tests — novelty cooldown
+  (first-pass/repeat/expiry/pruning/kind-independence), momentum
+  threshold+acceleration semantics, heartbeat task contracts via bus spies
+  (momentum publishes once then dedupes; volume task emits
+  `scanner.volume_spike` and never the old name; breakout dedupes; sweep emits
+  exactly one worker-tagged `scanner.updated`), `scan(publish=False)` silent +
+  `source:"api"` tagging. All fetchers monkeypatched — no network.
+- `tests/test_event_bridge.py` extended: `scanner.breakout` /
+  `scanner.volume_spike` / `scanner.momentum` → `scanner` channel mapping.
+- Full hermetic backend suite: 197 passed (the `test_phase*`/`test_backend`
+  `requests`-based suites require a running dev server — unchanged, unaffected).
+- Frontend `CI=false yarn build` (craco) passes clean (+1.4 kB gz); only the
+  pre-existing TradeJournal eslint warning remains.
+- Manual (needs running backend+frontend): Markets → Scanner tab; hit cards
+  slide in within ~2–3 min of heartbeat cycles; table refreshes silently after
+  sweeps; preset-button REST scans do NOT trigger refetch (source gating);
+  no `/market/scanner` polling while live; offline falls back to 60s poll.
+
+Notes / follow-ups
+
+- Hit events are broadcast on the `scanner` channel (public market data);
+  per-user notification fan-out (`create_notification`) and AI auto-analysis
+  of hits are the doc's next steps for the scanner flow — deferred.
+- The dedupe cooldown is process-local; if the backend is ever scaled to
+  multiple worker processes, only one process should run the heartbeat engine
+  (already the deployment model) or the cooldown moves to Redis.
+
+---
+
+# Sprint R5 — Portfolio Live Migration
+
+Status
+
+COMPLETED
+
+Authority
+
+REALTIME_SYSTEM.md (Path A — continues R1 audit / R2 backbone / R3 client /
+R4 scanner in REALTIME_MIGRATION_PLAN.md; closes the audit's §4.8 Portfolio gap)
+
+Objective
+
+Convert the portfolio from fetch-on-mount to a live, push-driven surface:
+streaming P&L, live allocation updates, broker-tick-driven recomputes,
+animated counters, live charts, and event-triggered AI portfolio refresh —
+per the doc's *Broker WebSocket → Portfolio Service → Socket → PnL Updated →
+Number Animation → Allocation Chart Updates* flow.
+
+Delivered
+
+- **Live portfolio stream** (`backend/services/portfolio_stream.py`, new) —
+  server-side recompute layer: builds a per-user snapshot through
+  `portfolio_engine` (never re-implements portfolio math) and publishes a
+  per-user `portfolio.updated` bus event (`data.user_id` → the R2 bridge
+  delivers only to that user's sockets, `portfolio` channel). Payload:
+  `{pnl, allocation, holdings (light marks), open_positions, reason}` +
+  legacy-compat flat `total_pnl`/`total_unrealized_pnl`. Light quotes map
+  (cached 2d Yahoo + factual sector metadata) — marks, not indicators.
+- **Heartbeat producer** (`services/heartbeat_engine.py`) —
+  `task_monitor_portfolio` (90s) upgraded from "manual open trades only" to
+  the FULL broker+manual portfolio for every user with positions, using one
+  shared quote prefetch per cycle; emits `portfolio.updated`
+  (`reason:"monitor"`) via the bus instead of the legacy `portfolio_update`
+  send (the store maps the event into the same consumer state).
+- **Broker streaming → live P&L** (`services/broker_engine.py`) — official
+  broker ticks now drive the portfolio: `_on_stream_tick` maps
+  `instrument_token → symbol` via the user's synced `db.holdings`, persists
+  fresh `last_price`/`market_value` marks (REST reads stay live between Yahoo
+  refreshes), and publishes a throttled (3s/user, process-local, tick prices
+  supersede cached quotes) `reason:"broker_tick"` snapshot. `sync_portfolio`
+  additionally publishes the doc's `portfolio.synced` event + a
+  `reason:"broker_sync"` snapshot. All best-effort — a recompute error never
+  breaks the raw tick forward. Events documented in `event_bus.py`.
+- **Store** (`frontend/src/store/realtimeStore.js`) — `portfolio.updated` →
+  new `portfolioLive` slice (full snapshot + `updatedAt`) while still feeding
+  `portfolioUpdate` for legacy consumers (Dashboard card, PortfolioMonitor);
+  `portfolio.synced` → `portfolioSynced`. New selectors `selectPortfolioLive`,
+  `selectPortfolioSynced`.
+- **Portfolio page live migration** (`pages/Portfolio.jsx`) — live snapshot
+  overlays the intelligence bundle (marks only; analytics stay server-computed):
+  value strip uses GSAP `AnimatedNumber` count-up + `usePriceFlash` green/red
+  flash on total value and P&L, with a pulsing LIVE badge showing snapshot
+  time; holdings rows extracted into `HoldingRow` (per-row price flash — only
+  the affected row updates); allocation pie + sector bars read the live
+  allocation; equity curve appends a streaming "Live" point so the chart moves
+  intraday; **AI portfolio refresh**: silent intelligence refetch triggered by
+  `portfolio.synced` (immediate, deduped) and `portfolio.updated` (≥60s
+  apart) — event-triggered, never a timer; no polling added (page stays
+  fetch-on-mount + events, manual refresh retained).
+- **Dashboard** (`pages/Dashboard.jsx`) — portfolio summary card now also
+  merges live `current_value`/`invested` from R5 snapshots (existing
+  AnimatedNumber animates them).
+
+Verification
+
+- `tests/test_portfolio_stream.py` (new): 8 hermetic tests — snapshot payload
+  shape + legacy-compat fields, per-user `portfolio.updated` publish,
+  no-holdings silence, tick price override, tick mark persistence, tick
+  throttle + `reset_state` re-arm, unmatched-token silence, heartbeat task
+  contract (broker + manual users each get one `reason:"monitor"` event with
+  shared-prefetch P&L). Bus spied in-process; quotes injected — no network.
+- `tests/test_event_bridge.py` extended: `portfolio.updated` /
+  `portfolio.synced` → `portfolio` channel mapping.
+- Full hermetic backend suite: 205 passed (197 pre-R5 + 8 new; the
+  `test_phase*`/`test_backend` `requests`-based suites still require a running
+  dev server — unchanged).
+- Frontend `CI=false yarn build` (craco) passes clean (+0.7 kB gz); only the
+  pre-existing TradeJournal eslint warning remains.
+- Manual (needs running backend+frontend): Portfolio page shows LIVE badge;
+  value/P&L count up and flash on heartbeat cycles (~90s); with a connected
+  Zerodha session ticks move rows/value within seconds (3s throttle);
+  allocation pie/bars follow; Performance tab shows the moving "Live" point;
+  broker sync refreshes the AI intelligence bundle silently.
+
+Notes / follow-ups
+
+- The tick throttle is process-local (same trade-off as scanner_worker's
+  cooldown; single-heartbeat deployment model). Multi-process scale moves it
+  to Redis.
+- Realized P&L is intentionally absent from live snapshots — it changes only
+  when a trade closes and stays owned by the REST intelligence bundle.
+- Zerodha funds card on the Portfolio page is still fetch-on-mount; a
+  `funds.updated` broker event is the natural next step.
+
+---
+
+# Sprint R7 — AI Live Activity
+
+Status
+
+COMPLETED
+
+Authority
+
+REALTIME_SYSTEM.md (§ "AI Thinking Process" / "AI Activity Timeline" — "Never
+fake AI progress. Always display actual AI workflow.")
+
+Objective
+
+Convert the AI chat from a static "Thinking…" indicator into an event-driven,
+per-request step timeline — the doc's *Collecting Market Data → … → Completed*
+flow, but with truthful labels that map to the work the chat pipeline actually
+performs. Steps stream live over the existing event bus → WebSocket bridge and
+update only the assistant bubble (no page rerender, no polling).
+
+Delivered
+
+- **Reusable step emitter** (`backend/services/ai_activity.py`, new) — `AIRun`
+  publishes a run-correlated, per-user timeline on the `ai` domain:
+  `ai.run.started` (full step plan), `ai.step` (index + `running`/`done`/
+  `warning`), `ai.run.completed`. Every event carries `user_id` so the R2
+  bridge delivers only to that user's sockets, and a `run_id` so the client
+  correlates a step burst to the request that fired it. `step()` is an async
+  context manager (running on enter; done/warning on exit) and all emission is
+  best-effort — a bus/socket failure can never break the AI reply.
+- **Chat pipeline instrumented** (`server.py` → `ai_chat`) — genuine stages
+  wrapped as steps: *Recalling your context* (AI memory load), *Reviewing our
+  conversation* (session history), and a model step whose label follows the
+  provider that actually serves — *Consulting Claude* / *Consulting Gemini* /
+  *Composing your answer* — via `ModelRouter.resolve_provider()` (the existing
+  history-less fallback is nested inside that step). `run_id` added to
+  `ChatMessage` (`models.py`) and threaded through `chat_endpoint`.
+- **Store** (`frontend/src/store/realtimeStore.js`) — new `aiRun` slice; the
+  `ai` domain now branches: `ai.run.started`/`ai.step`/`ai.run.completed` drive
+  `aiRun` (stale-run guard by `runId`), all other `ai.*` still feed the
+  background `activityUpdates` feed. New selector `selectAIRun`.
+- **Live UI** (`frontend/src/components/ai/AIStepTimeline.jsx`, new) — renders
+  the correlated run's steps with per-status icons (pending/running-spinner/
+  done-check/warning) and a framer-motion staggered entrance; falls back to the
+  original three-dot pulse when no matching live run exists yet (first paint or
+  socket offline). Wired into `pages/AIAssistant.jsx` (replaces the inline dots
+  while `sending`); `hooks/useAIWorkspace.js` generates a `run_id` per send,
+  posts it to `/chat`, and exposes `activeRunId`.
+
+Verification
+
+- Backend `python3 -c "ast.parse(...)"` clean on all changed modules; frontend
+  babel (react-app preset) parses all four changed files clean.
+- Manual (needs running backend+frontend): open AI Workspace → send a message →
+  the assistant bubble shows the three stages advancing live (spinner → check)
+  instead of static dots, then the answer replaces the timeline. With the socket
+  offline the bubble falls back to the pulsing dots (no regression).
+
+Notes / follow-ups
+
+- Chat runs three truthful stages (memory/history/model). Multi-tool pipelines
+  (Morning Report, Trade/Portfolio review) adopted the same `AIRun` emitter in
+  Sprint R7 Phase 2 (below).
+- `run_id` correlation is client-generated per send. Since Phase 2 the store
+  keys runs by `runId`, so concurrent timelines coexist.
+
+---
+
+# Sprint R7 Phase 2 — AI Live Activity: Full-Surface Rollout
+
+Status
+
+COMPLETED (2026-07-16)
+
+Authority
+
+REALTIME_SYSTEM.md (§ "AI Thinking Process" / "AI Activity Timeline" / "Morning
+Report Flow" — "Never fake AI progress. All steps visible.")
+
+Objective
+
+Extend the R7 `AIRun` live-step system beyond chat to every AI surface: the
+Morning Report page shows the doc's *Collecting Market Data → Reading News →
+Scanning NSE → … → Completed* pipeline live; Portfolio/Trade review panels show
+their real stages; the 8:30 IST scheduler run broadcasts to every dashboard.
+
+Delivered — backend
+
+- **Morning report instrumented** (`server.py` → new `generate_morning_report`,
+  extracted from `morning_report_full`) — six truthful steps
+  (`MORNING_REPORT_STEPS`): *Collecting Market Data* (`real_overview`),
+  *Reading News* (NEW real phase — `news_service.get_market_sentiment()`, cached
+  RSS; result persisted as `report["news_sentiment"]` + a key-risks line; feed
+  failure → step `warning`, report still generated), *Scanning NSE* (top picks),
+  *Analyzing Sector Flows* (FII/DII + sectors + mood), *Generating Report*
+  (AI briefing), *Saving Report* (Mongo). Endpoint accepts `?run_id=` for
+  correlation. Cache hits return before the run starts — zero events. Overview
+  unavailable → run completes `warning`.
+- **Portfolio review** (`POST /api/ai/portfolio-review`) — optional
+  `PortfolioReviewRequest{run_id}` body (backward compatible); 3-step run:
+  *Reading your holdings → Scanning portfolio health → Consulting the AI*.
+- **Trade review** (`POST /api/ai/trade-review`) — `run_id` on
+  `TradeReviewRequest`; steps *Reviewing execution with AI* (+ *Saving review*
+  only when a `trade_id` save actually happens); cached reviews emit nothing.
+- **Scheduler broadcast** (`services/scheduler.py` → `morning_analysis_job`) —
+  wrapped in a `user_id=None` AIRun (*Scanning NSE → Generating Morning Report →
+  Notifying Traders*); the bridge broadcasts null-user events on the `ai`
+  channel, so every connected dashboard watches the 8:30 pipeline live. The
+  redundant `log_activity("Scanning NSE top gainers")` line was removed.
+
+Delivered — frontend
+
+- **Keyed run store** (`realtimeStore.js`) — single `aiRun` slot replaced by
+  `aiRuns` map keyed by `runId` (+ `aiRunOrder`, pruning oldest *completed*
+  runs beyond 6). Only the patched run's object identity changes. Broadcast
+  runs' `ai.step` events also mirror into `activityUpdates` (legacy
+  activity-feed shape) so the dashboard AI Activity timeline shows scheduler
+  runs. New actions: `resolveAIRun(runId, status)` (REST-settle reconciliation:
+  no step may stay stuck "running" after the request resolves/fails) and
+  `clearAIRun(runId)`. `selectAIRun` replaced by factory `selectAIRunById`.
+- **`AIPipelineProgress.jsx`** (new) — page-level pipeline card: progress bar,
+  animated "X of N" counter, step rows (shared `StepIcon`), GSAP entrance,
+  `fallback` prop (shown until `ai.run.started` arrives — covers cache hits)
+  and a `staleMs` guard (active run silent >45s degrades to fallback).
+- **Surfaces wired** — `MorningReport.jsx` sends `run_id` and replaces loading
+  skeletons with `AIPipelineProgress`; `PortfolioReviewPanel.jsx` /
+  `TradeReviewPanel.jsx` send `run_id` and replace skeleton bars with the
+  compact `AIStepTimeline`; `useAIWorkspace.js` (chat) now resolves + clears
+  its run on settle. All surfaces call `resolveAIRun`/`clearAIRun` in
+  catch/finally.
+
+Tests
+
+- `backend/tests/test_ai_live_activity.py` (new, 6 tests, hermetic): ordered
+  started→running/done→completed events with correct labels/indices; `run_id`
+  passthrough over HTTP; cache hit emits zero events; failing fetch → step +
+  run `warning`; unavailable overview → run `warning`; scheduler job events all
+  carry `user_id: None`. Full hermetic suite: 210 passed (1 pre-existing
+  `test_trading_engine.py` failure unrelated to R7, fails on clean tree too).
+
+Follow-ups
+
+- [ ] Migrate `heartbeat_engine` tasks off `activity_logger` onto AIRun
+      broadcast runs (single AI-activity system; retire `activity_feed`).
+- [ ] Extract `generate_morning_report` (and siblings) out of the `server.py`
+      monolith into a service module once its `db`/provider globals are
+      injectable.
+
+---
+
+# Sprint R7.5 — AI Context Engine & Real-Time Audit
+
+Status
+
+COMPLETED
+
+Authority
+
+REALTIME_SYSTEM.md (source of truth) + AI_AGENT_SYSTEM.md ("Agents never
+guess"; the AI must reason from the Market Engine, never from model memory).
+
+Objective
+
+Audit the full real-time pipeline and fix the core AI defect: the chat
+assistant answered like a general-purpose LLM ("I don't have access to live
+market data") because the chat request injected only memory + conversation
+history — never live platform data. Combined with the Master Prompt's
+anti-fabrication rule, the model correctly but uselessly disclaimed live access.
+
+Audit findings
+
+- **Delivery layer is healthy** — event_bus → event_bridge → WebSocket is
+  event-driven and <100ms; one socket/user, heartbeat, reconnect, GSAP flashes
+  all work. `ai_activity`, `trade_stream`, `trade_review`, `AIStepTimeline` are
+  fully wired end-to-end (not stubs).
+- **Root cause of the AI bug** — `server.ai_chat()` fed only `{memory}` + last 10
+  turns; the `ai_chat` prompt had no live-data slot. Fixed this sprint.
+- **"Feels static" root cause** — the free Yahoo data SOURCE is polled on
+  30–180s cycles (indices 10–15s, trades 60s, portfolio 90s, scanner 120–180s).
+  This is a data-source limitation, not a pipeline bug; true sub-second ticks
+  need a broker websocket feed. Documented; cadence tuning deferred (see below).
+
+Delivered
+
+- **AI Context Builder** (`backend/services/ai_context_builder.py`, new) —
+  `build_chat_context(db, user, quotes_map_func)` assembles one compact, live,
+  token-budgeted (~500 tok) markdown snapshot before every chat request:
+  market snapshot (NIFTY/Bank Nifty/Sensex/VIX/breadth/sentiment/status),
+  gainers/losers, sectors, global markets, portfolio + P&L + risk, open trades,
+  watchlist, latest news + sentiment, broker status, user memory, recent
+  platform AI activity. Composes existing services only (`real_market`,
+  `portfolio_engine`, `news_service`, `ai_memory`, `activity_logger`) — no new
+  data source. Fully best-effort (per-section isolation), concurrent under one
+  4s budget, and per-user micro-cached (8s). `quotes_map_func` is injected
+  (`server.real_quotes_map`) to avoid a circular import, matching
+  `portfolio_engine`/`portfolio_stream`.
+- **Prompt Builder update** (`services/prompt_library.py`, `ai_chat` → 1.1.0) —
+  new `{live_context}` slot; the AI is told the context is live ground truth,
+  must NEVER mention knowledge cutoff / training data / "an AI model" / inability
+  to access live data, and — only when the market feed is truly unavailable —
+  must reply exactly "The live market feed is temporarily unavailable. Please
+  try again in a few moments."
+- **Chat pipeline wired** (`server.ai_chat`) — builds context as the first
+  timeline step ("Reading live market data") and renders it into the prompt;
+  best-effort so an empty context still yields a valid reply. No API-contract or
+  frontend change.
+
+Verification
+
+- Import/AST clean on all changed modules (project venv). `ai_chat` renders to
+  v1.1.0 with the live_context slot and the exact fallback sentence.
+- Async smoke test of `build_chat_context` with stub db + quotes: live Yahoo
+  overview fetched, portfolio/open-trades/watchlist/broker/news sections
+  rendered, ~475 tokens, micro-cache returns the same object, and a forced
+  section failure (missing memory collection) degraded gracefully without
+  breaking the build.
+
+Notes / follow-ups (out of scope this sprint)
+
+- Real-time cadence tuning (tighter heartbeat/broadcast for indices/watchlist/
+  portfolio) — needs a broker websocket feed for true Zerodha/TradingView-grade
+  sub-second ticks.
+- Proactive AI-model-generated alerts (trade opportunities, exit signals) — the
+  monitoring scaffolding already exists in `heartbeat_engine.py`.
+- Chat response streaming (SSE/WebSocket).
+- The other agent endpoints (advisor, portfolio-review) already inject their own
+  live data; they can adopt `build_chat_context` for a unified snapshot later.
+
+---
+
+# Sprint R8 — Notifications & Watchlist Live Migration
+
+Status
+
+COMPLETED
+
+Authority
+
+REALTIME_SYSTEM.md (source of truth for all real-time behavior); closes
+migration-plan gaps §4.6 (Breaking News), §4.10 (Watchlist), §4.11
+(Notifications), §4.13 (Morning Report).
+
+Objective
+
+Make every alerting surface push-driven: notifications toast in live and the
+badge increments without polling; the watchlist streams price + RSI + volume
+ratio per row; breaking headlines interrupt with a live toast; the morning
+report announces itself the moment the 8:30 pipeline finishes.
+
+Delivered — Backend
+
+- [x] Breaking-news pipeline: `news_service` now classifies every article's
+  `importance`/`is_breaking` deterministically (`_BREAKING_TERMS`) and
+  `filter_breaking_novel()` cooldown-gates headlines (2h, process-local,
+  mirrors `scanner_worker.filter_novel`); heartbeat `task_scan_news` publishes
+  `news.breaking {articles, count}` for novel breaking items only.
+- [x] Notification unification: every remaining direct
+  `db.notifications.insert_one` migrated to
+  `notification_service.create_notification` so ALL alerts push
+  `notification.created` live — morning report, exit reminder, EOD report
+  (scheduler), portfolio-monitor AI alerts, TRADE_ENTRY (manual + Zerodha),
+  EMERGENCY_STOP, monitor/run alerts, WEEKLY_REVIEW (server.py). The helper's
+  single insert is now the only write path.
+- [x] Watchlist stream: new heartbeat `task_watchlist_stream` (120s) enriches
+  every watchlisted symbol (RSI, volume ratio via `fetch_real_stock_quote`)
+  and broadcasts `watchlist.quotes`; watchlist add/remove REST endpoints
+  publish per-user `watchlist.updated {action, symbol}` for cross-surface
+  sync. Bridge maps `watchlist.*` → `watchlist` channel.
+- [x] Morning report ready-signal: `morning_analysis_job` publishes broadcast
+  `morningreport.generated {date, picks}` after the report is saved; bridge
+  maps the domain onto the `ai` channel every dashboard already subscribes to.
+
+Delivered — Frontend
+
+- [x] Store: `news.breaking` (prepend + `breakingNews` slice),
+  `watchlist.quotes` (folded into the shared `priceTicks` store),
+  `watchlist.updated` (`watchlistEvent` slice), `morningreport.generated`
+  (`morningReportReadyAt`), `decrementUnread`; new selectors (`selectNews`,
+  `selectBreakingNews`, `selectLatestNotification`, `selectWatchlistEvent`,
+  `selectMorningReportReadyAt`); provider subscribes to the `watchlist`
+  channel.
+- [x] `NotificationToast.jsx` (new, mounted in Layout): global toast host —
+  notification.created and breaking-news pushes slide down (severity-styled,
+  auto-dismiss, click-through to the owning surface, max 3 stacked).
+- [x] NotificationPanel: live prepend while open; mark-read/mark-all-read now
+  sync the store badge (`decrementUnread` / `markNotificationsRead`).
+- [x] Watchlist page: rows patch price, change, RSI, volume ratio AND
+  since-added P&L from the live tick store; add/remove in another tab syncs
+  via `watchlist.updated`; 30s poll remains disconnected-only.
+- [x] News page: streamed headlines merge in live (breaking first, deduped by
+  title) with a LIVE badge; BREAKING article badge now driven by real data.
+- [x] Dashboard: news, notifications and watchlist widgets all patch from the
+  store (no new fetches while connected); morning-report card refetches on the
+  ready-signal.
+- [x] Morning Report page: auto-refreshes in place when
+  `morningreport.generated` arrives.
+
+Verification
+
+- `tests/test_sprint_r8.py` (9 tests: importance classification, breaking
+  novelty gate incl. cooldown expiry + untitled skip, bridge routing for
+  watchlist/morningreport/news.breaking) — all pass alongside the existing
+  event-bridge/scanner/portfolio/AI suites (210+ passing; only pre-existing
+  live-server integration tests and one pre-existing trading-engine assertion
+  fail, unrelated to R8).
+- Frontend production build compiles clean (craco build).
+
+---
+
+# Sprint R9 — Performance Optimization
+
+Status
+
+COMPLETED
+
+Authority
+
+REALTIME_SYSTEM.md (§ "Performance Rules" — batch updates, virtualize long
+lists, lazy load, memoize, only changed components rerender) + the
+performance skill targets (fast initial load, minimal re-renders, efficient
+Redis usage).
+
+Objective
+
+Land the doc's performance rules as concrete infrastructure: batch the event
+firehose on the client, stop no-op re-renders at the store, window long
+lists, split the bundle per route, and cut Redis round-trips + per-socket
+serialization on the backend.
+
+Delivered — Frontend
+
+- [x] Event batching (`context/RealtimeProvider.jsx`) — inbound socket
+  messages queue for a 40ms window (setTimeout, so batching survives
+  background tabs) and apply as one burst via the store's new
+  `applyMessages`; `pong` bypasses the batch. A heartbeat cycle that emits a
+  dozen events now produces one coalesced store update.
+- [x] Store coalescing + selective rendering (`store/realtimeStore.js`) —
+  `applyMessages` folds every price-bearing message in a burst (`prices`,
+  `price_tick`, `market.index.updated`, `watchlist.quotes`) into ONE
+  `_mergePrices` write. `_mergePrices` now MERGES per symbol — fixing a real
+  bug where the 15s price stream replaced tick objects and wiped the
+  RSI/volume_ratio fields the 120s watchlist stream had added — preserves
+  object identity on no-op ticks, and skips the write entirely when nothing
+  moved. New factory selector `selectTickForSymbol`.
+- [x] Memoization — `WatchlistRow` is `memo`ized and subscribes to its own
+  symbol tick (a burst re-renders only rows whose symbols moved; the page no
+  longer clones the whole list per tick); News page gains a memoized
+  `ArticleCard` (stable title+published keys, was index-keyed), `useMemo`d
+  filtering and source counts; Dashboard's index/watchlist tick-patch effects
+  keep previous state identity on no-op ticks.
+- [x] Virtualization (`hooks/useVirtualList.js`, new) — dependency-free list
+  windowing (scroll-window + spacer paddings, row height corrected from the
+  first rendered row). Watchlist windows itself beyond 60 rows; smaller lists
+  keep the staggered entrance animation.
+- [x] Lazy loading (`App.js`, `components/layout/Layout.jsx`) — all 21 routed
+  pages converted to `React.lazy` route-level code splitting; outer Suspense
+  in App.js for public pages, nested Suspense around Layout's `<Outlet/>` so
+  in-app navigation suspends only the content region (sidebar/navbar/toast
+  host never unmount). Main bundle drops to ~160 kB gz with page chunks
+  (86/55/27 kB…) loading on demand.
+
+Delivered — Backend (Redis optimization)
+
+- [x] `services/cache.py` — `cache_get_many` (one MGET round-trip) and
+  `cache_set_many` (one non-transactional pipeline); the in-memory fallback
+  store is now bounded (1024 keys: expired-entry sweep first, oldest-written
+  eviction only if still over) instead of growing forever.
+- [x] `services/real_market.fetch_all_universe_quotes` — when the 30s bundle
+  key misses, every per-symbol quote key is warmed in ONE `cache_get_many`
+  call (~50 sequential Redis GETs → 1 MGET); only true misses fall through to
+  the Yahoo fetch.
+- [x] `server.py` `ConnectionManager` — every fan-out path (`broadcast`,
+  `broadcast_to_channel`, `send_to_user`) serializes the message ONCE and
+  sends text; previously `ws.send_json` re-ran `json.dumps` per socket.
+  `send_to_user` also short-circuits when the user has no sockets.
+
+Verification
+
+- `tests/test_sprint_r9.py` (new, 7 hermetic tests): get_many/set_many
+  roundtrip + expired/missing key omission + empty-input safety, memory bound
+  under overflow, expired-sweep-before-eviction, universe warm-hit skips the
+  HTTP fetch (metadata still applied), broadcast sends one identical
+  pre-serialized payload to every subscribed socket + reaps dead sockets,
+  datetime-safe serialization. `test_event_bridge.py`'s FakeWS extended with
+  `send_text`.
+- Full hermetic backend suite: 227 passed (the single `test_trading_engine`
+  failure is pre-existing — fails on the clean tree too, noted since R7).
+- Frontend `CI=false yarn build` (craco) compiles clean; only the 3
+  pre-existing eslint warnings in untouched files remain. Bundle is now
+  route-split (main ~160 kB gz + ~30 on-demand chunks).
+
+Notes / follow-ups
+
+- News list stays memoized-but-unvirtualized (100-article cap, variable card
+  heights); revisit with `useVirtualList` if the cap ever grows.
+- The batching window is client-side only; backend producers already batch
+  (15s `prices` map, 120s `watchlist.quotes`). If per-tick broker feeds ever
+  broadcast publicly, add server-side coalescing at the bridge.
+
+---
+
+# Sprint 10 — Morning Report
+
+Status
+
+COMPLETED
+
+Authority
+
+AI_AGENT_SYSTEM.md (§9 "Morning Report Agent"), MARKET_ENGINE.md (§ "Morning
+Report Builder"), PROMPT.md (§ "Morning Report Prompt"), DATABASE.md,
+MARKET_DATA_ARCHITECTURE.md (all market reads via the Market Gateway).
+
+Objective
+
+Complete the automated Morning Report: every market day before the open,
+covering Global Markets, Gift Nifty, News, Economic Calendar, Scanner, Top
+Picks, Risk Warnings and Portfolio Alerts, with notifications sent
+automatically.
+
+Starting state — the report existed (mood, indices, picks, key risks, AI
+briefing, FII/DII) but was missing most of the doc's sections, and its
+"Global Cues" line was a **hardcoded sentence** asserting the same claim
+every morning regardless of what global markets did.
+
+Architecture — two layers
+
+The report is now split, because its halves have different identities and
+lifetimes. The shared **market layer** (global markets, Gift Nifty, news,
+calendar, scanner, picks, risks) costs tens of provider calls, so it is built
+once per day and persisted to `db.reports`. The per-user **personal layer**
+(portfolio alerts) is computed fresh on every request and never written into
+the shared document — a correctness requirement, not an optimization: the
+shared doc is cached by *date alone*, so any per-user field stored in it
+would be served to the next user who asked. Merged at read time by
+`get_morning_report()`.
+
+Delivered — Backend
+
+- [x] `services/morning_report.py` (new) — owns the whole pipeline; the 8:30
+  job and the on-demand API route both call it, so a scheduled briefing and a
+  user-requested one can never drift apart. Extracted ~130 lines of business
+  logic out of `server.py` (routes now only wire).
+- [x] Global Markets — real, via `market_gateway.get_global_markets()`.
+  Replaces the fabricated "US futures and Asian markets influencing early
+  Indian session…" string with a summary derived from the actual quotes
+  ("Overnight global cues are broadly positive — 4 of 6 tracked indices closed
+  higher. Hang Seng +2.80% led; Nikkei 225 -2.79% lagged."). `global_cues` is
+  retained as a field for the Dashboard card and existing API consumers, now
+  carrying that real text.
+- [x] Gift Nifty — `services/market_engine/gift_nifty.py` (new): a collector
+  behind the gateway with a priority-ordered adapter chain, normalization,
+  validation and caching. No free feed carries Gift Nifty (probed Yahoo, NSE
+  IX, Alpha Vantage; it is an NSE IX instrument needing a data subscription),
+  so it ships reporting `available: false` with the reason the UI shows
+  verbatim — never a derived guess. A licensed feed registers one adapter and
+  every consumer picks it up unchanged.
+- [x] News — top headlines (high-importance first, then newest) alongside the
+  existing sentiment score.
+- [x] Economic Calendar — today's events + nearest high-importance ones, via
+  the previously-unused `economic_calendar.get_calendar()`.
+- [x] Risk Warnings — now also fold in today's high-importance calendar events
+  and an indicated Gift Nifty gap; every line still names its evidence.
+- [x] Portfolio Alerts — cross-references holdings against this morning's
+  market state (risk factors from the portfolio engine, holdings in weak
+  sectors, headlines naming a stock the user owns, critical monitor flags).
+  Every alert carries a `why`.
+- [x] Prompt — the AI briefing now loads from `prompt_library` (`morning_report`)
+  instead of a hardcoded string, per PROMPT.md ("never hardcode prompts").
+- [x] Notifications — **two bugs fixed**: the job checked the `trade_alerts`
+  preference instead of the `morning_report` preference `models.py` defines,
+  and only swept `db.trades.distinct("user_id")` — so a user who subscribed to
+  the morning report but had never placed a trade was silently never notified.
+  Now honors `morning_report`, reaches every subscriber, dedupes (180 min), and
+  sends the branded HTML email via `build_morning_report_email`.
+- [x] Honest degradation — `services/ai_activity.py` gained `step.warn()`:
+  a section that fails and degrades marks its step `warning` and the run
+  completes `warning`, instead of reporting `done` for work that didn't
+  succeed. A dead scanner now costs the picks section, not the whole briefing.
+
+Delivered — Frontend
+
+- [x] `components/morning/` (new) — `GiftNiftyCard`, `GlobalMarketsCard`,
+  `NewsHeadlines`, `EconomicCalendarCard`, `PortfolioAlertsCard`, and a shared
+  `SectionUnavailable` that renders the backend's own reason verbatim.
+- [x] `pages/MorningReport.jsx` — composes the new sections; portfolio alerts
+  lead (the payoff), then overnight (global + Gift Nifty + FII/DII), then news
+  + calendar, then risks.
+- [x] Unavailable states are honest end-to-end — the FII/DII card previously
+  rendered `₹0 Cr` when the value was missing ("institutions were flat" is a
+  materially different claim from "NSE hasn't published yet"); it and
+  `IndexCard` now say so.
+
+Verification
+
+- `tests/test_sprint10_morning_report.py` (new, 20 hermetic tests): every
+  section present; global summary reflects real quotes and degrades honestly;
+  headlines rank high-importance first; risks grounded in the collected VIX /
+  FII numbers; unavailable inputs reported not invented; Gift Nifty
+  unavailable without a feed, uses a registered adapter, falls through a
+  failing one, rejects a nonsense quote, and surfaces a gap as a risk;
+  portfolio alerts connect market events to holdings, are severity-ordered,
+  carry reasoning, degrade alone, and **never enter the shared cache**;
+  notifications honor the preference and reach a never-traded user.
+- `tests/test_ai_live_activity.py` updated to the service and the new
+  contracts (a cache hit must still not fake *market-layer* progress; a failed
+  section degrades honestly rather than failing the report).
+- `tests/_fakedb.py` — `_Cursor.__aiter__` added so the double speaks the
+  Motor cursor protocol the notification sweep uses (`async for` instead of
+  loading every user into memory).
+- Full hermetic backend suite: 247 passed, up from 227. The 48 failures are
+  pre-existing and identical on a clean tree (verified by stashing) — they
+  need a live server on :8000.
+- Driven end-to-end against live providers: real global markets, headlines,
+  calendar and picks populate; Gift Nifty reports unavailable; the personal
+  layer does not leak into the shared document.
+- Frontend `CI=false npx craco build` compiles clean; no new warnings.
+
+Notes / follow-ups
+
+- **Claude is 404ing platform-wide** (out of this sprint's scope, filed under
+  Technical Debt): `services/claude_provider.py` pins
+  `claude-3-haiku-20240307` (retired 2026-04-19) and
+  `services/ai_debate_engine.py` pins `claude-3-5-sonnet-20241022` (retired
+  2025-10-28). Every Claude call fails and silently falls back to Gemini —
+  including this report, whose prompt prefers Claude.
+- Gift Nifty stays unavailable until an NSE IX subscription or licensed vendor
+  feed exists; the adapter seam is ready.
+- The economic calendar is still the curated static generator (its own Phase 2
+  note); the report consumes it through the gateway, so a live source is a
+  drop-in.
+
+---
+
 # Technical Debt
 
 Every technical debt item must contain
@@ -835,6 +1642,60 @@ Target Version
 Owner
 
 Status
+
+---
+
+## TD-001 — Claude models are retired; every Claude call 404s
+
+Description
+
+`services/claude_provider.py` pins `claude-3-haiku-20240307` for both
+`CLAUDE_DEFAULT_MODEL` and `CLAUDE_FAST_MODEL`; `services/ai_debate_engine.py`
+pins `claude-3-5-sonnet-20241022`. Both model IDs have passed their retirement
+dates (2026-04-19 and 2025-10-28) and now return HTTP 404 `not_found_error`.
+
+Reason
+
+Model IDs were pinned at build time and never revisited. The failure is silent:
+`get_debate_engine()` catches the error and falls through to Gemini, so the
+platform stays up and no alarm fires.
+
+Impact
+
+Claude is effectively absent from the product despite being the documented
+primary reasoning model (INDEX.md, AI_AGENT_SYSTEM.md → "Claude & Gemini
+Collaboration"). Every prompt the library routes with `prefer="claude"` —
+morning report, portfolio review, risk analysis, complex reports — is served by
+Gemini instead. The AI Debate System cannot produce two viewpoints, because one
+participant always errors. Observed live: `Claude provider error: Error code:
+404 - model: claude-3-haiku-20240307`.
+
+Fix
+
+Repoint to current models — `claude-opus-4-8` for reasoning-heavy work,
+`claude-haiku-4-5` where the fast model is wanted. Note the API surface has
+moved on since these IDs: `budget_tokens` is removed in favor of
+`thinking={"type": "adaptive"}`, sampling params (`temperature`/`top_p`/`top_k`)
+are rejected on Opus 4.7+, and assistant-turn prefills 400. Audit the provider
+call sites against those before switching, and add a startup health check so a
+retired model surfaces loudly instead of silently degrading.
+
+Priority
+
+High — the platform's primary AI provider is entirely non-functional.
+
+Target Version
+
+1.2
+
+Owner
+
+Unassigned
+
+Status
+
+Open — found during Sprint 10 verification (2026-07-16), not fixed there
+because it is platform-wide scope rather than Morning Report scope.
 
 ---
 
@@ -1000,6 +1861,82 @@ This section should always contain the next highest-priority work.
 
 Current Objective
 
+**FEATURE FREEZE — Production Hardening program (2026-07-17).**
+
+The MVP is feature complete (Phase 1 Sprints 1–12; Phase 2 Releases R1–R9). The
+Sprint 12 Production Readiness Audit returned NOT READY (score 4.2/10): two
+critical authentication backdoors, wildcard CORS with credentials, insecure
+cookies, broken Docker packaging, no CI/CD, no rate limiting, mock data in
+admin analytics, no frontend tests. No new product features ship until
+Production Certification.
+
+Next Recommended Sprint: **PH1.1 — Authentication Backdoor Removal**
+(remove `GET /api/auth/auto-login` and the Google OAuth demo/mock fallbacks).
+PH3.1 (Backend Test Suite Repair) may run in parallel.
+
+Authoritative documents: PRODUCTION_HARDENING.md and PRODUCTION_ROADMAP.md.
+Task tracking below under "Production Hardening Program".
+
+---
+
+# Production Hardening Program (PH1–PH3)
+
+Status: NOT_STARTED (awaiting PH1 implementation approval)
+
+Priority: Critical — blocks all other work
+
+Full sprint definitions (objective, scope, acceptance criteria, validation,
+rollback, estimates) live in PRODUCTION_ROADMAP.md. Status tracker:
+
+## PH1 — Production Security Hardening
+
+- [ ] PH1.1 Authentication Backdoor Removal — NOT_STARTED — Critical
+- [ ] PH1.2 Google OAuth Production Flow — NOT_STARTED — Critical
+- [ ] PH1.3 Cookie & Session Security — NOT_STARTED — Critical
+- [ ] PH1.4 CORS & Security Headers — NOT_STARTED — Critical
+- [ ] PH1.5 Password Policy, Validation & Email Verification — NOT_STARTED — High
+- [ ] PH1.6 JWT Lifecycle & Refresh Rotation — NOT_STARTED — High
+- [ ] PH1.7 Rate Limiting & Brute-Force Protection — NOT_STARTED — High
+- [ ] PH1.8 Secrets & Environment Hardening — NOT_STARTED — High
+- [ ] PH1.9 Real-Time & WebSocket Security — NOT_STARTED — High
+- [ ] PH1.10 Admin Hardening & Session Management — NOT_STARTED — Medium
+- [ ] PH1.11 Dependency & Vulnerability Scanning — NOT_STARTED — Medium
+- [ ] PH1.12 Security Certification — NOT_STARTED — Critical (gate)
+
+## PH2 — Production Infrastructure & DevOps
+
+- [ ] PH2.1 Backend Production Dockerfile — NOT_STARTED — Critical
+- [ ] PH2.2 Frontend Production Dockerfile — NOT_STARTED — Critical
+- [ ] PH2.3 Compose Split: Dev vs Prod — NOT_STARTED — Critical
+- [ ] PH2.4 Environment & Configuration Framework — NOT_STARTED — High
+- [ ] PH2.5 CI Pipeline Foundation — NOT_STARTED — Critical
+- [ ] PH2.6 CI Extended: Docker, Security & Integration — NOT_STARTED — High
+- [ ] PH2.7 CD & Release Automation — NOT_STARTED — High
+- [ ] PH2.8 Database & Redis Production Configuration — NOT_STARTED — High
+- [ ] PH2.9 Structured Logging — NOT_STARTED — High
+- [ ] PH2.10 Monitoring, Metrics & Alerting — NOT_STARTED — High
+- [ ] PH2.11 Backup & Disaster Recovery — NOT_STARTED — High
+- [ ] PH2.12 Infrastructure Certification & Staging Sign-off — NOT_STARTED — Critical (gate)
+
+## PH3 — Production Quality Assurance
+
+- [ ] PH3.1 Backend Test Suite Repair & Hermeticity — NOT_STARTED — Critical (parallel-safe now)
+- [ ] PH3.2 Mock Data Eradication (ADR-021) — NOT_STARTED — High (parallel-safe now)
+- [ ] PH3.3 Frontend Test Foundation & Smoke Suite — NOT_STARTED — Critical
+- [ ] PH3.4 Frontend Service & Hook Coverage — NOT_STARTED — Medium
+- [ ] PH3.5 API Contract & Error-State Testing — NOT_STARTED — High
+- [ ] PH3.6 Backend Decomposition (server.py → Routers) — NOT_STARTED — Medium
+- [ ] PH3.7 Performance Benchmarking & Load Testing — NOT_STARTED — Medium
+- [ ] PH3.8 Accessibility & Responsive Audit — NOT_STARTED — Medium
+- [ ] PH3.9 End-to-End Critical Journeys — NOT_STARTED — High
+- [ ] PH3.10 Documentation Synchronization — NOT_STARTED — High
+- [ ] PH3.11 Regression & Release Test Protocol — NOT_STARTED — High
+- [ ] PH3.12 Production Certification & Launch Readiness — NOT_STARTED — Critical (final gate)
+
+---
+
+# Previous Focus (superseded 2026-07-17)
+
 Sprint 9 (Trading Engine) is COMPLETE — `services/trading_engine.py` closes
 the trade lifecycle on top of the Broker Engine: a pre-trade Risk Manager
 enforcing the user's own limits (max trades/day, daily loss budget, SL/target
@@ -1015,6 +1952,25 @@ summary strip. The engine runs inside the existing 60s trade_monitor cron.
 
 Next: admin portal and payments/subscriptions (Milestones 6+), then a
 dedicated Risk Dashboard page and Strategy Builder.
+
+---
+
+# Market Data Architecture (Provider Independence)
+
+Status: PLANNING
+
+Priority: Critical
+
+Design approved and documented in MARKET_DATA_ARCHITECTURE.md (2026-07-16); ADR-026 recorded in DECISIONS.md. Documentation system synchronized.
+
+Implementation phases (per MARKET_DATA_ARCHITECTURE.md):
+
+- [ ] Phase 1 — Formalize Provider Adapter contract; wrap Yahoo path as YahooPollingAdapter
+- [ ] Phase 2 — Source Manager + provider.status events + frontend tier indicator (Live/Delayed)
+- [ ] Phase 3 — Zerodha Kite WebSocket adapter; per-user switching; failover to Yahoo
+- [ ] Phase 4 — Remaining broker adapters (Upstox, Angel One, Fyers, Dhan)
+- [ ] Phase 5 — Hardening: latency scoring, flap suppression, probation, chaos tests
+- [ ] Phase 6 — Enterprise/licensed feeds (future)
 
 ---
 

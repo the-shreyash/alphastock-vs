@@ -175,17 +175,16 @@ async def run_monitoring_cycle(db, quote_func, whatsapp_func=None):
             if already_sent:
                 continue
 
-            # Save as notification
-            await db.notifications.insert_one({
-                "user_id": user_id,
-                "type": alert["type"],
-                "symbol": alert["symbol"],
-                "title": f"AI Alert: {alert['symbol']}",
-                "message": alert["message"],
-                "severity": alert["severity"],
-                "read": False,
-                "created_at": datetime.now(timezone.utc).isoformat(),
-            })
+            # Save as notification (also pushes notification.created live)
+            from services.notification_service import create_notification
+            await create_notification(
+                db, user_id,
+                type=alert["type"],
+                title=f"AI Alert: {alert['symbol']}",
+                message=alert["message"],
+                severity=alert["severity"],
+                symbol=alert["symbol"],
+            )
 
             quote = quote_func(alert["symbol"])
             price_val = quote["price"] if quote else 0

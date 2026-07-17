@@ -2,17 +2,23 @@ import { useEffect, useState } from "react";
 import { ClipboardCheck, Cpu, TrendingUp, TrendingDown } from "lucide-react";
 import api from "../../services/api";
 import AIText from "./AIText";
+import AIStepTimeline from "./AIStepTimeline";
+import { useRealtimeStore } from "../../store/realtimeStore";
 
 /**
  * TradeReviewPanel — the Trading Coach. Lists the user's closed trades and, on
  * selection, generates (or loads a cached) AI review via POST /api/ai/trade-review.
  * Grounded in the real trade numbers only — no fabrication.
+ *
+ * Sprint R7: while a review generates, the live AI step timeline replaces the
+ * static skeletons (cached reviews return instantly and never start a run).
  */
 export default function TradeReviewPanel() {
   const [trades, setTrades] = useState(null);
   const [selected, setSelected] = useState(null);
   const [review, setReview] = useState(null);
   const [loading, setLoading] = useState(false);
+  const [activeRunId, setActiveRunId] = useState(null);
 
   useEffect(() => {
     api.get("/trades/history")
@@ -21,15 +27,23 @@ export default function TradeReviewPanel() {
   }, []);
 
   const runReview = async (trade) => {
+    const runId = (crypto?.randomUUID?.() || `run-${Date.now()}-${Math.random().toString(36).slice(2)}`);
     setSelected(trade._id);
     setReview(null);
+    setActiveRunId(runId);
     setLoading(true);
     try {
-      const { data } = await api.post("/ai/trade-review", { trade_id: trade._id });
+      const { data } = await api.post("/ai/trade-review", { trade_id: trade._id, run_id: runId });
       setReview(data);
     } catch {
+      useRealtimeStore.getState().resolveAIRun(runId, "warning");
       setReview({ content: "Could not generate a review for this trade. Please try again." });
     } finally {
+      // REST settled — reconcile lost WS frames, then drop the finished run.
+      const store = useRealtimeStore.getState();
+      store.resolveAIRun(runId);
+      store.clearAIRun(runId);
+      setActiveRunId(null);
       setLoading(false);
     }
   };
@@ -80,7 +94,9 @@ export default function TradeReviewPanel() {
             <p className="body-text max-w-xs">Select a closed trade to get an AI coaching review — mistakes, strengths and lessons.</p>
           </div>
         ) : loading ? (
-          <div className="space-y-2">{[1, 2, 3, 4, 5, 6].map((i) => <div key={i} className="h-4 rounded skeleton" />)}</div>
+          <div className="py-4">
+            <AIStepTimeline runId={activeRunId} />
+          </div>
         ) : (
           <>
             <div className="flex items-center gap-2 mb-3">

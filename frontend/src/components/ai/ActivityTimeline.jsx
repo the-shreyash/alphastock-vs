@@ -1,11 +1,13 @@
 import { useEffect, useState, useCallback } from "react";
 import { Activity, Search, Newspaper, Bell, BarChart3, Eye } from "lucide-react";
 import api from "../../services/api";
+import { useRealtimeStore, selectActivityUpdates, selectConnected } from "../../store/realtimeStore";
 
 /**
- * ActivityTimeline — the AI Activity feed ("the AI never sleeps"). Polls
- * GET /api/ai/activity for the truthful running/done trace of background AI
- * work (heartbeat scans, monitoring, ranking). Read-only; no fabricated events.
+ * ActivityTimeline — the AI Activity feed ("the AI never sleeps"). Backfills
+ * once from GET /api/ai/activity, then streams live entries from the real-time
+ * store's `activity_feed` pushes (Sprint R3); the poll is kept only as a
+ * disconnected fallback. Read-only; no fabricated events.
  */
 const CATEGORY_ICON = {
   scan: Search,
@@ -23,6 +25,8 @@ const STATUS_COLOR = {
 
 export default function ActivityTimeline({ pollMs = 15000, limit = 12 }) {
   const [items, setItems] = useState(null);
+  const activityUpdate = useRealtimeStore(selectActivityUpdates);
+  const connected = useRealtimeStore(selectConnected);
 
   const load = useCallback(() => {
     api.get("/ai/activity")
@@ -30,11 +34,24 @@ export default function ActivityTimeline({ pollMs = 15000, limit = 12 }) {
       .catch(() => setItems([]));
   }, []);
 
+  // Backfill once on mount; poll only while the live feed is unavailable.
   useEffect(() => {
     load();
+    if (connected) return undefined;
     const id = setInterval(load, pollMs);
     return () => clearInterval(id);
-  }, [load, pollMs]);
+  }, [load, pollMs, connected]);
+
+  // Prepend live pushes from the store's activity_feed stream (deduped).
+  useEffect(() => {
+    if (!activityUpdate) return;
+    setItems((prev) => {
+      const list = Array.isArray(prev) ? prev : [];
+      const exists = list.some((a) => a.time === activityUpdate.time && a.action === activityUpdate.action);
+      if (exists) return list;
+      return [activityUpdate, ...list].slice(0, 50);
+    });
+  }, [activityUpdate]);
 
   return (
     <div className="glass-card p-5" data-testid="ai-activity-timeline">

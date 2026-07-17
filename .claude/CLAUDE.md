@@ -1,6 +1,6 @@
 # Claude Instructions
 ## StockAssist AI Engineering Handbook
-Version: 1.0
+Version: 1.1
 
 ---
 
@@ -302,6 +302,16 @@ Whenever a real API is available:
 Use it.
 
 Never simulate production data.
+
+Market data specifically:
+
+All market data flows through the Market Gateway and Source Manager.
+
+Never call a market data provider directly from business logic, AI, or frontend code.
+
+Never let the frontend or AI know which provider produced the data.
+
+MARKET_DATA_ARCHITECTURE.md is the authoritative document for all provider behavior.
 
 ---
 

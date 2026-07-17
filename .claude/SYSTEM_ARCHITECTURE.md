@@ -1,6 +1,6 @@
 # StockAssist AI
 ## System Architecture
-Version: 1.0
+Version: 1.1
 Part 1 - Foundation Architecture
 
 ---
@@ -84,14 +84,26 @@ MongoDB
 Redis
 Vector DB (Future)
                        │
-External APIs
+────────────────────────────────────────
+Market Data Layer
+(see MARKET_DATA_ARCHITECTURE.md)
+────────────────────────────────────────
+                       │
+Market Gateway
+Source Manager
+Provider Adapters
+                       │
+Market Data Providers
                        │
 Yahoo Finance
+Broker WebSockets (Zerodha, Upstox, Angel One, Fyers, Dhan)
+Licensed Exchange Feeds (Future)
+                       │
+Other External APIs
+                       │
 TradingView
 Claude
 Gemini
-Zerodha
-Upstox
 News API
 Economic Calendar
 Mail Service
@@ -1870,13 +1882,37 @@ Monitoring Engine
 
 ## Purpose
 
-The Market Engine is responsible for collecting, normalizing, caching, and distributing all market data.
+The Market Engine is responsible for processing, caching, and distributing all market data.
 
 Every market-related feature depends on this engine.
 
-The engine should be provider-independent.
+The engine is provider-independent by design.
 
-Switching from Yahoo Finance to another provider should require minimal changes.
+It never communicates with market data providers directly. All market data enters the platform through the Market Gateway, is normalized into the universal market event model, and only then reaches the Market Engine.
+
+Provider selection, switching, and failover are handled by the Source Manager.
+
+Switching providers requires zero changes to the Market Engine.
+
+Authoritative reference: MARKET_DATA_ARCHITECTURE.md.
+
+```
+Market Data Providers
+        ↓
+Market Gateway
+        ↓
+Source Manager
+        ↓
+Normalization Layer
+        ↓
+Market Engine
+        ↓
+Redis Event Bus
+        ↓
+WebSocket
+        ↓
+Frontend
+```
 
 ---
 
@@ -2748,11 +2784,21 @@ Use Redis.
 
 # Failover Strategy
 
-If Yahoo Finance fails
+Market data failover is owned by the Source Manager (see MARKET_DATA_ARCHITECTURE.md):
+
+If the active market data provider fails
 
 ↓
 
-Fallback Provider
+Source Manager falls back to the next provider in the priority list
+(Broker WebSocket → Licensed Exchange Feed → Yahoo Finance)
+
+↓
+
+If no provider is available, the UI shows last cached data,
+clearly timestamped, with a single calm banner.
+
+Never expose internal provider errors to users.
 
 If Claude fails
 

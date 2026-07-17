@@ -29,6 +29,7 @@ class FakeWS:
 
     def __init__(self, fail=False):
         self.sent = []
+        self.raw_sent = []  # pre-serialized payloads (Sprint R9 fan-out path)
         self.fail = fail
 
     async def accept(self):
@@ -38,6 +39,15 @@ class FakeWS:
         if self.fail:
             raise RuntimeError("socket dead")
         self.sent.append(message)
+
+    async def send_text(self, payload):
+        # Fan-out paths serialize once and send text (Sprint R9). Decode back
+        # to a dict so existing assertions keep working unchanged.
+        import json
+        if self.fail:
+            raise RuntimeError("socket dead")
+        self.raw_sent.append(payload)
+        self.sent.append(json.loads(payload))
 
 
 def _new_manager():
@@ -101,8 +111,13 @@ def test_resolve_channel_mapping():
     assert bridge.resolve_channel("market.index.updated") == "market"
     assert bridge.resolve_channel("sector.analyzed") == "sectors"
     assert bridge.resolve_channel("scanner.updated") == "scanner"
+    assert bridge.resolve_channel("scanner.breakout") == "scanner"
+    assert bridge.resolve_channel("scanner.volume_spike") == "scanner"
+    assert bridge.resolve_channel("scanner.momentum") == "scanner"
     assert bridge.resolve_channel("news.received") == "news"
     assert bridge.resolve_channel("notification.created") == "notifications"
+    assert bridge.resolve_channel("portfolio.updated") == "portfolio"
+    assert bridge.resolve_channel("portfolio.synced") == "portfolio"
     # Unknown domain falls through to the domain name itself.
     assert bridge.resolve_channel("custom.thing") == "custom"
 

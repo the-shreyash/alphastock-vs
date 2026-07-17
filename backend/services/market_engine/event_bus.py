@@ -9,11 +9,33 @@ Events:
     price.updated                    Stock price change
     sector.updated                   Sector performance recalculated
     news.received                    New article classified
-    scanner.updated                  Scanner results refreshed
+    scanner.updated                  Scanner results refreshed (data.source:
+                                     "worker" = continuous sweep, "api" = REST)
+    scanner.breakout                 NEW breakout hit (novelty-gated)
+    scanner.volume_spike             NEW volume-spike hit (novelty-gated)
+    scanner.momentum                 NEW momentum hit (novelty-gated)
     opportunity.detected             Trading opportunity found
     market.alert                     Significant market movement
     calendar.event                   Economic calendar event
     breadth.updated                  Market breadth recalculated
+    portfolio.updated                Per-user live portfolio snapshot (data
+                                     carries user_id; data.reason: "monitor" |
+                                     "broker_tick" | "broker_sync")
+    portfolio.synced                 Per-user broker portfolio sync completed
+    trade.updated                    Per-user open-trades snapshot (data
+                                     carries user_id + trades[]; data.reason:
+                                     "monitor" | "broker_tick" | "engine")
+    trade.trailing_stop              Per-user: trailing stop ratcheted
+                                     (old_stop → new_stop, best_price)
+    trade.target_hit                 Per-user: target level hit (level,
+                                     quantity, auto, order_id when auto-exit)
+    trade.sl_hit                     Per-user: stop loss breached
+    trade.closed                     Per-user: trade fully closed (data.source:
+                                     "engine" | "manual"; pnl, pnl_percent)
+    trade.review.ready               Per-user: AI trade review generated for a
+                                     closed trade (data.review)
+    broker.order.updated             Per-user: live broker order status change
+                                     (data.order — normalized order fields)
 """
 import asyncio
 import logging

@@ -293,14 +293,29 @@ def apply_partial_exit(trade: dict, price: float, quantity: int, reason: str) ->
 # ─── Monitor cycle ───────────────────────────────────────────────────────────
 
 async def _notify(db, trade: dict, title: str, message: str, severity: str, ntype: str):
+    """Create the user notification via notification_service so the
+    ``notification.created`` event fires (live toast + unread badge, Sprint R6)
+    instead of the pre-R6 silent direct insert."""
     try:
-        await db.notifications.insert_one({
-            "user_id": trade["user_id"], "type": ntype, "symbol": trade.get("symbol"),
-            "title": title, "message": message, "severity": severity,
-            "read": False, "created_at": _now_iso(),
-        })
+        from services.notification_service import create_notification
+        await create_notification(
+            db, trade["user_id"], type=ntype, title=title, message=message,
+            severity=severity, symbol=trade.get("symbol"),
+            data={"trade_id": str(trade.get("_id"))})
     except Exception as e:
         logger.error(f"Trading engine notification failed: {e}")
+
+
+async def _publish(event_type: str, data: dict) -> None:
+    """Best-effort bus publish — a realtime failure never breaks bookkeeping.
+
+    The R2 bridge delivers ``trade.*`` events per-user (payload carries
+    ``user_id``) on the ``trades`` channel."""
+    try:
+        from services.market_engine.event_bus import event_bus
+        await event_bus.publish(event_type, data)
+    except Exception as e:
+        logger.warning(f"Trading engine event publish failed ({event_type}): {e}")
 
 
 async def _broker_exit(broker_engine, trade: dict, quantity: int, reason: str):
@@ -327,7 +342,8 @@ async def run_cycle(db, quotes: dict, broker_engine=None, ws_push=None) -> dict:
     this cycle never triggers its own market-data fan-out).
     """
     trades = await db.trades.find({"status": "OPEN", "is_paper": {"$ne": True}}).to_list(200)
-    stats = {"checked": 0, "trailed": 0, "targets_hit": 0, "sl_exits": 0, "auto_orders": 0}
+    stats = {"checked": 0, "trailed": 0, "targets_hit": 0, "sl_exits": 0,
+             "auto_orders": 0, "closed_trades": []}
 
     for trade in trades:
         quote = quotes.get((trade.get("symbol") or "").upper())
@@ -337,6 +353,11 @@ async def run_cycle(db, quotes: dict, broker_engine=None, ws_push=None) -> dict:
         stats["checked"] += 1
         events = list(trade.get("events") or [])
         update = {}
+        # Granular lifecycle events (Sprint R6), flushed AFTER the db write so
+        # a client refetch triggered by an event never reads pre-update state.
+        pending_events = []
+        base = {"user_id": trade["user_id"], "trade_id": str(trade["_id"]),
+                "symbol": trade["symbol"]}
 
         # 1. Trailing stop ratchet (always safe — never places an order).
         trail = update_trailing_stop(trade, price)
@@ -347,6 +368,11 @@ async def run_cycle(db, quotes: dict, broker_engine=None, ws_push=None) -> dict:
                 f"Trailing stop moved ₹{trade.get('stop_loss')} → ₹{trail['stop_loss']} "
                 f"(best price ₹{trail.get('best_price', trade.get('best_price'))}).",
                 price))
+            pending_events.append(("trade.trailing_stop", {
+                **base, "old_stop": trade.get("stop_loss"),
+                "new_stop": trail["stop_loss"],
+                "best_price": trail.get("best_price", trade.get("best_price")),
+                "price": price}))
         if trail:
             update.update(trail)
             trade = {**trade, **trail}
@@ -379,6 +405,10 @@ async def run_cycle(db, quotes: dict, broker_engine=None, ws_push=None) -> dict:
                 update["targets_hit"] = hits
                 trade = {**trade, "targets_hit": hits}
                 events.append(make_event("TARGET_HIT", message, price))
+                pending_events.append(("trade.target_hit", {
+                    **base, "level": level, "target_price": action["target_price"],
+                    "price": price, "quantity": qty, "auto": auto,
+                    "order_id": hit.get("order_id"), "message": message}))
                 await _notify(db, trade, f"Target {level} hit: {trade['symbol']}",
                               message, "positive", "TARGET_HIT")
 
@@ -399,8 +429,23 @@ async def run_cycle(db, quotes: dict, broker_engine=None, ws_push=None) -> dict:
                 else:
                     message += " Exit to protect capital."
                 events.append(make_event("SL_HIT", message, price))
+                pending_events.append(("trade.sl_hit", {
+                    **base, "stop_loss": trade.get("stop_loss"), "price": price,
+                    "quantity": action["quantity"], "auto": auto,
+                    "message": message}))
                 await _notify(db, trade, f"Stop loss hit: {trade['symbol']}",
                               message, "critical", "ENGINE_SL_HIT")
+
+        # Full close this pass (auto-exit booked everything) → trade.closed
+        # event + entry in stats so the caller can start the AI trade review.
+        if update.get("status") and update["status"] != "OPEN":
+            stats["closed_trades"].append(dict(base))
+            pending_events.append(("trade.closed", {
+                **base, "status": update["status"],
+                "exit_price": update.get("exit_price"),
+                "pnl": update.get("pnl"),
+                "pnl_percent": update.get("pnl_percent"),
+                "source": "engine"}))
 
         if len(events) != len(trade.get("events") or []) or update:
             update["events"] = events
@@ -415,6 +460,8 @@ async def run_cycle(db, quotes: dict, broker_engine=None, ws_push=None) -> dict:
                     }})
                 except Exception:
                     pass
+            for event_type, data in pending_events:
+                await _publish(event_type, data)
     return stats
 
 

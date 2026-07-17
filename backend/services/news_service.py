@@ -1,10 +1,20 @@
 """Stock market news aggregator from RSS feeds, with deterministic
-keyword-based sentiment derived from real headlines (never random)."""
+keyword-based sentiment and importance derived from real headlines
+(never random).
+
+Sprint R8: every article also carries `importance` ("high" | "normal") and
+`is_breaking` so the live pipeline (heartbeat `task_scan_news` →
+`news.breaking` event) and the News UI can surface market-moving headlines
+the moment they appear. `filter_breaking_novel()` is the flood gate: it keeps
+a per-headline cooldown so a published `news.breaking` event always carries
+headlines the platform has not streamed before (mirrors
+market_engine.scanner_worker.filter_novel).
+"""
 # pyrefly: ignore [missing-import]
 import feedparser
 import logging
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor
 
 from services.cache import cache_get, cache_set, cache_delete
@@ -36,6 +46,67 @@ _NEGATIVE_TERMS = (
     "downgraded", "bearish", "weak", "sell-off", "selloff", "misses", "concern",
     "concerns", "fear", "fears", "pressure", "slide", "slides", "negative", "cut",
 )
+
+
+# Headlines matching any of these are market-moving enough to interrupt the
+# user (breaking badge + live toast). Deliberately conservative: routine
+# "stock rises 2%" coverage must never trigger a breaking push.
+_BREAKING_TERMS = (
+    "crash", "crashes", "circuit breaker", "upper circuit", "lower circuit",
+    "plunge", "plunges", "sensex tanks", "nifty tanks", "market rout",
+    "emergency", "rbi rate", "repo rate", "rate cut", "rate hike",
+    "monetary policy", "fed rate", "record high", "all-time high",
+    "all time high", "lifetime high", "black monday", "sell-off deepens",
+    "fraud", "scam", "default", "insolvency", "bankruptcy", "sebi bans",
+    "sebi order", "trading halt", "halted", "war", "sanctions", "tariff",
+    "budget 2", "union budget", "election result", "downgrade to junk",
+    "moratorium", "merger", "acquisition", "acquires", "takeover", "delisting",
+    "ipo opens", "ipo allotment", "stake sale", "open offer", "buyback",
+)
+
+BREAKING_COOLDOWN_MINUTES = 120  # one live push per headline per 2h window
+
+# Process-local memory of already-streamed breaking headlines (title-keyed).
+_recent_breaking: dict = {}
+
+
+def _classify_importance(text: str) -> str:
+    """Deterministic importance for a headline/summary: 'high' when it matches
+    a market-moving term, otherwise 'normal'."""
+    t = (text or "").lower()
+    return "high" if any(term in t for term in _BREAKING_TERMS) else "normal"
+
+
+def filter_breaking_novel(articles, now=None):
+    """Return only breaking articles not streamed within the cooldown window.
+
+    Survivors are recorded so the next scan suppresses them; expired entries
+    are pruned to bound memory. State is process-local by design — only the
+    heartbeat process publishes `news.breaking`, and a restart harmlessly
+    re-arms the cooldown.
+    """
+    now = now or datetime.now(timezone.utc)
+    cutoff = now - timedelta(minutes=BREAKING_COOLDOWN_MINUTES)
+
+    for key, seen_at in list(_recent_breaking.items()):
+        if seen_at < cutoff:
+            del _recent_breaking[key]
+
+    novel = []
+    for article in articles or []:
+        if not article.get("is_breaking"):
+            continue
+        key = (article.get("title") or "").lower()[:80]
+        if not key or key in _recent_breaking:
+            continue
+        _recent_breaking[key] = now
+        novel.append(article)
+    return novel
+
+
+def reset_breaking_state() -> None:
+    """Clear the breaking-news cooldown memory (test isolation)."""
+    _recent_breaking.clear()
 
 
 def _classify_sentiment(text: str) -> str:
@@ -74,6 +145,7 @@ def _parse_feed(feed_info):
 
             title = _strip_html(entry.get("title", "")).strip()
             summary = _strip_html(entry.get("summary", ""))[:200].strip()
+            importance = _classify_importance(f"{title} {summary}")
             articles.append({
                 "title": title,
                 "link": entry.get("link", ""),
@@ -82,6 +154,8 @@ def _parse_feed(feed_info):
                 "source": feed_info["name"],
                 "category": feed_info["category"],
                 "sentiment": _classify_sentiment(f"{title} {summary}"),
+                "importance": importance,
+                "is_breaking": importance == "high",
             })
         return articles
     except Exception as e:

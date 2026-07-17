@@ -1,6 +1,6 @@
 # StockAssist AI
 ## Features Documentation
-Version: 1.0
+Version: 1.1
 
 Status: Active Development
 
@@ -588,9 +588,27 @@ Downgrade
 
 ---
 
+# Market Data Tiers
+
+Market data quality follows the user's data tier, never their subscription plan (authoritative: MARKET_DATA_ARCHITECTURE.md).
+
+Free / Guest Users
+
+Yahoo Finance — near real-time, push-delivered, delayed at the source. Full access to learning, paper trading, analysis, watchlists, charts, AI chat, news, and manual portfolio.
+
+Connected Broker Users
+
+Broker streaming WebSocket — live tick-level prices, portfolio, orders, P&L, watchlist, scanner, and AI context. Activated automatically when a broker (Zerodha, Upstox, Angel One, Fyers, Dhan) is connected. No subscription required.
+
+Premium Users
+
+Pay for AI intelligence — portfolio intelligence, morning reports, advanced scanner, coach, strategy builder, backtesting, journal analytics, trade review, risk engine, automation. Never for market data.
+
+---
+
 # Platform Features
 
-Real-Time Market Data
+Real-Time Market Data (provider-independent, via Market Gateway)
 
 AI Monitoring
 

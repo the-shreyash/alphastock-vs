@@ -9,65 +9,44 @@ logger = logging.getLogger(__name__)
 scheduler = AsyncIOScheduler(timezone="Asia/Kolkata")
 
 
-async def morning_analysis_job(db, ai_func):
-    """8:30 AM weekdays: Scan stocks, generate picks, create morning report.
-    All data comes live from services.real_market — no simulated fallbacks."""
+async def morning_analysis_job(db, ai_func=None):
+    """8:30 AM weekdays: generate the full morning report and notify subscribers.
+
+    Sprint 10: the report itself — every section, the persistence, the
+    ready-signal broadcast and the notification fan-out — is owned by
+    services/morning_report.py, which the on-demand API route also calls. This
+    job is now purely the schedule trigger, so a scheduled briefing and a
+    user-requested one can never drift apart.
+
+    The report streams a broadcast AIRun timeline (user_id=None → the `ai`
+    channel reaches every connected dashboard), so users watch the morning
+    pipeline run live instead of discovering the report after the fact.
+
+    `ai_func` is accepted for backwards compatibility with existing callers and
+    is no longer used; the briefing is generated from the centralized prompt
+    library inside the report service.
+    """
     logger.info("Running morning analysis job...")
     try:
-        from services.activity_logger import log_activity
-        from services.real_market import fetch_real_top_picks, fetch_real_market_overview
-        log_activity("Scanning NSE top gainers", "scan", "done")
+        from services.morning_report import generate_and_notify
 
-        # Use real live picks from Yahoo Finance + technical scoring
-        real_picks_result = await fetch_real_top_picks(3)
-        picks = real_picks_result.get("picks", [])
+        report = await generate_and_notify(db)
 
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        picks = report.get("top_picks") or []
+        # Mirror the picks snapshot the AI Picks page reads.
         if picks:
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             await db.market_analysis.update_one(
                 {"date": today},
-                {"$set": {"top_picks": picks, "generated_at": datetime.now(timezone.utc).isoformat(), "type": "morning"}},
-                upsert=True
+                {"$set": {
+                    "top_picks": picks,
+                    "generated_at": datetime.now(timezone.utc).isoformat(),
+                    "type": "morning",
+                }},
+                upsert=True,
             )
         else:
             logger.warning("Morning analysis: live picks unavailable — skipping picks snapshot")
-
-        # Real market overview for morning report
-        overview = await fetch_real_market_overview()
-        report = await ai_func()
-        await db.market_analysis.update_one(
-            {"date": today},
-            {"$set": {"morning_report": report, "overview_snapshot": overview}},
-        )
-
-        # Only notify users who have open trades or recently traded (personal relevance)
-        pick_summary = (
-            f"{len(picks)} AI picks generated. Top: {picks[0]['name']} ({picks[0]['confidence']}% confidence). Check AI Picks."
-            if picks else "Morning report is ready. Live pick data was unavailable this morning."
-        )
-        users_with_activity = await db.trades.distinct("user_id")
-        for uid in users_with_activity:
-            user_prefs = await db.users.find_one({"_id": uid if not isinstance(uid, str) else uid}, {"notification_prefs": 1})
-            prefs = (user_prefs or {}).get("notification_prefs", {})
-            if prefs.get("trade_alerts", True):
-                await db.notifications.insert_one({
-                    "user_id": uid if isinstance(uid, str) else str(uid),
-                    "type": "MORNING_REPORT",
-                    "title": "Morning Analysis Ready",
-                    "message": pick_summary,
-                    "read": False,
-                    "created_at": datetime.now(timezone.utc).isoformat(),
-                })
-
-                # Send email if user has email_alerts enabled
-                if prefs.get("email_alerts", False):
-                    try:
-                        from services.email_service import send_notification as email_notify
-                        user_email = (user_prefs or {}).get("email", "")
-                        if user_email:
-                            await email_notify("MORNING_REPORT", user_email, content=pick_summary)
-                    except Exception as e:
-                        logger.error(f"Email notification failed for {uid}: {e}")
 
         logger.info(f"Morning analysis complete: {len(picks)} picks generated")
     except Exception as e:
@@ -131,6 +110,7 @@ async def trade_monitor_job(db, ws_broadcast):
         # Trading Engine pass (Sprint 9): trailing stops, multi-target partial
         # exits, SL detection + consented broker auto-exits. Runs BEFORE the
         # advisory portfolio monitor so alerts reflect post-engine state.
+        stats = {}
         try:
             from services.trading_engine import run_cycle
             from services.broker_engine import broker_engine
@@ -148,24 +128,25 @@ async def trade_monitor_job(db, ws_broadcast):
         wa_func = send_whatsapp if wa_configured() else None
         alert_count = await run_monitoring_cycle(db, sync_quote_func, wa_func)
 
-        # Also broadcast updates via WebSocket
-        for trade in open_trades:
-            quote = quote_cache.get(trade["symbol"])
-            if not quote:
-                continue
-            if ws_broadcast:
-                await ws_broadcast({
-                    "type": "trade_update",
-                    "user_id": trade["user_id"],
-                    "data": {
-                        "trade_id": str(trade["_id"]),
-                        "symbol": trade["symbol"],
-                        "current_price": quote["price"],
-                        "entry_price": trade["entry_price"],
-                        "unrealized_pnl": round((quote["price"] - trade["entry_price"]) * trade["quantity"], 2),
-                    },
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                })
+        # Sprint R6: stream per-user `trade.updated` snapshots through the
+        # event bus (bridge → per-user delivery on the `trades` channel).
+        # Replaces the legacy `trade_update` BROADCAST, which sent every
+        # user's open-trade P&L to every connected socket.
+        try:
+            from services import trade_stream
+            await trade_stream.publish_all(db, quote_cache, reason="engine")
+        except Exception as e:
+            logger.error(f"Trade stream publish error: {e}")
+
+        # Engine-closed trades → background AI trade review (the doc's flow:
+        # Trade Closed → Journal Updated → AI Trade Review Starts).
+        for closed in stats.get("closed_trades") or []:
+            try:
+                from services.trade_review import generate_close_intelligence
+                asyncio.create_task(generate_close_intelligence(db, closed["trade_id"]))
+            except Exception as e:
+                logger.error(
+                    f"Trade review scheduling failed for {closed.get('symbol')}: {e}")
 
     except Exception as e:
         logger.error(f"Trade monitor error: {e}")
@@ -181,17 +162,17 @@ async def exit_reminder_job(db):
             uid = t["user_id"]
             user_trades.setdefault(uid, []).append(t)
 
+        from services.notification_service import create_notification
         for uid, trades in user_trades.items():
             # Only notify users with their own open trades
             symbols = ", ".join([t["symbol"] for t in trades[:3]])
-            await db.notifications.insert_one({
-                "user_id": uid,
-                "type": "EXIT_REMINDER",
-                "title": "Close Your Positions",
-                "message": f"3:15 PM approaching! You have {len(trades)} open position(s): {symbols}. Close intraday trades now.",
-                "read": False,
-                "created_at": datetime.now(timezone.utc).isoformat(),
-            })
+            await create_notification(
+                db, uid,
+                type="EXIT_REMINDER",
+                title="Close Your Positions",
+                message=f"3:15 PM approaching! You have {len(trades)} open position(s): {symbols}. Close intraday trades now.",
+                severity="warning",
+            )
         logger.info(f"Exit reminders sent to {len(user_trades)} users with open trades")
     except Exception as e:
         logger.error(f"Exit reminder error: {e}")
@@ -225,16 +206,15 @@ async def eod_report_job(db):
         )
 
         # Notify all users
+        from services.notification_service import create_notification
         users = await db.users.find({}, {"_id": 1}).to_list(1000)
         for u in users:
-            await db.notifications.insert_one({
-                "user_id": str(u["_id"]),
-                "type": "EOD_REPORT",
-                "title": "End of Day Report",
-                "message": f"Market closed. Today's P&L: INR {'+' if total_pnl >= 0 else ''}{total_pnl:.2f}. Trades: {wins}W / {losses}L.",
-                "read": False,
-                "created_at": datetime.now(timezone.utc).isoformat(),
-            })
+            await create_notification(
+                db, str(u["_id"]),
+                type="EOD_REPORT",
+                title="End of Day Report",
+                message=f"Market closed. Today's P&L: INR {'+' if total_pnl >= 0 else ''}{total_pnl:.2f}. Trades: {wins}W / {losses}L.",
+            )
 
             # Send email EOD report if user has email_alerts
             user_full = await db.users.find_one({"_id": u["_id"]}, {"email": 1, "notification_prefs": 1})

@@ -8,7 +8,7 @@ import json
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor
 
-from services.cache import cache_get, cache_set
+from services.cache import cache_get, cache_set, cache_get_many
 
 logger = logging.getLogger(__name__)
 executor = ThreadPoolExecutor(max_workers=5)
@@ -685,15 +685,31 @@ async def detect_chart_patterns(symbol: str) -> dict:
 async def fetch_all_universe_quotes():
     """Fetch 2d quotes for all stocks in STOCK_UNIVERSE in parallel, utilizing caching."""
     from market_data import STOCK_UNIVERSE
-    
+
     cache_key = "all_universe_quotes_2d"
     cached = await cache_get(cache_key)
     if cached:
         return cached
 
-    tasks = [fetch_yahoo_quote(s["symbol"], range_str="2d") for s in STOCK_UNIVERSE]
+    # Warm every per-symbol quote key in ONE batched read (Sprint R9): when the
+    # bundle expires but the per-symbol entries are still fresh, this replaces
+    # ~len(universe) sequential Redis GETs (one inside each fetch_yahoo_quote)
+    # with a single MGET. Only true misses fall through to the HTTP fetch.
+    per_symbol_keys = {
+        s["symbol"]: f"yahoo_{resolve_yahoo_ticker(s['symbol'])}_2d"
+        for s in STOCK_UNIVERSE
+    }
+    warm = await cache_get_many(list(per_symbol_keys.values()))
+
+    async def _quote_for(stock):
+        hit = warm.get(per_symbol_keys[stock["symbol"]])
+        if hit:
+            return hit
+        return await fetch_yahoo_quote(stock["symbol"], range_str="2d")
+
+    tasks = [_quote_for(s) for s in STOCK_UNIVERSE]
     results = await asyncio.gather(*tasks, return_exceptions=True)
-    
+
     quotes = []
     for s, res in zip(STOCK_UNIVERSE, results):
         if isinstance(res, Exception) or res is None:
