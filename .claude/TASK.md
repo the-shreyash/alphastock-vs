@@ -1914,10 +1914,27 @@ via `apply_cors(app)`. Guarded by 30 hermetic tests in
 Security **headers** (HSTS/CSP/etc.) were de-scoped from this CORS-only sprint
 and are carried forward as PH1.4b. See CHANGELOG.md.
 
+PH1.5 (Password Policy & Account Protection) is COMPLETE (2026-07-19): password
+policy is centralized in `backend/security/passwords.py` — the only place
+passwords are validated, hashed, or verified. New passwords must be 12–64 chars
+(≤72 UTF-8 bytes) with upper/lower/number/special, and must not be common
+(bundled blocklist), email-/name-derived, repeated-character, or sequential;
+enforced at the model layer on `UserCreate` (422, actionable messages, input
+never echoed — a sanitizing RequestValidationError handler strips FastAPI's
+default input reflection). bcrypt cost is now explicit (12); `verify_password`
+never raises (fixed a 500 on password login against Google-native accounts) and
+timing-equalizes failures via a dummy-hash comparison, so login cannot reveal
+whether an email exists. Existing users, API contracts, and the `ip:email`
+lockout (5/15min, now hermetically testable via FakeDB `$inc`) are preserved.
+Guarded by 40 hermetic tests in `backend/tests/test_password_policy.py`.
+Finding H10 (password half) closed; R-05 partially mitigated (rate-limiting
+half is PH1.7). Email scope (EmailStr, verification, password reset, SMTP
+decision OR-6) was deliberately split out to PH1.5b. See CHANGELOG.md.
+
 Next Recommended Sprint: **PH1.4b — Security Headers** (HSTS, X-Frame-Options,
 X-Content-Type-Options, Referrer-Policy, Permissions-Policy, CSP), awaiting
-review/approval of PH1.4. Alternatively **PH1.5 — Password Policy, Validation &
-Email Verification**. PH3.1 (Backend Test Suite Repair) may run in parallel.
+review/approval of PH1.5. Alternatively **PH1.6 — JWT Lifecycle & Refresh
+Rotation**. PH3.1 (Backend Test Suite Repair) may run in parallel.
 
 Authoritative documents: PRODUCTION_HARDENING.md and PRODUCTION_ROADMAP.md.
 Task tracking below under "Production Hardening Program".
@@ -1926,7 +1943,7 @@ Task tracking below under "Production Hardening Program".
 
 # Production Hardening Program (PH1–PH3)
 
-Status: IN_PROGRESS (PH1.1 + PH1.2 complete 2026-07-17; PH1.3 + PH1.4 complete 2026-07-18; SI1.1 Repository Audit complete 2026-07-17)
+Status: IN_PROGRESS (PH1.1 + PH1.2 complete 2026-07-17; PH1.3 + PH1.4 complete 2026-07-18; PH1.5 complete 2026-07-19; SI1.1 Repository Audit complete 2026-07-17)
 
 Priority: Critical — blocks all other work
 
@@ -1940,7 +1957,8 @@ rollback, estimates) live in PRODUCTION_ROADMAP.md. Status tracker:
 - [x] PH1.3 Cookie & Session Security — COMPLETE (2026-07-18) — Critical
 - [x] PH1.4 CORS Hardening — COMPLETE (2026-07-18) — Critical
 - [ ] PH1.4b Security Headers (HSTS/CSP/etc., split from PH1.4) — NOT_STARTED — Critical
-- [ ] PH1.5 Password Policy, Validation & Email Verification — NOT_STARTED — High
+- [x] PH1.5 Password Policy & Account Protection (password portion of the roadmap's PH1.5) — COMPLETE (2026-07-19) — High
+- [ ] PH1.5b Email Validation & Verification (EmailStr, verification flow, password reset, SMTP decision OR-6 — split from PH1.5) — NOT_STARTED — High
 - [ ] PH1.6 JWT Lifecycle & Refresh Rotation — NOT_STARTED — High
 - [ ] PH1.7 Rate Limiting & Brute-Force Protection — NOT_STARTED — High
 - [ ] PH1.8 Secrets & Environment Hardening — NOT_STARTED — High

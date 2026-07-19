@@ -3,13 +3,13 @@
 
 Version: 1.2
 
-Status: PH1 In Progress — PH1.1 complete (2026-07-17): findings B1/B2 closed, risks R-01/R-02 closed; startup admin seeding (default password + plaintext credentials file) also removed under PH1.1. PH1.2 complete (2026-07-17): Google OAuth hardened — CSRF `state`, id_token verification, `email_verified` gate, redirect_uri allowlist, safe account linking; risk R-02 fully closed. PH1.3 complete (2026-07-18): authentication cookies production-hardened and centralized in `backend/security/cookies.py` — `Secure` forced in production, `HttpOnly`+`SameSite` on all cookies, matched-attribute clearing, unified OAuth-state cookie posture; finding B4 closed, risk R-04 closed. PH1.4 complete (2026-07-18): CORS production-hardened and centralized in `backend/security/cors.py` — wildcard-with-credentials default removed, environment-driven exact-match origin allowlist (`CORS_ALLOWED_ORIGINS`), restricted methods/headers, fail-closed in production; finding B3 closed, risk R-03 closed. Security headers de-scoped to PH1.4b.
+Status: PH1 In Progress — PH1.1 complete (2026-07-17): findings B1/B2 closed, risks R-01/R-02 closed; startup admin seeding (default password + plaintext credentials file) also removed under PH1.1. PH1.2 complete (2026-07-17): Google OAuth hardened — CSRF `state`, id_token verification, `email_verified` gate, redirect_uri allowlist, safe account linking; risk R-02 fully closed. PH1.3 complete (2026-07-18): authentication cookies production-hardened and centralized in `backend/security/cookies.py` — `Secure` forced in production, `HttpOnly`+`SameSite` on all cookies, matched-attribute clearing, unified OAuth-state cookie posture; finding B4 closed, risk R-04 closed. PH1.4 complete (2026-07-18): CORS production-hardened and centralized in `backend/security/cors.py` — wildcard-with-credentials default removed, environment-driven exact-match origin allowlist (`CORS_ALLOWED_ORIGINS`), restricted methods/headers, fail-closed in production; finding B3 closed, risk R-03 closed. Security headers de-scoped to PH1.4b. PH1.5 complete (2026-07-19): production password policy centralized in `backend/security/passwords.py` — model-layer 422 enforcement (12–64 chars, character classes, common/sequential/repeated/identity-derived rejection), explicit bcrypt cost 12, never-raising timing-equalized verification (fixed OAuth-account login 500), sanitized validation errors; finding H10 password-half closed, risk R-05 partially mitigated. Email scope (EmailStr/verification/reset, OR-6) split out to PH1.5b.
 
 Date: 2026-07-17
 
 Owner: Engineering (CTO)
 
-Companion Document: PRODUCTION_ROADMAP.md (sprint-level plan for PH1–PH3)
+Companion Documents: PRODUCTION_ROADMAP.md (sprint-level plan for PH1–PH3) · SECURITY_ARCHITECTURE.md (security engineering blueprint, authoritative for PH1 architecture detail)
 
 Baseline Input: PRODUCTION_READINESS_REPORT.md (Sprint 12 audit, 2026-07-17)
 
@@ -71,7 +71,7 @@ Verified in code on branch `sprint-r3-frontend-realtime`:
 | H7 | Fabricated admin analytics (revenue series, `revenue_today = total_payments * 499`, hardcoded feature usage) — violates ADR-021 | `backend/server.py:4357, 4059, 4374` | HIGH |
 | H8 | 6 failing backend tests: 1 stale assertion, 5 non-hermetic live-server integration tests | `backend/tests/` | HIGH |
 | H9 | Zero frontend tests | `frontend/src/` | HIGH |
-| H10 | No password policy, `email: str` not `EmailStr`, no email verification | `backend/models.py:32` | HIGH |
+| H10 | No password policy, `email: str` not `EmailStr`, no email verification — password policy ✅ closed PH1.5 (2026-07-19, `backend/security/passwords.py`); `EmailStr` + verification outstanding (PH1.5b) | `backend/models.py:32` | HIGH |
 | H11 | JWT lifetimes diverge from SECURITY.md (24 h access vs 15 min spec; no refresh rotation/revocation) | `backend/server.py` | HIGH |
 | M12 | No rate limiting anywhere | global | MEDIUM |
 | M13 | `server.py` is a 4,823-line monolith | `backend/server.py` | MEDIUM |
@@ -91,7 +91,7 @@ Verified in code on branch `sprint-r3-frontend-realtime`:
 | R-02 | ~~Arbitrary login as demo user via OAuth mock-code / fail-open session exchange~~ **CLOSED** (PH1.1 removed the bypasses; PH1.2 added state/CSRF, id_token verification, `email_verified` gate, redirect_uri allowlist, safe linking) | — | — | **CLOSED** | PH1.1–1.2 |
 | R-03 | ~~Credentialed CSRF-style requests from any origin (wildcard CORS + cookies)~~ **CLOSED** (PH1.4: environment-driven exact-match origin allowlist, wildcard never paired with credentials, centralized in `backend/security/cors.py`) | — | — | **CLOSED** | PH1.4 |
 | R-04 | ~~Auth tokens transmitted over plain HTTP (`secure=False`)~~ **CLOSED** (PH1.3: `Secure` forced in production, `HttpOnly`+`SameSite` everywhere, centralized cookie policy) | — | — | **CLOSED** | PH1.3 |
-| R-05 | Credential stuffing / brute force succeeds (no rate limiting, no password policy) | High | Severe | **HIGH** | PH1.5, PH1.7 |
+| R-05 | Credential stuffing / brute force succeeds (no rate limiting, no password policy) — ⚠️ partially mitigated: password policy + timing-equalized login shipped PH1.5 (2026-07-19); platform-wide rate limiting remains PH1.7 | High | Severe | **HIGH** | PH1.5 ✅, PH1.7 |
 | R-06 | Stolen access token valid for 24 h; refresh tokens never rotate or revoke | Medium | High | **HIGH** | PH1.6 |
 | R-07 | Deployment impossible or hand-rolled (broken Docker, no CI/CD) → unreproducible prod, config drift | Certain today | High | **HIGH** | PH2.1–2.7 |
 | R-08 | Regression ships unnoticed (no frontend tests, non-hermetic backend suite, no pipeline gate) | High | High | **HIGH** | PH3.1–3.5 |
@@ -137,7 +137,12 @@ Definition of launchable: **≥ 9.0 composite with no category below 8.0** (see 
 
 # 4. Security Strategy
 
-Authoritative reference: SECURITY.md. This section defines the hardening posture; sprint detail lives in PRODUCTION_ROADMAP.md (PH1).
+Authoritative references: SECURITY.md (operational policy) and
+**SECURITY_ARCHITECTURE.md** (engineering blueprint — module design, threat
+model, trust boundaries, sequence diagrams, and the authoritative
+implemented-vs-planned status for every control referenced below). This
+section defines the hardening posture; sprint detail lives in
+PRODUCTION_ROADMAP.md (PH1).
 
 ## Principles for this program
 
@@ -358,7 +363,7 @@ Risks that remain open **after** the program completes, requiring ongoing owners
 | OR-3 | In-process cron jobs die with the API server; no independent worker tier yet | Acceptable at launch scale; worker extraction scheduled post-launch (DEPLOYMENT.md background workers) |
 | OR-4 | MFA for admin accounts designed (PH1.10) but not enforced at launch | Enforce before Closed Beta ends; interim: strong passwords + audit-log review |
 | OR-5 | 80% frontend coverage target not reached at launch (smoke-level only) | PH3.4 continues post-launch; coverage gate ratchets up in CI |
-| OR-6 | Email verification depends on production SMTP provider selection | Decision required during PH1.5; risk if deferred |
+| OR-6 | Email verification depends on production SMTP provider selection | Decision required during PH1.5b (email scope was split out of PH1.5, which shipped password-policy-only); risk if deferred |
 | OR-7 | Broker API policy changes (Zerodha/Upstox) | Quarterly policy review; adapter isolation limits blast radius |
 | OR-8 | Regulatory exposure of AI-generated trading guidance | Disclaimers audit at launch checklist; legal review before Commercial Launch |
 

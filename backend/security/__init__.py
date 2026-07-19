@@ -5,6 +5,8 @@ identically everywhere they are used. Current tenants:
 
 * `security.cookies` (PH1.3) — centralized authentication-cookie policy.
 * `security.cors` (PH1.4) — centralized, environment-driven CORS policy.
+* `security.passwords` (PH1.5) — centralized password policy + bcrypt
+  primitives; the only place passwords are validated, hashed, or verified.
 
 Subsequent hardening sprints add their own modules here (CSRF, headers, rate
 limiting, token lifecycle) per PRODUCTION_ROADMAP.md.

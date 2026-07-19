@@ -1,7 +1,10 @@
-from pydantic import BaseModel, Field, ConfigDict, BeforeValidator
+from pydantic import BaseModel, Field, ConfigDict, BeforeValidator, model_validator
+from pydantic_core import PydanticCustomError
 from typing import Optional, List, Annotated
 from datetime import datetime, timezone
 from bson import ObjectId
+
+from security.passwords import normalize_password, validate_new_password
 
 
 def _object_id_to_str(v):
@@ -33,6 +36,21 @@ class UserCreate(BaseModel):
     name: str
     email: str
     password: str
+
+    @model_validator(mode="after")
+    def _enforce_password_policy(self):
+        """Production password policy (PH1.5), enforced at the model layer so a
+        weak password is rejected with 422 before it ever reaches hashing.
+        Cross-field by design: the policy rejects passwords derived from the
+        user's own email or name. The normalized (whitespace-stripped) password
+        replaces the raw value so validation and hashing can never disagree.
+        Applies to NEW registrations only — UserLogin is deliberately
+        unvalidated so existing accounts keep working."""
+        self.password = normalize_password(self.password)
+        violations = validate_new_password(self.password, email=self.email, name=self.name)
+        if violations:
+            raise PydanticCustomError("password_policy", " ".join(violations))
+        return self
 
 class UserLogin(BaseModel):
     email: str

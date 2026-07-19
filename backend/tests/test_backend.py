@@ -49,7 +49,9 @@ class TestAuth:
         assert data["role"] == "user"
 
         # Duplicate email
-        r2 = requests.post(f"{API}/auth/register", json={"name": "Dup", "email": email, "password": "x"}, timeout=20)
+        # Password must satisfy the PH1.5 policy or the 422 fires before the
+        # duplicate-email 400 check.
+        r2 = requests.post(f"{API}/auth/register", json={"name": "Dup", "email": email, "password": "Dupl!cate92Xy"}, timeout=20)
         assert r2.status_code == 400
 
         # Login with new user

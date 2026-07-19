@@ -26,9 +26,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import bcrypt
 from dotenv import load_dotenv
 from motor.motor_asyncio import AsyncIOMotorClient
+
+# Central hashing primitive (PH1.5) — explicit bcrypt cost, one policy module.
+# Seeding hashes directly (no policy validation): dev-only convenience creds
+# are sanctioned here and this script refuses to run in production anyway.
+from security.passwords import hash_password
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
@@ -53,7 +57,7 @@ async def main() -> int:
             print(f"Admin user already exists: {admin_email} — leaving it untouched.")
             return 0
 
-        password_hash = bcrypt.hashpw(admin_password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+        password_hash = hash_password(admin_password)
         await db.users.insert_one({
             "name": "Admin",
             "email": admin_email,

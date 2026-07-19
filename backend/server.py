@@ -11,7 +11,6 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
 import os
 import logging
-import bcrypt
 import jwt as pyjwt
 import secrets
 import httpx
@@ -42,6 +41,12 @@ from security.cookies import (
     clear_oauth_state_cookie,
 )
 from security.cors import apply_cors
+
+# Centralized password policy + hashing primitives (PH1.5). Passwords are
+# hashed/verified ONLY through this module (explicit bcrypt cost, safe
+# verification that never raises on empty/malformed hashes, timing-equalized
+# failures). Policy validation for new passwords lives on the UserCreate model.
+from security.passwords import hash_password, verify_password
 
 from models import (
     UserCreate, UserLogin, UserResponse, UserSettingsUpdate,
@@ -158,17 +163,27 @@ async def broker_error_handler(request, exc: BrokerError):
     return _JSONResponse(status_code=status, content={"detail": exc.user_message, "code": exc.code})
 
 
+# Request-validation errors must never echo the submitted values back (PH1.5).
+# FastAPI's default 422 handler includes each error's `input` — for an auth
+# payload that would reflect the raw password to the client (and into any
+# response logging). Strip errors down to loc/msg/type: same shape the
+# frontend already consumes (detail[].msg), minus the reflected input.
+from fastapi.exceptions import RequestValidationError
+
+@app.exception_handler(RequestValidationError)
+async def validation_error_handler(request, exc: RequestValidationError):
+    sanitized = [
+        {"loc": e.get("loc", []), "msg": e.get("msg", "Invalid input"), "type": e.get("type", "validation_error")}
+        for e in exc.errors()
+    ]
+    return _JSONResponse(status_code=422, content={"detail": sanitized})
+
+
 # JWT Config
 JWT_ALGORITHM = "HS256"
 
 def get_jwt_secret():
     return os.environ["JWT_SECRET"]
-
-def hash_password(password: str) -> str:
-    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
-
-def verify_password(plain: str, hashed: str) -> bool:
-    return bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
 
 def create_access_token(user_id: str, email: str) -> str:
     payload = {"sub": user_id, "email": email, "exp": datetime.now(timezone.utc) + timedelta(hours=24), "type": "access"}
@@ -835,7 +850,12 @@ async def login(data: UserLogin, response: Response, request: Request):
             await db.login_attempts.delete_one({"identifier": identifier})
 
     user = await db.users.find_one({"email": email})
-    if not user or not verify_password(data.password, user["password_hash"]):
+    # Always run exactly one bcrypt comparison (verify_password pads with a
+    # dummy hash when the account is missing or has no password, e.g.
+    # OAuth-native accounts) so response timing never reveals whether the
+    # email exists. The 401 below is identical for both failure causes.
+    password_ok = verify_password(data.password, user.get("password_hash") if user else None)
+    if not user or not password_ok:
         current = await db.login_attempts.find_one({"identifier": identifier})
         count = (current.get("count", 0) if current else 0) + 1
         update_doc = {"$inc": {"count": 1}}

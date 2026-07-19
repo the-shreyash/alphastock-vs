@@ -99,7 +99,7 @@ class TestLegitimateAuthStillWorks:
 
     def test_wrong_password_rejected(self, client, fake_db):
         client.post("/api/auth/register", json={
-            "name": "T", "email": "t2@example.com", "password": "RightPass1!",
+            "name": "T", "email": "t2@example.com", "password": "RightPass781!",
         })
         r = client.post("/api/auth/login", json={"email": "t2@example.com", "password": "wrong"})
         assert r.status_code == 401

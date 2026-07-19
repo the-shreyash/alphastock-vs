@@ -5,6 +5,97 @@ This file records documentation-system versions and, from v1.0 launch onward, pr
 
 ---
 
+# Sprint PH1.5 — Password Policy & Account Protection — 2026-07-19
+
+**Production Hardening PH1.5 complete. Finding H10 (password half) closed; risk
+R-05 partially mitigated (password-policy half — the rate-limiting half remains
+PH1.7).**
+
+Replaced the accept-anything password handling (`password: str`, no validator,
+implicit bcrypt cost) with a production-grade, centralized password policy.
+Enforcement is at the model layer, so weak passwords are rejected with 422
+before they ever reach hashing. Existing users, login, and OAuth are unchanged:
+the policy applies to **new** passwords only, and the register/login API
+contracts (payloads, success shapes, generic 401, `ip:email` lockout) are
+byte-for-byte preserved.
+
+Added
+
+- `backend/security/passwords.py` — the single source of truth for password
+  policy, hashing, and verification. No password may be validated, hashed, or
+  verified outside this module.
+  - **Policy** (`validate_new_password`, returns every violated rule at once):
+    12–64 characters (and ≤72 UTF-8 bytes — the bcrypt truncation boundary);
+    uppercase + lowercase + number + special character required; rejects
+    common passwords, email-/name-derived passwords, repeated-character
+    passwords (<5 unique chars), and sequential runs (alphabet/digits/qwerty
+    rows, forward or reversed). Leading/trailing whitespace is normalized away
+    before validation *and* hashing.
+  - **Hashing** — bcrypt with an explicit, pinned cost factor
+    (`BCRYPT_ROUNDS = 12`); previously the cost was the silent library default.
+  - **Verification** — constant-time (`bcrypt.checkpw`) and never raises:
+    empty/malformed stored hashes return `False` after a dummy-hash comparison,
+    which also **timing-equalizes** login failures (unknown email, OAuth-only
+    account, and wrong password all cost one bcrypt comparison).
+- `backend/security/data/common_passwords.txt` — bundled, curated common-password
+  blocklist (~450 lowercase entries; padding-resistant matching strips trailing
+  digits/punctuation, so `Monkey987654!!` still matches `monkey`). No new
+  dependencies.
+- `backend/tests/test_password_policy.py` — 40 hermetic tests: every policy rule
+  (boundaries, character classes, common/sequential/repeated/identity-derived,
+  whitespace, multibyte length), hashing primitives (explicit cost, round-trip,
+  never-raises, delegation), register-endpoint enforcement (422 + no user
+  created, clean error contract, unchanged success shape), and the sprint's
+  compatibility guarantees (legacy weak-password login works, OAuth-native
+  401-not-500, indistinguishable failures, lockout preserved/cleared).
+
+Changed
+
+- `backend/models.py` — `UserCreate` gained a `model_validator` that normalizes
+  the password and enforces the policy (422 with actionable rule messages;
+  cross-field checks against the user's own email/name). `UserLogin` is
+  deliberately unvalidated so existing accounts keep working.
+- `backend/server.py` — removed the inline `hash_password`/`verify_password`
+  definitions (and the now-unused `bcrypt` import); both are imported from
+  `security.passwords`. Login now always runs exactly one bcrypt comparison
+  (timing-equalization) — this also fixed a real bug where password login
+  against a Google-OAuth-native account (`password_hash: ""`) raised
+  `ValueError` → 500 instead of the generic 401. Added a sanitizing
+  `RequestValidationError` handler: 422 bodies now carry only `loc`/`msg`/`type`
+  — FastAPI's default handler echoed the submitted input (including raw
+  passwords) back in every validation error.
+- `backend/scripts/seed_dev_admin.py` — hashes via `security.passwords`
+  (consistent cost factor; still dev-only, still no policy on seeded creds).
+- `backend/tests/_fakedb.py` — `update_one` now supports `$inc` (match and
+  upsert), making the login-lockout counter hermetically testable for the
+  first time.
+- `frontend/src/pages/Register.jsx` — client-side minimum raised 6 → 12 to
+  mirror the server policy; full rule feedback comes from the API's 422
+  messages, which the existing `formatApiError` already renders.
+
+Security outcome
+
+- No weak password can enter the system through any current registration path;
+  policy logic exists in exactly one module (no per-endpoint drift).
+- bcrypt cost is an explicit, reviewed constant; verification can no longer
+  500 on hostile or legacy data.
+- Login failures are generic **and** timing-equalized; validation errors no
+  longer reflect submitted values. Password-hash exposure re-verified: no
+  endpoint returns `password_hash` (covered by tests).
+- Brute-force lockout (5 attempts / 15 min per `ip:email`) preserved unchanged
+  and now under test.
+
+Not in scope (deferred, unchanged)
+
+- Password change endpoint and password reset flow (reviewed: neither exists;
+  no reset tokens are generated anywhere) — deferred with `EmailStr` and email
+  verification to an unscheduled PH1.5b (SMTP provider decision OR-6 moves with
+  them). Platform-wide rate limiting remains PH1.7; JWT lifetime/rotation and
+  session revocation remain PH1.6. Audit-logging of password-login events
+  remains a tracked gap (SECURITY_ARCHITECTURE.md §22, PH1.6/PH1.7 candidate).
+
+---
+
 # Sprint PH1.4 — CORS Hardening — 2026-07-18
 
 **Production Hardening PH1.4 complete. Risk R-03 / finding B3 closed.**

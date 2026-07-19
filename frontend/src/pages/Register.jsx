@@ -25,7 +25,9 @@ export default function Register() {
 
   const handleSubmit = async (e) => {
     e.preventDefault(); setError("");
-    if (password.length < 6) { setError("Password must be at least 6 characters"); return; }
+    // Mirrors the server-side policy minimum (PH1.5); the API enforces the
+    // full rule set and its 422 messages render via formatApiError below.
+    if (password.length < 12) { setError("Password must be at least 12 characters"); return; }
     setLoading(true);
     try { await register(name, email, password); navigate("/dashboard"); }
     catch (err) { setError(formatApiError(err.response?.data?.detail) || err.message); }

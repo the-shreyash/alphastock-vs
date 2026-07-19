@@ -679,6 +679,11 @@ OAuth
 
 Passkeys
 
+Authoritative detail (module design, cookie/JWT/OAuth lifecycle, sequence
+diagrams, implementation status): **SECURITY_ARCHITECTURE.md**. Google OAuth
+is implemented and hardened (SECURITY_ARCHITECTURE.md §13); refresh rotation,
+device tracking, and session listing are planned (§9, §12, PH1.6/PH1.10).
+
 ---
 
 # Authorization
@@ -698,6 +703,11 @@ Admin
 Super Admin
 
 Permissions are checked on every request.
+
+Current enforcement is role-based (`require_admin` and per-route role checks),
+not the fine-grained permission system described in SECURITY.md. See
+SECURITY_ARCHITECTURE.md §6–§8 for the authoritative authorization
+architecture and the tracked gap.
 
 ---
 

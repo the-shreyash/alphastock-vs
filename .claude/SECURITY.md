@@ -1,15 +1,17 @@
 # StockAssist AI
 ## Security Documentation
 
-Version: 1.1
+Version: 1.2
 
-Status: Active Development
+Status: Active Development — PH1.4 complete (2026-07-18)
 
 ---
 
 # Purpose
 
-This document defines every security requirement for StockAssist AI.
+This document is the high-level, operational security guide for StockAssist AI: the rules, policies, and checklists every developer follows day to day.
+
+For the engineering-depth blueprint — exact module design, request/OAuth/refresh/logout sequence diagrams, threat model, trust boundaries, and the authoritative record of what is implemented versus planned — see **SECURITY_ARCHITECTURE.md**, the single source of truth for all security architecture decisions. Where this document and SECURITY_ARCHITECTURE.md appear to differ on implementation detail, SECURITY_ARCHITECTURE.md is authoritative; it is derived directly from the codebase.
 
 Security is not a feature.
 
@@ -140,66 +142,32 @@ Magic Links
 The Google OAuth flow is fail-closed and follows OAuth 2.0 / OpenID Connect
 best practices (hardened in PH1.2).
 
-Flow initiation
+Summary: server-side authorization-code exchange only, CSRF `state`
+double-submit plus single-use server-side replay protection, cryptographic
+`id_token` verification, a mandatory `email_verified` gate, an allowlisted
+redirect URI bound to the flow's state, `sub`-first identity resolution with
+safe account linking, and immutable audit logging of every outcome. Missing
+Google credentials fail closed (401, no session).
 
-The authorization URL and the CSRF `state` are generated server-side
-(`GET /api/auth/google/login-url`). The `state` is a cryptographically random
-value bound to the browser via a short-lived httponly cookie. The client never
-constructs the Google URL.
-
-CSRF and replay protection
-
-The callback exchange (`POST /api/auth/google/session`) requires the `state` and
-validates it (constant-time) against the httponly cookie (double-submit, per-browser
-binding). It is also backed by a single-use server-side record (Redis when
-configured, in-memory fallback otherwise) that is consumed on first use — this
-defeats replay and gives an authoritative TTL expiry across processes. Missing,
-mismatched, replayed, or expired state is rejected.
-
-Identity verification
-
-The returned OpenID Connect `id_token` is cryptographically verified (signature
-against Google's public keys, audience = our client_id, expiry, issuer). Identity
-is taken only from the verified token — never from an unauthenticated endpoint.
-
-Email verification gate
-
-A Google account whose `email_verified` claim is not true is rejected. An
-unverified email never creates a new account and never links to an existing one.
-
-Redirect URI
-
-The redirect URI must match an allowlist derived from configured frontend
-origins. There is no hardcoded fallback.
-
-Identity and account linking
-
-The Google `sub` claim is the primary external identity (stable across Google
-profile or email changes); the verified email is the secondary key. Accounts
-resolve by `sub` first, then by verified email to link an existing email/password
-account — the Google identity is attached and the password credential is
-preserved rather than taken over. Email is the unique key, so no duplicate
-accounts are created. An email already bound to a different `sub` is rejected.
-
-Audit logging
-
-Every OAuth outcome is written to an immutable security-audit log
-(`security_audit_logs`): successes (with new-account / linked flags) and failures
-with a machine-readable reason. The log records ip, user-agent, and outcome —
-never tokens, authorization codes, or state values.
-
-Configuration errors fail closed
-
-When `GOOGLE_CLIENT_ID`/`GOOGLE_CLIENT_SECRET` are unset, Google sign-in returns
-401 and no session is issued.
+Full design, rationale, and the OAuth login sequence diagram:
+**SECURITY_ARCHITECTURE.md §13 (Google OAuth Architecture)** and **§29 (OAuth
+Login Sequence)**.
 
 ---
 
 # Password Policy
 
+Status: ENFORCED since PH1.5 (2026-07-19) for all new passwords, centralized
+in `backend/security/passwords.py` and applied at the model layer (422 before
+hashing). Existing accounts are unaffected — login never re-validates policy.
+
 Minimum Length
 
 12 Characters
+
+Maximum Length
+
+64 Characters (and 72 UTF-8 bytes — the bcrypt truncation boundary)
 
 Require
 
@@ -211,9 +179,29 @@ Number
 
 Special Character
 
+Reject
+
+Common passwords (bundled blocklist, padding-resistant matching)
+
+Password equal to or containing the user's email or name
+
+Repeated-character passwords (fewer than 5 unique characters)
+
+Sequential passwords (alphabet, digit, or keyboard-row runs, either direction)
+
+Leading/trailing whitespace is stripped before validation and hashing.
+
 Never store passwords in plain text.
 
 Hash passwords using Argon2 or bcrypt with a strong cost factor.
+(Implemented: bcrypt with explicit cost factor 12.)
+
+Login failures are generic and timing-equalized — the response never reveals
+whether the email exists, and validation errors never echo the submitted
+password.
+
+Full design and rationale: **SECURITY_ARCHITECTURE.md §15 (Password Security
+Architecture)**.
 
 ---
 
@@ -289,35 +277,17 @@ Authentication cookies are the browser's session credential and are hardened
 centrally in `backend/security/cookies.py` (PH1.3). No auth cookie is set or
 cleared anywhere else, so the policy cannot drift across call sites.
 
-Cookies in use:
+Cookies in use: `access_token` and `refresh_token` (session, Path `/`) and
+`g_oauth_state` (short-lived Google OAuth CSRF state, Path `/api/auth`,
+single-use). All three are always `HttpOnly`; `Secure` is forced `True` in
+production regardless of environment override; `SameSite` defaults to `Lax`
+and is configurable. Clearing mirrors the exact attributes used when setting,
+so browsers actually delete the cookie. Session fixation is structurally
+prevented: login, registration, and Google OAuth all mint fresh tokens and
+overwrite cookies in place.
 
-- `access_token` — access JWT. HttpOnly, Path `/`.
-- `refresh_token` — refresh JWT. HttpOnly, Path `/`.
-- `g_oauth_state` — short-lived Google OAuth CSRF state. HttpOnly, Path
-  `/api/auth`, single-use, burned after the exchange.
-
-Policy:
-
-- **HttpOnly** — always. JavaScript never needs these cookies; this keeps them
-  out of reach of XSS.
-- **Secure** — driven by `COOKIE_SECURE` and **forced `True` when
-  `APP_ENV=production`** (the override is ignored in production). No auth token
-  is ever transmitted over plain HTTP in production. Development defaults to
-  `False` so cookies work over `http://localhost`.
-- **SameSite** — `Lax` by default (a cookie-layer CSRF baseline: cookies are
-  withheld on cross-site sub-requests). Configurable via `COOKIE_SAMESITE`
-  (`lax`/`strict`/`none`); `None` requires `Secure` and is auto-degraded to
-  `Lax` when it would not be `Secure`. The OAuth-state cookie is never `Strict`
-  so it survives the top-level redirect back from Google.
-- **Path** — least required: session cookies at `/`; OAuth state at `/api/auth`.
-- **Domain** — optional `COOKIE_DOMAIN` for subdomain session sharing;
-  host-only when unset.
-- **Clearing** — logout and OAuth burn mirror the exact key/path/domain/security
-  attributes used when setting, so browsers actually delete the cookie.
-
-Session fixation: login, registration and Google OAuth all mint fresh tokens
-and overwrite the cookies in place, so a pre-authentication cookie value can
-never be promoted to an authenticated session.
+Full policy table, design rationale, and defaults:
+**SECURITY_ARCHITECTURE.md §10 (Cookie Architecture)**.
 
 ---
 
@@ -347,7 +317,8 @@ Never trust frontend role checks.
 
 # Fine-Grained Permissions
 
-Permissions include
+Target design (not yet implemented — see SECURITY_ARCHITECTURE.md §8 for the
+gap and current state). Planned permissions include
 
 View Portfolio
 
@@ -366,6 +337,10 @@ Manage AI
 Manage Feature Flags
 
 Each permission is individually configurable.
+
+Authorization today is role-based, not permission-based: `require_admin` gates
+`/api/admin/*` on `role ∈ {admin, super_admin}`. No PH1 sprint currently owns
+building the fine-grained system described above.
 
 ---
 
@@ -450,6 +425,10 @@ Admin
 Configurable
 
 Different endpoints may have stricter limits.
+
+Not yet implemented platform-wide (PH1.7). A narrower mechanism already exists
+today: login attempts are locked out per `ip:email` after 5 failures for 15
+minutes. See SECURITY_ARCHITECTURE.md §21 (Rate Limiting Strategy).
 
 ---
 
@@ -741,9 +720,10 @@ Reject unauthorized subscriptions.
 
 Protect state-changing endpoints.
 
-Use SameSite cookies where applicable.
-
-Validate CSRF tokens when using cookie-based authentication.
+`SameSite=Lax` on all auth cookies is the current baseline (withholds cookies
+on cross-site sub-requests). A dedicated CSRF token layer for cookie-based,
+state-changing routes is designed but **not yet scheduled to a PH1 sprint** —
+see SECURITY_ARCHITECTURE.md §18 for the gap and the recommended next step.
 
 ---
 
@@ -792,52 +772,19 @@ Only trusted origins.
 Cross-Origin Resource Sharing is production-hardened and centralized in
 `backend/security/cors.py` (PH1.4). It is the single place CORS is configured;
 `server.py` wires it in via `apply_cors(app)`. The previous
-wildcard-with-credentials default (`Access-Control-Allow-Origin: *` +
-`allow_credentials=True`) — which is both unsafe and forbidden by the Fetch
-standard — has been removed.
+wildcard-with-credentials default has been removed.
 
-Allowed origins
+Summary: `CORS_ALLOWED_ORIGINS` is the canonical, exact-match origin allowlist
+(legacy `CORS_ORIGINS`/`FRONTEND_URL` still honored). A literal `*` is stripped
+from every source, so a wildcard can never enter the allowlist or pair with
+credentials. Development falls back to `http://localhost:3000` /
+`http://localhost:5173` only when nothing is configured and `APP_ENV` is not
+`production`; production assumes nothing and fails closed (empty allowlist →
+every cross-origin request rejected). Methods and headers are enumerated, not
+wildcarded; no response headers are exposed.
 
-`CORS_ALLOWED_ORIGINS` is the single source of truth: a comma-separated,
-exact-match allowlist of origins (scheme + host + port, no trailing slash).
-Legacy `CORS_ORIGINS` and `FRONTEND_URL` are still honored as inputs for
-backward compatibility. A literal `*` is stripped from every source, so a
-wildcard can never enter the allowlist or pair with credentials. The browser's
-`Origin` header is compared verbatim; an unknown origin never receives
-`Access-Control-Allow-Origin` and is blocked.
-
-Development
-
-When no origin variable is configured (and `APP_ENV` is not `production`), the
-policy falls back to the local dev origins `http://localhost:3000` and
-`http://localhost:5173`, so the app runs with zero configuration.
-
-Production
-
-Nothing is assumed. An unconfigured allowlist in production is empty and every
-cross-origin request is rejected (fail closed). Deployments must set
-`CORS_ALLOWED_ORIGINS` explicitly.
-
-Credentials, methods, headers
-
-Credentials are allowed (`Access-Control-Allow-Credentials: true`) — the app
-authenticates with HttpOnly session cookies — but only because origins are an
-exact allowlist and never the wildcard; the two invariants are enforced
-together. Allowed methods are restricted to those the REST API serves
-(`GET, POST, PUT, PATCH, DELETE, OPTIONS`) and allowed request headers to those
-the frontend sends (`Authorization, Content-Type, Accept, Origin,
-X-Requested-With`) rather than reflecting `*`. No response headers are exposed
-(cookie-based auth needs none). Preflight (`OPTIONS`) is handled by the
-middleware and cached for 10 minutes.
-
-Environment variables
-
-- `CORS_ALLOWED_ORIGINS` — canonical exact-match origin allowlist (comma
-  separated). Required in production.
-- `CORS_ORIGINS` — legacy input, still honored. Wildcard `*` is ignored.
-- `FRONTEND_URL` — legacy input, still honored (also used by the OAuth
-  redirect-URI allowlist, PH1.2).
-- `APP_ENV` — `production` disables the local dev-origin fallback (fail closed).
+Full origin-resolution precedence, environment variables, and rationale:
+**SECURITY_ARCHITECTURE.md §19 (CORS Strategy)**.
 
 ---
 
