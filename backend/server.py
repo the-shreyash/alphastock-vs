@@ -11,7 +11,6 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
 import os
 import logging
-import jwt as pyjwt
 import secrets
 import httpx
 import json
@@ -41,6 +40,7 @@ from security.cookies import (
     clear_oauth_state_cookie,
 )
 from security.cors import apply_cors
+from security.headers import apply_security_headers
 
 # Centralized password policy + hashing primitives (PH1.5). Passwords are
 # hashed/verified ONLY through this module (explicit bcrypt cost, safe
@@ -179,19 +179,46 @@ async def validation_error_handler(request, exc: RequestValidationError):
     return _JSONResponse(status_code=422, content={"detail": sanitized})
 
 
-# JWT Config
-JWT_ALGORITHM = "HS256"
+# JWT & Session Config (PH1.6)
+# All token crypto lives in security.jwt (issuance/verification/claims); the
+# refresh-token family / rotation / revocation state lives in the DB-backed
+# security.sessions.SessionStore. server.py only composes the two: it never
+# encodes/decodes a JWT or writes a session document by hand. See
+# SECURITY_ARCHITECTURE.md §9/§11/§12.
+from security import jwt as jwt_service
+from security.sessions import (
+    SessionStore,
+    ROTATED, REUSE_DETECTED, REVOKED, EXPIRED, NOT_FOUND,
+    REASON_LOGOUT,
+)
 
-def get_jwt_secret():
-    return os.environ["JWT_SECRET"]
 
-def create_access_token(user_id: str, email: str) -> str:
-    payload = {"sub": user_id, "email": email, "exp": datetime.now(timezone.utc) + timedelta(hours=24), "type": "access"}
-    return pyjwt.encode(payload, get_jwt_secret(), algorithm=JWT_ALGORITHM)
+def create_access_token(user_id: str, email: str, session_id: Optional[str] = None) -> str:
+    """Mint an access token. ``session_id`` binds the token to a refresh-token
+    family; when omitted (the test-harness / ad-hoc bearer path) a standalone
+    id is generated so the token is still fully valid — access verification is
+    stateless and does not require the session to exist in the store."""
+    return jwt_service.create_access_token(
+        user_id, email, session_id or jwt_service.new_jti()
+    )
 
-def create_refresh_token(user_id: str) -> str:
-    payload = {"sub": user_id, "exp": datetime.now(timezone.utc) + timedelta(days=7), "type": "refresh"}
-    return pyjwt.encode(payload, get_jwt_secret(), algorithm=JWT_ALGORITHM)
+
+async def _issue_session(user_id: str, email: str, request: Request,
+                         response: Response) -> str:
+    """Open a fresh session and set both auth cookies (login / register / OAuth).
+
+    Allocates the first refresh ``jti``, records the session (with device/IP
+    context for PH1.10), then mints an access + refresh pair carrying the new
+    ``sid``. Returns the access token (echoed in the JSON body for the SPA)."""
+    refresh_jti = jwt_service.new_jti()
+    ua = request.headers.get("user-agent") if request else None
+    ip = request.client.host if (request and request.client) else None
+    session_id = await SessionStore(db).create(user_id, refresh_jti, user_agent=ua, ip=ip)
+    access = jwt_service.create_access_token(user_id, email, session_id)
+    refresh = jwt_service.create_refresh_token(user_id, session_id, refresh_jti)
+    set_auth_cookies(response, access, refresh)
+    return access
+
 
 async def get_current_user(request: Request) -> dict:
     token = request.cookies.get("access_token")
@@ -202,19 +229,23 @@ async def get_current_user(request: Request) -> dict:
     if not token:
         raise HTTPException(status_code=401, detail="Not authenticated")
     try:
-        payload = pyjwt.decode(token, get_jwt_secret(), algorithms=[JWT_ALGORITHM])
-        if payload.get("type") != "access":
-            raise HTTPException(status_code=401, detail="Invalid token type")
-        user = await db.users.find_one({"_id": ObjectId(payload["sub"])})
-        if not user:
-            raise HTTPException(status_code=401, detail="User not found")
-        user["_id"] = str(user["_id"])
-        user.pop("password_hash", None)
-        return user
-    except pyjwt.ExpiredSignatureError:
+        payload = jwt_service.decode_token(token, expected_type="access")
+    except jwt_service.TokenExpired:
         raise HTTPException(status_code=401, detail="Token expired")
-    except pyjwt.InvalidTokenError:
+    except jwt_service.TokenError:
         raise HTTPException(status_code=401, detail="Invalid token")
+
+    user = await db.users.find_one({"_id": ObjectId(payload["sub"])})
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
+    # Global invalidation lever: any token minted before the account's
+    # password_changed_at (set by a future password change or a security event)
+    # is stale, even if it has not yet expired. Access AND refresh both honor it.
+    if jwt_service.token_issued_before(payload, user.get("password_changed_at")):
+        raise HTTPException(status_code=401, detail="Token expired")
+    user["_id"] = str(user["_id"])
+    user.pop("password_hash", None)
+    return user
 
 # NOTE: authentication cookies are set/cleared exclusively via
 # security.cookies (imported above) — set_auth_cookies / set_access_cookie /
@@ -810,7 +841,7 @@ admin_router = APIRouter(prefix="/api/admin", tags=["Admin Portal"])
 # ============ AUTH ROUTES ============
 
 @auth_router.post("/register")
-async def register(data: UserCreate, response: Response):
+async def register(data: UserCreate, response: Response, request: Request):
     email = data.email.lower().strip()
     if await db.users.find_one({"email": email}):
         raise HTTPException(status_code=400, detail="Email already registered")
@@ -829,9 +860,7 @@ async def register(data: UserCreate, response: Response):
     }
     result = await db.users.insert_one(user_doc)
     user_id = str(result.inserted_id)
-    access = create_access_token(user_id, email)
-    refresh = create_refresh_token(user_id)
-    set_auth_cookies(response, access, refresh)
+    access = await _issue_session(user_id, email, request, response)
     return {"id": user_id, "name": data.name, "email": email, "role": "user", "capital": 100000, "token": access}
 
 @auth_router.post("/login")
@@ -866,9 +895,7 @@ async def login(data: UserLogin, response: Response, request: Request):
 
     await db.login_attempts.delete_one({"identifier": identifier})
     user_id = str(user["_id"])
-    access = create_access_token(user_id, email)
-    refresh = create_refresh_token(user_id)
-    set_auth_cookies(response, access, refresh)
+    access = await _issue_session(user_id, email, request, response)
     return {
         "id": user_id, "name": user["name"], "email": email,
         "role": user.get("role", "user"), "capital": user.get("capital", 100000),
@@ -880,11 +907,31 @@ async def get_me(user: dict = Depends(get_current_user)):
     return user
 
 @auth_router.post("/logout")
-async def logout(response: Response):
-    # Clear every authentication cookie via the central policy so the delete
-    # attributes (path/domain/secure/samesite) match how they were set.
+async def logout(request: Request, response: Response):
+    # Revoke the current session server-side (so its refresh token is dead even
+    # if it was captured) then clear every auth cookie via the central policy so
+    # the delete attributes (path/domain/secure/samesite) match how they were
+    # set. Best-effort revoke: a missing/old/invalid refresh cookie still logs
+    # the browser out cleanly.
+    token = request.cookies.get("refresh_token")
+    if token:
+        try:
+            payload = jwt_service.decode_token(token, expected_type="refresh")
+            await SessionStore(db).revoke(payload["sid"], reason=REASON_LOGOUT)
+        except jwt_service.TokenError:
+            pass
     clear_auth_cookies(response)
     return {"message": "Logged out"}
+
+@auth_router.post("/logout-all")
+async def logout_all(request: Request, response: Response, user: dict = Depends(get_current_user)):
+    """Sign out of every device: revoke all of the user's refresh-token
+    families and clear the current browser's cookies. Outstanding access tokens
+    (≤15 min) drain on their own; the service-layer primitive
+    (``SessionStore.revoke_all_for_user``) is what PH1.10's UI will call."""
+    revoked = await SessionStore(db).revoke_all_for_user(user["_id"], reason="logout_all")
+    clear_auth_cookies(response)
+    return {"message": "Signed out of all devices", "sessions_revoked": revoked}
 
 @auth_router.post("/refresh")
 async def refresh_token(request: Request, response: Response):
@@ -892,18 +939,32 @@ async def refresh_token(request: Request, response: Response):
     if not token:
         raise HTTPException(status_code=401, detail="No refresh token")
     try:
-        payload = pyjwt.decode(token, get_jwt_secret(), algorithms=[JWT_ALGORITHM])
-        if payload.get("type") != "refresh":
-            raise HTTPException(status_code=401, detail="Invalid token type")
-        user = await db.users.find_one({"_id": ObjectId(payload["sub"])})
-        if not user:
-            raise HTTPException(status_code=401, detail="User not found")
-        access = create_access_token(str(user["_id"]), user["email"])
-        # Re-issue the access cookie through the central hardened policy.
-        set_access_cookie(response, access)
-        return {"message": "Token refreshed"}
-    except pyjwt.InvalidTokenError:
+        payload = jwt_service.decode_token(token, expected_type="refresh")
+    except jwt_service.TokenError:
         raise HTTPException(status_code=401, detail="Invalid refresh token")
+
+    user = await db.users.find_one({"_id": ObjectId(payload["sub"])})
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
+    # Global invalidation lever (password change / security event) applies to
+    # refresh too — a stale refresh token cannot be rotated into fresh access.
+    if jwt_service.token_issued_before(payload, user.get("password_changed_at")):
+        raise HTTPException(status_code=401, detail="Invalid refresh token")
+
+    # Rotate: the presented token is single-use. Replaying an already-rotated
+    # token (reuse) revokes the whole family — see security.sessions.
+    new_jti = jwt_service.new_jti()
+    result = await SessionStore(db).rotate(payload["sid"], payload["jti"], new_jti)
+    if not result.ok:
+        raise HTTPException(status_code=401, detail="Invalid refresh token")
+
+    user_id = str(user["_id"])
+    access = jwt_service.create_access_token(user_id, user["email"], payload["sid"])
+    refresh = jwt_service.create_refresh_token(user_id, payload["sid"], new_jti)
+    # Re-issue BOTH cookies through the central hardened policy: rotation means
+    # the refresh token changes on every use, not just the access token.
+    set_auth_cookies(response, access, refresh)
+    return {"message": "Token refreshed"}
 
 
 # ============ MARKET ROUTES ============
@@ -3010,9 +3071,7 @@ async def google_auth_session(request: Request, response: Response):
             capital = 100000
             new_account = True
 
-    access = create_access_token(user_id, email)
-    refresh = create_refresh_token(user_id)
-    set_auth_cookies(response, access, refresh)
+    access = await _issue_session(user_id, email, request, response)
     await log_auth_event("oauth_login_success", request, email=email, user_id=user_id,
                          detail={"new_account": new_account, "linked": linked})
 
@@ -4879,6 +4938,13 @@ async def get_recent_ai_activity():
 # full policy and rationale.
 apply_cors(app)
 
+# HTTP security headers are centralized in security.headers (PH1.4b):
+# anti-clickjacking, anti-MIME-sniffing, transport security (HSTS), a strict
+# Content-Security-Policy, and the cross-origin isolation family. Applied AFTER
+# CORS so it wraps (and decorates) even CORS preflight/rejection responses. See
+# that module for the full policy and rationale.
+apply_security_headers(app)
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -4901,6 +4967,13 @@ async def startup():
     await db.security_audit_logs.create_index("timestamp")
     await db.security_audit_logs.create_index("event")
     await db.security_audit_logs.create_index("email")
+
+    # Session store (PH1.6) — one document per refresh-token family. The TTL
+    # index reaps sessions at their absolute expiry (Mongo purges docs whose
+    # `expires_at` Date is in the past); session_id is the unique family handle.
+    await db.sessions.create_index("session_id", unique=True)
+    await db.sessions.create_index("user_id")
+    await db.sessions.create_index("expires_at", expireAfterSeconds=0)
     await db.feature_flags.create_index("key", unique=True)
     await db.announcements.create_index("created_at")
     await db.support_tickets.create_index("status")

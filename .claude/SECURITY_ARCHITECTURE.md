@@ -99,8 +99,8 @@ Inherited from SECURITY.md §Security Principles, made concrete:
 | Cross-site credentialed requests (CSRF via CORS) | Wildcard-with-credentials removed; exact-match allowlist, fail-closed in production | ✅ Closed (PH1.4) |
 | Cross-site state-changing request via cookie auth (CSRF proper) | `SameSite=Lax` baseline only; dedicated CSRF token layer not yet built | ⚠️ Partial — gap, see §18 |
 | Credential stuffing / brute force | Per-`ip:email` lockout on login (5 attempts / 15 min); production password policy + timing-equalized failures (PH1.5) | ⚠️ Partial — platform-wide rate limiting is PH1.7 |
-| Stolen long-lived access token | 24h access token, no revocation | ⚠️ Open — PH1.6 |
-| Refresh token replay | No rotation, no reuse detection | ⚠️ Open — PH1.6 |
+| Stolen long-lived access token | 15-min access token; global invalidation via `password_changed_at` + token `ver` kill-switch | ✅ Closed (PH1.6) |
+| Refresh token replay | Rotation on every use + reuse detection that revokes the whole family; server-side revocation store | ✅ Closed (PH1.6) |
 | Cross-user Socket.IO event leakage | No connection/room authorization yet | ⚠️ Open — PH1.9 |
 | Weak/missing production secrets | No boot-time validator yet (`JWT_SECRET` merely required, not strength-checked) | ⚠️ Open — PH1.8 |
 | Vulnerable dependency | No scanning yet | ⚠️ Open — PH1.11 |
@@ -204,19 +204,24 @@ This is recorded here explicitly (rather than silently left as a doc/code mismat
 
 # 9. Session Architecture
 
-A "session" is a JWT access/refresh pair, not a server-side session object — StockAssist AI is stateless with respect to *valid* sessions (no session table to check on every request) but is gaining server-side state for *revocation* in PH1.6.
+A "session" is a **refresh-token family**: a durable server-side record (one MongoDB `sessions` document, `backend/security/sessions.py`) that tracks the single refresh token currently valid for one login on one device. Access-token verification stays **stateless** — no per-request session lookup — so the hot path is unchanged; the session store is consulted only at the refresh boundary (rotation + theft detection) and at logout. Immediate, global invalidation of *access* tokens (which the stateless path cannot revoke individually) rides on the `password_changed_at` marker and the in-code token `ver` kill-switch.
 
-| Property | Current | Target (SECURITY.md / PH1.6) |
-|---|---|---|
-| Access token lifetime | 24 hours | 15 minutes |
-| Refresh token lifetime | 7 days | 30 days |
-| Refresh rotation | None — same refresh token reusable until expiry | Rotate on every use |
-| Reuse detection | None | Revoke token family on replay |
-| Server-side revocation store | None | Redis-backed revocation list |
-| Session listing (device/IP/last-activity) | None | `GET /api/auth/sessions` (PH1.10) |
-| Logout-specific-session / logout-all | Only logout-current (clears cookies) | Both, once revocation store exists |
+| Property | Value (PH1.6) |
+|---|---|
+| Access token lifetime | 15 minutes (`JWT_ACCESS_TTL_SECONDS`, default 900) |
+| Refresh token lifetime | 7 days (`JWT_REFRESH_TTL_SECONDS`, default 604800), sliding on use |
+| Refresh rotation | Rotate on every use — new `jti` issued, old token single-use/dead |
+| Reuse detection | Replay of a rotated token revokes the **entire family** |
+| Server-side revocation store | MongoDB `sessions` collection (durable; TTL-reaped at expiry) |
+| Access-token global invalidation | `password_changed_at` (per-user) + token `ver` (platform-wide) |
+| Session listing (device/IP/last-activity) | Captured now (`user_agent`/`ip`); `GET /api/auth/sessions` UI is PH1.10 |
+| Logout / logout-all | `POST /api/auth/logout` revokes the current family; `POST /api/auth/logout-all` revokes every family for the user |
 
-The `access_token`/`refresh_token` cookie **names are session-scoped** (`Path=/`), so a single logout call clears the entire session in one shot (no per-path cookie duplication is possible — a deliberate PH1.3 design choice, see `backend/security/cookies.py` docstring).
+**Why MongoDB, not the Redis cache layer:** rotation with reuse detection needs an *authoritative, durable* record of which token is current. The `services.cache` layer is best-effort and evictable — losing a record there would silently drop reuse detection or log users out on a flush. Sessions live in Mongo beside their users, survive restarts, and are auto-purged by a TTL index on `expires_at`.
+
+**Migration note (existing sessions):** PH1.6 validation is strict and fail-closed (every token must carry `aud`/`iss`/`jti`/`ver`/`sid`), so tokens minted before the upgrade fail verification. On deploy, every active user re-authenticates once via the normal 401 → login flow — a deliberate clean cutover, not a regression. No data migration is required.
+
+The `access_token`/`refresh_token` cookie **names are session-scoped** (`Path=/`), so a single logout call clears the entire session in one shot (no per-path cookie duplication is possible — a deliberate PH1.3 design choice, see `backend/security/cookies.py` docstring). The access cookie's `Max-Age` (24h, PH1.3) intentionally outlives the 15-min JWT: the browser simply presents an expired token, which is rejected and triggers a silent refresh — harmless. Aligning cookie `Max-Age` to token lifetime is a cosmetic PH1.3-owned follow-up, out of scope for PH1.6.
 
 ---
 
@@ -240,42 +245,52 @@ Key design decisions (see file docstring for full rationale):
 
 # 11. JWT Lifecycle
 
+All token crypto is centralized in `backend/security/jwt.py` (PH1.6) — the only place a JWT is encoded or decoded. It is pure and framework-agnostic (no FastAPI, no DB); `server.py` composes it with the `SessionStore` (§12).
+
 ```
-Issuance                          Verification                    Expiry
-────────────────────────────────  ───────────────────────────────  ──────────────
-create_access_token(user_id,      get_current_user():               24h → 401
-  email)                            - read cookie or Bearer header    "Token expired"
-  → {sub, email, exp, type:access}  - pyjwt.decode(secret, HS256)
-create_refresh_token(user_id)       - assert type == "access"       7d → 401
-  → {sub, exp, type:refresh}        - load user from MongoDB          "No refresh token"
-                                     - 401 on any failure              at /api/auth/refresh
+Issuance (security.jwt)              Verification (decode_token)        Expiry
+──────────────────────────────────  ─────────────────────────────────  ──────────────
+create_access_token(uid, email, sid) read cookie or Bearer header       15m → TokenExpired → 401
+  → {sub,email,type:access,sid,jti,  pyjwt.decode(secret, HS256,          "Token expired"
+     iat,exp,aud,iss,ver}              audience, issuer, require=[…])
+create_refresh_token(uid, sid, jti)  assert type / ver                   7d  → 401 at
+  → {sub,type:refresh,sid,jti,        (get_current_user also loads user   /api/auth/refresh
+     iat,exp,aud,iss,ver}              + checks password_changed_at)
 ```
 
 - **Algorithm:** HS256, single shared secret (`JWT_SECRET`, required env var, no default).
-- **Claims:** `sub` (user id), `email` (access only), `exp`, `type` (`access`/`refresh` — prevents a refresh token being used as an access token or vice versa).
-- **No `iat`, `jti`, or `aud` claims today** — `jti` is required for the reuse-detection/revocation design in §12; this is a known PH1.6 prerequisite, not an oversight.
-- **Verification is symmetric** for access and refresh (same secret, same algorithm) — only the `type` claim and the endpoint that reads them differ.
+- **Claims:** `sub` (user id), `email` (access only), `type` (`access`/`refresh`), `sid` (owning session/family), `jti` (unique id — the handle the store rotates/revokes), `iat` (anchor for `password_changed_at`), `exp`, `aud`, `iss`, `ver` (token schema version).
+- **`aud`/`iss` are validated** on decode — a token minted for another audience/issuer (or a stray HS256 token sharing the secret) is rejected.
+- **`ver` is a global kill-switch** — pinned in code (`TOKEN_VERSION`, like the bcrypt cost); bumping it in a reviewed diff invalidates every token in circulation at once.
+- **Strict, fail-closed validation** — `decode_token` requires all of `exp/iat/aud/iss/sub/jti/type/ver/sid`; a token missing any (e.g. a pre-PH1.6 token) is rejected (see §9 migration note).
+- **Typed errors** — verification raises `TokenExpired` / `TokenInvalid` (never a raw `pyjwt` type or an `HTTPException`); the web layer maps both to a generic 401 that never reveals which check failed.
+- **Verification is symmetric** for access and refresh (same secret/algorithm/aud/iss) — only the required `type` and the reading endpoint differ.
 
 ---
 
 # 12. Refresh Token Lifecycle
 
-Current (`POST /api/auth/refresh`): reads `refresh_token` cookie → decodes → confirms `type == "refresh"` → issues a **new access token only** via `set_access_cookie`. The refresh token itself is **not rotated or re-issued** — the same refresh token remains valid, unchanged, until its own 7-day expiry.
+`POST /api/auth/refresh` (PH1.6): reads the `refresh_token` cookie → `decode_token(expected_type="refresh")` → checks `password_changed_at` → **rotates** the token via `SessionStore.rotate(sid, presented_jti, new_jti)` → issues a **new access AND new refresh** pair via `set_auth_cookies`. Every refresh changes the refresh token; the presented one is single-use.
 
 ```
-Client                          Server
+Client                          Server (server.py + SessionStore)
   │  POST /api/auth/refresh       │
-  │  (refresh_token cookie)       │
+  │  (refresh_token cookie: jti=J0)│
   ├───────────────────────────────►
-  │                                │ decode refresh_token
-  │                                │ verify type == "refresh"
-  │                                │ create_access_token(sub)
-  │                                │ set_access_cookie (new)
-  │  ◄─────────────────────────────┤ refresh_token cookie UNCHANGED
-  │  200 + new access cookie      │
+  │                                │ decode refresh_token (aud/iss/exp/ver/type)
+  │                                │ reject if iat < password_changed_at
+  │                                │ rotate(sid, J0, J1):
+  │                                │   J0 == current_jti ? → current_jti = J1  (ROTATED)
+  │                                │   J0 != current_jti ? → revoke family     (REUSE → 401)
+  │                                │   revoked / expired / unknown? → 401
+  │                                │ mint access(sid) + refresh(sid, jti=J1)
+  │  ◄─────────────────────────────┤ set_auth_cookies (BOTH rotated)
+  │  200 + new access & refresh   │
 ```
 
-**Target design (PH1.6):** rotate the refresh token on every use (issue a new one, invalidate the old), detect reuse of an already-rotated token as a signal of theft (revoke the entire token family), and back both by a Redis-resident revocation store so a compromised token can be killed server-side before its natural expiry. This is the single highest-value remaining authentication sprint (Risk R-06).
+**Reuse detection (the core of R-06):** the family stores only `current_jti`. Replaying an already-rotated refresh token (its `jti` no longer current, but the family still live) is the fingerprint of a stolen token used after the legitimate client already rotated — it **revokes the whole family**, so both the thief's and the victim's tokens stop working and the compromise surfaces as a forced re-login instead of a silent takeover. A revoked or expired family refreshes to nothing (401).
+
+**Sliding expiry:** each rotation extends the family's absolute expiry by a full refresh lifetime, so an actively-used session is never logged out mid-use (an absolute session cap is a future enhancement). Rotation, revocation, and reuse detection are implemented in `backend/security/sessions.py` and covered by `backend/tests/test_jwt_sessions.py`.
 
 ---
 
@@ -365,7 +380,29 @@ Full origin-resolution logic, precedence, and rationale are documented in the mo
 
 # 20. Security Headers Strategy
 
-**Not yet implemented — PH1.4b**, explicitly split out of PH1.4 (which delivered CORS only). Target middleware (`backend/security/headers.py`): HSTS, `X-Frame-Options`, `X-Content-Type-Options`, `Referrer-Policy`, `Permissions-Policy`, and a CSP compatible with the CRA frontend build. Acceptance target: an A grade on an external header scan (e.g. securityheaders.com) against staging.
+**Implemented — PH1.4b** (2026-07-20), split out of PH1.4 (which delivered CORS only). All HTTP response security headers are centralized in `backend/security/headers.py` and applied by a single pure-ASGI `SecurityHeadersMiddleware` (`apply_security_headers(app)`). A pure-ASGI middleware is used deliberately — it sets headers on the `http.response.start` message without buffering the body (safe for streaming/SSE), touches only the `http` scope (WebSocket upgrades pass through), and *enforces* its values (overwriting any inner-handler value so the posture cannot be weakened downstream). It is wired **after** CORS so it wraps and decorates even CORS preflight and rejected-origin responses.
+
+**Headers emitted on every response:**
+
+| Header | Value (default) | Purpose |
+| --- | --- | --- |
+| `X-Content-Type-Options` | `nosniff` | Stops MIME sniffing. |
+| `X-Frame-Options` | `DENY` | Anti-clickjacking for pre-CSP browsers (defense-in-depth with `frame-ancestors`). |
+| `Referrer-Policy` | `strict-origin-when-cross-origin` | Never leaks path/query cross-origin; nothing on HTTPS→HTTP downgrade. |
+| `Permissions-Policy` | powerful features disabled `()` | Denies camera/mic/geolocation/USB/etc. the API never needs. |
+| `Cross-Origin-Opener-Policy` | `same-origin` | Isolates the browsing-context group. |
+| `Cross-Origin-Resource-Policy` | `same-origin` | Blocks *no-cors* cross-origin embedding of API responses (the credentialed CORS frontend uses `mode: cors` and is unaffected — CORP only governs no-cors loads). |
+| `X-XSS-Protection` | `0` | Neutralizes the deprecated, buggy legacy auditor (superseded by CSP). |
+| `Content-Security-Policy` | `default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'` | Strict API lockdown — **no `unsafe-inline`/`unsafe-eval`**. |
+
+**Conditional headers:**
+
+- `Strict-Transport-Security` (`max-age=63072000; includeSubDomains`) — emitted **only** over HTTPS or in production (mirrors how `security.cookies` forces `Secure` in production). `X-Forwarded-Proto: https` is honored behind a TLS-terminating proxy so a plain-HTTP dev origin never pins itself. `preload` is opt-in (`HSTS_PRELOAD`) since it is a hard-to-reverse public commitment.
+- `Cross-Origin-Embedder-Policy: require-corp` — implemented but **opt-in** (`CROSS_ORIGIN_EMBEDDER_POLICY`); it offers no protection to the API's own JSON yet would break same-origin HTML tooling (Swagger UI) pulling cross-origin subresources without CORP.
+
+**Environment-driven & nonce-capable:** every header value is overridable by environment variable (`CONTENT_SECURITY_POLICY`, `PERMISSIONS_POLICY`, `REFERRER_POLICY`, `X_FRAME_OPTIONS`, `CROSS_ORIGIN_OPENER_POLICY`, `CROSS_ORIGIN_RESOURCE_POLICY`, `CROSS_ORIGIN_EMBEDDER_POLICY`, `HSTS_ENABLE`/`HSTS_MAX_AGE`/`HSTS_INCLUDE_SUBDOMAINS`/`HSTS_PRELOAD`), so a deployment can relax a single directive without a code change. For future nonce-based CSP, a `{nonce}` placeholder in the policy is replaced with a fresh per-request `secrets.token_urlsafe(16)` nonce that is also exposed on `request.state.csp_nonce` for a downstream HTML handler to stamp onto `<script nonce=…>`. 35 hermetic tests in `backend/tests/test_security_headers.py`.
+
+Acceptance target: an A grade on an external header scan (e.g. securityheaders.com) against staging.
 
 ---
 
@@ -428,9 +465,13 @@ backend/
 │   │                                place passwords are validated, hashed, or verified
 │   ├── data/
 │   │   └── common_passwords.txt  (PH1.5) bundled common-password blocklist
+│   ├── headers.py          (PH1.4b) HTTP security-header policy + middleware —
+│   │                                the only place security response headers are set
 │   ├── csrf.py             (planned, unscheduled) CSRF token middleware — see §18
-│   ├── headers.py          (planned, PH1.4b) security-header middleware
-│   ├── tokens.py           (planned, PH1.6) JWT issuance/rotation/revocation service
+│   ├── jwt.py              (PH1.6) JWT issuance/verification — the only place a
+│   │                                token is encoded or decoded (pure crypto)
+│   ├── sessions.py         (PH1.6) SessionStore: refresh-token families, rotation,
+│   │                                reuse detection, revocation (logout / logout-all)
 │   ├── rate_limit.py       (planned, PH1.7) tiered rate limiter
 │   └── oauth.py            (not yet extracted) candidate home for the Google OAuth
 │                                    logic currently inline in server.py — extraction
@@ -446,6 +487,7 @@ backend/
     ├── test_oauth_hardening.py   (PH1.2) 26 tests — OAuth flow correctness
     ├── test_cookie_security.py   (PH1.3) 24 tests — cookie policy
     ├── test_cors_hardening.py    (PH1.4) 30 tests — CORS policy
+    ├── test_security_headers.py  (PH1.4b) 35 tests — HTTP security headers
     └── test_password_policy.py   (PH1.5) 40 tests — password policy + login compatibility
 ```
 
@@ -460,6 +502,9 @@ Current pipeline (as wired in `server.py` today):
 ```
 Request
    │
+   ▼
+SecurityHeadersMiddleware (security/headers.py, apply_security_headers)  ── stamps
+   │                                                security headers on every response
    ▼
 CORSMiddleware (security/cors.py, apply_cors)   ── origin check, preflight
    │
@@ -476,13 +521,13 @@ Pydantic model validation (route parameters/body)
 Route handler (business logic, per-user data scoping)
    │
    ▼
-Response (+ set/clear cookies via security/cookies.py where applicable)
+Response (+ security headers via security/headers.py; set/clear cookies via security/cookies.py where applicable)
 ```
 
-**Target pipeline** once PH1.4b–PH1.9 land (additions in bold):
+**Target pipeline** once PH1.6–PH1.9 land (additions in bold; Security Headers landed in PH1.4b):
 
 ```
-Request → **Rate Limiter (PH1.7)** → CORS → **Security Headers (PH1.4b)** →
+Request → **Rate Limiter (PH1.7)** → Security Headers (PH1.4b) → CORS →
 Route dispatch → **CSRF token check on state-changing routes (unscheduled, §18)** →
 Auth (get_current_user/require_admin) → Model validation → Handler →
 **Audit log write (where applicable)** → Response (+ security headers, cookies)
@@ -564,18 +609,24 @@ Every `else` branch above logs a `oauth_login_failure` event with a specific `re
 # 30. Session Refresh Sequence
 
 ```
-Client                                    Server
+Client                                    Server (server.py + SessionStore)
   │  POST /api/auth/refresh                 │
-  │  (refresh_token cookie)                 │
+  │  (refresh_token cookie, jti=J0)         │
   ├─────────────────────────────────────────►
   │                                          │ token = cookie["refresh_token"]
   │                                          │   missing → 401 "No refresh token"
-  │                                          │ decode(token, JWT_SECRET, HS256)
-  │                                          │ assert type == "refresh" → else 401
-  │                                          │ access = create_access_token(sub)
-  │                                          │ set_access_cookie(access)
-  │  ◄───────────────────────────────────────┤   NOTE: refresh_token cookie is
-  │  200 + new access_token cookie           │   NOT rotated (PH1.6 will change this)
+  │                                          │ decode_token(token, "refresh")
+  │                                          │   bad sig/aud/iss/exp/ver/type → 401
+  │                                          │ reject if iat < password_changed_at → 401
+  │                                          │ rotate(sid, J0, new J1):
+  │                                          │   J0==current → current=J1        (ROTATED)
+  │                                          │   J0!=current → revoke family      (REUSE→401)
+  │                                          │   revoked/expired/unknown          (→401)
+  │                                          │ access = create_access_token(sub, sid)
+  │                                          │ refresh = create_refresh_token(sub, sid, J1)
+  │                                          │ set_auth_cookies(access, refresh)
+  │  ◄───────────────────────────────────────┤   BOTH cookies rotated
+  │  200 + new access & refresh cookies      │
 ```
 
 ---
@@ -583,17 +634,23 @@ Client                                    Server
 # 31. Logout Sequence
 
 ```
-Client                                    Server
+Client                                    Server (server.py + SessionStore)
   │  POST /api/auth/logout                  │
+  │  (refresh_token cookie)                 │
   ├─────────────────────────────────────────►
+  │                                          │ if refresh cookie present & valid:
+  │                                          │   SessionStore.revoke(sid)  (best-effort)
   │                                          │ clear_auth_cookies(response):
   │                                          │   delete access_token  (path=/, matching attrs)
   │                                          │   delete refresh_token (path=/, matching attrs)
   │  ◄───────────────────────────────────────┤
   │  200 {"message": "Logged out"}           │
+
+POST /api/auth/logout-all (authenticated): SessionStore.revoke_all_for_user(uid)
+  → revokes every refresh-token family for the user, then clears the current cookies.
 ```
 
-No server-side revocation occurs — the JWTs remain cryptographically valid until their natural expiry even after logout; only the cookie is removed from the browser. This is a direct consequence of the stateless-JWT design in §9 and is closed by the PH1.6 revocation store (a "logout" will additionally revoke the token family server-side once that exists).
+Logout now revokes the current session's refresh-token family server-side (PH1.6), so a captured refresh token is dead immediately, not merely removed from this browser. Outstanding **access** tokens (≤15 min) drain on their own; for immediate global access-token invalidation, a password change / security event sets `password_changed_at`, which `get_current_user` and `refresh` both honor (§9, §11). This closes the stateless-logout gap called out in §9.
 
 ---
 
@@ -603,7 +660,7 @@ This section is the authoritative forward-looking security sequence; PRODUCTION_
 
 | Sprint | Architectural change this document will need to reflect |
 |---|---|
-| PH1.4b Security Headers | New `security/headers.py` module in §26; pipeline update in §27 |
+| PH1.4b Security Headers | ✅ Done — `security/headers.py` in §26; §20 now "current"; pipeline updated in §27 |
 | PH1.5 Password/Email/Verification | ✅ Password portion done (§15 now "current"). §16, §17 and `EmailStr` deferred to unscheduled PH1.5b |
 | PH1.6 JWT & Refresh Rotation | §9, §11, §12, §30 rewritten for rotation + revocation store; `jti` claim added |
 | PH1.7 Rate Limiting | §21 rewritten; login-lockout folded into the new limiter per the note in §21 |
@@ -670,7 +727,7 @@ StockAssist AI's security architecture, as of PH1.4 completion, is **strong at t
 | Google OAuth hardening | ✅ Complete | §13, §29, PH1.2 |
 | Cookie security | ✅ Complete | §10, PH1.3 |
 | CORS hardening | ✅ Complete | §19, PH1.4 |
-| Security headers | ❌ Not started | §20, PH1.4b |
+| Security headers | ✅ Complete | §20, PH1.4b |
 | Password policy | ✅ Complete | §15, PH1.5 |
 | Email policy/verification | ❌ Not started (deferred from PH1.5 → PH1.5b) | §16–§17 |
 | JWT lifecycle/rotation | ❌ Not started | §11–§12, PH1.6 |

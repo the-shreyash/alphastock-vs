@@ -3,7 +3,7 @@
 
 Version: 1.2
 
-Status: Active Development — PH1.4 complete (2026-07-18)
+Status: Active Development — PH1.4b complete (2026-07-20)
 
 ---
 
@@ -241,6 +241,8 @@ Rotate refresh tokens after use.
 
 Immediately revoke compromised tokens.
 
+**Implemented (PH1.6):** access-token lifetime is 15 minutes and refresh tokens rotate on every use with reuse detection (a replayed refresh revokes the whole family) — see SECURITY_ARCHITECTURE.md §11/§12. Both lifetimes are env-configurable (`JWT_ACCESS_TTL_SECONDS`, `JWT_REFRESH_TTL_SECONDS`); the shipped **default refresh lifetime is 7 days** (aligned with the `refresh_token` cookie Max-Age). Deployments that want the 30-day policy target above set `JWT_REFRESH_TTL_SECONDS=2592000`. Server-side revocation is durable (MongoDB `sessions` collection); token `ver` and `password_changed_at` provide platform-wide and per-user kill-switches for compromised tokens.
+
 ---
 
 # Session Management
@@ -268,6 +270,8 @@ View Active Sessions
 Logout Specific Session
 
 Logout All Sessions
+
+**Implemented (PH1.6):** each login/registration/OAuth opens a durable session (refresh-token family) that captures `session_id`, `user_agent`, `ip`, created/last-used timestamps, and absolute expiry — the data-model groundwork for the "active sessions" screen. `POST /api/auth/logout` revokes the current session; `POST /api/auth/logout-all` revokes every session for the user (`SessionStore.revoke_all_for_user`). The user-facing "View Active Sessions / Logout Specific Session" **UI** and device/country enrichment are PH1.10.
 
 ---
 
@@ -790,19 +794,31 @@ Full origin-resolution precedence, environment variables, and rationale:
 
 # Security Headers
 
-Enable
+**Implemented and centralized in `backend/security/headers.py` (PH1.4b).** A
+single pure-ASGI `SecurityHeadersMiddleware` (`apply_security_headers(app)`,
+wired after CORS) stamps the security headers on **every** response — the only
+place security response headers are set. Every value is environment-overridable;
+the CSP is nonce-capable (`{nonce}` placeholder → per-request nonce, also on
+`request.state.csp_nonce`) for future HTML rendering.
 
-HSTS
+Emitted on every response:
 
-X-Frame-Options
+- `X-Content-Type-Options: nosniff`
+- `X-Frame-Options: DENY`
+- `Referrer-Policy: strict-origin-when-cross-origin`
+- `Permissions-Policy` — powerful features (camera, mic, geolocation, USB, …) disabled
+- `Cross-Origin-Opener-Policy: same-origin`
+- `Cross-Origin-Resource-Policy: same-origin` (safe with the credentialed CORS frontend — CORP only blocks *no-cors* loads)
+- `X-XSS-Protection: 0` — deprecated legacy auditor neutralized (superseded by CSP)
+- `Content-Security-Policy: default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'` — strict API lockdown, **no `unsafe-*`**
 
-X-Content-Type-Options
+Conditional:
 
-Referrer-Policy
+- `Strict-Transport-Security: max-age=63072000; includeSubDomains` — only over HTTPS / production (honors `X-Forwarded-Proto` behind a proxy; `preload` opt-in)
+- `Cross-Origin-Embedder-Policy: require-corp` — implemented, opt-in via `CROSS_ORIGIN_EMBEDDER_POLICY`
 
-Permissions-Policy
-
-Content-Security-Policy
+Full header matrix, environment variables, and rationale:
+**SECURITY_ARCHITECTURE.md §20 (Security Headers Strategy)**.
 
 ---
 

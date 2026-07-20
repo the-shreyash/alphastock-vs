@@ -5,6 +5,169 @@ This file records documentation-system versions and, from v1.0 launch onward, pr
 
 ---
 
+# Sprint PH1.6 — JWT Lifecycle & Session Security — 2026-07-20
+
+**Production Hardening PH1.6 complete. The two highest-value open authentication
+risks — long-lived access tokens (R-06) and refresh-token replay — are closed.**
+
+Before this sprint, access tokens lived 24 hours, refresh tokens never rotated
+or revoked, and logout only deleted cookies (the JWTs stayed cryptographically
+valid until natural expiry). A stolen token was usable for a day; a captured
+refresh token for a week, undetectably. PH1.6 centralizes all JWT logic, shortens
+the access token to 15 minutes, rotates refresh tokens on every use with theft
+detection, and adds a durable server-side revocation store — without changing any
+public API contract.
+
+Added
+
+- `backend/security/jwt.py` — the single source of truth for JWT issuance and
+  verification (pure crypto, no FastAPI/DB). The only place a token is encoded or
+  decoded.
+  - **Hardened claim set on every token:** `iat`, `jti` (unique id — the handle
+    the session store rotates/revokes), `aud`, `iss`, `sid` (owning session), and
+    `ver` (token schema version), alongside the existing `sub`/`email`/`type`/`exp`.
+  - **Strict, fail-closed verification** (`decode_token`) — validates signature,
+    `exp`, `aud`, `iss`, requires every claim, and checks `type`/`ver`. Raises
+    typed, framework-neutral `TokenExpired`/`TokenInvalid` (never a raw `pyjwt`
+    error), which the web layer maps to a generic 401.
+  - **Configurable lifetimes** — `JWT_ACCESS_TTL_SECONDS` (default **900 / 15 min**)
+    and `JWT_REFRESH_TTL_SECONDS` (default **604800 / 7 days**), plus `JWT_ISSUER` /
+    `JWT_AUDIENCE`. `TOKEN_VERSION` is a pinned-in-code global kill-switch.
+  - **`password_changed_at` support** (`token_issued_before`) — the anchor a future
+    password change / forced-logout uses to invalidate every outstanding token by
+    `iat`, for both access and refresh.
+- `backend/security/sessions.py` — `SessionStore`, the DB-backed session (refresh-
+  token family) store. One MongoDB `sessions` document per login/device.
+  - **Rotation on every refresh** — the presented refresh token is single-use; a
+    new `jti` becomes current and the old one is dead.
+  - **Reuse detection** — replaying an already-rotated refresh token (its `jti` no
+    longer current) is treated as theft and **revokes the entire family**, so both
+    attacker and victim are forced to re-login (closes refresh-replay).
+  - **Revocation** — `revoke` (single session / logout) and `revoke_all_for_user`
+    (logout-all-devices); durable, TTL-reaped at `expires_at`.
+  - **PH1.10 groundwork** — captures `user_agent`, `ip`, created/last-used
+    timestamps, and exposes `list_for_user` for the future active-sessions screen.
+- `backend/tests/test_jwt_sessions.py` — 34 hermetic tests: claim set, every
+  rejection path (expired / wrong-aud / wrong-iss / bad-signature / wrong-type /
+  stale-version / missing-claim / garbage), rotation, reuse→family-revoke, revoke,
+  revoke-all, `password_changed_at`, and the full HTTP lifecycle.
+- `POST /api/auth/logout-all` — authenticated "sign out of all devices" endpoint.
+
+Changed
+
+- `backend/server.py` — `create_access_token`/`get_current_user`/`refresh`/`logout`
+  now delegate to `security.jwt` + `security.sessions`; the inline `pyjwt`
+  encode/decode and the old 24h/7d helpers are gone. Login/register/OAuth open a
+  session via a shared `_issue_session` helper (captures device/IP). Refresh
+  rotates **both** cookies. Startup provisions `sessions` indexes (unique
+  `session_id`, `user_id`, TTL on `expires_at`). `import jwt as pyjwt` removed.
+- `backend/security/__init__.py` — tenant index lists `jwt` and `sessions`.
+- `backend/tests/test_cookie_security.py` — the PH1.3 test that asserted refresh
+  does *not* rotate the refresh cookie (explicitly deferred to PH1.6) now asserts
+  the rotated refresh cookie carries the hardened flags.
+
+Migration
+
+- **Clean cutover.** Strict validation rejects pre-PH1.6 tokens (no `aud`/`ver`),
+  so active users re-authenticate once via the normal 401 → login flow on deploy.
+  No data migration. `cookies.py` (cookie `Max-Age`) is unchanged — the access
+  cookie's 24h Max-Age harmlessly outlives the 15-min JWT (expired token →
+  silent refresh); aligning them is a cosmetic PH1.3-owned follow-up.
+
+Risk R-06 closed. Threat-model rows "Stolen long-lived access token" and "Refresh
+token replay" move to ✅ Closed. Note: the roadmap's placeholder `tokens.py` was
+realized as two cohesive modules (`jwt.py` pure crypto + `sessions.py` stateful
+store) and refresh defaults to 7 days (env-tunable to the SECURITY.md 30-day
+target); both deviations are recorded in PRODUCTION_ROADMAP.md PH1.6.
+
+---
+
+# Sprint PH1.4b — HTTP Security Headers — 2026-07-20
+
+**Production Hardening PH1.4b complete. The "no security headers" gap (flagged in
+the PH0 audit and de-scoped from the CORS-only PH1.4) is closed.**
+
+Before this sprint the API emitted **no** security response headers — every
+response could be framed, MIME-sniffed, and leaked referrers, with no transport
+pinning and no content policy. PH1.4b adds the full defensive header set in one
+centralized, environment-driven place, wired *after* CORS so even CORS
+preflight and rejected-origin responses carry the headers. API contracts and
+payloads are unchanged; only response headers are added.
+
+Added
+
+- `backend/security/headers.py` — the single source of truth for HTTP response
+  security headers. No security header may be set anywhere else.
+  - **Middleware** (`SecurityHeadersMiddleware`, `apply_security_headers`) — a
+    pure-ASGI middleware (not `BaseHTTPMiddleware`) chosen so it never buffers
+    the body (safe for streaming/SSE), touches only the `http` scope
+    (WebSocket upgrades pass through), and **enforces** its values (overwriting
+    any inner-handler value so the posture cannot be weakened downstream).
+  - **Emitted on every response:** `X-Content-Type-Options: nosniff`,
+    `X-Frame-Options: DENY`, `Referrer-Policy: strict-origin-when-cross-origin`,
+    a locked-down `Permissions-Policy` (camera/mic/geolocation/USB/… disabled),
+    `Cross-Origin-Opener-Policy: same-origin`,
+    `Cross-Origin-Resource-Policy: same-origin`, `X-XSS-Protection: 0` (the
+    deprecated, buggy legacy auditor neutralized), and a strict
+    `Content-Security-Policy` (`default-src 'none'; base-uri 'none';
+    form-action 'none'; frame-ancestors 'none'`) — **no `unsafe-inline` /
+    `unsafe-eval` anywhere.**
+  - **Conditional:** `Strict-Transport-Security`
+    (`max-age=63072000; includeSubDomains`) is emitted **only** over HTTPS or in
+    production (honors `X-Forwarded-Proto` behind a TLS-terminating proxy;
+    `preload` opt-in) so a plain-HTTP dev origin never pins itself.
+    `Cross-Origin-Embedder-Policy: require-corp` is implemented but **opt-in**
+    (`CROSS_ORIGIN_EMBEDDER_POLICY`) — it protects the API's own JSON not at all
+    yet would break same-origin HTML tooling (Swagger UI) pulling cross-origin
+    subresources without CORP.
+  - **Environment-driven & nonce-capable:** every header value is overridable
+    via environment variable (`CONTENT_SECURITY_POLICY`, `PERMISSIONS_POLICY`,
+    `REFERRER_POLICY`, `X_FRAME_OPTIONS`, `CROSS_ORIGIN_*`, and the `HSTS_*`
+    family). A `{nonce}` placeholder in the CSP is replaced per request with a
+    fresh `secrets.token_urlsafe(16)` nonce, also exposed on
+    `request.state.csp_nonce` for a future HTML handler to stamp onto
+    `<script nonce=…>` tags.
+- `backend/tests/test_security_headers.py` — 35 hermetic tests (no network, no
+  Mongo): HSTS enablement/value and HTTPS/production gating, the strict default
+  CSP and its nonce substitution, the cross-origin isolation family, every
+  environment override, and real wire behavior through the middleware on
+  success, error, CORS-preflight, and nonce-based responses.
+
+Changed
+
+- `backend/server.py` — wires `apply_security_headers(app)` immediately after
+  `apply_cors(app)` (so headers wrap CORS responses too). No other change.
+- `backend/security/__init__.py` — records `security.headers` in the tenant index.
+
+Notes
+
+- **CORP is safe with the credentialed CORS frontend:** `Cross-Origin-Resource-Policy`
+  only governs *no-cors* cross-origin loads, so the frontend's `mode: cors`
+  requests (governed by `security.cors`) are unaffected while the API can no
+  longer be embedded as an opaque subresource.
+- **Swagger UI (`/docs`) and any HTML served from the API origin** will be
+  restricted by the strict `default-src 'none'` CSP; a deployment that needs it
+  relaxes `CONTENT_SECURITY_POLICY` (or, preferably, disables docs in
+  production). No production JSON API endpoint is affected.
+
+Verification
+
+- `pytest backend/tests/test_security_headers.py backend/tests/test_cors_hardening.py
+  backend/tests/test_cookie_security.py backend/tests/test_password_policy.py`
+  → **128 passed** (33 new + 95 regression). Manual: real-app smoke check on
+  `/api` in production mode confirmed all headers present (including HSTS) and
+  the CORS 400 rejection still carries `X-Frame-Options`.
+
+Scope note
+
+- Out of scope and untouched per the sprint definition: JWT/refresh, cookies,
+  OAuth, password policy, CSRF, rate limiting, email verification,
+  infrastructure/Docker, logging, database, and the frontend. Deferred:
+  request-scoped nonce propagation into rendered HTML templates (the header/state
+  plumbing exists now; no HTML is rendered by the API yet).
+
+---
+
 # Sprint PH1.5 — Password Policy & Account Protection — 2026-07-19
 
 **Production Hardening PH1.5 complete. Finding H10 (password half) closed; risk

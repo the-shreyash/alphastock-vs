@@ -1931,10 +1931,38 @@ Finding H10 (password half) closed; R-05 partially mitigated (rate-limiting
 half is PH1.7). Email scope (EmailStr, verification, password reset, SMTP
 decision OR-6) was deliberately split out to PH1.5b. See CHANGELOG.md.
 
-Next Recommended Sprint: **PH1.4b — Security Headers** (HSTS, X-Frame-Options,
-X-Content-Type-Options, Referrer-Policy, Permissions-Policy, CSP), awaiting
-review/approval of PH1.5. Alternatively **PH1.6 — JWT Lifecycle & Refresh
-Rotation**. PH3.1 (Backend Test Suite Repair) may run in parallel.
+PH1.4b (Security Headers) is COMPLETE (2026-07-20): all HTTP response security
+headers are centralized in `backend/security/headers.py` and applied by one
+pure-ASGI `SecurityHeadersMiddleware` (`apply_security_headers(app)`), wired
+*after* CORS so even CORS preflight/rejection responses carry the headers. Every
+response gets `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`,
+`Referrer-Policy: strict-origin-when-cross-origin`, a locked-down
+`Permissions-Policy`, `Cross-Origin-Opener-Policy`/`Cross-Origin-Resource-Policy:
+same-origin`, `X-XSS-Protection: 0` (deprecated auditor neutralized), and a
+strict, nonce-capable CSP (`default-src 'none'; base-uri 'none'; form-action
+'none'; frame-ancestors 'none'` — no `unsafe-*`). `Strict-Transport-Security`
+(`max-age=63072000; includeSubDomains`) is emitted only over HTTPS/production;
+`Cross-Origin-Embedder-Policy: require-corp` is implemented but opt-in. Every
+value is environment-overridable and the CSP supports a `{nonce}` placeholder
+resolved per request (`request.state.csp_nonce`). Guarded by 35 hermetic tests
+in `backend/tests/test_security_headers.py`. The "no security headers" gap is
+closed. See CHANGELOG.md.
+
+PH1.6 (JWT Lifecycle & Session Security) is COMPLETE (2026-07-20): all JWT logic
+centralized in `backend/security/jwt.py` (15-min access, hardened `iat`/`jti`/
+`aud`/`iss`/`ver`/`sid` claim set, strict fail-closed verification, configurable
+lifetimes); refresh-token families / rotation / reuse-detection / revocation in
+`backend/security/sessions.py` (`SessionStore`, MongoDB-backed). Refresh now
+rotates both tokens; a replayed refresh token revokes the whole family. Logout
+revokes the current session; new `POST /api/auth/logout-all` revokes all sessions.
+`password_changed_at` + token `ver` are the global kill-switches. 34 hermetic
+tests in `backend/tests/test_jwt_sessions.py`. Risk R-06 / finding H11 closed.
+See CHANGELOG.md and PRODUCTION_ROADMAP.md PH1.6 (records the tokens.py→jwt.py+
+sessions.py split, Mongo-vs-Redis store, and 7-day refresh default deviations).
+
+Next Recommended Sprint: **PH1.7 — Rate Limiting & Brute-Force Protection**,
+awaiting review/approval of PH1.6. Alternatively **PH1.5b — Email Validation &
+Verification**. PH3.1 (Backend Test Suite Repair) may run in parallel.
 
 Authoritative documents: PRODUCTION_HARDENING.md and PRODUCTION_ROADMAP.md.
 Task tracking below under "Production Hardening Program".
@@ -1943,7 +1971,7 @@ Task tracking below under "Production Hardening Program".
 
 # Production Hardening Program (PH1–PH3)
 
-Status: IN_PROGRESS (PH1.1 + PH1.2 complete 2026-07-17; PH1.3 + PH1.4 complete 2026-07-18; PH1.5 complete 2026-07-19; SI1.1 Repository Audit complete 2026-07-17)
+Status: IN_PROGRESS (PH1.1 + PH1.2 complete 2026-07-17; PH1.3 + PH1.4 complete 2026-07-18; PH1.5 complete 2026-07-19; PH1.4b + PH1.6 complete 2026-07-20; SI1.1 Repository Audit complete 2026-07-17)
 
 Priority: Critical — blocks all other work
 
@@ -1956,10 +1984,10 @@ rollback, estimates) live in PRODUCTION_ROADMAP.md. Status tracker:
 - [x] PH1.2 Google OAuth Production Hardening — COMPLETE (2026-07-17) — Critical
 - [x] PH1.3 Cookie & Session Security — COMPLETE (2026-07-18) — Critical
 - [x] PH1.4 CORS Hardening — COMPLETE (2026-07-18) — Critical
-- [ ] PH1.4b Security Headers (HSTS/CSP/etc., split from PH1.4) — NOT_STARTED — Critical
+- [x] PH1.4b Security Headers (HSTS/CSP/etc., split from PH1.4) — COMPLETE (2026-07-20) — Critical
 - [x] PH1.5 Password Policy & Account Protection (password portion of the roadmap's PH1.5) — COMPLETE (2026-07-19) — High
 - [ ] PH1.5b Email Validation & Verification (EmailStr, verification flow, password reset, SMTP decision OR-6 — split from PH1.5) — NOT_STARTED — High
-- [ ] PH1.6 JWT Lifecycle & Refresh Rotation — NOT_STARTED — High
+- [x] PH1.6 JWT Lifecycle & Refresh Rotation — COMPLETE (2026-07-20) — High
 - [ ] PH1.7 Rate Limiting & Brute-Force Protection — NOT_STARTED — High
 - [ ] PH1.8 Secrets & Environment Hardening — NOT_STARTED — High
 - [ ] PH1.9 Real-Time & WebSocket Security — NOT_STARTED — High

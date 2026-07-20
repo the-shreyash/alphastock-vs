@@ -102,6 +102,26 @@ Architecture reference: every PH1 sprint implements against **SECURITY_ARCHITECT
 
 ## PH1.4b — Security Headers (carried forward)
 
+> **Status (2026-07-20): COMPLETE.** HTTP response security headers are
+> centralized in `backend/security/headers.py` and wired via a single
+> pure-ASGI `SecurityHeadersMiddleware` (`apply_security_headers(app)`),
+> applied *after* CORS so even CORS preflight/rejection responses carry the
+> headers. Emitted on every response: `X-Content-Type-Options: nosniff`,
+> `X-Frame-Options: DENY`, `Referrer-Policy: strict-origin-when-cross-origin`,
+> a locked-down `Permissions-Policy`, `Cross-Origin-Opener-Policy: same-origin`,
+> `Cross-Origin-Resource-Policy: same-origin`, `X-XSS-Protection: 0` (legacy
+> auditor neutralized), and a strict, nonce-capable `Content-Security-Policy`
+> (`default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors
+> 'none'` — no `unsafe-*` anywhere). `Strict-Transport-Security`
+> (`max-age=63072000; includeSubDomains`) is emitted **only** over HTTPS /
+> production. `Cross-Origin-Embedder-Policy: require-corp` is implemented but
+> opt-in (`CROSS_ORIGIN_EMBEDDER_POLICY`) to avoid breaking same-origin HTML
+> tooling. Every header is environment-overridable; the CSP supports a
+> `{nonce}` placeholder resolved per request and exposed on
+> `request.state.csp_nonce`. 35 hermetic tests in
+> `backend/tests/test_security_headers.py`. CORP is safe alongside the
+> credentialed CORS frontend because CORP only blocks *no-cors* loads.
+
 - **Architecture reference:** SECURITY_ARCHITECTURE.md §20 (Security Headers Strategy), §27 (Security Middleware Pipeline).
 - **Objective:** Browsers receive the full defensive header set.
 - **Scope:** Security-header middleware: HSTS, X-Frame-Options, X-Content-Type-Options, Referrer-Policy, Permissions-Policy, and a CSP compatible with the CRA build. (Split out of PH1.4, which delivered CORS only.)
@@ -143,17 +163,23 @@ Architecture reference: every PH1 sprint implements against **SECURITY_ARCHITECT
 
 ## PH1.6 — JWT Lifecycle & Refresh Rotation
 
-- **Architecture reference:** SECURITY_ARCHITECTURE.md §9 (Session Architecture), §11 (JWT Lifecycle), §12 (Refresh Token Lifecycle), §30 (Session Refresh Sequence).
+- **Status:** ✅ **COMPLETE (2026-07-20).** Access token 15 min; refresh token rotation on every use with reuse detection (a replayed refresh revokes the whole family); durable server-side revocation store (MongoDB `sessions` collection); `password_changed_at` + token `ver` global kill-switches; logout revokes the current session and `POST /api/auth/logout-all` revokes every session; device/IP/timestamp capture as PH1.10 groundwork. Centralized in `backend/security/jwt.py` (pure token crypto) + `backend/security/sessions.py` (`SessionStore`). 34 hermetic tests in `backend/tests/test_jwt_sessions.py` (rotation, replay→family-revoke, expired/revoked/wrong-aud/wrong-iss/bad-sig/wrong-type/stale-ver rejection, logout, logout-all, `password_changed_at`). Risk R-06 / finding H11 closed.
+- **Architecture reference:** SECURITY_ARCHITECTURE.md §9 (Session Architecture), §11 (JWT Lifecycle), §12 (Refresh Token Lifecycle), §30 (Session Refresh Sequence), §31 (Logout Sequence).
 - **Objective:** Token lifetimes and rotation per SECURITY.md.
-- **Scope:** Access token 15 min; refresh token 30 days with rotation on every use, reuse detection (revoke family on replay), and a server-side revocation store (Redis); silent-refresh behavior verified in the frontend interceptor; sessions listing groundwork (device/IP capture).
-- **Deliverables:** Token service; revocation store; migration note for existing sessions; tests including replay attack.
-- **Files Expected:** `backend/security/tokens.py`, `backend/server.py`, `frontend/src/services/api.js` (interceptor), `backend/tests/test_token_rotation.py`.
+- **Scope:** Access token 15 min; refresh token with rotation on every use, reuse detection (revoke family on replay), and a durable server-side revocation store; sessions-listing groundwork (device/IP capture).
+- **Deliverables:** Token service; session/revocation store; migration note for existing sessions; tests including replay attack. ✅ All delivered.
+- **Deviations from the original plan (recorded per the rollback/ADR discipline):**
+  - **Module shape:** the placeholder single `backend/security/tokens.py` was realized as **two cohesive modules** — `security/jwt.py` (pure, framework-agnostic token crypto) and `security/sessions.py` (the DB-backed stateful `SessionStore`). Splitting crypto from persistence keeps each single-responsibility and independently testable; matches the one-tenant-per-concern convention of the `security/` package.
+  - **Revocation store backing:** **MongoDB, not Redis.** Rotation with reuse detection needs an *authoritative, durable* record; the `services.cache` (Redis/in-memory) layer is best-effort and evictable, which would silently drop reuse detection. Sessions live in Mongo beside their users and are TTL-reaped. (Rationale in SECURITY_ARCHITECTURE.md §9.)
+  - **Refresh lifetime default:** shipped **7 days** (env `JWT_REFRESH_TTL_SECONDS`), aligned with the existing `refresh_token` cookie `Max-Age`; SECURITY.md's 30-day policy target is reached by config (`=2592000`) without a code change.
+  - **Frontend interceptor & `test_token_rotation.py` filename:** interceptor verification is deferred to the frontend-realtime track (this sprint is backend-scoped; the existing 401→login/refresh interceptor already handles the new behavior); tests live in `test_jwt_sessions.py`.
+- **Files touched:** `backend/security/jwt.py`, `backend/security/sessions.py`, `backend/security/__init__.py`, `backend/server.py`, `backend/tests/test_jwt_sessions.py`, `backend/tests/test_cookie_security.py`.
 - **Dependencies:** PH1.3.
-- **Acceptance Criteria:** Access token expires in 15 min; reused refresh token → 401 + family revoked; users are not visibly logged out during normal use.
-- **Validation Steps:** Time-travel tests (freezegun); manual soak on staging for one session lifetime.
+- **Acceptance Criteria:** ✅ Access token expires in 15 min; reused refresh token → 401 + family revoked; users are not visibly logged out during normal use (rotation is silent).
+- **Validation Steps:** Hermetic time-independent tests (crafted expired/forged tokens instead of freezegun, which is not a project dependency); manual soak on staging for one session lifetime remains a pre-launch item.
 - **Rollback Plan:** Lifetimes are env-configured; revert to previous values without code rollback if UX breaks, and record deviation as an ADR.
 - **Estimated Difficulty:** High. **Estimated Time:** 2 days.
-- **Success Metrics:** Risk R-06 closed; zero support reports of surprise logouts after one week on staging.
+- **Success Metrics:** Risk R-06 closed; zero support reports of surprise logouts after one week on staging (to confirm on staging).
 
 ## PH1.7 — Rate Limiting & Brute-Force Protection
 

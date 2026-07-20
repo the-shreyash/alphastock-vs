@@ -214,8 +214,15 @@ class TestRefresh:
         assert attrs.get("samesite") == "lax"
         assert attrs.get("path") == "/"
         assert attrs.get("max-age") == "86400"
-        # Refresh must not rotate/re-set the refresh token here (PH1.6 owns that).
-        assert _cookie_header(r, "refresh_token") is None
+        # PH1.6: refresh now ROTATES — a fresh refresh token is re-issued through
+        # the same hardened cookie policy on every refresh (the old one is dead).
+        refresh_header = _cookie_header(r, "refresh_token")
+        assert refresh_header is not None
+        refresh_attrs = _attrs(refresh_header)
+        assert refresh_attrs.get("httponly") is True
+        assert refresh_attrs.get("samesite") == "lax"
+        assert refresh_attrs.get("path") == "/"
+        assert refresh_attrs.get("max-age") == "604800"
 
     def test_refresh_without_cookie_rejected(self, client, fake_db, dev_env):
         r = client.post("/api/auth/refresh")
