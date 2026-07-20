@@ -20,6 +20,8 @@ import asyncio
 import logging
 from typing import Any, Dict, List, Optional, Tuple
 
+from services.market_engine.event_bus import event_bus
+
 logger = logging.getLogger(__name__)
 
 # Dimension weights (sum to 1.0)
