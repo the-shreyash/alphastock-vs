@@ -1,5 +1,5 @@
 import { lazy, Suspense } from "react";
-import { BrowserRouter, Routes, Route, Navigate, useLocation } from "react-router-dom";
+import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
 import { AuthProvider, useAuth } from "./context/AuthContext";
 import { ThemeProvider } from "./context/ThemeContext";
 import { RealtimeProvider } from "./context/RealtimeProvider";
@@ -86,17 +86,13 @@ function PublicRoute({ children }) {
 }
 
 function AppRouter() {
-  const location = useLocation();
-  if (location.hash?.includes("session_id=")) {
-    return <AuthCallback />;
-  }
-
   return (
     <Suspense fallback={<PageFallback />}>
     <Routes>
       <Route path="/" element={<PublicRoute><Landing /></PublicRoute>} />
       <Route path="/login" element={<PublicRoute><Login /></PublicRoute>} />
       <Route path="/register" element={<PublicRoute><Register /></PublicRoute>} />
+      <Route path="/auth/google/callback" element={<AuthCallback />} />
       <Route path="/broker/callback" element={<BrokerCallback />} />
       <Route path="/" element={<ProtectedRoute><Layout /></ProtectedRoute>}>
         <Route path="dashboard" element={<Dashboard />} />

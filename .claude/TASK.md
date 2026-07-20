@@ -1870,9 +1870,99 @@ cookies, broken Docker packaging, no CI/CD, no rate limiting, mock data in
 admin analytics, no frontend tests. No new product features ship until
 Production Certification.
 
-Next Recommended Sprint: **PH1.1 — Authentication Backdoor Removal**
-(remove `GET /api/auth/auto-login` and the Google OAuth demo/mock fallbacks).
-PH3.1 (Backend Test Suite Repair) may run in parallel.
+PH1.1 (Authentication Backdoor Removal) is COMPLETE (2026-07-17): the
+auto-login endpoint, the Google OAuth demo/mock/legacy fallbacks, and the
+startup admin seeding (default password + plaintext credentials file) are
+removed; dev admin creation now lives in `backend/scripts/seed_dev_admin.py`
+(refuses to run in production); guarded by `backend/tests/test_auth_hardening.py`.
+
+PH1.2 (Google OAuth Production Hardening) is COMPLETE (2026-07-17): the OAuth
+flow now enforces a CSRF `state` (backend-issued httponly cookie double-submit
+**plus a single-use server-side record for replay protection and authoritative
+TTL expiry, via Redis/in-memory `services/cache.py`**), cryptographically
+verifies the Google id_token (signature + issuer + audience) and requires
+`email_verified`, allowlists and binds the redirect_uri (no hardcoded dev
+fallback), uses the Google **`sub` as the primary identity** (verified email for
+safe linking; `sub_conflict` rejected) without creating duplicates, and writes
+**immutable OAuth security-audit events** (`security_audit_logs`). Guarded by 26
+hermetic tests in `backend/tests/test_oauth_hardening.py`. Risk R-02 fully
+closed. See CHANGELOG.md.
+
+PH1.3 (Cookie & Session Security) is COMPLETE (2026-07-18): every authentication
+cookie is production-hardened and centralized in `backend/security/cookies.py` —
+`Secure` forced when `APP_ENV=production` (env-driven `COOKIE_SECURE` in dev),
+`HttpOnly` + `SameSite` on all cookies, `Path`/`Domain`/`Max-Age` from one policy,
+and clearing that matches the set attributes so logout reliably removes every
+cookie. The Google OAuth-state cookie now shares this unified posture (never
+`Strict`; burned after use). Session fixation is mitigated (login/register/OAuth
+mint fresh tokens that overwrite in place). Guarded by 24 hermetic tests in
+`backend/tests/test_cookie_security.py`. Finding B4 and risk R-04 closed. CSRF
+**token** middleware and refresh-token rotation are intentionally deferred
+(SameSite=Lax provides the cookie-layer CSRF baseline now; rotation is PH1.6).
+See CHANGELOG.md.
+
+PH1.4 (CORS Hardening) is COMPLETE (2026-07-18): the wildcard-with-credentials
+CORS default is removed and the policy is centralized in
+`backend/security/cors.py`. Origins resolve from an environment-driven,
+exact-match allowlist (`CORS_ALLOWED_ORIGINS` canonical; legacy `CORS_ORIGINS`/
+`FRONTEND_URL` still honored), with `*` stripped from every source so a wildcard
+can never pair with credentials. Development falls back to `localhost:3000`/
+`localhost:5173`; production assumes nothing (fail closed). Methods and request
+headers are restricted; no response headers are exposed. `server.py` wires it in
+via `apply_cors(app)`. Guarded by 30 hermetic tests in
+`backend/tests/test_cors_hardening.py`. Finding B3 and risk R-03 closed.
+Security **headers** (HSTS/CSP/etc.) were de-scoped from this CORS-only sprint
+and are carried forward as PH1.4b. See CHANGELOG.md.
+
+PH1.5 (Password Policy & Account Protection) is COMPLETE (2026-07-19): password
+policy is centralized in `backend/security/passwords.py` — the only place
+passwords are validated, hashed, or verified. New passwords must be 12–64 chars
+(≤72 UTF-8 bytes) with upper/lower/number/special, and must not be common
+(bundled blocklist), email-/name-derived, repeated-character, or sequential;
+enforced at the model layer on `UserCreate` (422, actionable messages, input
+never echoed — a sanitizing RequestValidationError handler strips FastAPI's
+default input reflection). bcrypt cost is now explicit (12); `verify_password`
+never raises (fixed a 500 on password login against Google-native accounts) and
+timing-equalizes failures via a dummy-hash comparison, so login cannot reveal
+whether an email exists. Existing users, API contracts, and the `ip:email`
+lockout (5/15min, now hermetically testable via FakeDB `$inc`) are preserved.
+Guarded by 40 hermetic tests in `backend/tests/test_password_policy.py`.
+Finding H10 (password half) closed; R-05 partially mitigated (rate-limiting
+half is PH1.7). Email scope (EmailStr, verification, password reset, SMTP
+decision OR-6) was deliberately split out to PH1.5b. See CHANGELOG.md.
+
+PH1.4b (Security Headers) is COMPLETE (2026-07-20): all HTTP response security
+headers are centralized in `backend/security/headers.py` and applied by one
+pure-ASGI `SecurityHeadersMiddleware` (`apply_security_headers(app)`), wired
+*after* CORS so even CORS preflight/rejection responses carry the headers. Every
+response gets `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`,
+`Referrer-Policy: strict-origin-when-cross-origin`, a locked-down
+`Permissions-Policy`, `Cross-Origin-Opener-Policy`/`Cross-Origin-Resource-Policy:
+same-origin`, `X-XSS-Protection: 0` (deprecated auditor neutralized), and a
+strict, nonce-capable CSP (`default-src 'none'; base-uri 'none'; form-action
+'none'; frame-ancestors 'none'` — no `unsafe-*`). `Strict-Transport-Security`
+(`max-age=63072000; includeSubDomains`) is emitted only over HTTPS/production;
+`Cross-Origin-Embedder-Policy: require-corp` is implemented but opt-in. Every
+value is environment-overridable and the CSP supports a `{nonce}` placeholder
+resolved per request (`request.state.csp_nonce`). Guarded by 35 hermetic tests
+in `backend/tests/test_security_headers.py`. The "no security headers" gap is
+closed. See CHANGELOG.md.
+
+PH1.6 (JWT Lifecycle & Session Security) is COMPLETE (2026-07-20): all JWT logic
+centralized in `backend/security/jwt.py` (15-min access, hardened `iat`/`jti`/
+`aud`/`iss`/`ver`/`sid` claim set, strict fail-closed verification, configurable
+lifetimes); refresh-token families / rotation / reuse-detection / revocation in
+`backend/security/sessions.py` (`SessionStore`, MongoDB-backed). Refresh now
+rotates both tokens; a replayed refresh token revokes the whole family. Logout
+revokes the current session; new `POST /api/auth/logout-all` revokes all sessions.
+`password_changed_at` + token `ver` are the global kill-switches. 34 hermetic
+tests in `backend/tests/test_jwt_sessions.py`. Risk R-06 / finding H11 closed.
+See CHANGELOG.md and PRODUCTION_ROADMAP.md PH1.6 (records the tokens.py→jwt.py+
+sessions.py split, Mongo-vs-Redis store, and 7-day refresh default deviations).
+
+Next Recommended Sprint: **PH1.7 — Rate Limiting & Brute-Force Protection**,
+awaiting review/approval of PH1.6. Alternatively **PH1.5b — Email Validation &
+Verification**. PH3.1 (Backend Test Suite Repair) may run in parallel.
 
 Authoritative documents: PRODUCTION_HARDENING.md and PRODUCTION_ROADMAP.md.
 Task tracking below under "Production Hardening Program".
@@ -1881,7 +1971,7 @@ Task tracking below under "Production Hardening Program".
 
 # Production Hardening Program (PH1–PH3)
 
-Status: NOT_STARTED (awaiting PH1 implementation approval)
+Status: IN_PROGRESS (PH1.1 + PH1.2 complete 2026-07-17; PH1.3 + PH1.4 complete 2026-07-18; PH1.5 complete 2026-07-19; PH1.4b + PH1.6 complete 2026-07-20; SI1.1 Repository Audit complete 2026-07-17)
 
 Priority: Critical — blocks all other work
 
@@ -1890,12 +1980,14 @@ rollback, estimates) live in PRODUCTION_ROADMAP.md. Status tracker:
 
 ## PH1 — Production Security Hardening
 
-- [ ] PH1.1 Authentication Backdoor Removal — NOT_STARTED — Critical
-- [ ] PH1.2 Google OAuth Production Flow — NOT_STARTED — Critical
-- [ ] PH1.3 Cookie & Session Security — NOT_STARTED — Critical
-- [ ] PH1.4 CORS & Security Headers — NOT_STARTED — Critical
-- [ ] PH1.5 Password Policy, Validation & Email Verification — NOT_STARTED — High
-- [ ] PH1.6 JWT Lifecycle & Refresh Rotation — NOT_STARTED — High
+- [x] PH1.1 Authentication Backdoor Removal — COMPLETE (2026-07-17) — Critical
+- [x] PH1.2 Google OAuth Production Hardening — COMPLETE (2026-07-17) — Critical
+- [x] PH1.3 Cookie & Session Security — COMPLETE (2026-07-18) — Critical
+- [x] PH1.4 CORS Hardening — COMPLETE (2026-07-18) — Critical
+- [x] PH1.4b Security Headers (HSTS/CSP/etc., split from PH1.4) — COMPLETE (2026-07-20) — Critical
+- [x] PH1.5 Password Policy & Account Protection (password portion of the roadmap's PH1.5) — COMPLETE (2026-07-19) — High
+- [ ] PH1.5b Email Validation & Verification (EmailStr, verification flow, password reset, SMTP decision OR-6 — split from PH1.5) — NOT_STARTED — High
+- [x] PH1.6 JWT Lifecycle & Refresh Rotation — COMPLETE (2026-07-20) — High
 - [ ] PH1.7 Rate Limiting & Brute-Force Protection — NOT_STARTED — High
 - [ ] PH1.8 Secrets & Environment Hardening — NOT_STARTED — High
 - [ ] PH1.9 Real-Time & WebSocket Security — NOT_STARTED — High

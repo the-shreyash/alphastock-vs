@@ -164,4 +164,3 @@ Detailed developer instructions and architecture designs are stored in the `.cla
 - **Security & Vulnerability disclosure:** [SECURITY.md](file:///Users/shreyash12/Files/alpha_stock/alpha-stock-main/SECURITY.md)
 - **Technical & product support:** [SUPPORT.md](file:///Users/shreyash12/Files/alpha_stock/alpha-stock-main/SUPPORT.md)
 - **License Agreement:** [LICENSE](file:///Users/shreyash12/Files/alpha_stock/alpha-stock-main/LICENSE)
-# Here are your Instructions

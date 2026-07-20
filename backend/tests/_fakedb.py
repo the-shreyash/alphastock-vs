@@ -101,6 +101,9 @@ class FakeCollection:
             if _match(d, flt or {}):
                 if "$set" in update:
                     d.update(update["$set"])
+                if "$inc" in update:
+                    for k, v in update["$inc"].items():
+                        d[k] = d.get(k, 0) + v
                 return _Result(modified=1, matched=1)
         if upsert:
             newd = {}
@@ -112,6 +115,9 @@ class FakeCollection:
                     newd[k] = v
             if "$set" in update:
                 newd.update(update["$set"])
+            if "$inc" in update:
+                for k, v in update["$inc"].items():
+                    newd[k] = newd.get(k, 0) + v
             self.docs.append(newd)
         return _Result(modified=0, matched=0)
 

@@ -1,7 +1,7 @@
 # StockAssist AI
 ## Documentation Index
 
-Version: 1.2
+Version: 1.3
 
 Status: Feature Freeze — Production Hardening (PH1–PH3)
 
@@ -92,6 +92,8 @@ ROADMAP.md
 
 SYSTEM_ARCHITECTURE.md
 
+SECURITY_ARCHITECTURE.md
+
 REALTIME_SYSTEM.md
 
 MARKET_DATA_ARCHITECTURE.md
@@ -107,6 +109,11 @@ MARKET_ENGINE.md
 SECURITY.md
 
 DEPLOYMENT.md
+
+Relationship: SYSTEM_ARCHITECTURE.md's Authentication/Authorization sections
+defer to SECURITY_ARCHITECTURE.md for engineering depth. SECURITY.md is the
+operational policy summary of SECURITY_ARCHITECTURE.md — read SECURITY.md for
+the rules, SECURITY_ARCHITECTURE.md for how the code enforces them.
 
 3. AI Documents
 
@@ -239,6 +246,29 @@ Backend
 Architecture
 
 Infrastructure
+
+---
+
+SECURITY_ARCHITECTURE.md
+
+Purpose
+
+Single source of truth for security architecture: threat model, trust
+boundaries, authentication/authorization design, cookie/JWT/OAuth lifecycle,
+CORS/CSRF/rate-limiting strategy, sequence diagrams, and implemented-vs-planned
+status for every PH1 control.
+
+Read When
+
+Authentication
+
+Authorization
+
+Security
+
+Any PH1 sprint
+
+Any code touching sessions, cookies, CORS, or OAuth
 
 ---
 
@@ -670,6 +700,8 @@ PRODUCTION_ROADMAP.md
 
 SECURITY.md
 
+SECURITY_ARCHITECTURE.md
+
 DEPLOYMENT.md
 
 TESTING.md
@@ -812,6 +844,8 @@ DATABASE.md
 
 SECURITY.md
 
+SECURITY_ARCHITECTURE.md
+
 API_REFERENCE.md
 
 SYSTEM_ARCHITECTURE.md
@@ -831,6 +865,8 @@ SUBSCRIPTIONS.md
 PAYMENT_SYSTEM.md
 
 SECURITY.md
+
+SECURITY_ARCHITECTURE.md
 
 ---
 
@@ -984,7 +1020,7 @@ Priority Order
 
 7. DATABASE.md
 
-8. SECURITY.md
+8. SECURITY.md / SECURITY_ARCHITECTURE.md (SECURITY_ARCHITECTURE.md is authoritative for implementation detail; SECURITY.md is authoritative for operational policy)
 
 9. Remaining Documentation
 
@@ -1033,6 +1069,17 @@ If implementing AI, Broker, Portfolio, Scanner, Dashboard, or Notifications, rea
 ---
 
 # Documentation Changelog
+
+## Version 1.3 — 2026-07-18
+
+Major Changes
+
+- Created SECURITY_ARCHITECTURE.md — the single source of truth for security architecture (threat model, trust boundaries, authentication/authorization design, cookie/JWT/OAuth lifecycle, CORS/CSRF/rate-limiting strategy, sequence diagrams). Synthesizes PH1.1–PH1.4 (auth backdoor removal, Google OAuth hardening, cookie security, CORS hardening).
+- Added SECURITY_ARCHITECTURE.md to the Architecture Documents section and Documentation Priority list.
+- SECURITY.md trimmed to an operational policy summary; detailed engineering content (OAuth flow, cookie policy, CORS policy) moved to SECURITY_ARCHITECTURE.md and replaced with references.
+- SYSTEM_ARCHITECTURE.md's Authentication/Authorization sections now defer to SECURITY_ARCHITECTURE.md.
+- PRODUCTION_HARDENING.md and PRODUCTION_ROADMAP.md cross-reference SECURITY_ARCHITECTURE.md; every PH1 sprint (PH1.1–PH1.12) now cites the specific section(s) it implements or extends.
+- Identified and recorded two previously-unowned gaps: a CSRF token middleware layer (no PH1 sprint currently owns it) and a password-reset flow (folded into PH1.5 scope).
 
 ## Version 1.2 — 2026-07-17
 

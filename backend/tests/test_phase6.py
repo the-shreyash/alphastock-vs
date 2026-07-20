@@ -4,14 +4,17 @@ import pytest
 import requests
 
 BASE_URL = os.environ.get("REACT_APP_BACKEND_URL", "http://localhost:8000").rstrip("/")
+ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "admin@alphapartner.com")
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin123")
 
 
 @pytest.fixture(scope="module")
 def session():
     s = requests.Session()
-    # Auto-login to obtain JWT cookies + bearer
-    r = s.get(f"{BASE_URL}/api/auth/auto-login", timeout=20)
-    assert r.status_code == 200, f"auto-login failed: {r.status_code} {r.text}"
+    # Credential login to obtain JWT cookies + bearer
+    r = s.post(f"{BASE_URL}/api/auth/login",
+               json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD}, timeout=20)
+    assert r.status_code == 200, f"admin login failed: {r.status_code} {r.text}"
     token = r.json().get("token")
     s.headers.update({"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
     return s
@@ -124,14 +127,15 @@ class TestStockSearch:
         assert isinstance(r.json(), list)
 
 
-# ---- Auto-login still healthy ----
-class TestAutoLogin:
-    def test_auto_login_returns_token(self):
-        r = requests.get(f"{BASE_URL}/api/auth/auto-login", timeout=15)
+# ---- Credential login still healthy ----
+class TestAdminLogin:
+    def test_admin_login_returns_token(self):
+        r = requests.post(f"{BASE_URL}/api/auth/login",
+                          json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD}, timeout=15)
         assert r.status_code == 200
         d = r.json()
         assert d.get("token")
-        assert d.get("email") == "admin@alphapartner.com"
+        assert d.get("email") == ADMIN_EMAIL
 
 
 # ---- Existing surfaces still healthy (regression) ----

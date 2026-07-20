@@ -1,15 +1,17 @@
 # StockAssist AI
 ## Security Documentation
 
-Version: 1.1
+Version: 1.2
 
-Status: Active Development
+Status: Active Development — PH1.4b complete (2026-07-20)
 
 ---
 
 # Purpose
 
-This document defines every security requirement for StockAssist AI.
+This document is the high-level, operational security guide for StockAssist AI: the rules, policies, and checklists every developer follows day to day.
+
+For the engineering-depth blueprint — exact module design, request/OAuth/refresh/logout sequence diagrams, threat model, trust boundaries, and the authoritative record of what is implemented versus planned — see **SECURITY_ARCHITECTURE.md**, the single source of truth for all security architecture decisions. Where this document and SECURITY_ARCHITECTURE.md appear to differ on implementation detail, SECURITY_ARCHITECTURE.md is authoritative; it is derived directly from the codebase.
 
 Security is not a feature.
 
@@ -121,9 +123,9 @@ Supported
 
 Email & Password
 
-Future
+Google OAuth (hardened — see Google OAuth Security below)
 
-Google OAuth
+Future
 
 GitHub OAuth
 
@@ -135,11 +137,37 @@ Magic Links
 
 ---
 
+# Google OAuth Security
+
+The Google OAuth flow is fail-closed and follows OAuth 2.0 / OpenID Connect
+best practices (hardened in PH1.2).
+
+Summary: server-side authorization-code exchange only, CSRF `state`
+double-submit plus single-use server-side replay protection, cryptographic
+`id_token` verification, a mandatory `email_verified` gate, an allowlisted
+redirect URI bound to the flow's state, `sub`-first identity resolution with
+safe account linking, and immutable audit logging of every outcome. Missing
+Google credentials fail closed (401, no session).
+
+Full design, rationale, and the OAuth login sequence diagram:
+**SECURITY_ARCHITECTURE.md §13 (Google OAuth Architecture)** and **§29 (OAuth
+Login Sequence)**.
+
+---
+
 # Password Policy
+
+Status: ENFORCED since PH1.5 (2026-07-19) for all new passwords, centralized
+in `backend/security/passwords.py` and applied at the model layer (422 before
+hashing). Existing accounts are unaffected — login never re-validates policy.
 
 Minimum Length
 
 12 Characters
+
+Maximum Length
+
+64 Characters (and 72 UTF-8 bytes — the bcrypt truncation boundary)
 
 Require
 
@@ -151,9 +179,29 @@ Number
 
 Special Character
 
+Reject
+
+Common passwords (bundled blocklist, padding-resistant matching)
+
+Password equal to or containing the user's email or name
+
+Repeated-character passwords (fewer than 5 unique characters)
+
+Sequential passwords (alphabet, digit, or keyboard-row runs, either direction)
+
+Leading/trailing whitespace is stripped before validation and hashing.
+
 Never store passwords in plain text.
 
 Hash passwords using Argon2 or bcrypt with a strong cost factor.
+(Implemented: bcrypt with explicit cost factor 12.)
+
+Login failures are generic and timing-equalized — the response never reveals
+whether the email exists, and validation errors never echo the submitted
+password.
+
+Full design and rationale: **SECURITY_ARCHITECTURE.md §15 (Password Security
+Architecture)**.
 
 ---
 
@@ -193,6 +241,8 @@ Rotate refresh tokens after use.
 
 Immediately revoke compromised tokens.
 
+**Implemented (PH1.6):** access-token lifetime is 15 minutes and refresh tokens rotate on every use with reuse detection (a replayed refresh revokes the whole family) — see SECURITY_ARCHITECTURE.md §11/§12. Both lifetimes are env-configurable (`JWT_ACCESS_TTL_SECONDS`, `JWT_REFRESH_TTL_SECONDS`); the shipped **default refresh lifetime is 7 days** (aligned with the `refresh_token` cookie Max-Age). Deployments that want the 30-day policy target above set `JWT_REFRESH_TTL_SECONDS=2592000`. Server-side revocation is durable (MongoDB `sessions` collection); token `ver` and `password_changed_at` provide platform-wide and per-user kill-switches for compromised tokens.
+
 ---
 
 # Session Management
@@ -220,6 +270,28 @@ View Active Sessions
 Logout Specific Session
 
 Logout All Sessions
+
+**Implemented (PH1.6):** each login/registration/OAuth opens a durable session (refresh-token family) that captures `session_id`, `user_agent`, `ip`, created/last-used timestamps, and absolute expiry — the data-model groundwork for the "active sessions" screen. `POST /api/auth/logout` revokes the current session; `POST /api/auth/logout-all` revokes every session for the user (`SessionStore.revoke_all_for_user`). The user-facing "View Active Sessions / Logout Specific Session" **UI** and device/country enrichment are PH1.10.
+
+---
+
+# Cookie Security
+
+Authentication cookies are the browser's session credential and are hardened
+centrally in `backend/security/cookies.py` (PH1.3). No auth cookie is set or
+cleared anywhere else, so the policy cannot drift across call sites.
+
+Cookies in use: `access_token` and `refresh_token` (session, Path `/`) and
+`g_oauth_state` (short-lived Google OAuth CSRF state, Path `/api/auth`,
+single-use). All three are always `HttpOnly`; `Secure` is forced `True` in
+production regardless of environment override; `SameSite` defaults to `Lax`
+and is configurable. Clearing mirrors the exact attributes used when setting,
+so browsers actually delete the cookie. Session fixation is structurally
+prevented: login, registration, and Google OAuth all mint fresh tokens and
+overwrite cookies in place.
+
+Full policy table, design rationale, and defaults:
+**SECURITY_ARCHITECTURE.md §10 (Cookie Architecture)**.
 
 ---
 
@@ -249,7 +321,8 @@ Never trust frontend role checks.
 
 # Fine-Grained Permissions
 
-Permissions include
+Target design (not yet implemented — see SECURITY_ARCHITECTURE.md §8 for the
+gap and current state). Planned permissions include
 
 View Portfolio
 
@@ -268,6 +341,10 @@ Manage AI
 Manage Feature Flags
 
 Each permission is individually configurable.
+
+Authorization today is role-based, not permission-based: `require_admin` gates
+`/api/admin/*` on `role ∈ {admin, super_admin}`. No PH1 sprint currently owns
+building the fine-grained system described above.
 
 ---
 
@@ -352,6 +429,10 @@ Admin
 Configurable
 
 Different endpoints may have stricter limits.
+
+Not yet implemented platform-wide (PH1.7). A narrower mechanism already exists
+today: login attempts are locked out per `ip:email` after 5 failures for 15
+minutes. See SECURITY_ARCHITECTURE.md §21 (Rate Limiting Strategy).
 
 ---
 
@@ -643,9 +724,10 @@ Reject unauthorized subscriptions.
 
 Protect state-changing endpoints.
 
-Use SameSite cookies where applicable.
-
-Validate CSRF tokens when using cookie-based authentication.
+`SameSite=Lax` on all auth cookies is the current baseline (withholds cookies
+on cross-site sub-requests). A dedicated CSRF token layer for cookie-based,
+state-changing routes is designed but **not yet scheduled to a PH1 sprint** —
+see SECURITY_ARCHITECTURE.md §18 for the gap and the recommended next step.
 
 ---
 
@@ -691,29 +773,52 @@ Only trusted origins.
 
 # CORS Policy
 
-Allow only trusted origins.
+Cross-Origin Resource Sharing is production-hardened and centralized in
+`backend/security/cors.py` (PH1.4). It is the single place CORS is configured;
+`server.py` wires it in via `apply_cors(app)`. The previous
+wildcard-with-credentials default has been removed.
 
-Block unknown origins.
+Summary: `CORS_ALLOWED_ORIGINS` is the canonical, exact-match origin allowlist
+(legacy `CORS_ORIGINS`/`FRONTEND_URL` still honored). A literal `*` is stripped
+from every source, so a wildcard can never enter the allowlist or pair with
+credentials. Development falls back to `http://localhost:3000` /
+`http://localhost:5173` only when nothing is configured and `APP_ENV` is not
+`production`; production assumes nothing and fails closed (empty allowlist →
+every cross-origin request rejected). Methods and headers are enumerated, not
+wildcarded; no response headers are exposed.
 
-Restrict credentials appropriately.
+Full origin-resolution precedence, environment variables, and rationale:
+**SECURITY_ARCHITECTURE.md §19 (CORS Strategy)**.
 
 ---
 
 # Security Headers
 
-Enable
+**Implemented and centralized in `backend/security/headers.py` (PH1.4b).** A
+single pure-ASGI `SecurityHeadersMiddleware` (`apply_security_headers(app)`,
+wired after CORS) stamps the security headers on **every** response — the only
+place security response headers are set. Every value is environment-overridable;
+the CSP is nonce-capable (`{nonce}` placeholder → per-request nonce, also on
+`request.state.csp_nonce`) for future HTML rendering.
 
-HSTS
+Emitted on every response:
 
-X-Frame-Options
+- `X-Content-Type-Options: nosniff`
+- `X-Frame-Options: DENY`
+- `Referrer-Policy: strict-origin-when-cross-origin`
+- `Permissions-Policy` — powerful features (camera, mic, geolocation, USB, …) disabled
+- `Cross-Origin-Opener-Policy: same-origin`
+- `Cross-Origin-Resource-Policy: same-origin` (safe with the credentialed CORS frontend — CORP only blocks *no-cors* loads)
+- `X-XSS-Protection: 0` — deprecated legacy auditor neutralized (superseded by CSP)
+- `Content-Security-Policy: default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'` — strict API lockdown, **no `unsafe-*`**
 
-X-Content-Type-Options
+Conditional:
 
-Referrer-Policy
+- `Strict-Transport-Security: max-age=63072000; includeSubDomains` — only over HTTPS / production (honors `X-Forwarded-Proto` behind a proxy; `preload` opt-in)
+- `Cross-Origin-Embedder-Policy: require-corp` — implemented, opt-in via `CROSS_ORIGIN_EMBEDDER_POLICY`
 
-Permissions-Policy
-
-Content-Security-Policy
+Full header matrix, environment variables, and rationale:
+**SECURITY_ARCHITECTURE.md §20 (Security Headers Strategy)**.
 
 ---
 

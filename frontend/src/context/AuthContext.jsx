@@ -19,18 +19,10 @@ export function AuthProvider({ children }) {
     }
   }, []);
 
-  const autoLogin = async () => {
-    resetRefreshState();
-    const { data } = await api.get("/auth/auto-login");
-    if (data.token) localStorage.setItem("token", data.token);
-    setUser(data);
-    return data;
-  };
-
   useEffect(() => {
-    // CRITICAL: If returning from OAuth callback, skip the /me check.
-    // AuthCallback will exchange the session_id and establish the session first.
-    if (window.location.hash?.includes('session_id=')) {
+    // If we are on the Google OAuth callback route, let AuthCallback perform the
+    // code+state exchange and establish the session before we probe /me.
+    if (window.location.pathname.startsWith('/auth/google/callback')) {
       setLoading(false);
       return;
     }
@@ -65,7 +57,7 @@ export function AuthProvider({ children }) {
   };
 
   return (
-    <AuthContext.Provider value={{ user, loading, login, register, logout, checkAuth, autoLogin }}>
+    <AuthContext.Provider value={{ user, loading, login, register, logout, checkAuth }}>
       {children}
     </AuthContext.Provider>
   );

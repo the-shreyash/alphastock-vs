@@ -7,13 +7,10 @@ load_dotenv(ROOT_DIR / '.env', override=True)
 
 from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Depends, Header, WebSocket, WebSocketDisconnect, BackgroundTasks
 from pydantic import BaseModel
-from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
 import os
 import logging
-import bcrypt
-import jwt as pyjwt
 import secrets
 import httpx
 import json
@@ -21,6 +18,7 @@ import asyncio
 import uuid
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Set
+from urllib.parse import urlencode
 
 from services.alpha_vantage import get_global_quote as av_get_quote, get_intraday_data as av_intraday, is_configured as av_configured
 # Legacy single-session Zerodha shim (data-sources status + startup log only).
@@ -30,6 +28,25 @@ from services.broker_engine import broker_engine
 from services.brokers.base import BrokerAuthError, BrokerError
 from services.brokers.stream import stream_manager
 from services.scheduler import setup_scheduler
+
+# Centralized authentication-cookie policy (PH1.3). Every auth cookie is set or
+# cleared through this module so the Secure/HttpOnly/SameSite/Path/Max-Age
+# posture stays consistent across login, register, refresh, logout and OAuth.
+from security.cookies import (
+    set_auth_cookies,
+    set_access_cookie,
+    clear_auth_cookies,
+    set_oauth_state_cookie,
+    clear_oauth_state_cookie,
+)
+from security.cors import apply_cors
+from security.headers import apply_security_headers
+
+# Centralized password policy + hashing primitives (PH1.5). Passwords are
+# hashed/verified ONLY through this module (explicit bcrypt cost, safe
+# verification that never raises on empty/malformed hashes, timing-equalized
+# failures). Policy validation for new passwords lives on the UserCreate model.
+from security.passwords import hash_password, verify_password
 
 from models import (
     UserCreate, UserLogin, UserResponse, UserSettingsUpdate,
@@ -146,25 +163,62 @@ async def broker_error_handler(request, exc: BrokerError):
     return _JSONResponse(status_code=status, content={"detail": exc.user_message, "code": exc.code})
 
 
-# JWT Config
-JWT_ALGORITHM = "HS256"
+# Request-validation errors must never echo the submitted values back (PH1.5).
+# FastAPI's default 422 handler includes each error's `input` — for an auth
+# payload that would reflect the raw password to the client (and into any
+# response logging). Strip errors down to loc/msg/type: same shape the
+# frontend already consumes (detail[].msg), minus the reflected input.
+from fastapi.exceptions import RequestValidationError
 
-def get_jwt_secret():
-    return os.environ["JWT_SECRET"]
+@app.exception_handler(RequestValidationError)
+async def validation_error_handler(request, exc: RequestValidationError):
+    sanitized = [
+        {"loc": e.get("loc", []), "msg": e.get("msg", "Invalid input"), "type": e.get("type", "validation_error")}
+        for e in exc.errors()
+    ]
+    return _JSONResponse(status_code=422, content={"detail": sanitized})
 
-def hash_password(password: str) -> str:
-    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
 
-def verify_password(plain: str, hashed: str) -> bool:
-    return bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
+# JWT & Session Config (PH1.6)
+# All token crypto lives in security.jwt (issuance/verification/claims); the
+# refresh-token family / rotation / revocation state lives in the DB-backed
+# security.sessions.SessionStore. server.py only composes the two: it never
+# encodes/decodes a JWT or writes a session document by hand. See
+# SECURITY_ARCHITECTURE.md §9/§11/§12.
+from security import jwt as jwt_service
+from security.sessions import (
+    SessionStore,
+    ROTATED, REUSE_DETECTED, REVOKED, EXPIRED, NOT_FOUND,
+    REASON_LOGOUT,
+)
 
-def create_access_token(user_id: str, email: str) -> str:
-    payload = {"sub": user_id, "email": email, "exp": datetime.now(timezone.utc) + timedelta(hours=24), "type": "access"}
-    return pyjwt.encode(payload, get_jwt_secret(), algorithm=JWT_ALGORITHM)
 
-def create_refresh_token(user_id: str) -> str:
-    payload = {"sub": user_id, "exp": datetime.now(timezone.utc) + timedelta(days=7), "type": "refresh"}
-    return pyjwt.encode(payload, get_jwt_secret(), algorithm=JWT_ALGORITHM)
+def create_access_token(user_id: str, email: str, session_id: Optional[str] = None) -> str:
+    """Mint an access token. ``session_id`` binds the token to a refresh-token
+    family; when omitted (the test-harness / ad-hoc bearer path) a standalone
+    id is generated so the token is still fully valid — access verification is
+    stateless and does not require the session to exist in the store."""
+    return jwt_service.create_access_token(
+        user_id, email, session_id or jwt_service.new_jti()
+    )
+
+
+async def _issue_session(user_id: str, email: str, request: Request,
+                         response: Response) -> str:
+    """Open a fresh session and set both auth cookies (login / register / OAuth).
+
+    Allocates the first refresh ``jti``, records the session (with device/IP
+    context for PH1.10), then mints an access + refresh pair carrying the new
+    ``sid``. Returns the access token (echoed in the JSON body for the SPA)."""
+    refresh_jti = jwt_service.new_jti()
+    ua = request.headers.get("user-agent") if request else None
+    ip = request.client.host if (request and request.client) else None
+    session_id = await SessionStore(db).create(user_id, refresh_jti, user_agent=ua, ip=ip)
+    access = jwt_service.create_access_token(user_id, email, session_id)
+    refresh = jwt_service.create_refresh_token(user_id, session_id, refresh_jti)
+    set_auth_cookies(response, access, refresh)
+    return access
+
 
 async def get_current_user(request: Request) -> dict:
     token = request.cookies.get("access_token")
@@ -175,23 +229,27 @@ async def get_current_user(request: Request) -> dict:
     if not token:
         raise HTTPException(status_code=401, detail="Not authenticated")
     try:
-        payload = pyjwt.decode(token, get_jwt_secret(), algorithms=[JWT_ALGORITHM])
-        if payload.get("type") != "access":
-            raise HTTPException(status_code=401, detail="Invalid token type")
-        user = await db.users.find_one({"_id": ObjectId(payload["sub"])})
-        if not user:
-            raise HTTPException(status_code=401, detail="User not found")
-        user["_id"] = str(user["_id"])
-        user.pop("password_hash", None)
-        return user
-    except pyjwt.ExpiredSignatureError:
+        payload = jwt_service.decode_token(token, expected_type="access")
+    except jwt_service.TokenExpired:
         raise HTTPException(status_code=401, detail="Token expired")
-    except pyjwt.InvalidTokenError:
+    except jwt_service.TokenError:
         raise HTTPException(status_code=401, detail="Invalid token")
 
-def set_auth_cookies(response: Response, access_token: str, refresh_token: str):
-    response.set_cookie(key="access_token", value=access_token, httponly=True, secure=False, samesite="lax", max_age=86400, path="/")
-    response.set_cookie(key="refresh_token", value=refresh_token, httponly=True, secure=False, samesite="lax", max_age=604800, path="/")
+    user = await db.users.find_one({"_id": ObjectId(payload["sub"])})
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
+    # Global invalidation lever: any token minted before the account's
+    # password_changed_at (set by a future password change or a security event)
+    # is stale, even if it has not yet expired. Access AND refresh both honor it.
+    if jwt_service.token_issued_before(payload, user.get("password_changed_at")):
+        raise HTTPException(status_code=401, detail="Token expired")
+    user["_id"] = str(user["_id"])
+    user.pop("password_hash", None)
+    return user
+
+# NOTE: authentication cookies are set/cleared exclusively via
+# security.cookies (imported above) — set_auth_cookies / set_access_cookie /
+# clear_auth_cookies. This keeps the hardened cookie policy in one place.
 
 # --- AI Service (Modular Multi-Provider Architecture) ---
 # Uses AIDebateEngine: Claude + Gemini as equal intelligence partners.
@@ -783,7 +841,7 @@ admin_router = APIRouter(prefix="/api/admin", tags=["Admin Portal"])
 # ============ AUTH ROUTES ============
 
 @auth_router.post("/register")
-async def register(data: UserCreate, response: Response):
+async def register(data: UserCreate, response: Response, request: Request):
     email = data.email.lower().strip()
     if await db.users.find_one({"email": email}):
         raise HTTPException(status_code=400, detail="Email already registered")
@@ -802,9 +860,7 @@ async def register(data: UserCreate, response: Response):
     }
     result = await db.users.insert_one(user_doc)
     user_id = str(result.inserted_id)
-    access = create_access_token(user_id, email)
-    refresh = create_refresh_token(user_id)
-    set_auth_cookies(response, access, refresh)
+    access = await _issue_session(user_id, email, request, response)
     return {"id": user_id, "name": data.name, "email": email, "role": "user", "capital": 100000, "token": access}
 
 @auth_router.post("/login")
@@ -823,7 +879,12 @@ async def login(data: UserLogin, response: Response, request: Request):
             await db.login_attempts.delete_one({"identifier": identifier})
 
     user = await db.users.find_one({"email": email})
-    if not user or not verify_password(data.password, user["password_hash"]):
+    # Always run exactly one bcrypt comparison (verify_password pads with a
+    # dummy hash when the account is missing or has no password, e.g.
+    # OAuth-native accounts) so response timing never reveals whether the
+    # email exists. The 401 below is identical for both failure causes.
+    password_ok = verify_password(data.password, user.get("password_hash") if user else None)
+    if not user or not password_ok:
         current = await db.login_attempts.find_one({"identifier": identifier})
         count = (current.get("count", 0) if current else 0) + 1
         update_doc = {"$inc": {"count": 1}}
@@ -834,9 +895,7 @@ async def login(data: UserLogin, response: Response, request: Request):
 
     await db.login_attempts.delete_one({"identifier": identifier})
     user_id = str(user["_id"])
-    access = create_access_token(user_id, email)
-    refresh = create_refresh_token(user_id)
-    set_auth_cookies(response, access, refresh)
+    access = await _issue_session(user_id, email, request, response)
     return {
         "id": user_id, "name": user["name"], "email": email,
         "role": user.get("role", "user"), "capital": user.get("capital", 100000),
@@ -848,10 +907,31 @@ async def get_me(user: dict = Depends(get_current_user)):
     return user
 
 @auth_router.post("/logout")
-async def logout(response: Response):
-    response.delete_cookie("access_token", path="/")
-    response.delete_cookie("refresh_token", path="/")
+async def logout(request: Request, response: Response):
+    # Revoke the current session server-side (so its refresh token is dead even
+    # if it was captured) then clear every auth cookie via the central policy so
+    # the delete attributes (path/domain/secure/samesite) match how they were
+    # set. Best-effort revoke: a missing/old/invalid refresh cookie still logs
+    # the browser out cleanly.
+    token = request.cookies.get("refresh_token")
+    if token:
+        try:
+            payload = jwt_service.decode_token(token, expected_type="refresh")
+            await SessionStore(db).revoke(payload["sid"], reason=REASON_LOGOUT)
+        except jwt_service.TokenError:
+            pass
+    clear_auth_cookies(response)
     return {"message": "Logged out"}
+
+@auth_router.post("/logout-all")
+async def logout_all(request: Request, response: Response, user: dict = Depends(get_current_user)):
+    """Sign out of every device: revoke all of the user's refresh-token
+    families and clear the current browser's cookies. Outstanding access tokens
+    (≤15 min) drain on their own; the service-layer primitive
+    (``SessionStore.revoke_all_for_user``) is what PH1.10's UI will call."""
+    revoked = await SessionStore(db).revoke_all_for_user(user["_id"], reason="logout_all")
+    clear_auth_cookies(response)
+    return {"message": "Signed out of all devices", "sessions_revoked": revoked}
 
 @auth_router.post("/refresh")
 async def refresh_token(request: Request, response: Response):
@@ -859,17 +939,32 @@ async def refresh_token(request: Request, response: Response):
     if not token:
         raise HTTPException(status_code=401, detail="No refresh token")
     try:
-        payload = pyjwt.decode(token, get_jwt_secret(), algorithms=[JWT_ALGORITHM])
-        if payload.get("type") != "refresh":
-            raise HTTPException(status_code=401, detail="Invalid token type")
-        user = await db.users.find_one({"_id": ObjectId(payload["sub"])})
-        if not user:
-            raise HTTPException(status_code=401, detail="User not found")
-        access = create_access_token(str(user["_id"]), user["email"])
-        response.set_cookie(key="access_token", value=access, httponly=True, secure=False, samesite="lax", max_age=86400, path="/")
-        return {"message": "Token refreshed"}
-    except pyjwt.InvalidTokenError:
+        payload = jwt_service.decode_token(token, expected_type="refresh")
+    except jwt_service.TokenError:
         raise HTTPException(status_code=401, detail="Invalid refresh token")
+
+    user = await db.users.find_one({"_id": ObjectId(payload["sub"])})
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
+    # Global invalidation lever (password change / security event) applies to
+    # refresh too — a stale refresh token cannot be rotated into fresh access.
+    if jwt_service.token_issued_before(payload, user.get("password_changed_at")):
+        raise HTTPException(status_code=401, detail="Invalid refresh token")
+
+    # Rotate: the presented token is single-use. Replaying an already-rotated
+    # token (reuse) revokes the whole family — see security.sessions.
+    new_jti = jwt_service.new_jti()
+    result = await SessionStore(db).rotate(payload["sid"], payload["jti"], new_jti)
+    if not result.ok:
+        raise HTTPException(status_code=401, detail="Invalid refresh token")
+
+    user_id = str(user["_id"])
+    access = jwt_service.create_access_token(user_id, user["email"], payload["sid"])
+    refresh = jwt_service.create_refresh_token(user_id, payload["sid"], new_jti)
+    # Re-issue BOTH cookies through the central hardened policy: rotation means
+    # the refresh token changes on every use, not just the access token.
+    set_auth_cookies(response, access, refresh)
+    return {"message": "Token refreshed"}
 
 
 # ============ MARKET ROUTES ============
@@ -2645,147 +2740,344 @@ async def ai_monitoring_loop():
 
 google_auth_router = APIRouter(prefix="/api/auth", tags=["Google Auth"])
 
-# REMINDER: DO NOT HARDCODE THE URL, OR ADD ANY FALLBACKS OR REDIRECT URLS, THIS BREAKS THE AUTH
+# Fail-closed policy: a session is issued only after a successful server-side
+# authorization-code exchange with Google AND cryptographic verification of the
+# returned OpenID Connect id_token. There are no demo users, no simulation
+# fallbacks, and no third-party session exchanges (PH1.1). PH1.2 adds:
+#   - OAuth `state` CSRF protection (double-submit against the g_oauth_state cookie)
+#     PLUS a single-use server-side state record (replay protection + authoritative
+#     TTL expiry, shared across processes via Redis when configured)
+#   - id_token signature/issuer/audience verification via google-auth
+#   - mandatory `email_verified` gate before any account is created or linked
+#   - redirect_uri allowlisting (no hardcoded dev fallback) + binding the callback
+#     redirect_uri to the one issued at flow start
+#   - Google `sub` as the primary external identity; verified email for safe linking
+#   - immutable security-audit logging of every OAuth outcome
+
+GOOGLE_OAUTH_STATE_COOKIE = "g_oauth_state"
+GOOGLE_OAUTH_STATE_TTL = 600  # seconds — the state is single-use and short-lived
+GOOGLE_OAUTH_STATE_PREFIX = "oauth_state:"  # server-side store key namespace
+GOOGLE_AUTH_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth"
+GOOGLE_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
+GOOGLE_VALID_ISSUERS = ("accounts.google.com", "https://accounts.google.com")
+
+
+def _google_oauth_config() -> tuple[str, str]:
+    """Return (client_id, client_secret) from the environment, stripped."""
+    return (
+        os.environ.get("GOOGLE_CLIENT_ID", "").strip(),
+        os.environ.get("GOOGLE_CLIENT_SECRET", "").strip(),
+    )
+
+
+def _allowed_google_redirect_uris() -> Set[str]:
+    """Allowlist of acceptable OAuth redirect URIs, derived from configured
+    frontend origins. The callback path is fixed to `/auth/google/callback`.
+    A localhost origin is permitted only outside production so local dev works
+    without weakening the production allowlist."""
+    origins: list[str] = []
+    frontend_url = os.environ.get("FRONTEND_URL", "").strip()
+    if frontend_url:
+        origins.append(frontend_url)
+    cors = os.environ.get("CORS_ORIGINS", "").strip()
+    if cors and cors != "*":
+        origins.extend(cors.split(","))
+    if not origins and os.environ.get("APP_ENV", "development") != "production":
+        origins.append("http://localhost:3000")
+    uris: Set[str] = set()
+    for origin in origins:
+        origin = origin.strip().rstrip("/")
+        if origin:
+            uris.add(f"{origin}/auth/google/callback")
+    return uris
+
+
+def _set_oauth_state_cookie(response: Response, state: str) -> None:
+    # Delegated to the central PH1.3 cookie policy (security.cookies): the OAuth
+    # state cookie now shares the unified Secure/SameSite/Domain posture with the
+    # session cookies. It stays scoped to /api/auth and is never SameSite=Strict
+    # so it survives the top-level redirect back from Google.
+    set_oauth_state_cookie(response, state)
+
+
+def _clear_oauth_state_cookie(response: Response) -> None:
+    clear_oauth_state_cookie(response)
+
+
+async def _store_oauth_state(state: str, redirect_uri: str) -> None:
+    """Persist a single-use OAuth state record server-side. Uses Redis when
+    REDIS_URL is configured and an in-memory fallback otherwise (services/cache.py)
+    — the same graceful-degradation the rest of the app relies on. The record's
+    TTL is the authoritative expiry (the cookie max-age is client-controlled)."""
+    from services.cache import cache_set
+    await cache_set(
+        f"{GOOGLE_OAUTH_STATE_PREFIX}{state}",
+        {"redirect_uri": redirect_uri, "created": datetime.now(timezone.utc).isoformat()},
+        GOOGLE_OAUTH_STATE_TTL,
+    )
+
+
+async def _consume_oauth_state(state: str) -> Optional[dict]:
+    """Atomically fetch-and-delete the server-side state record. Returns the
+    record on first use, or None when it is missing, expired, or already used
+    (replay). Single-use is what defeats authorization-code/state replay."""
+    from services.cache import cache_get, cache_delete
+    key = f"{GOOGLE_OAUTH_STATE_PREFIX}{state}"
+    record = await cache_get(key)
+    if record is None:
+        return None
+    await cache_delete(key)
+    return record
+
+
+async def log_auth_event(event: str, request: Request, *, email: Optional[str] = None,
+                         user_id: Optional[str] = None, reason: Optional[str] = None,
+                         detail: Optional[dict] = None) -> None:
+    """Append an immutable authentication security-audit record (mirrors
+    log_admin_action). Records the actor context (ip, user-agent) and outcome,
+    but NEVER tokens, authorization codes, or state values (SECURITY.md logging
+    rule). Best-effort: a logging failure must never break the auth flow."""
+    try:
+        ip = request.client.host if request.client else None
+        await db.security_audit_logs.insert_one({
+            "event": event,
+            "email": email,
+            "user_id": user_id,
+            "reason": reason,
+            "ip": ip,
+            "user_agent": request.headers.get("user-agent"),
+            "details": detail or {},
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        })
+    except Exception as e:
+        logger.warning(f"auth audit log failed for {event}: {e}")
+
+
+async def _exchange_google_code(code: str, redirect_uri: str,
+                                client_id: str, client_secret: str) -> dict:
+    """Server-side authorization-code exchange. Raises HTTPException(401) on a
+    non-200 response and lets httpx.RequestError propagate for the caller to
+    map to a 502."""
+    async with httpx.AsyncClient(timeout=10) as client:
+        token_resp = await client.post(
+            GOOGLE_TOKEN_ENDPOINT,
+            data={
+                "code": code,
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "redirect_uri": redirect_uri,
+                "grant_type": "authorization_code",
+            },
+        )
+    if token_resp.status_code != 200:
+        raise HTTPException(status_code=401, detail="Google token exchange failed")
+    return token_resp.json()
+
+
+def _verify_google_id_token(id_tok: str, client_id: str) -> dict:
+    """Cryptographically verify a Google-issued OIDC id_token: signature (against
+    Google's public keys), audience (our client_id) and expiry. Raises ValueError
+    on any failure. Isolated as a module-level function so it can be substituted
+    in hermetic tests."""
+    from google.oauth2 import id_token as google_id_token
+    from google.auth.transport import requests as google_requests
+
+    return google_id_token.verify_oauth2_token(
+        id_tok, google_requests.Request(), client_id
+    )
+
+
+@google_auth_router.get("/google/login-url")
+async def google_login_url(response: Response, redirect_uri: Optional[str] = None):
+    """Start the Google OAuth flow. Generates a CSRF `state`, binds it to the
+    browser via a short-lived httponly cookie, and returns the Google
+    authorization URL to redirect to. Fail-closed when OAuth is not configured."""
+    client_id, client_secret = _google_oauth_config()
+    if not client_id or not client_secret:
+        raise HTTPException(status_code=401, detail="Google sign-in is not configured")
+
+    allowed = _allowed_google_redirect_uris()
+    if redirect_uri:
+        if redirect_uri.rstrip("/") not in allowed:
+            raise HTTPException(status_code=400, detail="Invalid redirect_uri")
+        chosen = redirect_uri
+    elif allowed:
+        chosen = sorted(allowed)[0]
+    else:
+        raise HTTPException(status_code=401, detail="Google sign-in is not configured")
+
+    state = secrets.token_urlsafe(32)
+    params = {
+        "client_id": client_id,
+        "redirect_uri": chosen,
+        "response_type": "code",
+        "scope": "openid email profile",
+        "state": state,
+        "prompt": "select_account",
+        "access_type": "online",
+    }
+    # Server-side single-use record (replay + authoritative expiry) bound to the
+    # redirect_uri, plus the httponly cookie (per-browser CSRF binding).
+    await _store_oauth_state(state, chosen)
+    _set_oauth_state_cookie(response, state)
+    return {"url": f"{GOOGLE_AUTH_ENDPOINT}?{urlencode(params)}", "redirect_uri": chosen}
+
 
 @google_auth_router.post("/google/session")
 async def google_auth_session(request: Request, response: Response):
-    """Exchange Google OAuth code or legacy session_id for user session."""
+    """Complete the Google OAuth flow: validate the CSRF state, exchange the
+    authorization code, verify the id_token, and issue a session."""
     body = await request.json()
-    session_id = body.get("session_id")
     code = body.get("code")
+    state = body.get("state")
     redirect_uri = body.get("redirect_uri")
 
-    if not session_id and not code:
-        raise HTTPException(status_code=400, detail="session_id or code required")
+    if not code:
+        raise HTTPException(status_code=400, detail="code required")
+    if not state:
+        raise HTTPException(status_code=400, detail="state required")
 
-    email = ""
-    name = ""
-    picture = ""
-    import secrets
-    session_token = secrets.token_hex(16)
+    # CSRF protection: the callback must present the same state we planted in the
+    # httponly cookie when the flow started (double-submit). Constant-time compare.
+    cookie_state = request.cookies.get(GOOGLE_OAUTH_STATE_COOKIE)
+    if not cookie_state or not secrets.compare_digest(state, cookie_state):
+        await log_auth_event("oauth_login_failure", request, reason="invalid_state")
+        raise HTTPException(status_code=400, detail="Invalid OAuth state")
 
-    if code:
-        client_id = os.environ.get("GOOGLE_CLIENT_ID", "").strip()
-        client_secret = os.environ.get("GOOGLE_CLIENT_SECRET", "").strip()
+    # Single-use server-side record: consume it (fetch-and-delete). A missing
+    # record means the state is expired or has already been used (replay).
+    state_record = await _consume_oauth_state(state)
+    _clear_oauth_state_cookie(response)  # burn the cookie regardless of outcome
+    if state_record is None:
+        await log_auth_event("oauth_login_failure", request, reason="replayed_or_expired_state")
+        raise HTTPException(status_code=400, detail="Invalid OAuth state")
 
-        # Development / Simulation Fallback
-        if not client_id or not client_secret or code == "mock-code-for-testing":
-            email = "demo-user@alphapartner.com"
-            name = "Demo User"
-            picture = ""
-        else:
-            try:
-                # Exchange code for tokens via direct Google OAuth
-                async with httpx.AsyncClient(timeout=10) as client:
-                    token_resp = await client.post(
-                        "https://oauth2.googleapis.com/token",
-                        data={
-                            "code": code,
-                            "client_id": client_id,
-                            "client_secret": client_secret,
-                            "redirect_uri": redirect_uri or "http://localhost:3000/auth/google/callback",
-                            "grant_type": "authorization_code",
-                        }
-                    )
-                    if token_resp.status_code != 200:
-                        raise HTTPException(status_code=401, detail=f"Google token exchange failed: {token_resp.text}")
-                    
-                    token_data = token_resp.json()
-                    access_token = token_data.get("access_token")
-                    
-                    # Fetch user details
-                    info_resp = await client.get(
-                        "https://www.googleapis.com/oauth2/v3/userinfo",
-                        headers={"Authorization": f"Bearer {access_token}"}
-                    )
-                    if info_resp.status_code != 200:
-                        raise HTTPException(status_code=401, detail="Failed to fetch user info from Google")
-                    
-                    user_info = info_resp.json()
-                    email = user_info.get("email", "").lower().strip()
-                    name = user_info.get("name", "")
-                    picture = user_info.get("picture", "")
-            except httpx.RequestError as e:
-                raise HTTPException(status_code=502, detail=f"Google Auth service error: {str(e)}")
-    else:
-        # Legacy/testing session exchange
-        if session_id == "invalid-xyz-nonexistent":
-            raise HTTPException(status_code=401, detail="Invalid session")
-        
-        try:
-            async with httpx.AsyncClient(timeout=10) as client:
-                resp = await client.get(
-                    "https://demobackend.emergentagent.com/auth/v1/env/oauth/session-data",
-                    headers={"X-Session-ID": session_id},
-                )
-                if resp.status_code == 200:
-                    google_data = resp.json()
-                    email = google_data.get("email", "").lower().strip()
-                    name = google_data.get("name", "")
-                    picture = google_data.get("picture", "")
-                    session_token = google_data.get("session_token", session_token)
-                else:
-                    # Simulation mode fallback for other session_ids
-                    email = "demo-user@alphapartner.com"
-                    name = "Demo User"
-                    picture = ""
-        except Exception as e:
-            # Fallback to simulated demo user if backend request fails/timeouts, preserving test requirements
-            email = "demo-user@alphapartner.com"
-            name = "Demo User"
-            picture = ""
+    client_id, client_secret = _google_oauth_config()
+    if not client_id or not client_secret:
+        raise HTTPException(status_code=401, detail="Google sign-in is not configured")
 
-    if not email:
-        raise HTTPException(status_code=400, detail="No email from Google")
+    # The redirect_uri must be allowlisted AND must match the one bound to this
+    # state at flow start (defense in depth against redirect substitution).
+    allowed = _allowed_google_redirect_uris()
+    if (not redirect_uri or redirect_uri.rstrip("/") not in allowed
+            or redirect_uri != state_record.get("redirect_uri")):
+        await log_auth_event("oauth_login_failure", request, reason="invalid_redirect_uri")
+        raise HTTPException(status_code=400, detail="Invalid redirect_uri")
 
-    # Find or create user
-    user = await db.users.find_one({"email": email})
-    if not user:
-        user_doc = {
-            "name": name,
-            "email": email,
-            "picture": picture,
-            "password_hash": "",  # No password for Google users
-            "auth_provider": "google",
-            "role": "user",
-            "capital": 100000,
-            "risk_level": "moderate",
-            "max_daily_loss": 5000,
-            "max_trades_per_day": 3,
-            "telegram_chat_id": None,
-            "notification_prefs": {"push": True, "email": True, "morning_report": True, "trade_alerts": True, "exit_reminder": True, "portfolio_alerts": True, "email_alerts": True, "telegram_alerts": False},
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        }
-        result = await db.users.insert_one(user_doc)
-        user_id = str(result.inserted_id)
-    else:
+    try:
+        token_data = await _exchange_google_code(code, redirect_uri, client_id, client_secret)
+    except httpx.RequestError:
+        await log_auth_event("oauth_login_failure", request, reason="google_unavailable")
+        raise HTTPException(status_code=502, detail="Google Auth service unavailable")
+    except HTTPException:
+        await log_auth_event("oauth_login_failure", request, reason="token_exchange_failed")
+        raise
+
+    id_tok = token_data.get("id_token")
+    if not id_tok:
+        await log_auth_event("oauth_login_failure", request, reason="missing_id_token")
+        raise HTTPException(status_code=401, detail="Google did not return an identity token")
+
+    try:
+        # Passing client_id as the audience makes verify_oauth2_token reject any
+        # token not minted for this application (wrong `aud`).
+        claims = _verify_google_id_token(id_tok, client_id)
+    except ValueError:
+        await log_auth_event("oauth_login_failure", request, reason="invalid_id_token")
+        raise HTTPException(status_code=401, detail="Invalid Google identity token")
+
+    if claims.get("iss") not in GOOGLE_VALID_ISSUERS:
+        await log_auth_event("oauth_login_failure", request, reason="bad_issuer")
+        raise HTTPException(status_code=401, detail="Invalid Google token issuer")
+
+    email = (claims.get("email") or "").lower().strip()
+    google_sub = claims.get("sub")
+    name = claims.get("name", "")
+    picture = claims.get("picture", "")
+    email_verified = claims.get("email_verified")
+    if isinstance(email_verified, str):
+        email_verified = email_verified.strip().lower() == "true"
+
+    if not email or not google_sub:
+        await log_auth_event("oauth_login_failure", request, email=email or None, reason="incomplete_identity")
+        raise HTTPException(status_code=401, detail="Google identity incomplete")
+    # Fail closed on unverified emails: an unverified Google email must never
+    # create a new account nor link to an existing one (account-takeover guard).
+    if email_verified is not True:
+        await log_auth_event("oauth_login_failure", request, email=email, reason="unverified_email")
+        raise HTTPException(status_code=401, detail="Google email is not verified")
+
+    # Account resolution. The Google `sub` is the PRIMARY external identity —
+    # stable even if the user's Google display name changes — so we resolve by
+    # it first. Verified email is the secondary key used only to safely link a
+    # pre-existing email/password account. Email remains the unique key, so no
+    # duplicate accounts are ever created.
+    new_account = False
+    linked = False
+    user = await db.users.find_one({"google_sub": google_sub})
+    if user:
         user_id = str(user["_id"])
-        # Update Google profile info
-        await db.users.update_one({"_id": user["_id"]}, {"$set": {"picture": picture, "name": name or user.get("name", "")}})
+        role = user.get("role", "user")
+        capital = user.get("capital", 100000)
+        # Refresh profile only — never mutate the email off a sub match.
+        await db.users.update_one(
+            {"_id": user["_id"]},
+            {"$set": {"picture": picture, "name": name or user.get("name", "")}},
+        )
+    else:
+        user = await db.users.find_one({"email": email})
+        if user:
+            existing_sub = user.get("google_sub")
+            if existing_sub and existing_sub != google_sub:
+                # This email is already bound to a different Google identity —
+                # anomalous (Google emails are unique). Never silently re-link.
+                await log_auth_event("oauth_login_failure", request, email=email,
+                                     user_id=str(user["_id"]), reason="sub_conflict")
+                raise HTTPException(status_code=401, detail="Account cannot be linked")
+            user_id = str(user["_id"])
+            role = user.get("role", "user")
+            capital = user.get("capital", 100000)
+            linked = user.get("auth_provider") != "google"
+            # Link: attach the Google identity; preserve password_hash/auth_provider
+            # so email/password login keeps working alongside Google.
+            await db.users.update_one(
+                {"_id": user["_id"]},
+                {"$set": {
+                    "picture": picture,
+                    "name": name or user.get("name", ""),
+                    "google_sub": google_sub,
+                }},
+            )
+        else:
+            user_doc = {
+                "name": name,
+                "email": email,
+                "picture": picture,
+                "password_hash": "",  # No password for Google-native users
+                "auth_provider": "google",
+                "google_sub": google_sub,
+                "role": "user",
+                "capital": 100000,
+                "risk_level": "moderate",
+                "max_daily_loss": 5000,
+                "max_trades_per_day": 3,
+                "telegram_chat_id": None,
+                "notification_prefs": {"push": True, "email": True, "morning_report": True, "trade_alerts": True, "exit_reminder": True, "portfolio_alerts": True, "email_alerts": True, "telegram_alerts": False},
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }
+            result = await db.users.insert_one(user_doc)
+            user_id = str(result.inserted_id)
+            role = "user"
+            capital = 100000
+            new_account = True
 
-    # Store session token
-    await db.user_sessions.update_one(
-        {"user_id": user_id},
-        {"$set": {
-            "user_id": user_id,
-            "session_token": session_token,
-            "expires_at": (datetime.now(timezone.utc) + timedelta(days=7)).isoformat(),
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        }},
-        upsert=True,
-    )
-
-    # Create JWT token for the user
-    access = create_access_token(user_id, email)
-    refresh = create_refresh_token(user_id)
-    set_auth_cookies(response, access, refresh)
-
-    # Also set session_token cookie
-    response.set_cookie(key="session_token", value=session_token, httponly=True, secure=False, samesite="lax", max_age=604800, path="/")
+    access = await _issue_session(user_id, email, request, response)
+    await log_auth_event("oauth_login_success", request, email=email, user_id=user_id,
+                         detail={"new_account": new_account, "linked": linked})
 
     return {
-        "id": user_id, "name": name, "email": email, "role": "user",
-        "picture": picture, "capital": 100000, "token": access,
+        "id": user_id, "name": name, "email": email, "role": role,
+        "picture": picture, "capital": capital, "token": access,
         "auth_provider": "google",
     }
 
@@ -3852,28 +4144,6 @@ Provide detailed analysis: entry strategy, risk factors, key support/resistance 
     }
 
 
-# ============ AUTO-LOGIN (SKIP AUTH FOR MAIN USER) ============
-
-@auth_router.get("/auto-login")
-async def auto_login(response: Response):
-    """Auto-login as the main admin user (development mode)."""
-    if not os.environ.get("ENABLE_AUTO_LOGIN", "true").lower() in ("true", "1", "yes"):
-        raise HTTPException(status_code=403, detail="Auto-login disabled")
-    admin_email = os.environ.get("ADMIN_EMAIL", "admin@alphapartner.com")
-    user = await db.users.find_one({"email": admin_email})
-    if not user:
-        raise HTTPException(status_code=404, detail="Admin user not found")
-    user_id = str(user["_id"])
-    access = create_access_token(user_id, admin_email)
-    refresh = create_refresh_token(user_id)
-    set_auth_cookies(response, access, refresh)
-    return {
-        "id": user_id, "name": user["name"], "email": admin_email,
-        "role": user.get("role", "admin"), "capital": user.get("capital", 100000),
-        "risk_level": user.get("risk_level", "moderate"), "token": access,
-    }
-
-
 # ============ GEMINI DIRECT ROUTES ============
 
 gemini_router = APIRouter(prefix="/api/gemini", tags=["Gemini"])
@@ -4663,13 +4933,17 @@ async def get_recent_ai_activity():
     return get_recent_activity()
 
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=os.environ.get('CORS_ORIGINS', '*').split(','),
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# CORS is centralized in security.cors (PH1.4): environment-driven, exact-match
+# origin allowlist with credentials — never a wildcard. See that module for the
+# full policy and rationale.
+apply_cors(app)
+
+# HTTP security headers are centralized in security.headers (PH1.4b):
+# anti-clickjacking, anti-MIME-sniffing, transport security (HSTS), a strict
+# Content-Security-Policy, and the cross-origin isolation family. Applied AFTER
+# CORS so it wraps (and decorates) even CORS preflight/rejection responses. See
+# that module for the full policy and rationale.
+apply_security_headers(app)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -4688,6 +4962,18 @@ async def startup():
     await db.admin_audit_logs.create_index("timestamp")
     await db.admin_audit_logs.create_index("admin_id")
     await db.admin_audit_logs.create_index("action")
+
+    # Security audit log (PH1.2) — immutable OAuth/auth security events
+    await db.security_audit_logs.create_index("timestamp")
+    await db.security_audit_logs.create_index("event")
+    await db.security_audit_logs.create_index("email")
+
+    # Session store (PH1.6) — one document per refresh-token family. The TTL
+    # index reaps sessions at their absolute expiry (Mongo purges docs whose
+    # `expires_at` Date is in the past); session_id is the unique family handle.
+    await db.sessions.create_index("session_id", unique=True)
+    await db.sessions.create_index("user_id")
+    await db.sessions.create_index("expires_at", expireAfterSeconds=0)
     await db.feature_flags.create_index("key", unique=True)
     await db.announcements.create_index("created_at")
     await db.support_tickets.create_index("status")
@@ -4715,54 +5001,9 @@ async def startup():
     # a backend restart doesn't force re-login. Encrypts legacy plaintext tokens.
     await broker_engine.load_sessions()
 
-    # Seed admin
-    admin_email = os.environ.get("ADMIN_EMAIL", "admin@alphapartner.com")
-    admin_password = os.environ.get("ADMIN_PASSWORD", "admin123")
-    existing = await db.users.find_one({"email": admin_email})
-    if not existing:
-        await db.users.insert_one({
-            "name": "Admin",
-            "email": admin_email,
-            "password_hash": hash_password(admin_password),
-            "role": "admin",
-            "capital": 500000,
-            "risk_level": "aggressive",
-            "max_daily_loss": 25000,
-            "max_trades_per_day": 10,
-            "telegram_chat_id": None,
-            "notification_prefs": {"push": True, "email": True, "morning_report": True, "trade_alerts": True, "exit_reminder": True, "portfolio_alerts": True, "email_alerts": True, "telegram_alerts": False},
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        })
-        logger.info(f"Admin user seeded: {admin_email}")
-    elif not verify_password(admin_password, existing["password_hash"]):
-        await db.users.update_one({"email": admin_email}, {"$set": {"password_hash": hash_password(admin_password)}})
-        logger.info("Admin password updated")
-
-    # Write test credentials
-    cred_path = Path(__file__).parent.parent / "memory" / "test_credentials.md"
-    cred_path.parent.mkdir(parents=True, exist_ok=True)
-    cred_path.write_text(f"""# Test Credentials
-## Admin
-- Email: {admin_email}
-- Password: {admin_password}
-- Role: admin
-
-## Auth Endpoints
-- POST /api/auth/register
-- POST /api/auth/login
-- POST /api/auth/google/session (Google OAuth)
-- GET /api/auth/me
-- POST /api/auth/logout
-- POST /api/auth/refresh
-
-## Zerodha
-- GET /api/zerodha/status
-- GET /api/zerodha/login-url
-- POST /api/zerodha/order
-
-## Data Sources
-- GET /api/data-sources
-""")
+    # Admin accounts are never seeded by the API server (PH1.1). For local
+    # development, run `python scripts/seed_dev_admin.py` — it refuses to run
+    # when APP_ENV=production.
 
     # Initialize Market Engine gateway
     try:

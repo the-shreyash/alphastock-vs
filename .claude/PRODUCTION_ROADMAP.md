@@ -3,11 +3,11 @@
 
 Version: 1.2
 
-Status: Approved Plan — Awaiting PH1 Implementation Approval
+Status: PH1 In Progress — PH1.1 complete (2026-07-17), awaiting review before PH1.2
 
 Date: 2026-07-17
 
-Companion Document: PRODUCTION_HARDENING.md (strategy, risk, certification)
+Companion Documents: PRODUCTION_HARDENING.md (strategy, risk, certification) · SECURITY_ARCHITECTURE.md (security engineering blueprint each PH1 sprint implements against)
 
 ---
 
@@ -39,10 +39,14 @@ Sprint sizing: one sprint = one focused unit of work, ½ day to 3 days each. Dif
 
 Goal: eliminate every finding in PRODUCTION_HARDENING.md §2 marked CRITICAL/HIGH in the security domain, and bring the system into SECURITY.md compliance.
 
+Architecture reference: every PH1 sprint implements against **SECURITY_ARCHITECTURE.md**, the authoritative security engineering blueprint. Each sprint below implements or extends the specific section(s) noted, and — per PRODUCTION_HARDENING.md §15 — must update those section(s) in the same PR (see SECURITY_ARCHITECTURE.md §32, Future Production Hardening Plan, for the full mapping).
+
 ---
 
 ## PH1.1 — Authentication Backdoor Removal
 
+- **Status:** ✅ COMPLETE (2026-07-17). B1 and B2 removed; startup admin seeding (default `admin123` password, boot-time password reset, plaintext `memory/test_credentials.md` write) also removed as the same finding class. Dev seeding moved to `backend/scripts/seed_dev_admin.py`; guarded by `backend/tests/test_auth_hardening.py` (11 hermetic tests).
+- **Architecture reference:** SECURITY_ARCHITECTURE.md §3 (Threat Model), §5 (Authentication Architecture).
 - **Objective:** Remove both authentication backdoors (B1, B2) so no unauthenticated caller can obtain any session.
 - **Scope:** Delete `GET /api/auth/auto-login` (`backend/server.py:3860`) and the `ENABLE_AUTO_LOGIN` switch. Delete the OAuth mock-code path, the demo-user fallback, and the legacy `session_id` exchange against `demobackend.emergentagent.com` (`backend/server.py:2672`). Replace dev convenience with a `scripts/seed_dev_admin.py` script guarded on `APP_ENV != production`.
 - **Deliverables:** Endpoints removed; dev seeding script; tests asserting 404/401 on removed paths.
@@ -56,6 +60,7 @@ Goal: eliminate every finding in PRODUCTION_HARDENING.md §2 marked CRITICAL/HIG
 
 ## PH1.2 — Google OAuth Production Flow
 
+- **Architecture reference:** SECURITY_ARCHITECTURE.md §13 (Google OAuth Architecture), §29 (OAuth Login Sequence).
 - **Objective:** Make Google OAuth fail-closed and production-correct.
 - **Scope:** Server-side authorization-code exchange with Google only; 401 when `GOOGLE_CLIENT_ID/SECRET` unset; state parameter (CSRF) on the OAuth flow; account-linking rules (existing email → link, new email → create) documented in USER_FLOWS.md.
 - **Deliverables:** Hardened `/api/auth/google/session`; OAuth integration tests with mocked Google token endpoint (test-only mocks, per ADR-021).
@@ -69,6 +74,8 @@ Goal: eliminate every finding in PRODUCTION_HARDENING.md §2 marked CRITICAL/HIG
 
 ## PH1.3 — Cookie & Session Security
 
+- **Architecture reference:** SECURITY_ARCHITECTURE.md §10 (Cookie Architecture), §18 (CSRF Protection Strategy — includes the tracked, unscheduled CSRF-token-layer gap).
+- **Status:** ✅ **COMPLETE (2026-07-18).** Cookie policy centralized in `backend/security/cookies.py`; all auth cookies (`access_token`, `refresh_token`, `g_oauth_state`) carry `HttpOnly; SameSite` always and `Secure` forced in production; logout clears every cookie with matching attributes; refresh remains functional; session fixation mitigated; 24 hermetic tests in `backend/tests/test_cookie_security.py`. Risk R-04 / finding B4 closed. **Deferred to a follow-up:** CSRF **token** middleware (SameSite=Lax delivers the cookie-layer CSRF baseline now); the dedicated `backend/security/csrf.py` token layer is carried forward as the next security item. Refresh-token rotation stays in PH1.6.
 - **Objective:** Auth cookies unusable over plain HTTP and resistant to CSRF.
 - **Scope:** `secure=True` on all four `set_cookie` call sites (env-driven `COOKIE_SECURE`, forced true when `APP_ENV=production`); confirm `httponly` + `samesite` strategy; CSRF token middleware for state-changing cookie-authenticated routes; central cookie helper so policy lives in one place.
 - **Deliverables:** Cookie helper module; CSRF protection; tests.
@@ -80,23 +87,71 @@ Goal: eliminate every finding in PRODUCTION_HARDENING.md §2 marked CRITICAL/HIG
 - **Estimated Difficulty:** Medium. **Estimated Time:** 1 day.
 - **Success Metrics:** Risk R-04 closed; no token ever sent over HTTP.
 
-## PH1.4 — CORS & Security Headers
+## PH1.4 — CORS Hardening
 
-- **Objective:** Only trusted origins may make credentialed requests; browsers receive the full defensive header set.
-- **Scope:** Require explicit `CORS_ORIGINS` in production (boot fails on `*` or unset); security-header middleware: HSTS, X-Frame-Options, X-Content-Type-Options, Referrer-Policy, Permissions-Policy, and a CSP compatible with the CRA build.
-- **Deliverables:** CORS boot validation; header middleware; tests asserting headers on responses.
-- **Files Expected:** `backend/security/headers.py`, `backend/server.py`, `backend/tests/test_security_headers.py`.
+- **Architecture reference:** SECURITY_ARCHITECTURE.md §19 (CORS Strategy).
+- **Status:** ✅ **COMPLETE (2026-07-18).** CORS policy centralized in `backend/security/cors.py`; the wildcard-with-credentials default is gone. Origins now resolve from an environment-driven, exact-match allowlist (`CORS_ALLOWED_ORIGINS`, canonical; legacy `CORS_ORIGINS`/`FRONTEND_URL` still honored). A literal `*` is stripped from every source, so a wildcard can never pair with credentials. Development falls back to `http://localhost:3000` / `http://localhost:5173`; production assumes nothing (empty allowlist → all cross-origin rejected, fail closed). Methods and request headers are restricted to what the API and frontend actually use (no `*`); no response headers are exposed. 30 hermetic tests in `backend/tests/test_cors_hardening.py`. Risk R-03 / finding B3 closed. **Security headers (HSTS, X-Frame-Options, X-Content-Type-Options, Referrer-Policy, Permissions-Policy, CSP) were de-scoped from this sprint and are carried forward** as PH1.4b below.
+- **Objective:** Only trusted origins may make credentialed requests.
+- **Scope:** Replace the wildcard default with an environment-driven exact-match origin allowlist; never allow `Access-Control-Allow-Origin: *` with credentials; restrict methods, request headers, and exposed response headers; centralize the policy in one module.
+- **Deliverables:** `backend/security/cors.py`; `apply_cors(app)` wiring in `server.py`; `backend/tests/test_cors_hardening.py`.
+- **Files Delivered:** `backend/security/cors.py`, `backend/server.py`, `backend/tests/test_cors_hardening.py`.
 - **Dependencies:** PH1.1 (and coordinates with PH1.8 env validation).
-- **Acceptance Criteria:** Prod boot with wildcard/missing CORS → startup error; disallowed origin gets no CORS grant; all headers present on API responses.
-- **Validation Steps:** curl with foreign Origin header; securityheaders.com scan against staging.
+- **Acceptance Criteria:** No wildcard origin remains; disallowed origin gets no CORS grant; credentials only for approved origins; local development still functions. ✅ Met.
+- **Validation Steps:** curl / TestClient with foreign Origin header → no ACAO; allowed origin → reflected ACAO + `Allow-Credentials: true`.
+- **Success Metrics:** Risk R-03 closed.
+
+## PH1.4b — Security Headers (carried forward)
+
+> **Status (2026-07-20): COMPLETE.** HTTP response security headers are
+> centralized in `backend/security/headers.py` and wired via a single
+> pure-ASGI `SecurityHeadersMiddleware` (`apply_security_headers(app)`),
+> applied *after* CORS so even CORS preflight/rejection responses carry the
+> headers. Emitted on every response: `X-Content-Type-Options: nosniff`,
+> `X-Frame-Options: DENY`, `Referrer-Policy: strict-origin-when-cross-origin`,
+> a locked-down `Permissions-Policy`, `Cross-Origin-Opener-Policy: same-origin`,
+> `Cross-Origin-Resource-Policy: same-origin`, `X-XSS-Protection: 0` (legacy
+> auditor neutralized), and a strict, nonce-capable `Content-Security-Policy`
+> (`default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors
+> 'none'` — no `unsafe-*` anywhere). `Strict-Transport-Security`
+> (`max-age=63072000; includeSubDomains`) is emitted **only** over HTTPS /
+> production. `Cross-Origin-Embedder-Policy: require-corp` is implemented but
+> opt-in (`CROSS_ORIGIN_EMBEDDER_POLICY`) to avoid breaking same-origin HTML
+> tooling. Every header is environment-overridable; the CSP supports a
+> `{nonce}` placeholder resolved per request and exposed on
+> `request.state.csp_nonce`. 35 hermetic tests in
+> `backend/tests/test_security_headers.py`. CORP is safe alongside the
+> credentialed CORS frontend because CORP only blocks *no-cors* loads.
+
+- **Architecture reference:** SECURITY_ARCHITECTURE.md §20 (Security Headers Strategy), §27 (Security Middleware Pipeline).
+- **Objective:** Browsers receive the full defensive header set.
+- **Scope:** Security-header middleware: HSTS, X-Frame-Options, X-Content-Type-Options, Referrer-Policy, Permissions-Policy, and a CSP compatible with the CRA build. (Split out of PH1.4, which delivered CORS only.)
+- **Deliverables:** Header middleware; tests asserting headers on responses.
+- **Files Expected:** `backend/security/headers.py`, `backend/server.py`, `backend/tests/test_security_headers.py`.
+- **Dependencies:** PH1.4.
+- **Acceptance Criteria:** All headers present on API responses.
+- **Validation Steps:** securityheaders.com scan against staging.
 - **Rollback Plan:** Revert middleware PR; CSP can be report-only first if it breaks the frontend.
 - **Estimated Difficulty:** Medium. **Estimated Time:** 1 day.
-- **Success Metrics:** Risk R-03 closed; A grade on header scan.
+- **Success Metrics:** A grade on header scan.
 
 ## PH1.5 — Password Policy, Input Validation & Email Verification
 
+> **Status (2026-07-19): password portion COMPLETE; email portion split out to PH1.5b.**
+> Delivered as "PH1.5 — Password Policy & Account Protection": centralized
+> `backend/security/passwords.py` (policy + explicit-cost bcrypt + safe,
+> timing-equalized verification), model-layer 422 enforcement on `UserCreate`,
+> bundled common-password blocklist, sanitized validation errors, FakeDB `$inc`
+> support, and 40 hermetic tests (`backend/tests/test_password_policy.py` — the
+> test file named below was superseded by this per-module naming). The
+> acceptance criterion "weak password → 422 with actionable message" passes;
+> the frontend mirrors the 12-char minimum inline and renders the API's rule
+> messages. `EmailStr`, strict-model hardening, email verification, the
+> password-reset flow, and the SMTP decision (OR-6) carry forward to **PH1.5b —
+> Email Validation & Verification** (tracked in TASK.md).
+
+- **Architecture reference:** SECURITY_ARCHITECTURE.md §15 (Password Security), §16 (Email Verification), §17 (Password Reset — currently unimplemented; fold into this sprint's scope).
 - **Objective:** Enforce SECURITY.md identity rules at the model layer.
-- **Scope:** `EmailStr` on all email fields; password validator (≥12 chars, upper/lower/number/special); email-verification flow (token email, verified flag, resend endpoint) with SMTP provider decision (OR-6); strict Pydantic models (reject unknown fields, bounded lengths) on auth payloads.
+- **Scope:** `EmailStr` on all email fields; password validator (≥12 chars, upper/lower/number/special); email-verification flow (token email, verified flag, resend endpoint) with SMTP provider decision (OR-6); strict Pydantic models (reject unknown fields, bounded lengths) on auth payloads. **Forward-password-reset flow** (`forgot-password`/`reset-password` endpoints) — identified during the SECURITY_ARCHITECTURE.md synchronization review as a gap with no prior owner; folded into this sprint since it shares the SMTP/token-email infrastructure being built here.
 - **Deliverables:** Hardened models; verification endpoints + email templates; tests.
 - **Files Expected:** `backend/models.py`, `backend/security/passwords.py`, `backend/services/email_service.py`, `backend/tests/test_registration_policy.py`.
 - **Dependencies:** PH1.1; SMTP provider decision.
@@ -108,19 +163,27 @@ Goal: eliminate every finding in PRODUCTION_HARDENING.md §2 marked CRITICAL/HIG
 
 ## PH1.6 — JWT Lifecycle & Refresh Rotation
 
+- **Status:** ✅ **COMPLETE (2026-07-20).** Access token 15 min; refresh token rotation on every use with reuse detection (a replayed refresh revokes the whole family); durable server-side revocation store (MongoDB `sessions` collection); `password_changed_at` + token `ver` global kill-switches; logout revokes the current session and `POST /api/auth/logout-all` revokes every session; device/IP/timestamp capture as PH1.10 groundwork. Centralized in `backend/security/jwt.py` (pure token crypto) + `backend/security/sessions.py` (`SessionStore`). 34 hermetic tests in `backend/tests/test_jwt_sessions.py` (rotation, replay→family-revoke, expired/revoked/wrong-aud/wrong-iss/bad-sig/wrong-type/stale-ver rejection, logout, logout-all, `password_changed_at`). Risk R-06 / finding H11 closed.
+- **Architecture reference:** SECURITY_ARCHITECTURE.md §9 (Session Architecture), §11 (JWT Lifecycle), §12 (Refresh Token Lifecycle), §30 (Session Refresh Sequence), §31 (Logout Sequence).
 - **Objective:** Token lifetimes and rotation per SECURITY.md.
-- **Scope:** Access token 15 min; refresh token 30 days with rotation on every use, reuse detection (revoke family on replay), and a server-side revocation store (Redis); silent-refresh behavior verified in the frontend interceptor; sessions listing groundwork (device/IP capture).
-- **Deliverables:** Token service; revocation store; migration note for existing sessions; tests including replay attack.
-- **Files Expected:** `backend/security/tokens.py`, `backend/server.py`, `frontend/src/services/api.js` (interceptor), `backend/tests/test_token_rotation.py`.
+- **Scope:** Access token 15 min; refresh token with rotation on every use, reuse detection (revoke family on replay), and a durable server-side revocation store; sessions-listing groundwork (device/IP capture).
+- **Deliverables:** Token service; session/revocation store; migration note for existing sessions; tests including replay attack. ✅ All delivered.
+- **Deviations from the original plan (recorded per the rollback/ADR discipline):**
+  - **Module shape:** the placeholder single `backend/security/tokens.py` was realized as **two cohesive modules** — `security/jwt.py` (pure, framework-agnostic token crypto) and `security/sessions.py` (the DB-backed stateful `SessionStore`). Splitting crypto from persistence keeps each single-responsibility and independently testable; matches the one-tenant-per-concern convention of the `security/` package.
+  - **Revocation store backing:** **MongoDB, not Redis.** Rotation with reuse detection needs an *authoritative, durable* record; the `services.cache` (Redis/in-memory) layer is best-effort and evictable, which would silently drop reuse detection. Sessions live in Mongo beside their users and are TTL-reaped. (Rationale in SECURITY_ARCHITECTURE.md §9.)
+  - **Refresh lifetime default:** shipped **7 days** (env `JWT_REFRESH_TTL_SECONDS`), aligned with the existing `refresh_token` cookie `Max-Age`; SECURITY.md's 30-day policy target is reached by config (`=2592000`) without a code change.
+  - **Frontend interceptor & `test_token_rotation.py` filename:** interceptor verification is deferred to the frontend-realtime track (this sprint is backend-scoped; the existing 401→login/refresh interceptor already handles the new behavior); tests live in `test_jwt_sessions.py`.
+- **Files touched:** `backend/security/jwt.py`, `backend/security/sessions.py`, `backend/security/__init__.py`, `backend/server.py`, `backend/tests/test_jwt_sessions.py`, `backend/tests/test_cookie_security.py`.
 - **Dependencies:** PH1.3.
-- **Acceptance Criteria:** Access token expires in 15 min; reused refresh token → 401 + family revoked; users are not visibly logged out during normal use.
-- **Validation Steps:** Time-travel tests (freezegun); manual soak on staging for one session lifetime.
+- **Acceptance Criteria:** ✅ Access token expires in 15 min; reused refresh token → 401 + family revoked; users are not visibly logged out during normal use (rotation is silent).
+- **Validation Steps:** Hermetic time-independent tests (crafted expired/forged tokens instead of freezegun, which is not a project dependency); manual soak on staging for one session lifetime remains a pre-launch item.
 - **Rollback Plan:** Lifetimes are env-configured; revert to previous values without code rollback if UX breaks, and record deviation as an ADR.
 - **Estimated Difficulty:** High. **Estimated Time:** 2 days.
-- **Success Metrics:** Risk R-06 closed; zero support reports of surprise logouts after one week on staging.
+- **Success Metrics:** Risk R-06 closed; zero support reports of surprise logouts after one week on staging (to confirm on staging).
 
 ## PH1.7 — Rate Limiting & Brute-Force Protection
 
+- **Architecture reference:** SECURITY_ARCHITECTURE.md §21 (Rate Limiting Strategy — fold the existing `login_attempts` lockout into the new limiter rather than running both in parallel).
 - **Objective:** Tiered rate limiting per SECURITY.md (Guest 30/min → Elite 600/min) with strict auth-endpoint limits.
 - **Scope:** ASGI rate limiter (slowapi or equivalent) backed by Redis; per-plan tiers resolved from the authenticated user; strict limits on `/api/auth/*` (e.g., 5 login attempts/min/IP + per-account lockout with backoff); 429 responses with `Retry-After`; frontend surfaces friendly retry messaging.
 - **Deliverables:** Limiter middleware; tier configuration; lockout logic; tests.
@@ -134,6 +197,7 @@ Goal: eliminate every finding in PRODUCTION_HARDENING.md §2 marked CRITICAL/HIG
 
 ## PH1.8 — Secrets & Environment Hardening
 
+- **Architecture reference:** SECURITY_ARCHITECTURE.md §23 (Secret Management), §24 (Environment Security).
 - **Objective:** No weak defaults anywhere; misconfigured production refuses to boot.
 - **Scope:** Boot-time config validator (typed registry of every env var: required-in-prod flag, format checks — `JWT_SECRET` ≥ 32 chars and not the known placeholder, Mongo/Redis URLs, CORS origins); remove `change_this_in_production_min_32_chars` and hardcoded n8n password from compose defaults; `.env.example` for backend and frontend; secret-rotation runbook.
 - **Deliverables:** `backend/config.py` validator; cleaned compose; `.env.example` files; runbook section in DEPLOYMENT.md.
@@ -147,6 +211,7 @@ Goal: eliminate every finding in PRODUCTION_HARDENING.md §2 marked CRITICAL/HIG
 
 ## PH1.9 — Real-Time & WebSocket Security
 
+- **Architecture reference:** SECURITY_ARCHITECTURE.md §4 (Trust Boundaries — extend the diagram with a Socket.IO lane), §32 (Future Production Hardening Plan — this sprint adds a new Real-Time Authorization Architecture section).
 - **Objective:** Socket.IO surface as protected as REST.
 - **Scope:** Authenticated connection handshake (cookie/token validation before join); per-room authorization (a user may only join their own portfolio/trade rooms; admin rooms require admin); per-connection message rate limits; idle disconnect; subscription validation against watchlist entitlements per REALTIME_SYSTEM.md.
 - **Deliverables:** Socket auth middleware; room authorization map; tests with socket.io test client.
@@ -160,6 +225,7 @@ Goal: eliminate every finding in PRODUCTION_HARDENING.md §2 marked CRITICAL/HIG
 
 ## PH1.10 — Admin Hardening & Session Management
 
+- **Architecture reference:** SECURITY_ARCHITECTURE.md §9 (Session Architecture — session listing/revocation), §14 (Future MFA Architecture — ADR-028), §8 (Permission System — a fine-grained permission system is a separate, unscheduled future item; do not conflate it with this sprint's admin-policy scope).
 - **Objective:** Admin surface meets SECURITY.md admin requirements; users get session visibility.
 - **Scope:** Active-sessions API (list/revoke one/revoke all) with device/IP/last-activity from PH1.6 groundwork; admin session shorter lifetime; admin action re-auth for destructive operations; MFA **design** (TOTP) recorded as an ADR with implementation scheduled pre-Closed-Beta (OR-4); audit-log review pass ensuring all admin mutations are logged.
 - **Deliverables:** Sessions endpoints + minimal settings UI wiring; admin policy enforcement; MFA design ADR.
@@ -173,6 +239,7 @@ Goal: eliminate every finding in PRODUCTION_HARDENING.md §2 marked CRITICAL/HIG
 
 ## PH1.11 — Dependency & Vulnerability Scanning
 
+- **Architecture reference:** SECURITY_ARCHITECTURE.md §25 (Dependency Security).
 - **Objective:** Supply chain continuously scanned.
 - **Scope:** `pip-audit` (backend) and `npm audit --omit=dev` (frontend) wired into CI (lands with PH2.6 if CI not yet ready — script-first so it runs locally); Dependabot config for pip, npm, docker, github-actions ecosystems; triage policy (critical = block merge, high = 7-day SLA) documented; move `black`/`flake8` from `requirements.txt` to `requirements-dev.txt` (finding M14).
 - **Deliverables:** Scan scripts; `.github/dependabot.yml`; split requirements files; triage policy in TESTING.md.
@@ -186,6 +253,7 @@ Goal: eliminate every finding in PRODUCTION_HARDENING.md §2 marked CRITICAL/HIG
 
 ## PH1.12 — Security Certification
 
+- **Architecture reference:** SECURITY_ARCHITECTURE.md §34 (Testing Strategy), and the document as a whole — it is the primary evidence artifact the pen-test checklist is executed against (§32).
 - **Objective:** Independent verification that PH1 achieved its goal; formal sign-off.
 - **Scope:** Execute the SECURITY.md penetration checklist against staging (authn, authz, rate limiting, XSS, CSRF, injection, session management, broker flow, WebSocket); OWASP Top 10 review; grep-evidence pack for removed backdoors; re-score security categories; write the Security Certification Report.
 - **Deliverables:** `docs/security/PH1_CERTIFICATION.md` report; fixed findings or ADR-recorded acceptances; sign-off entry in PRODUCTION_HARDENING.md §17.
