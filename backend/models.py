@@ -56,6 +56,36 @@ class UserLogin(BaseModel):
     email: str
     password: str
 
+
+# --- Identity Recovery Models (PH1.8) ---
+# Password-policy validation for the NEW password in the reset/change flows is
+# NOT done here: it is identity-aware (rejects passwords derived from the user's
+# own email/name) and the user's identity is only known after the token/session
+# is resolved server-side. The recovery endpoints run validate_new_password with
+# the resolved account, mirroring how UserCreate validates at registration.
+class VerifyEmailRequest(BaseModel):
+    """Redeem an email-verification token (from the emailed link)."""
+    token: str
+
+
+class ForgotPasswordRequest(BaseModel):
+    """Start password recovery for an email. The response is always generic —
+    it never reveals whether the address is registered."""
+    email: str
+
+
+class ResetPasswordRequest(BaseModel):
+    """Complete password recovery with a reset token + a new password."""
+    token: str
+    new_password: str
+
+
+class ChangePasswordRequest(BaseModel):
+    """Change the password of the authenticated user. Requires the current
+    password (re-authentication) and revokes every session on success."""
+    current_password: str
+    new_password: str
+
 class UserResponse(BaseDocument):
     name: str
     email: str

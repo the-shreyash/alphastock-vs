@@ -162,6 +162,39 @@ TEMPLATES = {
             </p>
         """),
     },
+    # ─── Identity recovery (PH1.8) ───────────────────────────────────────
+    # The action link is a single-use, expiring token minted by
+    # security.recovery; the copy states the fuse so the user knows to act.
+    "EMAIL_VERIFICATION": {
+        "subject": "Verify your AlphaPartner email",
+        "body": lambda **kw: _base_html("Confirm your email", f"""
+            <p>Welcome{(' ' + kw['name']) if kw.get('name') else ''} — confirm this is your email to secure your AlphaPartner account.</p>
+            <p style="margin-top:16px;">
+                <a href="{kw.get('verify_url', '#')}" style="display:inline-block;padding:10px 20px;background:#6366F1;color:#fff;border-radius:8px;text-decoration:none;font-weight:600;font-size:13px;">Verify Email</a>
+            </p>
+            <p style="margin-top:16px;font-size:12px;color:#52525B;">This link expires in {kw.get('expires_in', '24 hours')}. If you didn't create an account, you can safely ignore this email.</p>
+        """),
+    },
+    "PASSWORD_RESET": {
+        "subject": "Reset your AlphaPartner password",
+        "body": lambda **kw: _base_html("Reset your password", f"""
+            <p>We received a request to reset your AlphaPartner password. Use the button below to choose a new one.</p>
+            <p style="margin-top:16px;">
+                <a href="{kw.get('reset_url', '#')}" style="display:inline-block;padding:10px 20px;background:#6366F1;color:#fff;border-radius:8px;text-decoration:none;font-weight:600;font-size:13px;">Reset Password</a>
+            </p>
+            <p style="margin-top:16px;font-size:12px;color:#52525B;">This link expires in {kw.get('expires_in', '30 minutes')} and can be used once. If you didn't request this, ignore this email — your password stays unchanged.</p>
+        """),
+    },
+    "PASSWORD_CHANGED": {
+        "subject": "Your AlphaPartner password was changed",
+        "body": lambda **kw: _base_html("Password changed", f"""
+            <div style="padding:12px 16px;background:rgba(16,185,129,0.1);border-left:3px solid #10B981;border-radius:8px;margin:8px 0;">
+                <p style="margin:0;color:#FAFAFA;font-weight:600;">Your password was just changed.</p>
+                <p style="margin:4px 0 0;color:#A1A1AA;font-size:13px;">For your security, you've been signed out on every device and will need to log in again.</p>
+            </div>
+            <p style="margin-top:16px;font-size:13px;color:#A1A1AA;">If this wasn't you, reset your password immediately and contact support.</p>
+        """),
+    },
 }
 
 

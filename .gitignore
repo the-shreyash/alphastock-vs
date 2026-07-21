@@ -83,6 +83,11 @@ android-sdk/
 .env
 .env.*
 *.env
+# …but committed example templates carry NO real secrets and MUST be shared so
+# a new developer knows the full configuration surface (kept in sync with
+# backend/security/secrets.py via scripts/generate_env_example.py).
+!.env.example
+!**/.env.example
 credentials.json
 *.key
 .credentials

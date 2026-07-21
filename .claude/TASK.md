@@ -1960,9 +1960,64 @@ tests in `backend/tests/test_jwt_sessions.py`. Risk R-06 / finding H11 closed.
 See CHANGELOG.md and PRODUCTION_ROADMAP.md PH1.6 (records the tokens.py→jwt.py+
 sessions.py split, Mongo-vs-Redis store, and 7-day refresh default deviations).
 
-Next Recommended Sprint: **PH1.7 — Rate Limiting & Brute-Force Protection**,
-awaiting review/approval of PH1.6. Alternatively **PH1.5b — Email Validation &
-Verification**. PH3.1 (Backend Test Suite Repair) may run in parallel.
+PH1.7 (CSRF Protection & Rate Limiting) is COMPLETE (2026-07-21): CSRF centralized
+in `backend/security/csrf.py` — a signed double-submit token bound to the session,
+enforced by `CSRFMiddleware` on cookie-authenticated mutations, with Bearer
+requests exempt by construction (so no frontend change was needed). Rate limiting
+centralized in `backend/security/rate_limit.py` — one limiter, named per-endpoint
+policies (login 5/15min per ip:account with progressive lockout, register 5/hour,
+refresh 20/min, authenticated API 120/min per user, public API 60/min per IP), a
+pluggable `RateLimitStore` (MongoDB now, Redis-ready), and a platform-wide
+`RateLimitMiddleware`; every rejection carries `Retry-After`. The prior inline
+`login_attempts` lockout was folded in and removed. 44 hermetic tests
+(`test_csrf.py` 18, `test_rate_limit.py` 26). Threat-model rows for CSRF-proper,
+credential-stuffing/brute-force, and endpoint-flooding move to ✅ Closed. See
+CHANGELOG.md and SECURITY_ARCHITECTURE.md §18/§21.
+
+PH1.8 — Identity Recovery is COMPLETE (2026-07-22). This delivered the roadmap's
+**PH1.5b (Email Validation & Verification / password reset)** content — executed
+and labeled as the "PH1.8 — Identity Recovery" sprint; the roadmap's separate
+PH1.8 (Secrets & Environment Hardening) is unchanged and still pending. All
+recovery-token logic is centralized in `backend/security/recovery.py` (signed
+`<token_id>.<HMAC>` handle + authoritative `recovery_tokens` record with atomic
+single-use). New `/api/auth` endpoints: `verify-email`, `verify-email/request`,
+`forgot-password`, `reset-password`, `change-password`. The user model gains
+`email_verified` / `email_verified_at` / `verified_by`; new email/password
+accounts start unverified and are emailed a link (Google accounts are verified on
+creation/link). Forgot-password and resend return an identical generic response
+(no enumeration). A reset or change **revokes every session** and bumps
+`password_changed_at`, forcing re-login everywhere. Login is deliberately NOT
+blocked on `email_verified` (backward-compatible). 28 hermetic tests
+(`test_recovery.py`). See CHANGELOG.md and SECURITY_ARCHITECTURE.md §16/§17.
+Remaining follow-ups (technical debt): tighten `email: str` → `EmailStr`, and
+provision a real SMTP/SendGrid provider (open risk OR-6 — currently simulated).
+
+PH1.9 — Secrets & Supply Chain Security is COMPLETE (2026-07-22). This delivered
+the roadmap's **PH1.8 (Secrets & Environment Hardening)** content plus the
+supply-chain/dependency-auditing portion of the roadmap's **PH1.11**, executed
+and labeled as the "PH1.9 — Secrets & Supply Chain Security" sprint. The
+configuration surface is now centralized in `backend/security/secrets.py` (the
+authoritative `SECRET_REGISTRY` of every env var — category, sensitivity,
+required-in-environment), with a boot-time `validate_config()` that runs before
+the Mongo client and **fails closed** on a missing/weak critical secret,
+aggregating every problem into one value-free error (no secret is ever logged).
+Weak/hard-coded compose defaults were removed (`JWT_SECRET` placeholder → required;
+n8n `alphapartner123` → required `N8N_BASIC_AUTH_PASSWORD`). `requirements.txt`
+is now fully exact-pinned (4 floating `>=` bounds locked; 7 in-pin CVE patches
+applied — aiohttp/cryptography/httplib2/pillow/pyasn1/pymongo/python-multipart).
+A `security-audit` GitHub Actions workflow runs `pip-audit`/`pip check`/`npm
+audit`/`gitleaks` on every push + weekly. New: `backend/.env.example` +
+`frontend/.env.example` (generated from the registry, kept in sync by
+`scripts/generate_env_example.py`), `.claude/SECRETS.md` runbook, and
+`scripts/audit_dependencies.py`. 38 hermetic tests (`test_secrets.py`). Chosen
+deltas from the roadmap plan: module is `backend/security/secrets.py` (not
+`backend/config.py`) to follow the established security-package convention, and
+the rotation runbook is a dedicated `SECRETS.md` (not folded into DEPLOYMENT.md).
+See CHANGELOG.md and SECURITY_ARCHITECTURE.md §23/§24.
+
+Next Recommended Sprint: **PH1.9 — Real-Time & WebSocket Security** (roadmap
+slot: Socket.IO connection/room authorization, R-15), awaiting review/approval.
+PH3.1 (Backend Test Suite Repair) may run in parallel.
 
 Authoritative documents: PRODUCTION_HARDENING.md and PRODUCTION_ROADMAP.md.
 Task tracking below under "Production Hardening Program".
@@ -1971,7 +2026,7 @@ Task tracking below under "Production Hardening Program".
 
 # Production Hardening Program (PH1–PH3)
 
-Status: IN_PROGRESS (PH1.1 + PH1.2 complete 2026-07-17; PH1.3 + PH1.4 complete 2026-07-18; PH1.5 complete 2026-07-19; PH1.4b + PH1.6 complete 2026-07-20; SI1.1 Repository Audit complete 2026-07-17)
+Status: IN_PROGRESS (PH1.1 + PH1.2 complete 2026-07-17; PH1.3 + PH1.4 complete 2026-07-18; PH1.5 complete 2026-07-19; PH1.4b + PH1.6 complete 2026-07-20; PH1.7 complete 2026-07-21; PH1.5b/Identity Recovery + PH1.9 Secrets & Supply Chain complete 2026-07-22; SI1.1 Repository Audit complete 2026-07-17)
 
 Priority: Critical — blocks all other work
 
@@ -1986,13 +2041,13 @@ rollback, estimates) live in PRODUCTION_ROADMAP.md. Status tracker:
 - [x] PH1.4 CORS Hardening — COMPLETE (2026-07-18) — Critical
 - [x] PH1.4b Security Headers (HSTS/CSP/etc., split from PH1.4) — COMPLETE (2026-07-20) — Critical
 - [x] PH1.5 Password Policy & Account Protection (password portion of the roadmap's PH1.5) — COMPLETE (2026-07-19) — High
-- [ ] PH1.5b Email Validation & Verification (EmailStr, verification flow, password reset, SMTP decision OR-6 — split from PH1.5) — NOT_STARTED — High
+- [x] PH1.5b Email Verification & Account Recovery (verification flow, password reset, password change — delivered as the "PH1.8 — Identity Recovery" sprint) — COMPLETE (2026-07-22) — High — *follow-ups: EmailStr tightening + real SMTP provider (OR-6)*
 - [x] PH1.6 JWT Lifecycle & Refresh Rotation — COMPLETE (2026-07-20) — High
-- [ ] PH1.7 Rate Limiting & Brute-Force Protection — NOT_STARTED — High
-- [ ] PH1.8 Secrets & Environment Hardening — NOT_STARTED — High
+- [x] PH1.7 CSRF Protection & Rate Limiting — COMPLETE (2026-07-21) — High
+- [x] PH1.8 Secrets & Environment Hardening (delivered as the "PH1.9 — Secrets & Supply Chain Security" sprint, combined with the supply-chain portion of PH1.11) — COMPLETE (2026-07-22) — High
 - [ ] PH1.9 Real-Time & WebSocket Security — NOT_STARTED — High
 - [ ] PH1.10 Admin Hardening & Session Management — NOT_STARTED — Medium
-- [ ] PH1.11 Dependency & Vulnerability Scanning — NOT_STARTED — Medium
+- [~] PH1.11 Dependency & Vulnerability Scanning — PARTIAL (2026-07-22) — Medium — *CI auditing (pip-audit/npm audit/gitleaks), full pinning, and 7 CVE patches delivered in PH1.9; remaining: Dependabot config, requirements-dev split (M14), triage-SLA doc*
 - [ ] PH1.12 Security Certification — NOT_STARTED — Critical (gate)
 
 ## PH2 — Production Infrastructure & DevOps

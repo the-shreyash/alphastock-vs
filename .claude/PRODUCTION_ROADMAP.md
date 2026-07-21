@@ -161,6 +161,30 @@ Architecture reference: every PH1 sprint implements against **SECURITY_ARCHITECT
 - **Estimated Difficulty:** Medium. **Estimated Time:** 2 days.
 - **Success Metrics:** 100% of new accounts meet policy; verification completion rate measurable.
 
+## PH1.5b — Email Verification & Account Recovery
+
+> **Status: ✅ COMPLETE (2026-07-22).** Delivered as the **"PH1.8 — Identity
+> Recovery"** sprint (the operator reused the PH1.8 label; the roadmap's separate
+> PH1.8 — Secrets & Environment Hardening is unchanged and still pending). This
+> closes the email-verification / password-reset content carried forward from
+> PH1.5.
+
+- **Architecture reference:** SECURITY_ARCHITECTURE.md §16 (Email Verification), §17 (Password Reset) — both rewritten from "target/does-not-exist" to "current".
+- **Objective:** Make the identity lifecycle recoverable without weakening security.
+- **Delivered:**
+  - `backend/security/recovery.py` — the single source of truth for recovery tokens. Signed handle `<token_id>.<HMAC(secret, "prefix|purpose|user_id|token_id")>` bound to one user + one purpose, backed by an authoritative `recovery_tokens` record (`issued_at`/`expires_at`/`used_at`) enforcing expiry and **atomic single-use** (replay-safe); a fresh issue invalidates the user's prior unused token of that purpose. Secret: `RECOVERY_SECRET` else `JWT_SECRET` (domain-separated, no weak default). Lifetimes: verification 24h, reset 30 min (both env-overridable).
+  - New `/api/auth` endpoints: `verify-email`, `verify-email/request`, `forgot-password`, `reset-password`, `change-password`.
+  - User model: `email_verified` / `email_verified_at` / `verified_by`. New email/password accounts start unverified + emailed a link (out-of-band via `BackgroundTasks`); Google accounts verified on creation/link.
+  - Enumeration-safe: forgot-password / resend return an identical generic response; rate-limited via the existing `PASSWORD` policy (5/hour). Reset **and** change revoke every session (`revoke_all_for_user`) and bump `password_changed_at` → full sign-out. Shared `_apply_password_change` primitive keeps reset and change identical on the security-critical steps.
+  - `services/email_service.py` templates: `EMAIL_VERIFICATION`, `PASSWORD_RESET`, `PASSWORD_CHANGED`. `recovery_tokens` startup indexes (unique `token_id`, `(user_id,purpose)`, TTL on `expires_at`). CSRF default-exempt list extended with the three public recovery entrypoints.
+- **Files touched:** `backend/security/recovery.py` (new), `backend/security/__init__.py`, `backend/security/csrf.py`, `backend/models.py`, `backend/services/email_service.py`, `backend/server.py`, `backend/tests/test_recovery.py` (new), `backend/tests/test_password_policy.py` (register-contract assertion updated for the additive `email_verified` field).
+- **Tests:** 28 hermetic tests in `backend/tests/test_recovery.py` (token mint/verify/consume, single-use/replay, expiry, purpose-binding, signature tamper, reissue invalidation; verify success/expired/replay, forgot-password generic response, reset single-use/expiry/policy/session-revocation, change-password current-password/unchanged/policy/sign-out, register→login→me regression). Full hermetic security suite green.
+- **Deviations from the original PH1.5b scope (recorded per the rollback/ADR discipline):**
+  - **`EmailStr` tightening deferred.** Email remains `email: str`; switching to `EmailStr` is a candidate follow-up. Reason: it is orthogonal to recovery and would reject some already-registered addresses — kept out of a recovery-focused sprint to preserve backward compatibility.
+  - **Login is NOT blocked on `email_verified`** (the `REQUIRE_EMAIL_VERIFICATION` gate is not enabled). Reason: hard enforcement would lock out every pre-PH1.8 account and is unsafe until a real SMTP provider is provisioned (OR-6). The flag + endpoints are all in place; enabling enforcement is a one-line future gate.
+  - **SMTP provider still unprovisioned (OR-6 open).** Email send runs through the existing `email_service` which falls back to *simulated* mode when no SendGrid/SMTP is configured; the recovery flows are provider-agnostic and work the moment credentials are set.
+- **Remaining follow-ups (technical debt):** `EmailStr` tightening; provision SendGrid/SMTP (OR-6); optional `REQUIRE_EMAIL_VERIFICATION` enforcement gate; frontend `verify-email` / `reset-password` pages consuming the emailed `?token=` links.
+
 ## PH1.6 — JWT Lifecycle & Refresh Rotation
 
 - **Status:** ✅ **COMPLETE (2026-07-20).** Access token 15 min; refresh token rotation on every use with reuse detection (a replayed refresh revokes the whole family); durable server-side revocation store (MongoDB `sessions` collection); `password_changed_at` + token `ver` global kill-switches; logout revokes the current session and `POST /api/auth/logout-all` revokes every session; device/IP/timestamp capture as PH1.10 groundwork. Centralized in `backend/security/jwt.py` (pure token crypto) + `backend/security/sessions.py` (`SessionStore`). 34 hermetic tests in `backend/tests/test_jwt_sessions.py` (rotation, replay→family-revoke, expired/revoked/wrong-aud/wrong-iss/bad-sig/wrong-type/stale-ver rejection, logout, logout-all, `password_changed_at`). Risk R-06 / finding H11 closed.
@@ -181,21 +205,53 @@ Architecture reference: every PH1 sprint implements against **SECURITY_ARCHITECT
 - **Estimated Difficulty:** High. **Estimated Time:** 2 days.
 - **Success Metrics:** Risk R-06 closed; zero support reports of surprise logouts after one week on staging (to confirm on staging).
 
-## PH1.7 — Rate Limiting & Brute-Force Protection
+## PH1.7 — CSRF Protection & Rate Limiting — ✅ COMPLETE (2026-07-21)
 
-- **Architecture reference:** SECURITY_ARCHITECTURE.md §21 (Rate Limiting Strategy — fold the existing `login_attempts` lockout into the new limiter rather than running both in parallel).
-- **Objective:** Tiered rate limiting per SECURITY.md (Guest 30/min → Elite 600/min) with strict auth-endpoint limits.
-- **Scope:** ASGI rate limiter (slowapi or equivalent) backed by Redis; per-plan tiers resolved from the authenticated user; strict limits on `/api/auth/*` (e.g., 5 login attempts/min/IP + per-account lockout with backoff); 429 responses with `Retry-After`; frontend surfaces friendly retry messaging.
-- **Deliverables:** Limiter middleware; tier configuration; lockout logic; tests.
-- **Files Expected:** `backend/security/rate_limit.py`, `backend/server.py`, `backend/tests/test_rate_limiting.py`.
-- **Dependencies:** PH1.1; Redis available (already in stack).
-- **Acceptance Criteria:** Exceeding tier budget → 429; 6th login attempt in a minute → 429 regardless of credentials; limits configurable per env; health endpoints exempt.
-- **Validation Steps:** Automated burst tests; k6 mini-run against staging.
-- **Rollback Plan:** Limiter behind `RATE_LIMIT_ENABLED` (default true in production); disable only outside production.
-- **Estimated Difficulty:** Medium. **Estimated Time:** 1.5 days.
-- **Success Metrics:** Risk R-05 closed; credential-stuffing simulation blocked in staging test.
+- **Architecture reference:** SECURITY_ARCHITECTURE.md §18 (CSRF Protection Strategy) + §21 (Rate Limiting Strategy — fold the existing `login_attempts` lockout into the new limiter rather than running both in parallel).
+- **Objective:** Production-grade CSRF protection for cookie-authenticated mutations, and centralized rate limiting / brute-force / flooding protection.
+- **Scope (as delivered):** `security/csrf.py` (signed double-submit token bound to the session; `CSRFMiddleware`) + `security/rate_limit.py` (named per-endpoint policies, pluggable `RateLimitStore`, progressive lockout, platform-wide `RateLimitMiddleware`). Strict limits on `/api/auth/*`; 429 responses with `Retry-After`.
+- **Deliverables:** ✅ CSRF middleware + token lifecycle; ✅ limiter middleware + policies + lockout; ✅ 44 hermetic tests.
+- **Files Delivered:** `backend/security/csrf.py`, `backend/security/rate_limit.py`, `backend/server.py`, `backend/security/__init__.py`, `backend/tests/test_csrf.py`, `backend/tests/test_rate_limit.py`, `backend/tests/test_password_policy.py` (2 tests re-pointed to the new store).
+- **Dependencies:** PH1.1; PH1.6 (token decode reuse). MongoDB (already in stack).
+- **Acceptance Criteria:** ✅ Exceeding a tier budget → 429; ✅ 6th login attempt after 5 failures → 429 regardless of credentials; ✅ limits env-configurable (`RATE_LIMIT_<NAME>`); ✅ health endpoint exempt; ✅ CSRF: valid token accepted, missing/invalid/mismatched/wrong-session rejected (403), GET/bootstrap/Bearer exempt.
+- **Validation Steps:** ✅ Automated burst/lockout tests + CSRF matrix (hermetic); full PH1 security regression green (245 tests). k6/staging run deferred to PH2 (no staging env yet).
+- **Rollback Plan:** Middleware are independently revertable; per-policy env overrides tune limits without a code change; the rate-limit middleware fails **open** on storage error so it can never take the API down.
+- **Estimated Difficulty:** Medium. **Actual:** ~1 sprint.
+- **Success Metrics:** Risk R-05 closed; credential-stuffing/flooding blocked in tests.
+
+**Deviations from the original plan (recorded per the roadmap rule):**
+1. **CSRF folded into this sprint.** The originally-titled "Rate Limiting & Brute-Force Protection" sprint was executed as "CSRF Protection & Rate Limiting" — the previously-unowned CSRF token layer (SECURITY_ARCHITECTURE.md §18) now has a home here rather than remaining unscheduled.
+2. **MongoDB store, not Redis.** Per the sprint directive ("use the current persistence approach unless there is already infrastructure for Redis"), the limiter is MongoDB-backed behind a `RateLimitStore` interface shaped exactly for a drop-in Redis (`INCR`/`EXPIRE`) implementation later — no caller changes required.
+3. **Tiers.** Delivered the authenticated (120/min per user) vs public (60/min per IP) split plus the abuse-critical per-endpoint limits; the full role-tiered Guest/Free/Pro/Elite quotas from SECURITY.md remain future work.
+4. **No single `RATE_LIMIT_ENABLED` flag.** Superseded by per-policy env overrides + fail-open-on-storage-error, which together give finer, safer operational control than a blunt global kill-switch.
+5. **`test_rate_limiting.py` → `test_rate_limit.py`** to match the `test_<module>.py` convention (module is `rate_limit.py`).
+6. **No frontend change.** Because CSRF exempts Bearer requests (the SPA's auth path), the friendly-retry messaging / frontend wiring originally imagined was unnecessary for a non-breaking rollout; it becomes relevant only if/when a cookie-only client is introduced.
 
 ## PH1.8 — Secrets & Environment Hardening
+
+> **STATUS: ✅ COMPLETE (2026-07-22)** — delivered as the **"PH1.9 — Secrets &
+> Supply Chain Security"** sprint (numbering shifted because Identity Recovery
+> consumed the PH1.8 slot), combined with the supply-chain/dependency-auditing
+> portion of PH1.11. Actuals vs. the plan below:
+> - Validator lives in **`backend/security/secrets.py`** (not `backend/config.py`)
+>   — follows the established one-module-per-sprint security-package convention;
+>   the `SECRET_REGISTRY` is the typed registry the plan called for.
+> - Boot-time `validate_config()` wired into `server.py` before the Mongo client:
+>   fails closed, aggregates all problems, `JWT_SECRET` ≥ 32 + placeholder
+>   rejection, cross-field prod invariants (AI provider present, OAuth/broker
+>   both-or-neither, `ENABLE_AUTO_LOGIN` off, weak `ADMIN_PASSWORD` rejected).
+> - Removed weak compose defaults (`change_this_in_production_min_32_chars` →
+>   required `JWT_SECRET`; hard-coded n8n `alphapartner123` → required
+>   `N8N_BASIC_AUTH_PASSWORD`).
+> - `backend/.env.example` + `frontend/.env.example` (generated from the registry;
+>   `.gitignore` updated to permit committed examples). Rotation runbook is a
+>   dedicated **`.claude/SECRETS.md`** (not DEPLOYMENT.md).
+> - Supply chain (folds in PH1.11's core): full exact-pinning of
+>   `requirements.txt`, 7 in-pin CVE patches, and a `security-audit` CI workflow
+>   (pip-audit + pip check + npm audit + gitleaks, push + weekly).
+> - 38 hermetic tests in `backend/tests/test_secrets.py`. gitleaks-style history
+>   check: no real provider secret in history; the one committed value
+>   (`alphapartner123`) externalized — see SECRETS.md §9.
 
 - **Architecture reference:** SECURITY_ARCHITECTURE.md §23 (Secret Management), §24 (Environment Security).
 - **Objective:** No weak defaults anywhere; misconfigured production refuses to boot.
@@ -238,6 +294,15 @@ Architecture reference: every PH1 sprint implements against **SECURITY_ARCHITECT
 - **Success Metrics:** 100% admin mutations audited; session revocation < 30 s to take effect.
 
 ## PH1.11 — Dependency & Vulnerability Scanning
+
+> **STATUS: 🟡 PARTIAL (2026-07-22)** — the core supply-chain deliverables landed
+> in the PH1.9 sprint: `pip-audit` + `pip check` + `npm audit` + `gitleaks` in a
+> `security-audit` GitHub Actions workflow (push + weekly), full exact-pinning of
+> `backend/requirements.txt`, 7 in-pin CVE patches, and
+> `scripts/audit_dependencies.py` for local runs. **Remaining for this sprint:**
+> Dependabot config (`.github/dependabot.yml`), the `requirements.txt` →
+> `requirements-dev.txt` split (finding M14), and the triage-SLA policy in
+> TESTING.md. Deferred CVEs (starlette/litellm/ecdsa) are tracked in SECRETS.md §8.
 
 - **Architecture reference:** SECURITY_ARCHITECTURE.md §25 (Dependency Security).
 - **Objective:** Supply chain continuously scanned.

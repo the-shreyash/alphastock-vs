@@ -97,8 +97,9 @@ Inherited from SECURITY.md §Security Principles, made concrete:
 | Token theft via XSS | `HttpOnly` on all three auth cookies; JS never reads them | ✅ Closed (PH1.3) |
 | Token theft via plaintext transport | `Secure` forced true in production | ✅ Closed (PH1.3) |
 | Cross-site credentialed requests (CSRF via CORS) | Wildcard-with-credentials removed; exact-match allowlist, fail-closed in production | ✅ Closed (PH1.4) |
-| Cross-site state-changing request via cookie auth (CSRF proper) | `SameSite=Lax` baseline only; dedicated CSRF token layer not yet built | ⚠️ Partial — gap, see §18 |
-| Credential stuffing / brute force | Per-`ip:email` lockout on login (5 attempts / 15 min); production password policy + timing-equalized failures (PH1.5) | ⚠️ Partial — platform-wide rate limiting is PH1.7 |
+| Cross-site state-changing request via cookie auth (CSRF proper) | `SameSite=Lax` baseline **plus** a signed double-submit CSRF token bound to the session, enforced on cookie-authenticated mutations (`security/csrf.py`); Bearer requests exempt by construction | ✅ Closed (PH1.7), see §18 |
+| Credential stuffing / brute force | Centralized limiter (`security/rate_limit.py`): login 5 / 15 min per `ip:account` with progressive lockout, plus platform-wide per-user / per-IP tiers; production password policy + timing-equalized failures (PH1.5) | ✅ Closed (PH1.7), see §21 |
+| Endpoint flooding / token abuse | Platform-wide `RateLimitMiddleware` (authenticated 120/min per user, public 60/min per IP) + per-endpoint limits (register 5/h, refresh 20/min) with `Retry-After` | ✅ Closed (PH1.7), see §21 |
 | Stolen long-lived access token | 15-min access token; global invalidation via `password_changed_at` + token `ver` kill-switch | ✅ Closed (PH1.6) |
 | Refresh token replay | Rotation on every use + reuse detection that revokes the whole family; server-side revocation store | ✅ Closed (PH1.6) |
 | Cross-user Socket.IO event leakage | No connection/room authorization yet | ⚠️ Open — PH1.9 |
@@ -337,29 +338,56 @@ Hashing and verification:
 
 **Compatibility guarantees:** the policy applies to new passwords only — `UserLogin` is deliberately unvalidated, so pre-PH1.5 accounts (and their weaker passwords) authenticate unchanged; existing bcrypt hashes verify as before regardless of the cost factor they were minted with. The `ip:email` login lockout (§21) is preserved byte-for-byte.
 
-**Still open (unscheduled — "PH1.5b" candidate):** password change endpoint, password reset flow (§17), and `EmailStr`/email verification (§16) were deliberately excluded from PH1.5, which shipped as a password-policy-only sprint.
+**Password change / reset now implemented (PH1.8):** the change-password endpoint and the forgotten-password reset flow both route their new-password through this same module (`normalize_password` + `validate_new_password` with the resolved account's email/name, then `hash_password`), so recovery can never enforce a weaker policy than registration. See §16 / §17.
 
 ---
 
 # 16. Email Verification Architecture
 
-**Current:** does not exist. `email: str` (not `EmailStr`) means malformed addresses are accepted at registration; there is no `email_verified` flag on password-based accounts (only OAuth accounts get a verification signal, and only from Google — see §13). A user can register with an email they do not own and use the platform immediately.
+**Implemented — PH1.8.** All recovery-token logic is centralized in `backend/security/recovery.py` (the only module that mints, verifies, or burns a verification/reset token); the `/api/auth` endpoints compose it.
 
-**Target (PH1.5):** `EmailStr` validation at the model layer; a verification-token email flow (send → click → mark `email_verified=True`); a resend endpoint; an SMTP provider decision (tracked as open risk **OR-6**); and a product decision (recorded in USER_FLOWS.md) on whether unverified accounts are fully blocked or restricted-but-functional pending verification.
+**Token model:** the value emailed to the user is `<token_id>.<HMAC(secret, "stockassist.recovery.v1|purpose|user_id|token_id")>`. The signature makes it unforgeable without the server key and binds it to exactly one user **and** one purpose (a verification token can never redeem as a reset token). A `recovery_tokens` document (`token_id`, `user_id`, `purpose`, `issued_at`, `expires_at`, `used_at`) is the **authoritative** record: expiry and single-use are enforced against it, not against the stateless signature. HMAC key is `RECOVERY_SECRET` or the required `JWT_SECRET` (domain-separated, no weak default). Nothing logs a token.
+
+**Verification flow:** new email/password registrations are inserted with `email_verified: False` / `email_verified_at: None` / `verified_by: None`, and a verification link (24h, `RECOVERY_VERIFY_TTL_SECONDS`) is emailed **out-of-band via `BackgroundTasks`** so a slow/failed mailer never delays sign-up. `POST /api/auth/verify-email` (public) consumes the token — an atomic compare-and-set (`used_at: None → now`) burns it single-use, replay-safe — and sets `email_verified: True`, `email_verified_at`, `verified_by: "email"`. `POST /api/auth/verify-email/request` (authenticated) resends: issuing a new token invalidates the user's prior unused one (one live link at a time), and it is a silent no-op for an already-verified account (still returns the generic message). Both are rate-limited via the existing `PASSWORD` policy (5 / hour).
+
+**Google accounts** are marked `verified_by: "google"` on creation/link (Google already asserts, and §13 already enforces, a verified email — no separate verification email); pre-PH1.8 Google accounts self-heal the flag on next login.
+
+**Product decision (deliberate):** login is **NOT** blocked on `email_verified` — this keeps every pre-PH1.8 account working (backward-compatible) and avoids a hard lockout when SMTP is not yet provisioned (open risk **OR-6**). The flag is the enforcement hook a future verified-only gate flips on (and can already gate individual sensitive features). Email format is still `email: str` (not `EmailStr`) — tightening to `EmailStr` remains a candidate follow-up.
 
 ---
 
 # 17. Password Reset Architecture
 
-**Current:** does not exist — no `forgot-password` or `reset-password` endpoint found in `server.py`. This is not explicitly named as a PH1 finding in PRODUCTION_HARDENING.md, but it is a real gap for a platform requiring individual account credentials at scale. Flagged here as a **documentation gap** (§ Documentation Gaps in the final report) — it should be scoped as part of PH1.5 (identity hygiene) rather than discovered late.
+**Implemented — PH1.8.** Two entrypoints, both centralizing all token logic in `security.recovery` (see §16 for the token model).
+
+**Forgot → reset:** `POST /api/auth/forgot-password` (public) **always** returns an identical generic message (`"If an account matches, we've sent an email…"`) so it cannot enumerate registered emails; a reset link (30 min, `RECOVERY_RESET_TTL_SECONDS`) is sent only when the account exists **and** has a password to reset (OAuth-only accounts, which store an empty `password_hash`, are silently skipped). `POST /api/auth/reset-password` (public) consumes the single-use token, enforces the §15 password policy against the resolved account's identity, then rotates the credential.
+
+**Change:** `POST /api/auth/change-password` (authenticated) requires the **current** password (re-authentication — a stolen session alone cannot rotate the credential), rejects an unchanged new password, and enforces the §15 policy.
+
+**Shared rotation primitive (`_apply_password_change`):** reset and change both call one function so they can never diverge on the security-critical steps — hash the new password, stamp `password_changed_at` (the global token kill-switch honored by every access/refresh check, §11/§12), retire any outstanding reset tokens, **revoke every session** (`SessionStore.revoke_all_for_user`), and send a `PASSWORD_CHANGED` confirmation email. Net effect: after a reset or change the user is signed out on **every** device — refresh families are dead immediately and outstanding access tokens go stale on next use. All three endpoints are rate-limited via the `PASSWORD` policy.
+
+**Recovery token matrix:**
+
+| Token | Purpose | Lifetime | Single-use | Bound to | Revoked by |
+|-------|---------|----------|------------|----------|-----------|
+| Email verification | Prove address ownership | 24h (`RECOVERY_VERIFY_TTL_SECONDS`) | Yes (atomic burn) | user_id + purpose (HMAC) | reissue / redemption / TTL reap |
+| Password reset | Authorize credential change | 30 min (`RECOVERY_RESET_TTL_SECONDS`) | Yes (atomic burn) | user_id + purpose (HMAC) | reissue / redemption / password change / TTL reap |
 
 ---
 
 # 18. CSRF Protection Strategy
 
-**Current baseline:** `SameSite=Lax` on all auth cookies (`backend/security/cookies.py`) — cookies are withheld on cross-site sub-requests (the classic CSRF vector: `<img>`, `<form>` auto-submit, cross-site `fetch`) and only sent on top-level, same-site navigation. This is a real, effective baseline, not a placeholder.
+**Implemented — PH1.7.** Centralized in `backend/security/csrf.py`; wired via `apply_csrf_protection(app)`. A **signed double-submit cookie bound to the session** (OWASP "signed double-submit cookie") layered on top of the `SameSite=Lax` baseline (`security/cookies.py`).
 
-**Known gap:** no dedicated CSRF *token* layer (double-submit token or synchronizer token pattern) for state-changing cookie-authenticated routes. PH1.3's own completion notes call this out as "deferred to a follow-up," but — as identified in the architectural review for this document — **no PH1 sprint number currently owns it.** PH1.4b is headers-only; PH1.6 is JWT/refresh; neither is CSRF tokens. This document records the gap explicitly so it is not lost: a `backend/security/csrf.py` module, applied to all cookie-authenticated `POST`/`PUT`/`PATCH`/`DELETE` routes, is the recommended next-sprint candidate (see the Documentation Synchronization Report at the end of this sprint's summary).
+**Baseline (unchanged):** `SameSite=Lax` on all auth cookies withholds them on the classic cross-site sub-request vectors (`<img>`, `<form>` auto-submit, cross-site `fetch`). This is real and effective — but `Lax` still attaches cookies on *top-level* cross-site navigations (a lured link/redirect performing a `POST`), and a misconfigured `SameSite=None` deployment loses the baseline entirely. The token layer closes that residual surface independently of the cookie's `SameSite` value.
+
+**Token model:** on session issuance (login / register / OAuth) and on every refresh, the server plants a `csrf_token` cookie — **not** `HttpOnly`, so a same-origin script can read it and echo it in the `X-CSRF-Token` header. The token is `<nonce>.<HMAC(secret, "prefix|sid|nonce")>`: it carries no secret, is unforgeable without the server key, and is **bound to the session id (`sid`)**. The HMAC key is `CSRF_SECRET` when set, else the already-required `JWT_SECRET` (domain-separated by a fixed prefix so a CSRF MAC can never be confused with a JWT). Cookie `Secure`/`SameSite`/`Domain` are resolved through `security.cookies` so the CSRF cookie shares the auth cookies' production posture.
+
+**Enforcement rule (`CSRFMiddleware`):** a request must present a valid token **iff** it is (a) a mutating method (not `GET`/`HEAD`/`OPTIONS`/`TRACE`), (b) not an exempt auth-bootstrap path (login/register/refresh/logout/OAuth — these establish or rotate the very session the token binds to), (c) carries **no** `Authorization: Bearer` header, and (d) is genuinely cookie-authenticated (a valid `access_token` cookie). Validation requires header == cookie (double-submit) **and** the token's HMAC verifying against the cookie session's `sid` (binding). Any failure → **`403` (`code: CSRF_FAILED`)**, fail-closed.
+
+**Why Bearer requests are exempt (and why this is non-breaking):** the StockAssist SPA authenticates with an `Authorization: Bearer` token from `localStorage` (`server.get_current_user`). A cross-site attacker cannot read that token (same-origin policy) nor attach a custom `Authorization` header cross-site without a CORS preflight the exact-match allowlist (§19) denies — so a Bearer request carries no ambient cookie authority to forge and is inherently CSRF-safe. Enforcement therefore targets exactly the cookie-only attack surface (`get_current_user` also accepts the `access_token` cookie). This is also what makes the layer a **zero-frontend-change** rollout: the existing Bearer client is unaffected, while a future cookie-only client is already protected. 18 hermetic tests in `backend/tests/test_csrf.py`.
+
+**Token lifecycle:** minted on login/register/OAuth (`_issue_session`) and re-minted on every `/refresh` (same `sid` → stable binding); cleared on logout / logout-all. Cookie `Max-Age` matches the 7-day refresh horizon.
 
 ---
 
@@ -408,9 +436,31 @@ Acceptance target: an A grade on an external header scan (e.g. securityheaders.c
 
 # 21. Rate Limiting Strategy
 
-**Current:** one narrow, real mechanism — login brute-force lockout (`db.login_attempts`, keyed `f"{ip}:{email}"`): 5 failed attempts locks that identifier for 15 minutes (`429`). This is MongoDB-backed (not Redis), scoped to `/api/auth/login` only, and resets on any successful login.
+**Implemented — PH1.7.** Centralized in `backend/security/rate_limit.py` — one limiter, one storage model, one set of policies. The prior inline `db.login_attempts` lockout is **folded in** (removed as a standalone mechanism), closing the "two lockout systems on one endpoint" footgun this section previously flagged.
 
-**Target (SECURITY.md, PH1.7):** tiered, platform-wide rate limiting by subscription role — Guest 30/min, Free 120/min, Pro 300/min, Elite 600/min, Admin configurable — via an ASGI limiter (slowapi or equivalent) backed by Redis, with strict, separate limits on `/api/auth/*` regardless of tier. **PH1.7 should treat the existing login-lockout logic as prior art to fold into the new limiter, not as a competing mechanism to leave running in parallel** — two independent lockout systems on the same endpoint is itself a future footgun.
+**Storage — pluggable, MongoDB now, Redis-ready.** A `RateLimitStore` interface abstracts counting/lockout; the shipped `MongoRateLimitStore` uses the `rate_limits` collection (a fixed-window counter document per `(key, window_start)` plus one lockout document per key, both reaped by a TTL index). MongoDB — not an in-memory counter — is used deliberately: it is durable across restarts and shared across worker processes (an in-memory counter would silently reset on deploy and never see sibling workers), matching the pre-existing persistence choice for `login_attempts`. The interface is the exact shape a Redis `INCR`/`EXPIRE` store implements, so it can be swapped **without touching a single caller**.
+
+**Two enforcement surfaces:**
+
+1. **Inline (auth endpoints)** — login/register/refresh call the limiter directly (their identity comes from the request body / token, and login must count *failures only* so a successful login never consumes budget): `peek` → `record_failure` → `reset`.
+2. **Platform-wide middleware (`RateLimitMiddleware`)** — the endpoint-flooding backstop over all `/api` traffic: authenticated requests limited per user, anonymous per client IP.
+
+**Policy matrix (defaults; every policy env-overridable via `RATE_LIMIT_<NAME>="limit/window_seconds"`):**
+
+| Policy | Limit | Scope | Penalty | Endpoint(s) |
+|---|---|---|---|---|
+| `login` | 5 / 15 min | `ip:account` | Progressive lockout (escalates ×2 per repeat trip, cap 1h) | `POST /api/auth/login` (failures only) |
+| `register` | 5 / hour | `ip` | Lockout until window reset | `POST /api/auth/register` |
+| `refresh` | 20 / min | `session` (`sid`) | Lockout until window reset | `POST /api/auth/refresh` |
+| `password` | 5 / hour | `ip:account` | Lockout until window reset | future password change/reset endpoints |
+| `api_user` | 120 / min | `user` | Lockout until window reset | all authenticated `/api/*` (middleware) |
+| `api_ip` | 60 / min | `ip` | Lockout until window reset | all anonymous `/api/*` (middleware) |
+
+**Progressive penalties:** exceeding a policy arms a temporary lockout with an automatic expiry; `escalate` policies (login) double the lockout on each *successive* trip (trip history persists past the block), up to `max_block_seconds`. An *active* lockout is never re-escalated by a client that keeps hammering — only a fresh trip after the prior block expired escalates. Every rejection carries a `Retry-After` header; throttled tiers also emit `X-RateLimit-Limit/Remaining/Reset`.
+
+**Fail posture:** every *policy* decision is strict, but a *storage* error in the middleware degrades to "allow" (logged) so the throttle layer can never take the whole API down — availability is chosen over a hard fail for this layer specifically, while auth/CSRF/token layers remain fail-closed.
+
+**Concurrency note:** the Mongo counter is an increment-then-read (non-atomic), so simultaneous requests can momentarily under/over-count by at most the concurrency width — benign for a throttle and closed by an atomic Redis `INCR` store later. (The role-tiered Guest/Free/Pro/Elite quotas sketched in SECURITY.md remain future work; PH1.7 delivers the authenticated-vs-public split and the abuse-critical per-endpoint limits.)
 
 ---
 
@@ -431,25 +481,28 @@ Both are write-only from the application's perspective — no endpoint updates o
 
 # 23. Secret Management
 
-- No `.env` files committed to the repository; no hardcoded API keys found in source (verified as part of PH1.1's audit baseline and unchanged since).
-- `JWT_SECRET` is read via `os.environ["JWT_SECRET"]` — a bare KeyError (hard crash) if unset, which is fail-secure but not fail-*informative*: there is no boot-time validator yet that names the missing variable before the process dies on first request (PH1.8).
-- Google, broker, AI provider, and payment secrets are all environment-sourced; none observed hardcoded.
-- **Known weak points, both PH1.8 scope:** `docker-compose.yml` carries a placeholder `change_this_in_production_min_32_chars` default and a hardcoded n8n password — these must be removed, not just documented as "don't use the default."
-- No secret-rotation runbook exists yet (PH1.8 deliverable).
+**As of PH1.9, secret management is centralized in `backend/security/secrets.py`** — the single source of truth for the app's configuration surface.
+
+- **The registry.** `SECRET_REGISTRY` declares every environment variable the app reads: category, `sensitive` flag, the environments it is `required_in`, a `min_length` for signing keys, and a safe example. It is the authoritative inventory (mirrored to `backend/.env.example` and `.claude/SECRETS.md`) — adding an `os.environ[...]` read without a registry entry is a review defect.
+- **Boot-time validation (fail-closed, fail-informative).** `validate_config()` runs from `server.py` immediately after `load_dotenv` and *before* the Mongo client. It aggregates **every** problem into one value-free error. The old failure mode — `os.environ["JWT_SECRET"]` raising a bare `KeyError` at first request — is replaced by a named, up-front abort. Severity is environment-aware: the core trio (`MONGO_URL`/`DB_NAME`/`JWT_SECRET`) is fatal everywhere; production additionally rejects any missing required secret, a signing key < 32 chars, placeholder/weak values, half-configured OAuth/broker pairs, `ENABLE_AUTO_LOGIN=true`, a weak `ADMIN_PASSWORD`, and the absence of any AI provider.
+- **No secret is ever logged.** The startup summary is presence-only (names + counts); `redact()` collapses any value that must appear in diagnostics.
+- No `.env` files are committed (verified: no real provider secret in git history via `git log --all -S`; example templates are the only committed `.env.*`). Google, broker, AI-provider, and payment secrets are all environment-sourced.
+- **Resolved PH1.9 weak points:** `docker-compose.yml`'s placeholder `change_this_in_production_min_32_chars` `JWT_SECRET` default and hard-coded n8n password `alphapartner123` are removed — both are now required env vars with no baked default.
+- A secret-rotation runbook now exists: `.claude/SECRETS.md` (lifecycle, per-class rotation cadence, and leaked-credential incident response).
 
 ---
 
 # 24. Environment Security
 
-- `APP_ENV` is the single environment discriminator used consistently across `security/cookies.py` and `security/cors.py` (`is_production()` is the shared primitive both modules import from `security.cookies` — deliberate, so the two modules can never disagree about what "production" means).
-- No boot-time configuration validator exists yet — a misconfigured production deployment (weak `JWT_SECRET`, missing `CORS_ALLOWED_ORIGINS`) is only caught at request time (e.g., empty CORS allowlist) or not caught at all (weak but present `JWT_SECRET`). PH1.8 closes this with a typed env-var registry that hard-fails startup on any missing/weak required production value.
-- Three-environment strategy (dev/staging/prod) is designed in PRODUCTION_HARDENING.md §5 but staging does not yet exist as a running environment (PH2.12).
+- `APP_ENV` is the single environment discriminator used consistently across `security/cookies.py`, `security/cors.py`, and now `security/secrets.py` (`is_production()` is the shared primitive all three import from `security.cookies`; `secrets.app_env()` adds the dev/staging/prod tri-state — deliberate, so the modules can never disagree about what "production" means).
+- **PH1.9 closed the boot-time gap:** `security/secrets.py`'s `validate_config()` hard-fails startup on any missing/weak required production value (weak `JWT_SECRET`, missing `CORS_ALLOWED_ORIGINS`, absent AI provider, etc.), naming every offending variable at once. Misconfiguration is now caught before the first request, not at request time or never.
+- Three-environment strategy (dev/staging/prod) drives validation severity (§SECRETS.md §2); staging still does not yet exist as a running environment (PH2.12).
 
 ---
 
 # 25. Dependency Security
 
-`backend/requirements.txt` currently pins the relevant security-critical libraries: `bcrypt==4.1.3`, `PyJWT==2.13.0`, `google-auth==2.53.0`, `email-validator==2.3.0`, `redis==5.0.8`, `httpx==0.28.1`. No automated vulnerability scanning exists yet (`pip-audit`/`npm audit`, Dependabot) — PH1.11 scope. Dev tooling (`black`, `flake8`) is still pinned in the runtime `requirements.txt` rather than a separate `requirements-dev.txt` (finding M14), meaning the production image currently ships tooling it doesn't need.
+**As of PH1.9, `backend/requirements.txt` is fully exact-pinned** (`==` on every line — the last four floating `>=` bounds were locked), giving reproducible builds and a stable audit surface. Automated scanning now runs in CI (`.github/workflows/security-audit.yml`): `pip-audit --strict` + `pip check` (backend), `npm audit` (frontend), and `gitleaks` on every push/PR and weekly; `backend/scripts/audit_dependencies.py` runs the backend checks locally. The PH1.9 audit applied 7 in-pin CVE patches (aiohttp, cryptography, httplib2, pillow, pyasn1, pymongo, python-multipart); the remaining advisories are framework-locked (`starlette` under `fastapi==0.110.1`), AI-scope (`litellm`), or unfixed (`ecdsa`), tracked in SECRETS.md §8. **Remaining PH1.11 work:** Dependabot config, the `requirements.txt` → `requirements-dev.txt` split (finding M14 — `black`/`flake8`/etc. still ship in the runtime image), and a triage-SLA policy.
 
 ---
 
@@ -467,12 +520,23 @@ backend/
 │   │   └── common_passwords.txt  (PH1.5) bundled common-password blocklist
 │   ├── headers.py          (PH1.4b) HTTP security-header policy + middleware —
 │   │                                the only place security response headers are set
-│   ├── csrf.py             (planned, unscheduled) CSRF token middleware — see §18
+│   ├── csrf.py             (PH1.7) signed double-submit CSRF token bound to the
+│   │                                session — the only place a CSRF token is
+│   │                                minted, its cookie set/cleared, or validated
 │   ├── jwt.py              (PH1.6) JWT issuance/verification — the only place a
 │   │                                token is encoded or decoded (pure crypto)
 │   ├── sessions.py         (PH1.6) SessionStore: refresh-token families, rotation,
 │   │                                reuse detection, revocation (logout / logout-all)
-│   ├── rate_limit.py       (planned, PH1.7) tiered rate limiter
+│   ├── rate_limit.py       (PH1.7) centralized rate limiting: named policies,
+│   │                                pluggable RateLimitStore (Mongo now, Redis-
+│   │                                ready), progressive lockout, middleware
+│   ├── recovery.py         (PH1.8) identity-recovery tokens — the only place a
+│   │                                single-use email-verify / password-reset token
+│   │                                is minted, verified, or burned (signed handle +
+│   │                                authoritative recovery_tokens record)
+│   ├── secrets.py          (PH1.9) secret & config management — SECRET_REGISTRY of
+│   │                                every env var + boot-time validate_config()
+│   │                                (fail-closed); the config surface's single truth
 │   └── oauth.py            (not yet extracted) candidate home for the Google OAuth
 │                                    logic currently inline in server.py — extraction
 │                                    is not itself a scheduled sprint; noted as a
@@ -488,7 +552,12 @@ backend/
     ├── test_cookie_security.py   (PH1.3) 24 tests — cookie policy
     ├── test_cors_hardening.py    (PH1.4) 30 tests — CORS policy
     ├── test_security_headers.py  (PH1.4b) 35 tests — HTTP security headers
-    └── test_password_policy.py   (PH1.5) 40 tests — password policy + login compatibility
+    ├── test_password_policy.py   (PH1.5) 40 tests — password policy + login compatibility
+    ├── test_jwt_sessions.py      (PH1.6) tests — JWT lifecycle + session rotation
+    ├── test_csrf.py              (PH1.7) 18 tests — signed double-submit CSRF
+    ├── test_rate_limit.py        (PH1.7) 26 tests — limiter, lockout, middleware
+    ├── test_recovery.py          (PH1.8) 28 tests — identity-recovery tokens
+    └── test_secrets.py           (PH1.9) 38 tests — config validation + registry
 ```
 
 Convention established by PH1.1–PH1.4 and binding on every future security sprint: **one module per concern under `backend/security/`, one test file per module under `backend/tests/`, named `test_<concern>.py`.**
@@ -497,7 +566,7 @@ Convention established by PH1.1–PH1.4 and binding on every future security spr
 
 # 27. Security Middleware Pipeline
 
-Current pipeline (as wired in `server.py` today):
+Current pipeline (as wired in `server.py` today, PH1.7):
 
 ```
 Request
@@ -509,11 +578,17 @@ SecurityHeadersMiddleware (security/headers.py, apply_security_headers)  ── 
 CORSMiddleware (security/cors.py, apply_cors)   ── origin check, preflight
    │
    ▼
+RateLimitMiddleware (security/rate_limit.py, apply_rate_limiting)  ── per-user /
+   │                                       per-IP flooding backstop; 429 + Retry-After
+   ▼
+CSRFMiddleware (security/csrf.py, apply_csrf_protection)  ── signed double-submit
+   │                            check on cookie-authenticated mutations; 403 on failure
+   ▼
 Route dispatch (FastAPI router matching)
    │
    ▼
 Depends(get_current_user) / Depends(require_admin)   ── identity + role
-   │
+   │                            (auth endpoints additionally call the limiter inline)
    ▼
 Pydantic model validation (route parameters/body)
    │
@@ -521,17 +596,12 @@ Pydantic model validation (route parameters/body)
 Route handler (business logic, per-user data scoping)
    │
    ▼
-Response (+ security headers via security/headers.py; set/clear cookies via security/cookies.py where applicable)
+Response (+ security headers via security/headers.py; set/clear cookies via security/cookies.py and the CSRF cookie via security/csrf.py where applicable)
 ```
 
-**Target pipeline** once PH1.6–PH1.9 land (additions in bold; Security Headers landed in PH1.4b):
+**Middleware ordering rationale (deliberate deviation from the earlier idealized "rate limiter first" sketch):** Starlette runs middleware last-registered-first, so registering CSRF and the rate limiter *before* CORS/headers places them **inside** the CORS and header stampers. A `403`/`429` they emit therefore still flows back out through CORS (gaining `Access-Control-Allow-Origin`) and the header middleware — so a browser SPA can actually *read* the rejection and the response stays consistently hardened. They still reject *before* route dispatch, auth, and any handler/DB work; only the two cheap header/origin stampers run ahead of them. Putting the limiter truly outermost (as the original target diagram drew it) would strip CORS/security headers off exactly the error responses clients most need to interpret — hence this order.
 
-```
-Request → **Rate Limiter (PH1.7)** → Security Headers (PH1.4b) → CORS →
-Route dispatch → **CSRF token check on state-changing routes (unscheduled, §18)** →
-Auth (get_current_user/require_admin) → Model validation → Handler →
-**Audit log write (where applicable)** → Response (+ security headers, cookies)
-```
+**Remaining planned additions** (PH1.8–PH1.9): an audit-log write on auth-relevant handlers, and Socket.IO connection authorization.
 
 ---
 
@@ -663,13 +733,12 @@ This section is the authoritative forward-looking security sequence; PRODUCTION_
 | PH1.4b Security Headers | ✅ Done — `security/headers.py` in §26; §20 now "current"; pipeline updated in §27 |
 | PH1.5 Password/Email/Verification | ✅ Password portion done (§15 now "current"). §16, §17 and `EmailStr` deferred to unscheduled PH1.5b |
 | PH1.6 JWT & Refresh Rotation | §9, §11, §12, §30 rewritten for rotation + revocation store; `jti` claim added |
-| PH1.7 Rate Limiting | §21 rewritten; login-lockout folded into the new limiter per the note in §21 |
-| PH1.8 Secrets & Env Hardening | §23, §24 updated with the boot-time validator's actual registry |
-| PH1.9 WebSocket Security | New §"Real-Time Authorization Architecture"; §4 trust-boundary diagram gains a Socket.IO lane |
+| PH1.7 CSRF & Rate Limiting | ✅ Done — §18 rewritten (signed double-submit CSRF, `security/csrf.py`); §21 rewritten (centralized limiter, `security/rate_limit.py`, login-lockout folded in); §26 layout + §27 pipeline updated |
+| PH1.8 Secrets & Env Hardening | ✅ Done (as the "PH1.9 — Secrets & Supply Chain" sprint) — §23, §24 rewritten for `security/secrets.py` + boot-time `validate_config`; §26 layout + tests updated; SECRETS.md added |
+| PH1.9 WebSocket Security | (next) New §"Real-Time Authorization Architecture"; §4 trust-boundary diagram gains a Socket.IO lane |
 | PH1.10 Admin & Sessions | §9 session-listing moves to "current"; ADR-028 MFA design referenced from §14 |
-| PH1.11 Dependency Scanning | §25 updated with scan tooling and triage policy |
+| PH1.11 Dependency Scanning | 🟡 Partial — §25 updated with CI scan tooling + full pinning (PH1.9); Dependabot/split/triage still pending |
 | PH1.12 Security Certification | This document is the primary evidence artifact reviewed against the pen-test checklist |
-| Unscheduled: CSRF token layer | §18 — recommended to be its own sprint (see Documentation Synchronization Report) |
 | Unscheduled: Password reset flow | §17 — recommended to be folded into PH1.5 |
 | Unscheduled: OAuth module extraction | §26 — housekeeping, no urgency |
 
@@ -715,7 +784,7 @@ Beyond PH1 (post-certification, informed by SECURITY.md's "Future" markers and t
 
 # Architecture Summary
 
-StockAssist AI's security architecture, as of PH1.4 completion, is **strong at the transport/session-integrity layer and thin at the authorization/lifecycle layer**: cookies and CORS are production-hardened and centrally owned (§10, §19); OAuth is genuinely fail-closed with real cryptographic verification (§13); but JWTs don't rotate or revoke (§12), rate limiting is a single narrow mechanism (§21), authorization is binary rather than fine-grained (§8), and a CSRF token layer has no owner (§18). PH1.5–PH1.12 closes these in a defined order; this document is what keeps that sequence coherent instead of ad hoc.
+StockAssist AI's security architecture, as of PH1.9 completion, is **production-hardened across the transport, session-integrity, abuse-prevention, identity-lifecycle, and configuration layers**: cookies and CORS are centrally owned (§10, §19); OAuth is fail-closed with real cryptographic verification (§13); JWTs rotate with reuse detection and revocation (§12); a signed, session-bound CSRF token layer guards cookie-authenticated mutations (§18); centralized, progressive rate limiting protects against brute force and endpoint flooding (§21); the identity lifecycle is recoverable — single-use, expiring, enumeration-safe email verification and password reset/change, each forcing a full sign-out on credential rotation (§16–§17); and configuration is now centralized and validated at boot — `security/secrets.py` fails the process closed on a missing/weak critical secret (§23–§24), with the dependency set fully pinned and continuously audited in CI (§25). The remaining thin spots are authorization-layer (binary rather than fine-grained roles, §8; no Socket.IO connection authorization) and the deferred framework-locked CVEs (SECRETS.md §8). PH1.9 (Real-Time)–PH1.12 close these in a defined order; this document keeps that sequence coherent instead of ad hoc.
 
 ---
 
@@ -729,16 +798,16 @@ StockAssist AI's security architecture, as of PH1.4 completion, is **strong at t
 | CORS hardening | ✅ Complete | §19, PH1.4 |
 | Security headers | ✅ Complete | §20, PH1.4b |
 | Password policy | ✅ Complete | §15, PH1.5 |
-| Email policy/verification | ❌ Not started (deferred from PH1.5 → PH1.5b) | §16–§17 |
-| JWT lifecycle/rotation | ❌ Not started | §11–§12, PH1.6 |
-| Rate limiting | ⚠️ Partial (login only) | §21, PH1.7 |
-| Secrets/env validation | ❌ Not started | §23–§24, PH1.8 |
-| WebSocket security | ❌ Not started | §32, PH1.9 |
+| Email verification | ✅ Complete | §16, PH1.8 |
+| Password change / reset (identity recovery) | ✅ Complete | §17, PH1.8 |
+| JWT lifecycle/rotation | ✅ Complete | §11–§12, PH1.6 |
+| CSRF token layer | ✅ Complete | §18, PH1.7 |
+| Rate limiting | ✅ Complete | §21, PH1.7 |
+| Secrets/env validation | ✅ Complete | §23–§24, PH1.9 (`security/secrets.py`, boot-time `validate_config`) |
+| WebSocket security | ❌ Not started | §32, PH1.9 (Real-Time — next) |
 | Admin/session management | ❌ Not started | §9, PH1.10 |
-| Dependency scanning | ❌ Not started | §25, PH1.11 |
+| Dependency scanning | 🟡 Partial | §25, PH1.9 (CI pip-audit/npm audit/gitleaks + full pinning); PH1.11 for Dependabot/split |
 | Security certification | ❌ Not started | §34, PH1.12 |
-| CSRF token layer | ❌ Not started, unscheduled | §18 |
-| Password reset flow | ❌ Not started, unscheduled | §17 |
 | Fine-grained permissions | ❌ Not started, unscheduled | §8 |
 
 ---
@@ -759,6 +828,8 @@ StockAssist AI's security architecture, as of PH1.4 completion, is **strong at t
 
 | Version | Date | Change |
 |---|---|---|
+| 1.3 | 2026-07-22 | PH1.8 (Identity Recovery) implemented. §16 (Email Verification) and §17 (Password Reset) rewritten from "does not exist / target" to "current": single-use, expiring, signed recovery tokens centralized in `security/recovery.py` (`<token_id>.<HMAC>` + authoritative `recovery_tokens` record; atomic single-use burn); new `/api/auth` endpoints (`verify-email`, `verify-email/request`, `forgot-password`, `reset-password`, `change-password`); user model gains `email_verified`/`email_verified_at`/`verified_by`; reset & change force a full sign-out (`revoke_all_for_user` + `password_changed_at`). Recovery token matrix added. §15 "still open" note, §26 module tree (+`recovery.py`), Architecture Summary, and Implementation Status table updated. 28 new hermetic tests (`test_recovery.py`). Login is deliberately not blocked on `email_verified` (backward-compatible). |
+| 1.2 | 2026-07-21 | PH1.7 (CSRF Protection & Rate Limiting) implemented. §18 rewritten from "unowned gap" to "current" — signed double-submit CSRF token bound to the session (`security/csrf.py`, `CSRFMiddleware`), enforced on cookie-authenticated mutations, Bearer requests exempt by construction (zero-frontend-change rollout). §21 rewritten from "login-only" to "current" — centralized limiter (`security/rate_limit.py`) with pluggable `RateLimitStore` (MongoDB now, Redis-ready), named per-endpoint policies, progressive lockout with `Retry-After`, and a platform-wide `RateLimitMiddleware`; the inline `db.login_attempts` lockout was folded in and removed. §26 module tree + test list, §27 middleware pipeline (with ordering rationale), the threat matrix, §32 forward table, and the Implementation Status table all updated. 44 new hermetic tests (`test_csrf.py` 18, `test_rate_limit.py` 26). |
 | 1.1 | 2026-07-19 | PH1.5 (Password Policy & Account Protection) implemented: §15 rewritten from target to current (centralized `security/passwords.py`, model-layer 422 enforcement, explicit bcrypt cost 12, timing-equalized/never-raising verification, sanitized validation errors); §26 module tree and §3 threat table updated. §16/§17 (email verification, password reset) deliberately deferred to an unscheduled PH1.5b. |
 | 1.0 | 2026-07-18 | Initial document. Synthesizes PH1.1–PH1.4 implementation (auth backdoor removal, Google OAuth hardening, cookie security, CORS hardening) into the permanent security architecture blueprint. Establishes the CSRF-token-layer and password-reset-flow documentation gaps identified during this synchronization sprint. |
 

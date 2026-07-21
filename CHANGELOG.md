@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Identity Recovery (PH1.8):** `backend/security/recovery.py` — the single source of truth for single-use, expiring email-verification and password-reset tokens. Each token is a signed handle `<token_id>.<HMAC>` bound to one user + one purpose, backed by an authoritative `recovery_tokens` record enforcing expiry and atomic single-use (replay-safe); a fresh issue invalidates the user's prior unused token of that purpose. Secret: `RECOVERY_SECRET` else `JWT_SECRET`. Lifetimes: verification 24h, reset 30 min (env-overridable).
+- **Recovery endpoints (PH1.8):** `POST /api/auth/verify-email`, `/verify-email/request`, `/forgot-password`, `/reset-password`, `/change-password`. Public flows return an identical generic response (no email enumeration); a reset or change enforces the PH1.5 password policy, revokes every session, and bumps `password_changed_at` (full sign-out on every device).
+- **Email verification status (PH1.8):** user model gains `email_verified` / `email_verified_at` / `verified_by`; new email/password accounts start unverified and are emailed a link (Google accounts are verified on creation/link). Three branded email templates (`EMAIL_VERIFICATION`, `PASSWORD_RESET`, `PASSWORD_CHANGED`) and `recovery_tokens` startup indexes (unique `token_id`, `(user_id,purpose)`, TTL on `expires_at`).
+- **CSRF Protection (PH1.7):** `backend/security/csrf.py` — a signed double-submit CSRF token bound to the session, enforced via `CSRFMiddleware` on cookie-authenticated, state-changing requests (Bearer requests are exempt by construction, so no frontend change was required). Failures return `403`.
+- **Centralized Rate Limiting (PH1.7):** `backend/security/rate_limit.py` — one limiter with named per-endpoint policies (login 5/15min, register 5/hour, refresh 20/min, authenticated API 120/min per user, public API 60/min per IP), a pluggable `RateLimitStore` (MongoDB now, Redis-ready), progressive lockout with automatic expiry, and a platform-wide `RateLimitMiddleware`. Every rejection carries `Retry-After`.
+- **Tests:** `backend/tests/test_recovery.py` (28), `backend/tests/test_csrf.py` (25) and `backend/tests/test_rate_limit.py` (30) — hermetic coverage of the identity-recovery, CSRF and rate-limit matrices.
+
+### Changed
+- **Auth endpoints:** login/register/refresh now use the centralized limiter; login/register/OAuth and refresh issue the CSRF cookie; logout clears it. Register now returns an additive `email_verified` field and emails a verification link out-of-band; the three public recovery endpoints are CSRF-exempt (they carry their own single-use authorization). No breaking public-API contract change.
+- **Middleware pipeline:** CSRF and rate-limit middleware wired inside CORS/security-headers so `403`/`429` responses remain browser-readable and consistently hardened.
+
+### Removed
+- **Inline login lockout:** the ad-hoc `db.login_attempts` mechanism was folded into the centralized limiter and removed (its startup index dropped; new `rate_limits` collection + TTL added).
+
 ---
 
 ## [1.2.0] - 2026-07-17

@@ -5,6 +5,20 @@ from pathlib import Path
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env', override=True)
 
+# Boot-time secret & configuration validation (PH1.9). Fail fast, fail closed:
+# a missing/weak critical secret aborts startup here — before the Mongo client,
+# any router, or a single request — with one aggregated, value-free error rather
+# than a raw KeyError surfacing later. Non-fatal issues are logged as warnings.
+# security.secrets is the single source of truth for the config surface; see
+# .claude/SECRETS.md and SECURITY_ARCHITECTURE.md §23–§24.
+from security import secrets as _secret_config
+
+_config_report = _secret_config.validate_config()
+import logging as _bootstrap_logging
+for _w in _config_report.warnings:
+    _bootstrap_logging.getLogger("security.secrets").warning(_w)
+_bootstrap_logging.getLogger("security.secrets").info(_config_report.summary_line())
+
 from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Depends, Header, WebSocket, WebSocketDisconnect, BackgroundTasks
 from pydantic import BaseModel
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -42,6 +56,21 @@ from security.cookies import (
 from security.cors import apply_cors
 from security.headers import apply_security_headers
 
+# Centralized CSRF protection (PH1.7). Signed double-submit token bound to the
+# session; enforced only on cookie-authenticated, state-changing requests
+# (Bearer requests are CSRF-safe and exempt). The CSRF cookie is set/cleared
+# only through this module. See SECURITY_ARCHITECTURE.md §18.
+from security.csrf import (
+    apply_csrf_protection,
+    set_csrf_cookie,
+    clear_csrf_cookie,
+)
+
+# Centralized rate limiting & abuse protection (PH1.7). One limiter, one storage
+# model, one set of policies — the prior inline db.login_attempts lockout is
+# folded in here. See SECURITY_ARCHITECTURE.md §21.
+from security import rate_limit as ratelimit
+
 # Centralized password policy + hashing primitives (PH1.5). Passwords are
 # hashed/verified ONLY through this module (explicit bcrypt cost, safe
 # verification that never raises on empty/malformed hashes, timing-equalized
@@ -50,6 +79,7 @@ from security.passwords import hash_password, verify_password
 
 from models import (
     UserCreate, UserLogin, UserResponse, UserSettingsUpdate,
+    VerifyEmailRequest, ForgotPasswordRequest, ResetPasswordRequest, ChangePasswordRequest,
     TradeCreate, TradeResponse, TradeModify, TradeExitRequest,
     WatchlistAdd,
     ChatMessage, ChatResponse,
@@ -192,6 +222,17 @@ from security.sessions import (
     REASON_LOGOUT,
 )
 
+# Centralized identity-recovery tokens (PH1.8). Single-use, expiring
+# email-verification and password-reset tokens are minted / verified / burned
+# ONLY through this store; the endpoints below compose it with the password and
+# session primitives above. See SECURITY_ARCHITECTURE.md §29.
+from security.recovery import (
+    RecoveryStore,
+    PURPOSE_VERIFY_EMAIL,
+    PURPOSE_RESET_PASSWORD,
+)
+from security.passwords import normalize_password, validate_new_password
+
 
 def create_access_token(user_id: str, email: str, session_id: Optional[str] = None) -> str:
     """Mint an access token. ``session_id`` binds the token to a refresh-token
@@ -217,6 +258,9 @@ async def _issue_session(user_id: str, email: str, request: Request,
     access = jwt_service.create_access_token(user_id, email, session_id)
     refresh = jwt_service.create_refresh_token(user_id, session_id, refresh_jti)
     set_auth_cookies(response, access, refresh)
+    # Plant a session-bound CSRF token (PH1.7). Non-HttpOnly so a same-origin
+    # script can echo it in X-CSRF-Token on cookie-authenticated mutations.
+    set_csrf_cookie(response, session_id)
     return access
 
 
@@ -841,7 +885,14 @@ admin_router = APIRouter(prefix="/api/admin", tags=["Admin Portal"])
 # ============ AUTH ROUTES ============
 
 @auth_router.post("/register")
-async def register(data: UserCreate, response: Response, request: Request):
+async def register(data: UserCreate, response: Response, request: Request,
+                   background_tasks: BackgroundTasks):
+    # Anti account-spam: 5 registrations / hour per client IP (PH1.7).
+    ip = ratelimit.client_ip(request)
+    ratelimit.raise_if_limited(
+        await ratelimit.get_limiter(db).check(ratelimit.REGISTER, ip),
+        detail="Too many registration attempts. Please try again later.",
+    )
     email = data.email.lower().strip()
     if await db.users.find_one({"email": email}):
         raise HTTPException(status_code=400, detail="Email already registered")
@@ -855,28 +906,40 @@ async def register(data: UserCreate, response: Response, request: Request):
         "max_daily_loss": 5000,
         "max_trades_per_day": 3,
         "telegram_chat_id": None,
+        # Email-verification status (PH1.8). New email/password accounts start
+        # unverified; a verification link is emailed below. Login is NOT blocked
+        # on this flag (backward-compatible) — it gates verified-only features
+        # and is the hook a future hard-enforcement gate would flip on.
+        "email_verified": False,
+        "email_verified_at": None,
+        "verified_by": None,
         "notification_prefs": {"push": True, "email": True, "morning_report": True, "trade_alerts": True, "exit_reminder": True, "portfolio_alerts": True, "email_alerts": True, "telegram_alerts": False},
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     result = await db.users.insert_one(user_doc)
     user_id = str(result.inserted_id)
+    # Send the verification link out-of-band so a slow/misconfigured mailer never
+    # delays or fails sign-up (best-effort; see _send_recovery_email).
+    background_tasks.add_task(_dispatch_verification_email, user_id, email, data.name)
     access = await _issue_session(user_id, email, request, response)
-    return {"id": user_id, "name": data.name, "email": email, "role": "user", "capital": 100000, "token": access}
+    return {"id": user_id, "name": data.name, "email": email, "role": "user",
+            "capital": 100000, "email_verified": False, "token": access}
 
 @auth_router.post("/login")
 async def login(data: UserLogin, response: Response, request: Request):
     email = data.email.lower().strip()
-    ip = request.client.host if request.client else "unknown"
+    ip = ratelimit.client_ip(request)
     identifier = f"{ip}:{email}"
+    limiter = ratelimit.get_limiter(db)
 
-    # Brute force check
-    attempt = await db.login_attempts.find_one({"identifier": identifier})
-    if attempt and attempt.get("count", 0) >= 5:
-        locked_until = attempt.get("locked_until")
-        if locked_until and datetime.now(timezone.utc) < datetime.fromisoformat(locked_until):
-            raise HTTPException(status_code=429, detail="Too many attempts. Try again in 15 minutes.")
-        else:
-            await db.login_attempts.delete_one({"identifier": identifier})
+    # Brute-force gate (PH1.7): reject up front if this ip:account is already
+    # locked out or has exhausted its 5-per-15-min budget of FAILED attempts.
+    # Counting happens on failure only (below), so a legitimate user logging in
+    # repeatedly is never penalized.
+    ratelimit.raise_if_limited(
+        await limiter.peek(ratelimit.LOGIN, identifier),
+        detail="Too many attempts. Try again later.",
+    )
 
     user = await db.users.find_one({"email": email})
     # Always run exactly one bcrypt comparison (verify_password pads with a
@@ -885,15 +948,11 @@ async def login(data: UserLogin, response: Response, request: Request):
     # email exists. The 401 below is identical for both failure causes.
     password_ok = verify_password(data.password, user.get("password_hash") if user else None)
     if not user or not password_ok:
-        current = await db.login_attempts.find_one({"identifier": identifier})
-        count = (current.get("count", 0) if current else 0) + 1
-        update_doc = {"$inc": {"count": 1}}
-        if count >= 5:
-            update_doc["$set"] = {"locked_until": (datetime.now(timezone.utc) + timedelta(minutes=15)).isoformat()}
-        await db.login_attempts.update_one({"identifier": identifier}, update_doc, upsert=True)
+        await limiter.record_failure(ratelimit.LOGIN, identifier)
         raise HTTPException(status_code=401, detail="Invalid email or password")
 
-    await db.login_attempts.delete_one({"identifier": identifier})
+    # Success: clear the failure budget so prior typos don't linger.
+    await limiter.reset(ratelimit.LOGIN, identifier)
     user_id = str(user["_id"])
     access = await _issue_session(user_id, email, request, response)
     return {
@@ -921,6 +980,7 @@ async def logout(request: Request, response: Response):
         except jwt_service.TokenError:
             pass
     clear_auth_cookies(response)
+    clear_csrf_cookie(response)
     return {"message": "Logged out"}
 
 @auth_router.post("/logout-all")
@@ -931,6 +991,7 @@ async def logout_all(request: Request, response: Response, user: dict = Depends(
     (``SessionStore.revoke_all_for_user``) is what PH1.10's UI will call."""
     revoked = await SessionStore(db).revoke_all_for_user(user["_id"], reason="logout_all")
     clear_auth_cookies(response)
+    clear_csrf_cookie(response)
     return {"message": "Signed out of all devices", "sessions_revoked": revoked}
 
 @auth_router.post("/refresh")
@@ -942,6 +1003,15 @@ async def refresh_token(request: Request, response: Response):
         payload = jwt_service.decode_token(token, expected_type="refresh")
     except jwt_service.TokenError:
         raise HTTPException(status_code=401, detail="Invalid refresh token")
+
+    # Token-abuse gate (PH1.7): 20 refreshes / min per session. Keyed by the
+    # session id so a stolen refresh token cannot be spun in a tight loop; a
+    # legitimate SPA refreshes far less often. Applied only after the token is
+    # structurally valid so unauthenticated noise can't fill a session's bucket.
+    ratelimit.raise_if_limited(
+        await ratelimit.get_limiter(db).check(ratelimit.REFRESH, payload["sid"]),
+        detail="Too many refresh attempts. Please slow down.",
+    )
 
     user = await db.users.find_one({"_id": ObjectId(payload["sub"])})
     if not user:
@@ -964,7 +1034,256 @@ async def refresh_token(request: Request, response: Response):
     # Re-issue BOTH cookies through the central hardened policy: rotation means
     # the refresh token changes on every use, not just the access token.
     set_auth_cookies(response, access, refresh)
+    # Refresh the session-bound CSRF token alongside (same sid → same binding).
+    set_csrf_cookie(response, payload["sid"])
     return {"message": "Token refreshed"}
+
+
+# ============ IDENTITY RECOVERY (PH1.8) ============
+# Email verification, password reset, and password change. All single-use tokens
+# are minted / verified / burned through security.recovery (never inline here);
+# every public response is deliberately generic so it can never reveal whether an
+# email is registered (SECURITY_ARCHITECTURE.md §29). A password change or reset
+# revokes every session (SessionStore.revoke_all_for_user) AND bumps
+# password_changed_at, so outstanding access tokens go stale on next use too.
+
+# A generic, identical response for the enumeration-sensitive flows (request
+# verification / forgot password): the caller learns nothing about the account.
+_GENERIC_RECOVERY_MESSAGE = (
+    "If an account matches, we've sent an email with the next steps."
+)
+
+
+def _humanize_ttl(seconds: int) -> str:
+    """Render a token lifetime as human copy for the email ("24 hours")."""
+    if seconds % 3600 == 0:
+        hours = seconds // 3600
+        return f"{hours} hour" + ("s" if hours != 1 else "")
+    minutes = max(1, seconds // 60)
+    return f"{minutes} minute" + ("s" if minutes != 1 else "")
+
+
+def _recovery_link(path: str, token: str) -> str:
+    """Absolute frontend URL carrying a recovery token as a query param."""
+    from urllib.parse import quote
+    return f"{_frontend_base()}/{path.lstrip('/')}?token={quote(token, safe='')}"
+
+
+async def _send_recovery_email(notif_type: str, to_email: str, **kwargs) -> None:
+    """Best-effort recovery email — a delivery failure must never break (nor
+    change the shape of) the calling auth flow, so it is swallowed and logged."""
+    try:
+        from services.email_service import send_notification
+        await send_notification(notif_type, to_email, **kwargs)
+    except Exception as e:  # pragma: no cover - defensive; delivery is best-effort
+        logger.warning(f"recovery email ({notif_type}) send failed: {e}")
+
+
+async def _dispatch_verification_email(user_id: str, email: str, name: str) -> None:
+    """Mint a fresh verification token and email its link. Fire-and-forget from
+    the caller's perspective (registration / resend)."""
+    token = await RecoveryStore(db).issue(user_id, PURPOSE_VERIFY_EMAIL)
+    await _send_recovery_email(
+        "EMAIL_VERIFICATION", email,
+        name=name or "",
+        verify_url=_recovery_link("verify-email", token.value),
+        expires_in=_humanize_ttl(token.ttl_seconds),
+    )
+
+
+@auth_router.post("/verify-email/request")
+async def request_email_verification(request: Request,
+                                     user: dict = Depends(get_current_user)):
+    """Resend the current user's email-verification link.
+
+    Authenticated (a user verifying their own address) and idempotent from the
+    client's view: already-verified accounts return the same generic message
+    without sending anything, and issuing a new token invalidates any prior
+    unused one (security.recovery), so only the latest link works."""
+    ip = ratelimit.client_ip(request)
+    ratelimit.raise_if_limited(
+        await ratelimit.get_limiter(db).check(
+            ratelimit.PASSWORD, f"{ip}:{user['email']}"),
+        detail="Too many verification requests. Please try again later.",
+    )
+    if not user.get("email_verified"):
+        await _dispatch_verification_email(user["_id"], user["email"], user.get("name", ""))
+        await log_auth_event("email_verification_requested", request,
+                             email=user["email"], user_id=user["_id"])
+    return {"message": _GENERIC_RECOVERY_MESSAGE}
+
+
+@auth_router.post("/verify-email")
+async def verify_email(data: VerifyEmailRequest, request: Request):
+    """Redeem an email-verification token (public — the user clicks a link).
+
+    The token is single-use: ``consume`` burns it atomically, so a replayed link
+    is rejected. Responses are generic (a bad/expired/used token and an unknown
+    user both yield the same 400) so the endpoint reveals nothing."""
+    ip = ratelimit.client_ip(request)
+    ratelimit.raise_if_limited(
+        await ratelimit.get_limiter(db).check(ratelimit.PASSWORD, ip),
+        detail="Too many attempts. Please try again later.",
+    )
+    record = await RecoveryStore(db).consume(data.token, PURPOSE_VERIFY_EMAIL)
+    if not record:
+        await log_auth_event("email_verification_failure", request, reason="invalid_or_used_token")
+        raise HTTPException(status_code=400, detail="Verification link is invalid or has expired.")
+
+    try:
+        user_oid = ObjectId(record["user_id"])
+    except Exception:
+        raise HTTPException(status_code=400, detail="Verification link is invalid or has expired.")
+    result = await db.users.update_one(
+        {"_id": user_oid},
+        {"$set": {
+            "email_verified": True,
+            "email_verified_at": datetime.now(timezone.utc).isoformat(),
+            "verified_by": "email",
+        }},
+    )
+    if not getattr(result, "matched_count", 0):
+        raise HTTPException(status_code=400, detail="Verification link is invalid or has expired.")
+    await log_auth_event("email_verification_success", request, user_id=record["user_id"])
+    return {"message": "Your email has been verified.", "email_verified": True}
+
+
+@auth_router.post("/forgot-password")
+async def forgot_password(data: ForgotPasswordRequest, request: Request):
+    """Begin password recovery. ALWAYS returns the same generic message so it
+    cannot be used to enumerate registered emails — the reset email is sent only
+    when the account exists and can hold a password (OAuth-only accounts, which
+    store an empty ``password_hash``, are silently skipped)."""
+    email = (data.email or "").lower().strip()
+    ip = ratelimit.client_ip(request)
+    # Keyed by ip:email so one client cannot spray reset mail across accounts,
+    # while a genuine user retrying their own address is barely affected.
+    ratelimit.raise_if_limited(
+        await ratelimit.get_limiter(db).check(ratelimit.PASSWORD, f"{ip}:{email}"),
+        detail="Too many password reset requests. Please try again later.",
+    )
+    if email:
+        user = await db.users.find_one({"email": email})
+        # Only email a link to an account that actually has a password to reset;
+        # an OAuth-native account (empty hash) has nothing to reset and should
+        # keep using Google — but the response stays identical either way.
+        if user and user.get("password_hash"):
+            token = await RecoveryStore(db).issue(str(user["_id"]), PURPOSE_RESET_PASSWORD)
+            await _send_recovery_email(
+                "PASSWORD_RESET", email,
+                reset_url=_recovery_link("reset-password", token.value),
+                expires_in=_humanize_ttl(token.ttl_seconds),
+            )
+            await log_auth_event("password_reset_requested", request,
+                                 email=email, user_id=str(user["_id"]))
+        else:
+            await log_auth_event("password_reset_requested", request,
+                                 email=email, reason="no_resettable_account")
+    return {"message": _GENERIC_RECOVERY_MESSAGE}
+
+
+@auth_router.post("/reset-password")
+async def reset_password(data: ResetPasswordRequest, request: Request):
+    """Complete password recovery with a single-use reset token + a new password.
+
+    Enforces the PH1.5 password policy against the resolved account's identity,
+    burns the token (single-use / replay-safe), then invalidates EVERY session
+    and stamps ``password_changed_at`` so all outstanding access and refresh
+    tokens are dead. The user must log in again with the new password."""
+    ip = ratelimit.client_ip(request)
+    ratelimit.raise_if_limited(
+        await ratelimit.get_limiter(db).check(ratelimit.PASSWORD, ip),
+        detail="Too many attempts. Please try again later.",
+    )
+    record = await RecoveryStore(db).consume(data.token, PURPOSE_RESET_PASSWORD)
+    if not record:
+        await log_auth_event("password_reset_failure", request, reason="invalid_or_used_token")
+        raise HTTPException(status_code=400, detail="Reset link is invalid or has expired.")
+
+    try:
+        user_oid = ObjectId(record["user_id"])
+    except Exception:
+        raise HTTPException(status_code=400, detail="Reset link is invalid or has expired.")
+    user = await db.users.find_one({"_id": user_oid})
+    if not user:
+        raise HTTPException(status_code=400, detail="Reset link is invalid or has expired.")
+
+    new_password = normalize_password(data.new_password)
+    violations = validate_new_password(new_password, email=user.get("email", ""), name=user.get("name", ""))
+    if violations:
+        # The token is already burned; the user restarts via forgot-password.
+        raise HTTPException(status_code=422, detail=" ".join(violations))
+
+    await _apply_password_change(user, new_password)
+    await log_auth_event("password_reset_success", request,
+                         email=user.get("email"), user_id=record["user_id"])
+    return {"message": "Your password has been reset. Please log in with your new password."}
+
+
+@auth_router.post("/change-password")
+async def change_password(data: ChangePasswordRequest, request: Request,
+                          user: dict = Depends(get_current_user)):
+    """Change the authenticated user's password.
+
+    Requires the CURRENT password (re-authentication — a stolen session alone
+    cannot rotate the credential), enforces the PH1.5 policy on the new one, then
+    revokes every session and bumps ``password_changed_at``. The caller is signed
+    out everywhere (including this device) and must log in again."""
+    ip = ratelimit.client_ip(request)
+    ratelimit.raise_if_limited(
+        await ratelimit.get_limiter(db).check(ratelimit.PASSWORD, f"{ip}:{user['email']}"),
+        detail="Too many attempts. Please try again later.",
+    )
+    # Re-fetch with the hash (get_current_user strips password_hash).
+    full = await db.users.find_one({"_id": ObjectId(user["_id"])})
+    if not full:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    if not full.get("password_hash"):
+        # OAuth-native account: there is no password to verify against.
+        raise HTTPException(status_code=400, detail="This account has no password set.")
+    if not verify_password(data.current_password, full.get("password_hash")):
+        await log_auth_event("password_change_failure", request,
+                             email=full.get("email"), user_id=user["_id"],
+                             reason="wrong_current_password")
+        raise HTTPException(status_code=400, detail="Current password is incorrect.")
+
+    new_password = normalize_password(data.new_password)
+    violations = validate_new_password(new_password, email=full.get("email", ""), name=full.get("name", ""))
+    if violations:
+        raise HTTPException(status_code=422, detail=" ".join(violations))
+    if verify_password(new_password, full.get("password_hash")):
+        raise HTTPException(status_code=422, detail="New password must be different from the current password.")
+
+    await _apply_password_change(full, new_password)
+    await log_auth_event("password_change_success", request,
+                         email=full.get("email"), user_id=user["_id"])
+    return {"message": "Your password has been changed. Please log in again on all devices."}
+
+
+async def _apply_password_change(user: dict, new_password: str) -> None:
+    """The shared credential-rotation primitive for reset AND change.
+
+    Hashes the new password, stamps ``password_changed_at`` (the global token
+    kill-switch honored by every access/refresh check), retires any outstanding
+    recovery tokens, revokes every session, and sends a confirmation email. Kept
+    in one place so reset and change can never diverge on the security-critical
+    steps."""
+    now_iso = datetime.now(timezone.utc).isoformat()
+    await db.users.update_one(
+        {"_id": user["_id"] if isinstance(user["_id"], ObjectId) else ObjectId(str(user["_id"]))},
+        {"$set": {
+            "password_hash": hash_password(new_password),
+            "password_changed_at": now_iso,
+        }},
+    )
+    user_id = str(user["_id"])
+    # Any pending reset link is now moot — retire them so a leaked-but-unused
+    # link cannot be redeemed after the password already changed.
+    await RecoveryStore(db).invalidate_outstanding(user_id, PURPOSE_RESET_PASSWORD)
+    # Sign out everywhere: revoke refresh families; password_changed_at handles
+    # the still-live access tokens on their next use.
+    await SessionStore(db).revoke_all_for_user(user_id, reason="password_changed")
+    await _send_recovery_email("PASSWORD_CHANGED", user.get("email", ""), name=user.get("name", ""))
 
 
 # ============ MARKET ROUTES ============
@@ -3019,11 +3338,14 @@ async def google_auth_session(request: Request, response: Response):
         user_id = str(user["_id"])
         role = user.get("role", "user")
         capital = user.get("capital", 100000)
-        # Refresh profile only — never mutate the email off a sub match.
-        await db.users.update_one(
-            {"_id": user["_id"]},
-            {"$set": {"picture": picture, "name": name or user.get("name", "")}},
-        )
+        # Refresh profile only — never mutate the email off a sub match. Self-heal
+        # the verification flag for Google accounts that predate PH1.8.
+        sub_updates = {"picture": picture, "name": name or user.get("name", "")}
+        if not user.get("email_verified"):
+            sub_updates["email_verified"] = True
+            sub_updates["email_verified_at"] = datetime.now(timezone.utc).isoformat()
+            sub_updates["verified_by"] = "google"
+        await db.users.update_one({"_id": user["_id"]}, {"$set": sub_updates})
     else:
         user = await db.users.find_one({"email": email})
         if user:
@@ -3039,15 +3361,20 @@ async def google_auth_session(request: Request, response: Response):
             capital = user.get("capital", 100000)
             linked = user.get("auth_provider") != "google"
             # Link: attach the Google identity; preserve password_hash/auth_provider
-            # so email/password login keeps working alongside Google.
-            await db.users.update_one(
-                {"_id": user["_id"]},
-                {"$set": {
-                    "picture": picture,
-                    "name": name or user.get("name", ""),
-                    "google_sub": google_sub,
-                }},
-            )
+            # so email/password login keeps working alongside Google. Linking a
+            # verified Google email also confirms ownership of this address, so
+            # the account is marked verified (PH1.8) — the user need not also
+            # click a verification link.
+            link_updates = {
+                "picture": picture,
+                "name": name or user.get("name", ""),
+                "google_sub": google_sub,
+            }
+            if not user.get("email_verified"):
+                link_updates["email_verified"] = True
+                link_updates["email_verified_at"] = datetime.now(timezone.utc).isoformat()
+                link_updates["verified_by"] = "google"
+            await db.users.update_one({"_id": user["_id"]}, {"$set": link_updates})
         else:
             user_doc = {
                 "name": name,
@@ -3056,6 +3383,12 @@ async def google_auth_session(request: Request, response: Response):
                 "password_hash": "",  # No password for Google-native users
                 "auth_provider": "google",
                 "google_sub": google_sub,
+                # Google already asserted (and we enforced above) a verified
+                # email, so a Google-native account is verified on creation — no
+                # separate verification email needed (PH1.8).
+                "email_verified": True,
+                "email_verified_at": datetime.now(timezone.utc).isoformat(),
+                "verified_by": "google",
                 "role": "user",
                 "capital": 100000,
                 "risk_level": "moderate",
@@ -4933,6 +5266,25 @@ async def get_recent_ai_activity():
     return get_recent_activity()
 
 
+# Security middleware pipeline (see SECURITY_ARCHITECTURE.md §27). Starlette runs
+# middleware in reverse registration order (last added = outermost = runs first
+# on the request). We register CSRF and the rate limiter FIRST so they end up
+# *inside* CORS and the security headers: a 403/429 they emit still passes back
+# out through CORS (ACAO) and the header stamper, so a browser can actually read
+# the rejection — while they still reject before any route handler or DB work.
+#
+# Resulting request-time execution order:
+#   Security Headers → CORS → Rate Limiter → CSRF → route dispatch → handler
+#
+# CSRF protection (PH1.7): innermost of the four so it sees the same request the
+# route would, and its 403 is fully decorated on the way out.
+apply_csrf_protection(app)
+
+# Rate limiting (PH1.7): platform-wide flooding backstop. db_provider is a
+# late-binding accessor so the middleware always uses the current db handle
+# (and tests can monkeypatch server.db).
+ratelimit.apply_rate_limiting(app, lambda: db)
+
 # CORS is centralized in security.cors (PH1.4): environment-driven, exact-match
 # origin allowlist with credentials — never a wildcard. See that module for the
 # full policy and rationale.
@@ -4952,7 +5304,6 @@ logger = logging.getLogger(__name__)
 @app.on_event("startup")
 async def startup():
     await db.users.create_index("email", unique=True)
-    await db.login_attempts.create_index("identifier")
     await db.trades.create_index("user_id")
     await db.notifications.create_index("user_id")
     await db.chat_messages.create_index([("user_id", 1), ("session_id", 1)])
@@ -4974,6 +5325,20 @@ async def startup():
     await db.sessions.create_index("session_id", unique=True)
     await db.sessions.create_index("user_id")
     await db.sessions.create_index("expires_at", expireAfterSeconds=0)
+
+    # Rate-limit store (PH1.7) — window-counter + lockout docs. The compound
+    # index serves both the counter lookup (key, kind, window_start) and the
+    # lockout lookup (key, kind); the TTL index reaps expired buckets/lockouts.
+    await db.rate_limits.create_index([("key", 1), ("kind", 1), ("window_start", 1)])
+    await db.rate_limits.create_index("expires_at", expireAfterSeconds=0)
+
+    # Recovery-token store (PH1.8) — one document per single-use email-verify /
+    # password-reset token. token_id is the unique handle looked up at redeem
+    # time; the compound index serves the "invalidate a user's outstanding
+    # tokens" sweep; the TTL index reaps records once past their expires_at Date.
+    await db.recovery_tokens.create_index("token_id", unique=True)
+    await db.recovery_tokens.create_index([("user_id", 1), ("purpose", 1)])
+    await db.recovery_tokens.create_index("expires_at", expireAfterSeconds=0)
     await db.feature_flags.create_index("key", unique=True)
     await db.announcements.create_index("created_at")
     await db.support_tickets.create_index("status")

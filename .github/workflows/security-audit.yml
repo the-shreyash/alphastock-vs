@@ -1,0 +1,90 @@
+# ==============================================================================
+# StockAssist AI — Supply-chain & secret-hygiene CI (PH1.9)
+#
+# Automated, continuous verification of the two things a codebase silently rots
+# on: vulnerable dependencies and accidentally-committed secrets. Runs on every
+# push / PR and on a weekly schedule (new CVEs land against unchanged code).
+#
+# Jobs:
+#   backend-audit   — pip-audit against the fully-pinned requirements + pip check
+#   frontend-audit  — npm audit (high+ severity) against the lockfile
+#   secret-scan     — gitleaks history scan + a guard that no .env is tracked
+#   config-sync     — backend/.env.example must match the secret registry
+#
+# See .claude/SECRETS.md for the dependency-update and rotation policy.
+# ==============================================================================
+name: security-audit
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "0 6 * * 1"  # Mondays 06:00 UTC — catch newly-disclosed CVEs
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  backend-audit:
+    name: Backend dependency audit (pip-audit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install pip-audit
+        run: python -m pip install --upgrade pip pip-audit==2.7.3
+      - name: Audit pinned requirements for known vulnerabilities
+        # Fails the build on any advisory. Add --ignore-vuln GHSA-xxxx only with a
+        # documented justification in SECRETS.md (Dependency Update Policy).
+        run: pip-audit --strict --requirement backend/requirements.txt
+      - name: Verify dependency graph is internally consistent
+        run: |
+          python -m pip install --requirement backend/requirements.txt
+          python -m pip check
+
+  frontend-audit:
+    name: Frontend dependency audit (npm audit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Audit frontend dependencies (high severity and above)
+        working-directory: frontend
+        run: npm audit --audit-level=high
+
+  secret-scan:
+    name: Secret scan (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # full history so a secret in any past commit is caught
+      - name: Guard — no .env file may be tracked
+        run: |
+          if git ls-files | grep -E '(^|/)\.env$|(^|/)\.env\.(?!example)'; then
+            echo "::error::A real .env file is tracked. Remove it and rotate the secrets."
+            exit 1
+          fi
+          echo "No tracked .env files."
+      - name: Run gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  config-sync:
+    name: Config template in sync with registry
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: backend/.env.example matches security/secrets.py
+        working-directory: backend
+        run: python scripts/generate_env_example.py --check

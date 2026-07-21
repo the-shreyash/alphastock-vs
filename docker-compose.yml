@@ -35,8 +35,11 @@ services:
       MONGO_URL: mongodb://mongo:27017
       DB_NAME: alpha_stock_db
 
-      # Security
-      JWT_SECRET: ${JWT_SECRET:-change_this_in_production_min_32_chars}
+      # Security — no baked-in fallback. Compose fails fast if JWT_SECRET is unset
+      # (generate: python -c "import secrets;print(secrets.token_urlsafe(48))").
+      # Boot-time validation in security/secrets.py rejects weak/short values.
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is required — set it in a local .env (see backend/.env.example)}
+      APP_ENV: ${APP_ENV:-development}
 
       # AI Providers (dual-model debate architecture)
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
@@ -98,10 +101,11 @@ services:
     depends_on:
       - backend
     environment:
-      # Basic auth for the n8n editor UI
+      # Basic auth for the n8n editor UI. No hard-coded credential: the password
+      # is externalized and required (compose fails fast if it is unset).
       N8N_BASIC_AUTH_ACTIVE: "true"
-      N8N_BASIC_AUTH_USER: admin
-      N8N_BASIC_AUTH_PASSWORD: alphapartner123
+      N8N_BASIC_AUTH_USER: ${N8N_BASIC_AUTH_USER:-admin}
+      N8N_BASIC_AUTH_PASSWORD: ${N8N_BASIC_AUTH_PASSWORD:?N8N_BASIC_AUTH_PASSWORD is required — set it in a local .env}
       # Run workflow crons in IST so schedules match NSE market hours
       GENERIC_TIMEZONE: Asia/Kolkata
       TZ: Asia/Kolkata

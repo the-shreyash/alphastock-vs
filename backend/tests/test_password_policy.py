@@ -172,7 +172,11 @@ class TestRegisterEndpoint:
         r = self._register(client, STRONG)
         assert r.status_code == 200
         body = r.json()
-        assert set(body) == {"id", "name", "email", "role", "capital", "token"}
+        # PH1.8 added the additive `email_verified` flag (new accounts start
+        # unverified) so the SPA can surface a "verify your email" prompt; the
+        # rest of the register contract is unchanged and no hash ever leaks.
+        assert set(body) == {"id", "name", "email", "role", "capital", "token", "email_verified"}
+        assert body["email_verified"] is False
         assert "password_hash" not in body
 
     def test_stored_hash_is_bcrypt_cost_12_not_plaintext(self, client, fake_db):
@@ -266,21 +270,28 @@ class TestLoginCompatibility:
         assert "Too many attempts" in r.json()["detail"]
 
     def test_failures_against_oauth_account_count_toward_lockout(self, client, fake_db, oauth_user):
+        # PH1.7: the lockout now lives in the centralized limiter (db.rate_limits),
+        # but failures against a passwordless OAuth account must still count — the
+        # 6th attempt is throttled just as for a password account.
         for _ in range(5):
-            client.post("/api/auth/login",
-                        json={"email": "oauth@example.com", "password": "AnyGuess!123x"})
-        attempts = fake_db.login_attempts.docs
-        assert attempts and attempts[0]["count"] == 5
+            r = client.post("/api/auth/login",
+                            json={"email": "oauth@example.com", "password": "AnyGuess!123x"})
+            assert r.status_code == 401
+        blocked = client.post("/api/auth/login",
+                              json={"email": "oauth@example.com", "password": "AnyGuess!123x"})
+        assert blocked.status_code == 429
 
     def test_successful_login_clears_attempt_record(self, client, fake_db, legacy_user):
+        # PH1.7: a successful login resets the identity's failure budget in the
+        # centralized limiter store (db.rate_limits), same guarantee as before.
         for _ in range(3):
             client.post("/api/auth/login",
                         json={"email": self.LEGACY_EMAIL, "password": "Wrong!Guess9x"})
-        assert fake_db.login_attempts.docs
+        assert fake_db.rate_limits.docs  # a counter is being tracked
         r = client.post("/api/auth/login",
                         json={"email": self.LEGACY_EMAIL, "password": self.LEGACY_PASSWORD})
         assert r.status_code == 200
-        assert not fake_db.login_attempts.docs
+        assert not fake_db.rate_limits.docs  # budget cleared on success
 
 
 # --------------------------------------------------------------------------- #

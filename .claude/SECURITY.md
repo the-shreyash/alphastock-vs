@@ -1,9 +1,9 @@
 # StockAssist AI
 ## Security Documentation
 
-Version: 1.2
+Version: 1.3
 
-Status: Active Development — PH1.4b complete (2026-07-20)
+Status: Active Development — PH1.8 complete (2026-07-22)
 
 ---
 
@@ -202,6 +202,46 @@ password.
 
 Full design and rationale: **SECURITY_ARCHITECTURE.md §15 (Password Security
 Architecture)**.
+
+---
+
+# Account Recovery & Email Verification
+
+**Implemented — PH1.8.** The full identity-recovery lifecycle is centralized in
+`backend/security/recovery.py` — the only place a verification or reset token is
+minted, verified, or burned. Every recovery token is a signed handle
+(`<token_id>.<HMAC>`, bound to one user + one purpose) backed by an authoritative
+`recovery_tokens` record enforcing expiry and **atomic single-use** (replay-safe).
+
+Endpoints (`/api/auth`):
+
+- `POST /verify-email` — redeem an email-verification link (public, single-use).
+- `POST /verify-email/request` — resend the link (authenticated; no-op if already
+  verified; generic response).
+- `POST /forgot-password` — start a reset (public; **always** a generic response —
+  never reveals whether the email is registered; OAuth-only accounts skipped).
+- `POST /reset-password` — reset with a token + new password (public; enforces the
+  password policy; revokes every session).
+- `POST /change-password` — authenticated; requires the **current** password,
+  rejects an unchanged one, enforces the policy, revokes every session.
+
+Rules:
+
+- Verification tokens expire in **24h**, reset tokens in **30 min**
+  (`RECOVERY_VERIFY_TTL_SECONDS` / `RECOVERY_RESET_TTL_SECONDS`).
+- **Never reveal whether an email exists** — forgot-password / resend return an
+  identical generic message either way; all recovery reads are rate-limited
+  (`PASSWORD` policy, 5 / hour).
+- A password **reset or change signs the user out on every device** — all refresh
+  families are revoked and `password_changed_at` is bumped so outstanding access
+  tokens go stale on next use.
+- New email/password accounts start **unverified** and are emailed a link; Google
+  accounts are verified on creation/link. **Login is not blocked** on
+  `email_verified` (backward-compatible) — the flag gates verified-only features
+  and is the hook for future hard enforcement.
+
+Full design and rationale: **SECURITY_ARCHITECTURE.md §16 (Email Verification)
+and §17 (Password Reset)**.
 
 ---
 
@@ -430,9 +470,23 @@ Configurable
 
 Different endpoints may have stricter limits.
 
-Not yet implemented platform-wide (PH1.7). A narrower mechanism already exists
-today: login attempts are locked out per `ip:email` after 5 failures for 15
-minutes. See SECURITY_ARCHITECTURE.md §21 (Rate Limiting Strategy).
+**Implemented — PH1.7.** Centralized in `backend/security/rate_limit.py` (one
+limiter, one storage model, one set of policies). Current enforcement:
+
+- Platform-wide middleware over all `/api` traffic — **authenticated 120/min per
+  user**, **anonymous 60/min per IP** (the role-tiered Guest/Free/Pro/Elite
+  quotas above remain the future target; PH1.7 delivers the authenticated-vs-
+  public split plus the abuse-critical per-endpoint limits).
+- Per-endpoint limits: **login 5 / 15 min** per `ip:account` (failures only, with
+  a progressive lockout that escalates on repeat abuse), **register 5 / hour**
+  per IP, **refresh 20 / min** per session.
+- Every rejection returns **429 with a `Retry-After` header**; throttled tiers
+  also emit `X-RateLimit-Limit/Remaining/Reset`.
+- MongoDB-backed today behind a pluggable `RateLimitStore` interface so a Redis
+  store can be dropped in later without changing callers. The prior inline
+  `login_attempts` lockout was folded into this limiter and removed.
+
+See SECURITY_ARCHITECTURE.md §21 (Rate Limiting Strategy) for the full matrix.
 
 ---
 
@@ -441,6 +495,17 @@ minutes. See SECURITY_ARCHITECTURE.md §21 (Rate Limiting Strategy).
 Never store secrets inside source code.
 
 Store in secure environment variables or a secrets manager.
+
+**Implementation (PH1.9):** secret management is centralized in
+`backend/security/secrets.py`. The `SECRET_REGISTRY` there is the authoritative
+inventory of every configuration variable — its category, sensitivity, and the
+environments that require it. At startup, `validate_config()` runs before any
+database or route is constructed and **fails the process closed** on a missing
+or weak critical secret, aggregating every problem into one error and never
+logging a secret value. Committed `.env.example` templates (backend generated
+from the registry) document the surface; the operational runbook — inventory,
+per-class rotation cadence, dependency-update policy, and leaked-credential
+incident response — lives in **`.claude/SECRETS.md`**.
 
 Examples
 
@@ -460,7 +525,8 @@ Payment Secrets
 
 Encryption Keys
 
-Rotate secrets periodically.
+Rotate secrets periodically — see `.claude/SECRETS.md` §6 for the rotation
+policy per secret class, and §9 for the leaked-credential incident procedure.
 
 ---
 
@@ -724,10 +790,22 @@ Reject unauthorized subscriptions.
 
 Protect state-changing endpoints.
 
-`SameSite=Lax` on all auth cookies is the current baseline (withholds cookies
-on cross-site sub-requests). A dedicated CSRF token layer for cookie-based,
-state-changing routes is designed but **not yet scheduled to a PH1 sprint** —
-see SECURITY_ARCHITECTURE.md §18 for the gap and the recommended next step.
+**Implemented — PH1.7.** Two layers, defense in depth:
+
+1. `SameSite=Lax` on all auth cookies (baseline — withholds cookies on cross-site
+   sub-requests).
+2. A **signed double-submit CSRF token bound to the session**
+   (`backend/security/csrf.py`, `CSRFMiddleware`). On login/register/OAuth and
+   every refresh the server plants a readable `csrf_token` cookie; a
+   cookie-authenticated, state-changing request must echo it in the
+   `X-CSRF-Token` header (header must equal cookie **and** the token's HMAC must
+   verify against the session it authenticates as). Failure → **403**.
+
+Requests carrying an `Authorization: Bearer` token are **exempt by design** — a
+Bearer request cannot be forged cross-site and carries no ambient cookie
+authority, so enforcement targets exactly the cookie-only attack surface (this is
+also why the change required no frontend rework). Safe methods and the
+auth-bootstrap endpoints are exempt. See SECURITY_ARCHITECTURE.md §18.
 
 ---
 

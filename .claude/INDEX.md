@@ -108,12 +108,17 @@ MARKET_ENGINE.md
 
 SECURITY.md
 
+SECRETS.md
+
 DEPLOYMENT.md
 
 Relationship: SYSTEM_ARCHITECTURE.md's Authentication/Authorization sections
 defer to SECURITY_ARCHITECTURE.md for engineering depth. SECURITY.md is the
 operational policy summary of SECURITY_ARCHITECTURE.md — read SECURITY.md for
-the rules, SECURITY_ARCHITECTURE.md for how the code enforces them.
+the rules, SECURITY_ARCHITECTURE.md for how the code enforces them. SECRETS.md
+(PH1.9) is the operational secrets & supply-chain runbook: the secret inventory,
+environment strategy, rotation policy, dependency-update policy, and leaked-
+credential incident response; the code counterpart is `backend/security/secrets.py`.
 
 3. AI Documents
 

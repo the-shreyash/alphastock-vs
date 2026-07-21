@@ -5,6 +5,265 @@ This file records documentation-system versions and, from v1.0 launch onward, pr
 
 ---
 
+# Sprint PH1.9 — Secrets & Supply Chain Security — 2026-07-22
+
+**Production Hardening PH1.9 complete. Configuration is now centralized and
+validated: a misconfigured or weakly-configured production refuses to boot, the
+dependency set is fully pinned and continuously audited, and no hard-coded
+secret remains in the repository. Zero frontend or business-logic change.**
+
+This sprint delivers the roadmap's PH1.8 (Secrets & Environment Hardening)
+content plus the supply-chain core of PH1.11, executed under the "PH1.9" label
+(Identity Recovery had consumed the PH1.8 slot). Before it, the app read ~40 env
+vars ad hoc with no boot-time validation (a missing `JWT_SECRET` only surfaced
+at the first token operation), `docker-compose.yml` shipped a weak `JWT_SECRET`
+fallback and a hard-coded n8n password, `.env.example` was git-ignored (so no
+shareable template existed), and four dependencies floated on `>=` bounds.
+
+Added
+
+- `backend/security/secrets.py` — the single source of truth for the
+  configuration surface. `SECRET_REGISTRY` declares every variable (category,
+  `sensitive`, `required_in` environments, `min_length`, example). Boot-time
+  `validate_config()` **fails closed**: it aggregates every problem into one
+  value-free error and is called from `server.py` *before* the Mongo client or
+  any router. Severity is environment-aware — the core trio (`MONGO_URL`,
+  `DB_NAME`, `JWT_SECRET`) is fatal everywhere; production additionally makes
+  fatal any missing required secret, a signing key < 32 chars, any
+  placeholder/weak value, a half-configured OAuth or broker pair,
+  `ENABLE_AUTO_LOGIN=true`, a weak `ADMIN_PASSWORD`, and the absence of any AI
+  provider. No secret value is ever logged (`redact()`, presence-only summary).
+  Reuses `security.cookies.is_production` so environment semantics never drift.
+- `backend/.env.example` + `frontend/.env.example` — committed, placeholder-only
+  templates. The backend template is **generated** from the registry by
+  `backend/scripts/generate_env_example.py` (with a `--check` mode CI enforces),
+  so code and template can never drift.
+- `.github/workflows/security-audit.yml` — `pip-audit --strict` + `pip check`
+  (backend), `npm audit` (frontend), `gitleaks` history scan + a tracked-`.env`
+  guard, and the `.env.example` sync check. Runs on push/PR and weekly.
+- `backend/scripts/audit_dependencies.py` — local `pip check` + `pip-audit`
+  runner (degrades gracefully when pip-audit isn't installed).
+- `.claude/SECRETS.md` — the secrets & supply-chain runbook: inventory,
+  environment strategy, rotation policy (per secret class), dependency-update
+  policy, accepted-advisory backlog, and leaked-credential incident response.
+- `backend/tests/test_secrets.py` — 38 hermetic tests (env-aware validation,
+  core-trio enforcement, cross-field invariants, no-secret-in-output,
+  registry/example-sync integrity, accessors).
+
+Changed
+
+- `backend/server.py` — calls `security.secrets.validate_config()` immediately
+  after `load_dotenv`; logs the presence-only summary + any warnings. This is
+  the only server change (additive, non-breaking).
+- `backend/requirements.txt` — now **fully exact-pinned**: locked the 4 floating
+  `>=` bounds (aiohappyeyeballs, psutil, anthropic, litellm) and applied 7 in-pin
+  security patches (aiohttp 3.13.5→3.14.1, cryptography 48.0.0→48.0.1, httplib2
+  0.31.2→0.32.0, pillow 12.2.0→12.3.0, pyasn1 0.6.3→0.6.4, pymongo 4.5.0→4.6.3,
+  python-multipart 0.0.29→0.0.31). Verified to co-resolve; starlette/litellm/
+  ecdsa advisories deferred (framework-locked / AI-scope / unfixed) — see
+  SECRETS.md §8.
+- `docker-compose.yml` — removed the weak `JWT_SECRET` fallback (now required via
+  `${JWT_SECRET:?…}`) and the hard-coded n8n password `alphapartner123` (now
+  required `${N8N_BASIC_AUTH_PASSWORD:?…}`); added `APP_ENV`.
+- `.gitignore` — negations (`!.env.example`, `!**/.env.example`) so example
+  templates are committable while every real `.env` stays ignored.
+- `backend/security/__init__.py` — documents the new `security.secrets` tenant.
+
+Security notes
+
+- **Fail-fast, fail-closed:** `APP_ENV=production` with any missing/weak required
+  variable now exits before serving a single request, with a named-variable
+  error listing all problems at once.
+- **No secret in git history:** verified via `git log --all -S <value>` that no
+  real provider key or `JWT_SECRET` was ever committed and no `.env` was ever
+  tracked. One committed value existed — the n8n dev password `alphapartner123`
+  in `docker-compose.yml` (5 commits) — now externalized; low severity
+  (local-only editor basic-auth), documented in SECRETS.md §9.
+- **Rotation reminder:** live provider keys currently in local `.env` files have
+  existed in plaintext dev files and must be rotated before production launch
+  (SECRETS.md §9).
+
+Tests
+
+- `backend/tests/test_secrets.py` — 38/38 passing. Full backend hermetic suite
+  regression-checked (the pre-existing `requests`-based integration files and
+  one pre-existing `test_trading_engine` failure are unrelated and unchanged by
+  this sprint). Manual verification: prod-missing-secret aborts startup;
+  valid-prod loads clean; the real dev `.env` boots.
+
+---
+
+# Sprint PH1.8 — Identity Recovery — 2026-07-22
+
+**Production Hardening PH1.8 complete. The identity lifecycle is now
+recoverable: users can verify their email, change their password, and reset a
+forgotten one — each single-use, expiring, and safe against enumeration — with
+zero frontend break and no change to the JWT/CSRF/rate-limit/OAuth layers.**
+
+Before this sprint an account, once created, had no recovery path: no email
+verification, no password change, no forgotten-password reset, and no way to
+force-sign-out after a credential rotation. PH1.8 closes all four as a single
+reusable `backend/security/recovery.py` module composed by new `/api/auth`
+endpoints.
+
+Added
+
+- `backend/security/recovery.py` — the single source of truth for
+  identity-recovery tokens. A **signed handle backed by an authoritative
+  record**: the token handed to the user is `<token_id>.<HMAC(secret,
+  "prefix|purpose|user_id|token_id")>` (unforgeable, bound to exactly one user +
+  one purpose), while a `recovery_tokens` document carries `issued_at` /
+  `expires_at` / `used_at` so **expiry and single-use are enforced
+  authoritatively**. `consume()` burns a token with an atomic compare-and-set
+  (`used_at: None → now`) — replay-safe. Issuing a fresh token invalidates the
+  user's outstanding unused ones of that purpose (one live link at a time).
+  - Purposes & lifetimes (env-overridable): **email verification 24h**
+    (`RECOVERY_VERIFY_TTL_SECONDS`), **password reset 30 min**
+    (`RECOVERY_RESET_TTL_SECONDS`).
+  - HMAC key: `RECOVERY_SECRET` or the required `JWT_SECRET` (domain-separated by
+    a versioned prefix — no weak default, fail-closed). Never logs a token.
+- New `/api/auth` endpoints (all recovery logic centralized, never inline):
+  - **`POST /verify-email`** — redeem a verification token (public; single-use).
+  - **`POST /verify-email/request`** — resend the verification link
+    (authenticated; generic response; no-op if already verified).
+  - **`POST /forgot-password`** — start reset (public; **always** a generic
+    response — no email enumeration; OAuth-only accounts silently skipped).
+  - **`POST /reset-password`** — reset with a token + new password (public;
+    enforces the PH1.5 policy; revokes every session; stamps
+    `password_changed_at`).
+  - **`POST /change-password`** — authenticated; requires the **current**
+    password, rejects an unchanged one, enforces the PH1.5 policy, then revokes
+    every session and stamps `password_changed_at` (signed out everywhere).
+- `backend/tests/test_recovery.py` (28 tests) — hermetic: token
+  mint/verify/consume, single-use/replay, expiry, purpose-binding, signature
+  tamper, reissue invalidation; and the full endpoint matrix (verify success /
+  expired / replay, forgot-password generic response, reset single-use / expiry /
+  policy / session-revocation, change-password current-password /
+  unchanged-password / policy / sign-out, and the untouched register→login→me
+  lifecycle).
+
+Changed
+
+- **User model gains email-verification status:** `email_verified` (bool),
+  `email_verified_at`, `verified_by` (`"email"` | `"google"`). New
+  email/password registrations start **unverified** and are emailed a
+  verification link (out-of-band via `BackgroundTasks`; a slow/failed mailer
+  never delays sign-up). **Login is deliberately NOT blocked on this flag** —
+  backward-compatible; it is the hook a future verified-only gate flips on.
+- **Google OAuth accounts are verified on creation/link.** Google already
+  asserts (and we already enforce) a verified email, so a Google-native or
+  Google-linked account is marked `verified_by: "google"` with no separate
+  verification email; pre-PH1.8 Google accounts self-heal the flag on next login.
+- **`security.csrf`** default exempt paths extended with the three *public*
+  recovery entrypoints (`/verify-email`, `/forgot-password`, `/reset-password`)
+  — they carry their own single-use authorization or are anonymous, so they rely
+  on no ambient cookie authority. The *authenticated* recovery actions
+  (`change-password`, `verify-email/request`) stay CSRF-protected for cookie
+  clients.
+- **`services.email_service`** gains three branded templates:
+  `EMAIL_VERIFICATION`, `PASSWORD_RESET`, `PASSWORD_CHANGED` (security
+  confirmation).
+- **Register response** gains the additive `email_verified` field so the SPA can
+  surface a "verify your email" prompt; the rest of the contract is unchanged.
+- Startup creates the `recovery_tokens` indexes (`token_id` unique,
+  `(user_id, purpose)`, and a TTL index on `expires_at`).
+
+Security properties
+
+- **No enumeration:** forgot-password and verify-email/request return an
+  identical generic message whether or not the account exists; recovery reads run
+  through the existing rate limiter (`PASSWORD` policy, 5 / hour).
+- **Single-use + replay-safe:** every recovery token is burned atomically on
+  redemption; a replayed link is a generic 400.
+- **Full session invalidation:** a reset OR change revokes every refresh family
+  (`SessionStore.revoke_all_for_user`) and bumps `password_changed_at`, so
+  outstanding access tokens also go stale on next use — the user re-logs in
+  everywhere.
+
+Out of scope (unchanged): JWT crypto, rate limiting, CSRF enforcement model,
+OAuth login, cookie/header policy, trading engine, AI, frontend.
+
+---
+
+# Sprint PH1.7 — CSRF Protection & Rate Limiting — 2026-07-21
+
+**Production Hardening PH1.7 complete. The two remaining abuse-surface gaps —
+an unowned CSRF token layer and login-only rate limiting — are closed, without
+any frontend change or public-API break.**
+
+Before this sprint, cross-site state-changing requests were defended only by
+`SameSite=Lax` (a real baseline, but no token layer), and rate limiting was a
+single inline `db.login_attempts` lockout on `/api/auth/login`. PH1.7 adds a
+signed, session-bound CSRF token layer and a centralized, progressive rate
+limiter with a platform-wide flooding backstop — both as reusable
+`backend/security/` modules.
+
+Added
+
+- `backend/security/csrf.py` — the single source of truth for CSRF. A **signed
+  double-submit cookie bound to the session** (OWASP pattern): a non-HttpOnly
+  `csrf_token` cookie carrying `<nonce>.<HMAC(secret, "prefix|sid|nonce")>`,
+  echoed by the client in `X-CSRF-Token`.
+  - **`CSRFMiddleware`** enforces on a request iff it is a mutating method, a
+    non-exempt path, carries **no** `Authorization: Bearer` header, and is
+    cookie-authenticated. Validation = header==cookie (double-submit) **and** the
+    HMAC verifying against the cookie session's `sid` (binding). Failure → **403**
+    (`code: CSRF_FAILED`), fail-closed.
+  - **Bearer requests exempt by construction** — the SPA's `Authorization: Bearer`
+    path cannot be forged cross-site and carries no ambient cookie authority, so
+    enforcement targets exactly the cookie-only attack surface. This is what makes
+    the rollout require **zero frontend changes**.
+  - HMAC key: `CSRF_SECRET` or the required `JWT_SECRET` (domain-separated);
+    cookie `Secure`/`SameSite`/`Domain` resolved through `security.cookies`.
+- `backend/security/rate_limit.py` — the single limiter. Named per-endpoint
+  policies, a pluggable `RateLimitStore` interface (shipped `MongoRateLimitStore`,
+  Redis-ready), fixed-window counting, and **progressive lockout** with automatic
+  expiry and `Retry-After`.
+  - Policies (env-overridable via `RATE_LIMIT_<NAME>`): **login 5 / 15 min** per
+    `ip:account` (failures only; escalating lockout), **register 5 / hour** per IP,
+    **refresh 20 / min** per session, **password 5 / hour**, **authenticated API
+    120 / min** per user, **public API 60 / min** per IP.
+  - **`RateLimitMiddleware`** — platform-wide flooding backstop over all `/api`
+    traffic (per-user when authenticated, per-IP otherwise); emits
+    `X-RateLimit-*`; a storage error fails **open** (logged) so the throttle can
+    never take the API down.
+- `backend/tests/test_csrf.py` (18 tests) and `backend/tests/test_rate_limit.py`
+  (26 tests) — hermetic: token mint/verify/bind, every middleware
+  exempt/enforce/reject path, store/limiter semantics, lockout + escalation,
+  `Retry-After`, and the real auth-endpoint integrations.
+
+Changed
+
+- `backend/server.py`:
+  - `_issue_session` and `/refresh` now plant/re-mint the CSRF cookie;
+    `logout`/`logout-all` clear it.
+  - `login` replaces the inline `login_attempts` block with the centralized
+    limiter (`peek` → `record_failure` → `reset`); `register` and `refresh` gain
+    inline limits. Observable lockout behavior is preserved byte-for-byte.
+  - Middleware wired: `apply_csrf_protection` + `apply_rate_limiting` registered
+    **before** CORS/headers so a 403/429 still carries CORS + security headers
+    (execution order: Security Headers → CORS → Rate Limiter → CSRF → route).
+  - Startup drops the `login_attempts` index; adds `rate_limits` indexes
+    (compound `(key, kind, window_start)` + TTL on `expires_at`).
+- `backend/security/__init__.py` — tenant index lists `csrf` and `rate_limit`.
+- `backend/tests/test_password_policy.py` — two tests that asserted the internal
+  `login_attempts` collection now assert the new limiter's observable behavior
+  (`rate_limits`); the login-compatibility guarantees are unchanged.
+
+Migration
+
+- **No data migration, no API break.** The `login_attempts` collection is simply
+  no longer written (a Mongo TTL/manual drop can retire it). Existing Bearer-based
+  clients are unaffected by CSRF (exempt); a future cookie-only client reads the
+  `csrf_token` cookie and sets `X-CSRF-Token`. All limits are env-tunable.
+
+Threat-model rows "Cross-site state-changing request via cookie auth (CSRF
+proper)", "Credential stuffing / brute force", and "Endpoint flooding / token
+abuse" move to ✅ Closed. Remaining PH1 work: PH1.8 (secrets/env validator),
+PH1.9 (WebSocket authorization), PH1.10–PH1.12.
+
+---
+
 # Sprint PH1.6 — JWT Lifecycle & Session Security — 2026-07-20
 
 **Production Hardening PH1.6 complete. The two highest-value open authentication
