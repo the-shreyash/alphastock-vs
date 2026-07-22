@@ -2073,9 +2073,15 @@ PRODUCTION_HARDENING.md §17. **Decision: Phase 1 security CERTIFIED COMPLETE;
 overall production deployment remains NO-GO pending Phase 2 (infra/Docker/CI-CD)
 and Phase 3 (QA/frontend tests).**
 
-**PHASE 1 (PRODUCTION SECURITY HARDENING) IS COMPLETE.** Next Recommended Phase:
-**PH2 — Production Infrastructure & DevOps**, starting with **PH2.1 (Backend
-Production Dockerfile)**. Deferred-within-PH1 items to schedule in the PH1 tail or
+**PHASE 1 (PRODUCTION SECURITY HARDENING) IS COMPLETE.** Current phase:
+**PH2 — Production Infrastructure & DevOps**. PH2.1 (Backend Production
+Dockerfile), PH2.2 (Production Docker Compose) and PH2.3 (Secrets Management) are
+complete — the backend stack boots healthy from a single command with segmented
+networks, named volumes, no hardcoded credentials, and credentials deliverable as
+file-mounted Docker secrets rather than plaintext environment variables. Next:
+**PH2.4 (Environment & Configuration Framework)**, with **PH2.2b (Frontend
+Production Dockerfile)** outstanding and parallelizable.
+Deferred-within-PH1 items to schedule in the PH1 tail or
 alongside PH2: PH1.9 Real-Time/WebSocket Security (Socket.IO auth, R-15) and
 PH1.10b Admin Hardening & Session Management. PH3.1 (Backend Test Suite Repair —
 the pre-existing `test_trading_engine::test_run_cycle_trails_and_books_targets`
@@ -2116,8 +2122,9 @@ rollback, estimates) live in PRODUCTION_ROADMAP.md. Status tracker:
 ## PH2 — Production Infrastructure & DevOps
 
 - [x] PH2.1 Backend Production Dockerfile — COMPLETE (2026-07-22) — Critical — *Two-stage `backend/Dockerfile` (builder → slim runtime), non-root uid 10001, `docker/entrypoint.sh` (fail-closed config validation + pre-start hooks + `exec` signal handoff), stdlib-only `docker/healthcheck.sh`, `.dockerignore`, `production.env.example`. Verified: builds in 2m44s cold / 4.5s on a code change, boots healthy in 2.5s, graceful SIGTERM exit 0, runs under `--read-only --cap-drop=ALL`. Image 1.03 GB — misses the <400 MB target because ~220 MB of declared dependencies are never imported (see docs/deployment/DOCKER.md §10). Also surfaced: `pytz` missing from `requirements.txt`.*
-- [ ] PH2.2 Frontend Production Dockerfile — NOT_STARTED — Critical
-- [ ] PH2.3 Compose Split: Dev vs Prod — NOT_STARTED — Critical
+- [x] PH2.2 Production Docker Compose — COMPLETE (2026-07-22) — Critical — *Re-sequenced: the sprint as commissioned assigned PH2.2 to compose orchestration and PH2.3 to secrets; PRODUCTION_ROADMAP.md v1.2 still lists PH2.2 as the frontend image (now outstanding, see below) and PH2.3 as the compose split. Delivered: `docker-compose.yml` (production-shaped base — backend/mongo/redis, `name: stockassist`, YAML-anchored restart + `no-new-privileges` + bounded logging, `stop_grace_period: 30s`, loopback port binding, backend healthcheck inherited from the image rather than restated), `docker-compose.override.yml` (dev overlay — Mongo Express, Redis Insight `--profile tools`, n8n `--profile automation`, loopback DB ports, `APP_ENV=development`), `docker/mongodb/init-app-user.js` (least-privilege app user; root password never reaches the backend), `compose.env.example` (two-file env split: infra credentials vs application secrets), `docs/deployment/DOCKER_COMPOSE.md`. Two networks: `edge` (bridge) + `data` (`internal: true`, no egress). Named volumes only. 16/16 verification checks pass; cold start to all-healthy 13–32s, warm 12–14s. Security: MongoDB auth enabled and unpublished (was anonymous on `0.0.0.0:27017`), Redis password-protected, n8n basic-auth found dead upstream since n8n 1.0 and replaced with documented controls. Known limitation L1: the Redis pub/sub listener stops after ~3s — pre-existing defect at `backend/services/cache.py:47`, no functional regression at 1 worker/1 replica, fix owned by PH2.8.*
+- [ ] PH2.2b Frontend Production Dockerfile — NOT_STARTED — Critical — *`frontend/Dockerfile` has never existed in this repository; the pre-PH2.2 compose file declared a frontend service that could not build. Multi-stage node → nginx per PRODUCTION_ROADMAP.md.*
+- [x] PH2.3 Secrets Management — COMPLETE (2026-07-22) — Critical — *Source-resolution layer added to `backend/security/secrets.py`: one precedence order (`<NAME>_FILE` pointer → `$SECRETS_DIR/<name>` Docker/Swarm/K8s mount → plaintext env) applied to every variable, materialized into `os.environ` once at boot by `load_secrets()` — which is why ~30 existing `os.environ` consumers gained file-backed secret support with zero call-site changes. Fails closed: an unreadable pointer never falls back to the plaintext variable, and two sources for one secret is a boot error. `reload_secrets()` re-reads for rotation, reports changes by fingerprint (never value), and drops a revoked secret from the environment. Delivered: `docker-compose.secrets.yml` (opt-in overlay; retracts base values with `""` not `~`, since `~` inherits from the invoking shell), `secrets/generate.sh` + `secrets/README.md` + deny-by-default `secrets/.gitignore`, `docs/deployment/SECRETS.md`. Validation extended to credential *shape*: Mongo credentials, Redis password, Fernet-key format (error in every env), provider key shapes, and low-entropy detection (`aaaa…` clears a length check but not an offline attack). `REQUIRE_FILE_SECRETS=true` promotes plaintext delivery from warning to boot error. 68 new hermetic tests; full hermetic suite 694 passed / 1 pre-existing unrelated failure. Closes PH2.2 limitation **L3**. Bug found and fixed in-sprint: a `_FILE` pointer aimed inside `$SECRETS_DIR` conflicted with itself, which would have broken the documented configuration on every deploy. **Does NOT close PH2.2 L2** (in-container hot reload) — out of this sprint's scope, and now sharper: a bind-mounted `.env` would be a competing source. Residual limitations L1–L7 in docs/deployment/SECRETS.md §8.*
 - [ ] PH2.4 Environment & Configuration Framework — NOT_STARTED — High
 - [ ] PH2.5 CI Pipeline Foundation — NOT_STARTED — Critical
 - [ ] PH2.6 CI Extended: Docker, Security & Integration — NOT_STARTED — High

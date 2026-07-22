@@ -41,12 +41,21 @@ identically everywhere they are used. Current tenants:
   fail-safe `AuditLogger`. The one place a security-relevant event is shaped,
   redacted, and emitted — the prior scattered `log_auth_event` now delegates
   here. Every emit is best-effort: audit logging is observability, never a gate.
-* `security.secrets` (PH1.9) — centralized secret & configuration management:
-  the authoritative `SECRET_REGISTRY` of every environment variable (category,
-  sensitivity, which environments require it), boot-time `validate_config()`
-  that fails closed on missing/weak critical secrets, and value-free reporting
-  that never logs a secret. The one place the app's configuration surface is
-  defined; drives `backend/.env.example` and `.claude/SECRETS.md`.
+* `security.secrets` (PH1.9, extended in PH2.3) — centralized secret &
+  configuration management: the authoritative `SECRET_REGISTRY` of every
+  environment variable (category, sensitivity, which environments require it),
+  boot-time `validate_config()` that fails closed on missing/weak critical
+  secrets, and value-free reporting that never logs a secret. The one place the
+  app's configuration surface is defined; drives `backend/.env.example` and
+  `.claude/SECRETS.md`.
+  PH2.3 added the **source** layer: `resolve_all()` applies one precedence order
+  (`<NAME>_FILE` pointer → `$SECRETS_DIR/<name>` Docker/K8s mount → plaintext
+  env) to every variable, and `load_secrets()` materializes the result into
+  `os.environ` once at boot — which is why every existing `os.environ` consumer
+  in this codebase reads file-backed secrets without a call-site change. Fails
+  closed on an unreadable file or two competing sources; `reload_secrets()`
+  re-reads for rotation and reports changes by fingerprint, never by value.
+  See `docs/deployment/SECRETS.md`.
 * `security.roles` (PH1.12) — centralized role taxonomy & assignment
   authorization (finding F-1): the `ASSIGNABLE_ROLES` allowlist and
   `validate_role_assignment`, which enforces least privilege on elevation

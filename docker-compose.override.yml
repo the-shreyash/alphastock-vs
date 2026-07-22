@@ -1,0 +1,232 @@
+# ==============================================================================
+# StockAssist AI — Development overlay (PH2.2)
+#
+# WHAT THIS FILE IS
+# -----------------
+# Everything that makes the stack pleasant to work on and unacceptable to
+# deploy. Docker Compose merges `docker-compose.override.yml` on top of
+# `docker-compose.yml` AUTOMATICALLY when no `-f` flags are given, so:
+#
+#     docker compose up -d                     → base + THIS FILE   (development)
+#     docker compose -f docker-compose.yml up  → base only          (production-like)
+#
+# WHY THE DEFAULT IS THE DEVELOPMENT STACK
+# ----------------------------------------
+# Because the failure directions are not symmetric. If the default were the
+# production stack, a developer's habitual `docker compose up` would produce a
+# stack they cannot inspect — mildly annoying, self-correcting. With the default
+# being development, a production deploy that forgets a flag gets a database
+# browser and open database ports — quiet, and catastrophic. Compose's built-in
+# convention (override auto-merges, `-f` is explicit) already points this way;
+# the important half is that the production path is the EXPLICIT one and is what
+# every deployment document and runbook writes out in full.
+#
+# The alternative some teams choose is `docker-compose.prod.yml` as an additive
+# overlay on a dev base. That inverts the risk: forgetting the flag then leaves
+# development defaults running in production. Base = strict, overlay = relaxed
+# is the safer polarity, and it is the one PH2.3 will keep when it splits the
+# environment files out further.
+#
+# WHAT IS DELIBERATELY *NOT* HERE
+# -------------------------------
+# Source bind mounts and `uvicorn --reload`. See "Known limitations" in
+# docs/deployment/DOCKER_COMPOSE.md — mounting ./backend over /app would
+# reintroduce backend/.env inside the container, and server.py calls
+# load_dotenv(override=True), so that file would silently override the
+# environment Compose injects. The in-container hot-reload workflow is deferred
+# to the PH2.3 compose split, where it can be built with the dotenv interaction
+# handled properly.
+# ==============================================================================
+
+x-dev-logging: &dev-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+# Developer tools are not infrastructure: if one dies, nothing depends on it, so
+# it should stay dead and visible rather than restart-looping in the background.
+x-dev-tool: &dev-tool
+  restart: "no"
+  security_opt:
+    - no-new-privileges:true
+  logging: *dev-logging
+
+services:
+
+  # ── Backend: relaxed posture for local work ─────────────────────────────────
+  backend:
+    environment:
+      # `development` softens the rules enforced by security/secrets.py: a
+      # missing CORS allowlist or AI provider key becomes a warning instead of a
+      # fatal startup error, and cookies drop the Secure flag so they work over
+      # plain http://localhost. Set APP_ENV=production in .env to rehearse the
+      # strict path locally — worth doing before every deploy.
+      APP_ENV: ${APP_ENV:-development}
+      LOG_LEVEL: ${LOG_LEVEL:-debug}
+
+  # ── MongoDB: reachable from host tooling ────────────────────────────────────
+  mongo:
+    networks:
+      # ⚠ THIS LINE IS LOAD-BEARING, AND THE REASON IS NOT OBVIOUS.
+      # In the base stack mongo is attached ONLY to `data`, which is declared
+      # `internal: true`. An internal network has no gateway, so Docker has no
+      # NAT path to it and CANNOT publish a port from a container attached only
+      # to it. It does not error — it accepts the `ports:` entry, records the
+      # binding in the container config, and silently never listens. `docker ps`
+      # simply shows no mapping.
+      #
+      # Adding `edge` here gives the container a routable interface so the
+      # publication below actually works. The cost is that mongo gains internet
+      # egress in the development stack. That is an explicit, documented
+      # development-only relaxation: the production stack (base file alone)
+      # keeps the database on the isolated network with no egress and no
+      # published port.
+      - data
+      - edge
+    ports:
+      # Loopback-bound, always. `27017:27017` (no address) would bind 0.0.0.0
+      # and, because Docker's published ports are evaluated ahead of ufw and
+      # firewalld, expose the database to the local network — or to the internet
+      # on a cloud VM — regardless of what the host firewall claims. On a laptop
+      # on café wifi that is a real, routine exposure.
+      #
+      # Connect with:  mongosh "mongodb://<app-user>:<pw>@127.0.0.1:27017/alpha_stock?authSource=alpha_stock"
+      - "127.0.0.1:${MONGO_HOST_PORT:-27017}:27017"
+
+  # ── Redis: reachable from host tooling ──────────────────────────────────────
+  redis:
+    networks:
+      # Same reason as mongo above: a container on an `internal: true` network
+      # only cannot publish a port. Development-only relaxation.
+      - data
+      - edge
+    ports:
+      # Same loopback rule. Connect with:
+      #   redis-cli -h 127.0.0.1 -p 6379 -a "$REDIS_PASSWORD"
+      - "127.0.0.1:${REDIS_HOST_PORT:-6379}:6379"
+
+  # ============================================================================
+  # DEVELOPMENT-ONLY SERVICES
+  #
+  # None of these is a dependency of anything. No service in the base file
+  # references them, nothing waits on their health, and the stack is fully
+  # functional with all of them absent — which is exactly the property that lets
+  # the production stack simply not include this file.
+  # ============================================================================
+
+  # ── Mongo Express — web UI for the database ─────────────────────────────────
+  # Not behind a profile: it is the tool a developer reaches for every day, and
+  # a database you cannot see is a database you debug by guesswork.
+  #
+  # ⚠ It holds ROOT credentials. That is unavoidable — a database browser needs
+  #   to enumerate databases — and it is precisely why this service exists only
+  #   in the development overlay. Nothing in the production stack ever receives
+  #   the root password.
+  mongo-express:
+    <<: *dev-tool
+    image: mongo-express:${MONGO_EXPRESS_IMAGE_TAG:-1.0.2}
+    container_name: stockassist-mongo-express
+    depends_on:
+      mongo:
+        condition: service_healthy
+    environment:
+      ME_CONFIG_MONGODB_URL: mongodb://${MONGO_ROOT_USERNAME:?set MONGO_ROOT_USERNAME in .env}:${MONGO_ROOT_PASSWORD:?set MONGO_ROOT_PASSWORD in .env}@mongo:27017/?authSource=admin
+      ME_CONFIG_MONGODB_ENABLE_ADMIN: "true"
+      ME_CONFIG_BASICAUTH: "true"
+      # Required, with no default. Mongo Express historically shipped
+      # admin/pass as its documented default and was, for years, one of the most
+      # commonly found exposed admin panels on the internet. A tool with root
+      # database credentials does not get a default password in this repository,
+      # not even on loopback — laptops travel and ports get forwarded.
+      ME_CONFIG_BASICAUTH_USERNAME: ${MONGO_EXPRESS_USERNAME:?set MONGO_EXPRESS_USERNAME in .env}
+      ME_CONFIG_BASICAUTH_PASSWORD: ${MONGO_EXPRESS_PASSWORD:?set MONGO_EXPRESS_PASSWORD in .env}
+    ports:
+      - "127.0.0.1:${MONGO_EXPRESS_PORT:-8081}:8081"
+    networks:
+      # `data` to reach mongo, `edge` so the published port has a route out. A
+      # container attached only to an `internal: true` network cannot publish.
+      - data
+      - edge
+
+  # ── Redis Insight — web UI for Redis ────────────────────────────────────────
+  # Behind a profile: the image is an order of magnitude larger than the Redis
+  # server it inspects, and it is needed occasionally rather than daily.
+  #
+  #     docker compose --profile tools up -d
+  #
+  # Then add the connection manually in the UI (host `redis`, port 6379,
+  # password = REDIS_PASSWORD). Passing it in the environment would put the
+  # password into `docker inspect` for a tool that does not need it at startup.
+  redisinsight:
+    <<: *dev-tool
+    profiles: ["tools"]
+    image: redis/redisinsight:${REDISINSIGHT_IMAGE_TAG:-2.60}
+    container_name: stockassist-redisinsight
+    depends_on:
+      redis:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${REDISINSIGHT_PORT:-5540}:5540"
+    volumes:
+      # Named volume so saved connections survive a restart — the whole point of
+      # the tool is not re-entering connection details every morning.
+      - redisinsight_data:/data
+    networks:
+      - data
+      - edge
+
+  # ── n8n — automation workflow editor ────────────────────────────────────────
+  # Carried over from the pre-PH2.2 compose file so the existing workflow
+  # tooling in n8n/ keeps working. Behind a profile because it is an optional
+  # integration surface rather than part of the application:
+  #
+  #     docker compose --profile automation up -d
+  #
+  # It talks to the backend over the `edge` network (http://backend:8000) and is
+  # deliberately NOT on `data` — an automation runner that executes user-authored
+  # workflows has no business holding a route to the database.
+  #
+  # ⚠ AUTHENTICATION — A CORRECTION CARRIED OVER FROM THE PREVIOUS COMPOSE FILE.
+  #   That file set N8N_BASIC_AUTH_ACTIVE / _USER / _PASSWORD. Those variables
+  #   were REMOVED upstream in n8n 1.0 and are silently ignored by 1.70 —
+  #   verified during PH2.2: with all three set, `GET http://127.0.0.1:5678/`
+  #   answered 200 with no credentials. They are not carried forward, because a
+  #   security control that does nothing is worse than a documented absence.
+  #
+  #   What actually protects this service:
+  #     1. the loopback-only port binding below, and
+  #     2. n8n's own user management — the first browser visit forces creation
+  #        of an owner account, and every later visit requires that login.
+  #   Complete the owner setup immediately after the first `up`. Do not expose
+  #   this port beyond loopback without a reverse proxy performing auth (PH2.11).
+  n8n:
+    <<: *dev-tool
+    profiles: ["automation"]
+    image: n8nio/n8n:${N8N_IMAGE_TAG:-1.70.0}
+    container_name: stockassist-n8n
+    environment:
+      # Workflow crons run in IST so schedules line up with NSE market hours.
+      # This is the one place in the stack that is deliberately not UTC: the
+      # containers' clocks stay UTC, only n8n's cron interpretation is localized.
+      GENERIC_TIMEZONE: Asia/Kolkata
+      TZ: Asia/Kolkata
+      # Must match the backend's WEBHOOK_API_KEY (production.env) or inbound
+      # automation calls are rejected by the X-Webhook-Key check.
+      WEBHOOK_API_KEY: ${WEBHOOK_API_KEY:-}
+    ports:
+      - "127.0.0.1:${N8N_PORT:-5678}:5678"
+    volumes:
+      - n8n_data:/home/node/.n8n
+    networks:
+      - edge
+
+# ==============================================================================
+# Volumes used only by the development tooling. Compose merges this list with
+# the base file's, so the production stack never creates them.
+# ==============================================================================
+volumes:
+  redisinsight_data:
+    driver: local
+  n8n_data:
+    driver: local

@@ -62,8 +62,8 @@ LOG_LEVEL="${LOG_LEVEL:-info}"
 # default. A container behind a load balancer needs proxy headers to see the
 # real client IP (the rate limiter in security/rate_limit.py keys anonymous
 # traffic on it) — but trusting them from *any* source lets a caller forge its
-# own IP and walk straight through per-IP throttling. PH2.3 sets this to the
-# reverse proxy's address on the compose network.
+# own IP and walk straight through per-IP throttling. The reverse-proxy sprint
+# sets this to the proxy's address on the compose network.
 FORWARDED_ALLOW_IPS="${FORWARDED_ALLOW_IPS:-127.0.0.1}"
 # Seconds uvicorn waits for in-flight requests to finish after SIGTERM. Must be
 # comfortably below the orchestrator's kill grace period (Docker's default is
@@ -115,15 +115,26 @@ if [ "${WEB_CONCURRENCY}" -gt 1 ]; then
     log "WARNING: Scale with additional replicas, not workers, until then."
 fi
 
-# 2b. Full configuration validation, delegated to the application's own
-#     authority on the subject: security/secrets.py (PH1.8). Reimplementing
-#     "which variables are required in which environment" in shell would create
-#     a second source of truth that drifts from the code that actually reads
-#     them. This runs the exact same validator server.py runs at import time —
-#     the only difference is that it is run here, deliberately, so the operator
-#     sees the clean aggregated report instead of a Python traceback emerging
-#     from the middle of uvicorn's startup.
-log "Validating configuration for APP_ENV=${APP_ENV} ..."
+# 2b. Full secret resolution + configuration validation, delegated to the
+#     application's own authority on the subject: security/secrets.py (PH1.8,
+#     extended in PH2.3). Reimplementing "which variables are required in which
+#     environment" — or "where does a secret come from" — in shell would create a
+#     second source of truth that drifts from the code that actually reads them.
+#
+#     This is a DRY RUN, in a throwaway Python process. It resolves every secret
+#     source (Docker secrets, `<NAME>_FILE` pointers, plaintext env) and validates
+#     the result, so an unreadable secret file or a missing variable is reported
+#     here, cleanly and all at once. The server process performs the identical
+#     resolution again for itself at import time (server.py), against the same
+#     inputs — so this cannot mask a problem the real boot would hit. It exists so
+#     the operator sees an aggregated report instead of a Python traceback
+#     emerging from the middle of uvicorn's startup.
+#
+#     Note the resolved values never cross the process boundary: this child exits
+#     before uvicorn starts, so nothing it read is added to the environment the
+#     server inherits. That is deliberate — the validator is allowed to see
+#     secrets, `docker inspect` is not.
+log "Resolving secret sources and validating configuration for APP_ENV=${APP_ENV} ..."
 python - <<'PYTHON_VALIDATION'
 import sys
 
@@ -144,6 +155,12 @@ except secrets.SecretValidationError as exc:
 
 for warning in report.warnings:
     print(f"[entrypoint] warning: {warning}", file=sys.stderr)
+
+# Names only — this line answers "which secrets are still plaintext?" without
+# printing a single value.
+file_backed = report.from_file()
+if file_backed:
+    print(f"[entrypoint] file-backed secrets: {', '.join(file_backed)}")
 print(f"[entrypoint] {report.summary_line()}")
 PYTHON_VALIDATION
 log "Configuration OK."

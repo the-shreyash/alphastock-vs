@@ -5,6 +5,306 @@ This file records documentation-system versions and, from v1.0 launch onward, pr
 
 ---
 
+# Sprint PH2.3 — Production Secrets Management — 2026-07-22
+
+**Credentials no longer have to be plaintext environment variables. `security/
+secrets.py` gained a source-resolution layer — Docker/Swarm/Kubernetes secrets,
+the `<NAME>_FILE` convention, and plaintext env as the development fallback —
+applied through one precedence order to every variable, materialized into
+`os.environ` once at boot. No application logic changed, no call site changed,
+and no existing deployment breaks: the migration is opt-in and per-secret.**
+
+> **Design note — why the loader hydrates `os.environ` instead of introducing an
+> accessor.** About thirty modules already read configuration through call-time
+> `os.environ.get(...)` resolvers. Routing them all through a new accessor would
+> have meant a thirty-file refactor of security-critical code, and would have
+> created a rule that a future module can forget — the first one that forgets it
+> silently loses file support. Resolving centrally and writing the result into
+> the environment *before any of them is imported* gives every consumer file
+> support for free, keeps exactly one place that knows how to find a secret, and
+> — because those resolvers read at call time rather than capturing at import —
+> is what makes in-place rotation propagate to live code. The honest cost: after
+> hydration a secret is in the process environment, so `/proc/<pid>/environ`
+> inside the container still shows it. What goes away is the far larger
+> host-side surface — `docker inspect`, container metadata, child-process
+> inheritance. Recorded as limitation L1.
+
+Added
+
+- **Source resolution in `backend/security/secrets.py`** — `resolve_all()` /
+  `resolve_secret()` apply one precedence order to every variable: (1) a
+  `<NAME>_FILE` pointer, (2) a discovered `$SECRETS_DIR/<name>` mount, (3) a
+  plaintext environment variable. `load_secrets()` materializes the result into
+  `os.environ`; `validate_config()` calls it first, so validation and the running
+  application can never see different values. Two properties are load-bearing:
+  **an unreadable pointer never falls back to the plaintext variable** (the
+  silent downgrade is exactly how a rotation appears to succeed while the old key
+  stays in use), and **two sources for one secret is a boot error, not a merge**
+  (two sources means two owners; guessing lets a rotated value be shadowed by a
+  stale one). Discovery checks both `JWT_SECRET` and `jwt_secret` because the
+  ecosystem is split — Compose/Swarm names are conventionally lowercase,
+  Kubernetes keys usually are not — and is limited to registered names so a stray
+  file in the mount cannot invent an environment variable.
+- **`reload_secrets()`** — re-reads file sources and reports what changed by
+  keyed-HMAC fingerprint, never by value. Works because rotated Docker configs
+  and Kubernetes projected volumes rewrite the *same path* in place. Also drops a
+  revoked secret from `os.environ` rather than leaving the loader's own stale
+  write behind: a deleted secret must stop working. Nothing calls it
+  automatically yet (L5).
+- **`docker-compose.secrets.yml`** — an opt-in overlay delivering `mongo_url`,
+  `redis_url`, `jwt_secret` and the MongoDB root credentials as file-mounted
+  Docker secrets. Applied over `-f docker-compose.yml` (the explicit production
+  path, not the dev default). Retracts the base file's plaintext values with an
+  explicit empty string rather than null: `KEY: ~` means "inherit from the
+  invoking shell", so an operator with `MONGO_URL` exported in their terminal
+  would have it injected; `KEY: ""` is unconditional and identical on every
+  machine. Verified against a hostile host environment.
+- **`secrets/generate.sh`** + `secrets/README.md` + a deny-by-default
+  `secrets/.gitignore` — generates 48-byte CSPRNG values at `chmod 600` (umask
+  set *before* the write, never tightened after), composes `mongo_url`/`redis_url`
+  from the passwords it just wrote so a URI and its credential cannot drift, and
+  emits a real Fernet key for `BROKER_TOKEN_KEY`. It deliberately **refuses to
+  invent third-party credentials** — a placeholder Anthropic key is
+  indistinguishable from a real one to everything downstream. `--check` and
+  `--rotate` modes.
+- **`docs/deployment/SECRETS.md`** — the mechanism: architecture diagram,
+  precedence table, the full validation matrix, workflows for
+  development/Compose/Docker-Secrets, per-secret rotation blast radius, the
+  Swarm/Kubernetes/Vault migration paths (documented, not implemented), seven
+  known limitations, and a troubleshooting table.
+
+Changed
+
+- **Validation now covers credential *shape*, not only presence and length**
+  (the sprint brief's Mongo/Redis/OAuth/API-key/encryption-key requirements).
+  New in production: `MONGO_URL` must carry `user:password` (a credential-free
+  URI means the database is unauthenticated or every query fails auth — the 2017
+  ransom-wave configuration), `REDIS_URL` must carry a password (Redis has no
+  user model, and `CONFIG SET dir` + `SAVE` makes an open instance an RCE
+  primitive, not merely a cache leak), and provider key shapes are warned on.
+  New in **every** environment: `BROKER_TOKEN_KEY` must be a valid Fernet key —
+  an invalid one does not fail at boot, it fails the first time a user connects a
+  broker, weeks later.
+- **Low-entropy secret detection** (`looks_weak`) — the length check is gameable:
+  `aaaaaaaa…` clears "≥ 32 characters" and does not survive ten seconds of
+  offline attack. Rules are deliberately conservative (< 8 chars, ≤ 4 distinct
+  characters, < 8 distinct at ≥ 16 chars, keyboard/digit runs) because a false
+  positive blocks a production boot; a real `token_urlsafe(48)` clears all of
+  them by a wide margin. Error in production, warning in development.
+- **Delivery-posture reporting** — a *sensitive* secret arriving as plaintext is
+  a warning at every production boot, listing exactly which ones. Development is
+  deliberately not nagged: a warning that fires on every laptop boot is one
+  nobody reads in production either. `REQUIRE_FILE_SECRETS=true` promotes it to a
+  boot error, so a completed migration cannot silently regress.
+- `ConfigReport` gained `sources` / `from_file()` / `from_env()`; the startup
+  summary now reports `file-backed=N plaintext=N`. `docker/entrypoint.sh` prints
+  the file-backed names — names only, never values.
+- `server.py` — the boot comment now documents that hydration must precede every
+  other import, and why. No behavioural change beyond what `validate_config()`
+  now does.
+- `production.env.example`, `compose.env.example`, `.claude/SECRETS.md`,
+  `docs/deployment/README.md`, `docs/deployment/DOCKER_COMPOSE.md` (L2/L3 and §11
+  corrected), `backend/security/__init__.py`, `backend/.env.example`
+  (regenerated).
+
+Fixed (found during verification, in this sprint's own code)
+
+- **A `_FILE` pointer aimed inside `$SECRETS_DIR` conflicted with itself.** The
+  first end-to-end run against a real mount failed: `JWT_SECRET_FILE=/run/secrets/
+  jwt_secret` names precisely the path discovery scans, so the pointer and the
+  discovery were counted as two rival sources and the boot was refused — meaning
+  the configuration this sprint documents would have failed on every deploy.
+  Comparing paths would still have been wrong on a case-insensitive filesystem
+  (macOS, Windows), where `JWT_SECRET` and `jwt_secret` are one file under two
+  names. Fixed by having a successful pointer *suppress* discovery: an explicit
+  instruction leaves nothing to disambiguate. The conflict rule keeps its teeth
+  where ambiguity is real — a file source competing with a plaintext env var.
+
+Testing
+
+- `backend/tests/test_secret_loading.py` — **68 new hermetic tests** covering
+  every item on the sprint's testing checklist: env loading, Docker secret
+  discovery (lowercase and exact), the `_FILE` convention, precedence, conflicts,
+  missing/empty/oversized/binary/directory sources, placeholder and weak-value
+  rejection, production boot failure, development fallback, rotation, and four
+  tests asserting that no error message, summary line or `repr` ever contains a
+  secret value. File reads go through an injected reader; the cases that are
+  specifically *about* the filesystem use `tmp_path` and the real reader.
+- `backend/tests/test_secrets.py` — `base_prod_env` now uses a credentialed
+  `MONGO_URL`, since a credential-free one is a production error under the new
+  rule. 38 tests, unchanged otherwise.
+- Full hermetic backend suite: **694 passed, 1 failed** — the failure is the
+  documented pre-existing `test_trading_engine::test_run_cycle_trails_and_books_targets`
+  (unrelated, owned by PH3.1). Baseline was 626 passed with the same single
+  failure.
+- End-to-end verification against a real Docker-style mount: secrets resolve,
+  `security.jwt` (an unmodified consumer) reads the file-backed value, no secret
+  appears in the `docker inspect` view, in-place rotation propagates to live code,
+  and `REQUIRE_FILE_SECRETS=true` refuses the boot with a value-free message.
+- `docker compose -f docker-compose.yml -f docker-compose.secrets.yml config`
+  validates; retraction verified against a shell exporting hostile values.
+
+Known limitations
+
+- **L1** — after hydration, secrets are in the process environment (by design;
+  see the design note above).
+- **L2** — MongoDB's *app-user* credentials remain plaintext env vars.
+  `docker/mongodb/init-app-user.js` runs under `mongosh` and can only reach
+  `process.env`. Bounded exposure: consumed only on first initialization of an
+  empty volume, and the account it creates holds `readWrite` on one database. The
+  **root** password is fully file-backed.
+- **L3** — Redis's password is only partially covered. The official image has no
+  `_FILE` support; the overlay's `sh -c` wrapper removes it from `docker
+  inspect`'s `Cmd` but leaves it in `redis-server`'s argv inside that container,
+  and `REDISCLI_AUTH` must stay an env var because the healthcheck runs as a bare
+  exec. Closing both needs a generated `redis.conf`.
+- **L4** — rotating `BROKER_TOKEN_KEY` is destructive: no re-encryption migration
+  exists, so stored broker tokens become undecryptable.
+- **L5** — no automatic reload trigger. `reload_secrets()` exists and is tested,
+  but nothing calls it; rotation in practice still means restart.
+- **L6** — under plain Compose the secret files are plaintext on the host disk.
+  Inherent to file-based Compose secrets; Swarm removes it with no file change.
+- **L7** — no CI assertion that nothing under `secrets/` was force-added. Belongs
+  in PH2.5.
+
+Not in scope (unchanged, per the sprint brief): Vault, AWS/Azure/GCP secret
+managers, Kubernetes manifests, CI/CD, authentication, business logic, trading,
+AI. PH2.2's limitation **L2** (in-container hot reload) also remains open — this
+sprint sharpened rather than resolved it, since a bind-mounted `.env` would now
+be a competing source the loader refuses to boot on.
+
+---
+
+# Sprint PH2.2 — Production Docker Compose — 2026-07-22
+
+**The backend stack now starts with one command. PH2.1 produced a deployable
+image; PH2.2 turns it into a running system — backend, MongoDB and Redis, with
+network segmentation, named volumes, health-gated startup ordering and no
+credential of any kind hardcoded. Orchestration only: no CI, no CD, no
+Kubernetes, no reverse proxy, no TLS, and no application code changed.**
+
+> **Sprint numbering note.** `PRODUCTION_ROADMAP.md` v1.2 assigns PH2.2 to the
+> *frontend* production Dockerfile and PH2.3 to the compose split. The sprint as
+> commissioned re-sequenced these: compose orchestration was pulled forward to
+> PH2.2 and secrets management became PH2.3. The roadmap document has not been
+> renumbered — the dependency graph is unchanged and the frontend image sprint
+> is simply still outstanding. See "Known limitations" L6.
+
+Added
+
+- `docker-compose.yml` (replaces the previous file) — the **production-shaped
+  base stack**. Three services and nothing else: `backend` (the PH2.1 image,
+  built from `./backend` with the OCI provenance build args — build logic is
+  *not* duplicated, the Dockerfile stays the single authority), `mongo` and
+  `redis`. Explicit project `name: stockassist` so volume and container names do
+  not shift with the checkout directory. Cross-cutting policy is defined once
+  through YAML anchors: `restart: unless-stopped`, `no-new-privileges:true`, and
+  bounded json-file logging (10 MB × 3 — the default driver is unbounded, and a
+  full disk takes down every container on the host, not just the noisy one).
+  Deliberately contains **no `healthcheck:` block for the backend**: the image
+  already declares one, and restating it here would fork the definition so that
+  `docker run` and `docker compose up` probe the same image differently.
+  `stop_grace_period: 30s` because the entrypoint gives uvicorn 20s to drain and
+  Docker's default grace period is 10s — without it every `down` would `SIGKILL`
+  the server mid-drain. Backend port publishes to **127.0.0.1 by default**:
+  Docker writes published ports into the `DOCKER-USER` iptables chain, which is
+  evaluated *before* ufw/firewalld, so a `0.0.0.0` bind on a cloud VM is
+  internet-reachable regardless of the host firewall.
+- `docker-compose.override.yml` — the **development overlay**, auto-merged by
+  Compose so `docker compose up` is the developer path and
+  `-f docker-compose.yml` is the explicit production path (base = strict,
+  overlay = relaxed; forgetting a flag can never *add* a database browser to a
+  production stack). Adds Mongo Express, Redis Insight (`--profile tools`), n8n
+  (`--profile automation`), loopback-published database ports and
+  `APP_ENV=development`. Deliberately **no source bind mount and no
+  `--reload`** — mounting `./backend` over `/app` would reintroduce
+  `backend/.env` inside the container, and `server.py` calls
+  `load_dotenv(override=True)`, so that file would silently override every
+  variable Compose injects.
+- `docker/mongodb/init-app-user.js` — first-boot provisioning of a
+  **least-privilege application account** (`readWrite` on the application
+  database only). The mongo image creates a *cluster root* user; handing those
+  credentials to the application would mean an injection or a leaked container
+  environment carries the ability to drop every database and create users. The
+  root password never enters the backend container. Verified: the app user is
+  denied `admin` reads, `createUser` and `dropDatabase`, and `listDatabases`
+  returns only its own database.
+- `compose.env.example` — template for the project-root `.env` that **Compose
+  itself** reads. This is the second half of a deliberate two-file split:
+  infrastructure credentials (Mongo/Redis passwords, host ports, image tags) are
+  handed to the specific service that needs them, while application secrets
+  reach the backend through `production.env`. A least-privilege boundary and a
+  rotation boundary, not bookkeeping.
+- `docs/deployment/DOCKER_COMPOSE.md` — full stack documentation: architecture
+  and network diagrams, per-service rationale, network/volume design, the
+  environment split, operator guide, measured startup timings, a 16-point
+  verification table, seven known limitations, a troubleshooting matrix, and the
+  handoff to PH2.3.
+
+Changed
+
+- `production.env.example` — documents the PH2.2 two-file model and records that
+  `MONGO_URL` and `REDIS_URL` are **overridden by Compose** (a service's
+  `environment:` outranks its `env_file`), so a stale value cannot break the
+  stack's own wiring.
+- `docs/deployment/README.md` — indexes the new document and both env templates.
+
+Security findings closed or recorded
+
+- **MongoDB now requires authentication.** The previous compose file ran mongo
+  with no credentials and published 27017 on `0.0.0.0` — the exact configuration
+  behind the 2017–2020 MongoDB ransom wave. The production stack now enables
+  `--auth`, publishes no host port at all, and sits on an `internal: true`
+  network with no route to or from the internet.
+- **Redis is password-protected.** An unauthenticated Redis is a remote code
+  execution primitive, not merely a data leak (`CONFIG SET dir` + `SAVE` writes
+  arbitrary files). Verified: unauthenticated commands are refused with `NOAUTH`.
+- **n8n basic auth was already dead.** The previous compose file set
+  `N8N_BASIC_AUTH_ACTIVE` / `_USER` / `_PASSWORD`; those variables were removed
+  upstream in n8n 1.0 and are silently ignored by 1.70. Verified during this
+  sprint: with all three set, `GET http://127.0.0.1:5678/` answered **200 with
+  no credentials**. They are not carried forward — a control that does nothing
+  is worse than a documented absence. Access now rests on the loopback-only
+  binding plus n8n's own owner-account setup, both documented.
+- **`internal: true` silently disables port publishing.** A container attached
+  only to an internal network accepts a `ports:` entry, records the binding, and
+  never listens. Found while verifying the overlay; fixed by attaching mongo and
+  redis to `edge` in the development overlay only.
+
+Verified
+
+- 16 checks, all passing: health-gated startup ordering; least-privilege
+  database access (5 probes); network egress isolation (data tier has none, edge
+  tier does); no host ports for the databases in the production stack; named
+  volumes surviving a full `down` + `up` (14 collections, probe document, Redis
+  key); restart policy and AOF recovery after a Redis crash; and three
+  fail-closed paths — missing `production.env`, missing `REDIS_PASSWORD`, and a
+  weak `JWT_SECRET` under `APP_ENV=production` (backend exits 1, restart-loops,
+  never reports healthy, never serves traffic).
+- Timings (Apple silicon, image cached): cold start to all-healthy **13–32 s**,
+  warm start **12–14 s**, development stack with tools **16 s**, graceful
+  `down` **2 s**.
+
+Known limitations
+
+- **L1** — the Redis pub/sub listener stops after ~3 s
+  (`backend/services/cache.py:47` shares one client with `socket_timeout=3`,
+  and `pubsub.listen()` blocks longer by design). A pre-existing application
+  defect that was unreachable until this sprint put a Redis in the stack. No
+  functional regression at `WEB_CONCURRENCY=1` with one replica — the in-process
+  event bus carries every event and the cache path works normally. The fix
+  belongs to **PH2.8**, which owns cross-process fan-out and can test it.
+- **L2** — no in-container hot reload (PH2.3). **L3** — secrets are plaintext on
+  disk and visible in `docker inspect` (PH2.3). **L4** — single-node MongoDB, no
+  replica set, so no transactions or change streams. **L5** — no automated
+  backups (PH2.10). **L6** — the frontend is not in the stack: it has no
+  Dockerfile, and the service the previous compose file declared referenced
+  `frontend/Dockerfile`, which has never existed in this repository, so it could
+  never have built. **L7** — `read_only: true` is not enabled for the backend
+  (data-science dependencies write to a `$HOME` cache on first use).
+
+---
+
 # Sprint PH2.1 — Backend Production Dockerfile — 2026-07-22
 
 **First PH2 sprint. The backend is now a reproducible, non-root, fail-closed

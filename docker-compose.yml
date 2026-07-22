@@ -1,121 +1,425 @@
-version: "3.9"
+# ==============================================================================
+# StockAssist AI — Production-shaped backend stack (PH2.2)
+#
+# WHAT THIS FILE IS
+# -----------------
+# The BASE stack. Everything in this file is intended to be safe to run in a
+# production-like environment: no debugging tools, no source bind mounts, no
+# database ports on the host, no plaintext defaults for any credential.
+#
+# It orchestrates exactly three services — the backend built from the PH2.1
+# image, MongoDB, and Redis — plus the network and volume topology they need.
+#
+#   docker compose -f docker-compose.yml up -d        ← production-like stack
+#   docker compose up -d                              ← the above + dev tooling
+#                                                       (docker-compose.override.yml
+#                                                        is auto-merged)
+#
+# That asymmetry is deliberate and is the convention this project follows:
+#   * `-f docker-compose.yml` is EXPLICIT and therefore reproducible. Anything
+#     that must not exist in production simply is not in this file.
+#   * the bare `docker compose up` is the DEVELOPER path. Compose auto-merges
+#     docker-compose.override.yml, which layers on Mongo Express, host-published
+#     database ports and a relaxed APP_ENV.
+# A developer cannot accidentally get a production stack, and a production
+# deploy cannot accidentally get Mongo Express — the failure mode of a single
+# combined file with commented-out blocks.
+#
+# CONFIGURATION — TWO FILES, TWO AUDIENCES
+# ----------------------------------------
+#   .env             (project root, git-ignored)  → read by DOCKER COMPOSE for
+#                    the ${...} interpolations below: infrastructure credentials,
+#                    host ports, image tags. Never injected wholesale into any
+#                    container. Template: compose.env.example.
+#
+#   production.env   (git-ignored)                → injected into the BACKEND
+#                    container via `env_file`: application secrets only.
+#                    Template: production.env.example.
+#
+# The split is a least-privilege boundary, not bookkeeping. The MongoDB root
+# password lives in `.env` and is handed only to the mongo service; the backend
+# container never sees it, so application-level code execution cannot escalate
+# to database administration. It is also a rotation boundary: infrastructure
+# credentials are owned by whoever runs the stack, application secrets by
+# whoever owns the product integrations.
+#
+# Full documentation: docs/deployment/DOCKER_COMPOSE.md
+# ==============================================================================
+
+# An explicit project name, so container/volume/network names are stable no
+# matter what the checkout directory is called. Without it Compose derives the
+# project name from the directory ("alpha-stock-main" here), and a rename or a
+# second checkout silently produces a SECOND set of volumes — the classic "my
+# data disappeared" incident.
+name: stockassist
+
+# ── Reusable fragments ────────────────────────────────────────────────────────
+# Compose supports YAML anchors, and `x-` prefixed top-level keys are explicitly
+# reserved for extensions and ignored by the schema. Defining the cross-cutting
+# policies once means they cannot drift apart between services.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    # WHY: the json-file driver is unbounded by default. A service that logs
+    # steadily will fill the host disk — and a full disk takes down every
+    # container on the box, not just the noisy one. 10 MB × 3 files caps each
+    # service at 30 MB. Ship logs off-host (PH2.9) rather than raising this.
+    max-size: "10m"
+    max-file: "3"
+
+x-service-defaults: &service-defaults
+  # `unless-stopped` rather than `always`: the container comes back after a
+  # crash and after a host reboot, but an operator who deliberately stopped it
+  # during an incident finds it still stopped after that reboot. `always` would
+  # resurrect it and undo the intervention.
+  restart: unless-stopped
+  security_opt:
+    # Blocks setuid/setgid escalation inside the container for the process and
+    # all its children. The backend already runs as a non-root user; this makes
+    # that a one-way door rather than a starting position.
+    - no-new-privileges:true
+  logging: *default-logging
 
 services:
-  # ── MongoDB ─────────────────────────────────────────────────────
-  mongo:
-    image: mongo:7.0
-    container_name: alphapartner_mongo
-    restart: unless-stopped
-    volumes:
-      - mongo_data:/data/db
-    ports:
-      - "27017:27017"
-    environment:
-      MONGO_INITDB_DATABASE: alpha_stock_db
-    healthcheck:
-      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
 
-  # ── Backend (FastAPI) ────────────────────────────────────────────
+  # ============================================================================
+  # BACKEND — FastAPI application (PH2.1 image)
+  # ============================================================================
   backend:
+    <<: *service-defaults
+    # Build logic is NOT duplicated here. The Dockerfile is the single authority
+    # on how this image is produced; Compose only points at it and supplies the
+    # provenance build args. In a real deployment `image:` is pulled from a
+    # registry and `build:` is never executed (PH2.6 builds and pushes it in CI):
+    #     BACKEND_IMAGE=ghcr.io/org/stockassist-backend BACKEND_IMAGE_TAG=1.4.0 \
+    #         docker compose -f docker-compose.yml pull && ... up -d
     build:
       context: ./backend
       dockerfile: Dockerfile
-    container_name: alphapartner_backend
-    restart: unless-stopped
+      args:
+        APP_VERSION: ${APP_VERSION:-0.0.0-dev}
+        VCS_REF: ${VCS_REF:-unknown}
+        BUILD_DATE: ${BUILD_DATE:-unknown}
+    image: ${BACKEND_IMAGE:-stockassist-backend}:${BACKEND_IMAGE_TAG:-local}
+    container_name: stockassist-backend
+
+    # Application secrets, injected as a file rather than enumerated variable by
+    # variable. Enumerating them would create a second source of truth that
+    # drifts from security/secrets.py SECRET_REGISTRY every time an integration
+    # is added — and a missing variable would surface as a runtime feature
+    # failure rather than a startup error.
+    #
+    # Missing file = hard error. That is correct: this stack is production-
+    # shaped, and a production stack must never start with an unknown
+    # configuration. `cp production.env.example production.env` and fill it in.
+    env_file:
+      - ${BACKEND_ENV_FILE:-./production.env}
+
+    # Values Compose OWNS. `environment` has higher precedence than `env_file`,
+    # so these deliberately override whatever production.env says — the stack's
+    # own wiring cannot be broken by a stale value in an operator's env file.
+    environment:
+      # ── Infrastructure wiring (composed from .env, never hand-written) ──────
+      # The application user, not the root user (see docker/mongodb/init-app-user.js).
+      # `authSource` is the application database because that is where the user
+      # was created. `retryWrites`/`w=majority` are deliberately absent: this is
+      # a single-node mongod, not a replica set, and advertising replica-set
+      # semantics the deployment cannot honour is worse than not asking for them.
+      MONGO_URL: mongodb://${MONGO_APP_USERNAME:?set MONGO_APP_USERNAME in .env — see compose.env.example}:${MONGO_APP_PASSWORD:?set MONGO_APP_PASSWORD in .env — see compose.env.example}@mongo:27017/${MONGO_DB_NAME:-alpha_stock}?authSource=${MONGO_DB_NAME:-alpha_stock}
+      DB_NAME: ${MONGO_DB_NAME:-alpha_stock}
+      # Setting REDIS_URL is what activates the shared cache and the cross-
+      # process pub/sub fan-out in services/cache.py. Left unset, that module
+      # silently falls back to a per-process in-memory dict — correct for a
+      # single process, wrong the moment there is more than one.
+      REDIS_URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD in .env — see compose.env.example}@redis:6379/0
+
+      # ── Container runtime ───────────────────────────────────────────────────
+      # Defaults to the strict posture. The dev override relaxes it explicitly.
+      APP_ENV: ${APP_ENV:-production}
+      HOST: 0.0.0.0
+      PORT: ${BACKEND_CONTAINER_PORT:-8000}
+      # See production.env.example: the in-process scheduler and the in-memory
+      # WebSocket registry are not multi-process safe until PH2.8. Scale with
+      # replicas, not workers.
+      WEB_CONCURRENCY: ${WEB_CONCURRENCY:-1}
+
     ports:
-      - "8000:8000"
+      # Host side is configurable, container side is not — the container port is
+      # a property of the image (EXPOSE 8000), the host port is a property of
+      # the machine.
+      #
+      # Bound to 127.0.0.1 BY DEFAULT. This matters more than it looks: Docker
+      # writes published ports into the DOCKER-USER iptables chain, which is
+      # evaluated BEFORE most host firewalls (ufw/firewalld). A `0.0.0.0` bind
+      # on a cloud VM is reachable from the internet even when the host firewall
+      # says otherwise. Set BACKEND_BIND_ADDR=0.0.0.0 only when the machine's
+      # network boundary is enforced somewhere Docker cannot bypass — a cloud
+      # security group, or a reverse proxy in front (PH2.11).
+      - "${BACKEND_BIND_ADDR:-127.0.0.1}:${BACKEND_PORT:-8000}:${BACKEND_CONTAINER_PORT:-8000}"
+
     depends_on:
+      # `service_healthy`, not the bare list form. The bare form only waits for
+      # the container to be CREATED, which for a database means "the process has
+      # started", not "the process accepts authenticated connections" — mongod
+      # spends several seconds initializing storage and (on first boot) running
+      # the init scripts. Waiting on health turns a startup race that fails
+      # intermittently into a deterministic ordering.
       mongo:
         condition: service_healthy
+      redis:
+        condition: service_healthy
+
+    # NO `healthcheck:` BLOCK — deliberately.
+    # The image already declares one (backend/Dockerfile HEALTHCHECK →
+    # docker/healthcheck.sh, with a tuned 45s start period). Restating it here
+    # would fork the definition: `docker run` and `docker compose up` would then
+    # probe the service differently, and one of the two would quietly rot. The
+    # image is the authority on whether the image is healthy.
+
+    # uvicorn is given 20s to drain in-flight requests after SIGTERM
+    # (TIMEOUT_GRACEFUL_SHUTDOWN in docker/entrypoint.sh), but Docker's default
+    # grace period is 10s — so without this line every `compose down` would
+    # SIGKILL the server mid-drain and sever open requests and WebSockets. The
+    # orchestrator's patience must always exceed the application's.
+    stop_grace_period: 30s
+
+    networks:
+      # The only service on both networks: it must be reachable from the host
+      # and must reach the data tier. That dual membership is what makes the
+      # data network's isolation meaningful.
+      - edge
+      - data
+
+    # ── Optional hardening, left off by default and documented rather than
+    #    silently omitted ───────────────────────────────────────────────────────
+    # `read_only: true` + a tmpfs /tmp would make the container filesystem fully
+    # immutable, closing "write a webshell to disk" entirely. It is NOT enabled
+    # here because several data-science dependencies (yfinance and friends)
+    # write to a user cache directory under $HOME (=/app) on first use, and a
+    # failure there would surface as a market-data outage at runtime rather than
+    # as a startup error — the worst possible failure shape. Turning it on is a
+    # sprint of its own: enumerate the writable paths, mount tmpfs for each,
+    # then soak it.
+    #   read_only: true
+    #   tmpfs:
+    #     - /tmp:size=64m,mode=1777
+
+    # A named volume for future user uploads is DECLARED below but not mounted.
+    # Mounting it here today would create /app/uploads owned by root:root inside
+    # a container whose process runs as uid 10001, so the application could not
+    # write to it — a subtle, confusing failure. Wiring it up requires the image
+    # to pre-create the directory with the right ownership, which is a PH2.1
+    # change and out of scope for this sprint.
+    #   volumes:
+    #     - backend_uploads:/app/uploads
+
+  # ============================================================================
+  # MONGODB — primary datastore
+  # ============================================================================
+  mongo:
+    <<: *service-defaults
+    # Pinned to a minor version, matching the Dockerfile's base-image policy:
+    # patch updates arrive on rebuild, a major version never arrives by
+    # surprise. MongoDB majors change wire protocol behaviour and index
+    # semantics; that is a migration, not an update.
+    image: mongo:${MONGO_IMAGE_TAG:-7.0}
+    container_name: stockassist-mongo
+
     environment:
-      # Database
-      MONGO_URL: mongodb://mongo:27017
-      DB_NAME: alpha_stock_db
+      # Creating a root user is what makes the official entrypoint start mongod
+      # with --auth. There is no "anonymous" mode here: without these variables
+      # the image would happily serve an unauthenticated database, which on a
+      # host with any network exposure is a well-known ransomware target. Both
+      # are required (`:?`) — there is no default password anywhere in this file.
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USERNAME:?set MONGO_ROOT_USERNAME in .env — see compose.env.example}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:?set MONGO_ROOT_PASSWORD in .env — see compose.env.example}
+      MONGO_INITDB_DATABASE: ${MONGO_DB_NAME:-alpha_stock}
+      # Consumed by the init script, not by the image itself.
+      MONGO_APP_USERNAME: ${MONGO_APP_USERNAME:?set MONGO_APP_USERNAME in .env — see compose.env.example}
+      MONGO_APP_PASSWORD: ${MONGO_APP_PASSWORD:?set MONGO_APP_PASSWORD in .env — see compose.env.example}
 
-      # Security — no baked-in fallback. Compose fails fast if JWT_SECRET is unset
-      # (generate: python -c "import secrets;print(secrets.token_urlsafe(48))").
-      # Boot-time validation in security/secrets.py rejects weak/short values.
-      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is required — set it in a local .env (see backend/.env.example)}
-      APP_ENV: ${APP_ENV:-development}
-
-      # AI Providers (dual-model debate architecture)
-      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
-      GOOGLE_GEMINI_KEY: ${GOOGLE_GEMINI_KEY:-}
-
-      # Zerodha (optional — enables live trading)
-      KITE_API_KEY: ${KITE_API_KEY:-}
-      KITE_API_SECRET: ${KITE_API_SECRET:-}
-
-      # WhatsApp notifications (optional — Twilio)
-      TWILIO_ACCOUNT_SID: ${TWILIO_ACCOUNT_SID:-}
-      TWILIO_AUTH_TOKEN: ${TWILIO_AUTH_TOKEN:-}
-      TWILIO_WHATSAPP_FROM: ${TWILIO_WHATSAPP_FROM:-+14155238886}
-      USER_WHATSAPP_TO: ${USER_WHATSAPP_TO:-}
-
-      # Email notifications (optional — choose one)
-      SENDGRID_API_KEY: ${SENDGRID_API_KEY:-}
-      SMTP_HOST: ${SMTP_HOST:-}
-      SMTP_PORT: ${SMTP_PORT:-587}
-      SMTP_USER: ${SMTP_USER:-}
-      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
-      EMAIL_FROM: ${EMAIL_FROM:-alerts@alphapartner.ai}
-
-      # Market data (optional — Alpha Vantage for intraday data)
-      ALPHA_VANTAGE_KEY: ${ALPHA_VANTAGE_KEY:-}
-
-      # Google OAuth (optional — enables "Continue with Google" button)
-      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
-      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
     volumes:
-      - ./backend:/app
-    command: uvicorn server:app --host 0.0.0.0 --port 8000 --reload
+      # Named volumes, never a bind mount, for database storage. A bind mount to
+      # a host path inherits the host filesystem's semantics, and on macOS and
+      # Windows that path goes through a filesystem-sharing layer whose file
+      # locking and fsync behaviour MongoDB explicitly does not support — it
+      # corrupts data or refuses to start. Named volumes live in the Docker VM's
+      # native filesystem on every platform, so behaviour is identical
+      # everywhere and the data survives `docker compose down`.
+      - mongo_data:/data/db
+      # Separate volume for cluster metadata, matching the image's own VOLUME
+      # declarations. Without it, /data/configdb becomes an anonymous volume on
+      # every `up` — a slow accumulation of orphaned volumes on the host.
+      - mongo_config:/data/configdb
+      # Read-only bind mount of the bootstrap script. This is a bind mount by
+      # necessity (the file is source code, versioned in git, and must track the
+      # repository) and `:ro` guarantees the database container cannot alter its
+      # own provisioning logic.
+      - ./docker/mongodb/init-app-user.js:/docker-entrypoint-initdb.d/01-init-app-user.js:ro
 
-  # ── Frontend (React) ─────────────────────────────────────────────
-  frontend:
-    build:
-      context: ./frontend
-      dockerfile: Dockerfile
-      args:
-        REACT_APP_BACKEND_URL: http://localhost:8000
-        REACT_APP_GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
-    container_name: alphapartner_frontend
-    restart: unless-stopped
-    ports:
-      - "3000:3000"
-    depends_on:
-      - backend
-    environment:
-      REACT_APP_BACKEND_URL: http://localhost:8000
-      REACT_APP_GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+    healthcheck:
+      # `ping` is one of the few commands MongoDB answers before authentication,
+      # so the probe needs no credentials — which keeps the password out of the
+      # process table and out of `docker inspect`'s healthcheck definition.
+      # Piping through grep converts mongosh's output into the exit code Docker
+      # actually reads; mongosh alone can exit 0 while reporting a failed command.
+      test: ["CMD-SHELL", "mongosh --quiet --eval \"db.adminCommand('ping').ok\" | grep -q 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      # First boot does real work — allocating storage files, creating the root
+      # user, running the init script. Failures inside the start period do not
+      # count toward `retries`, so this window prevents a slow first start from
+      # being mistaken for a broken database.
+      start_period: 30s
 
-  # ── n8n (Automation Workflows) ───────────────────────────────────
-  n8n:
-    image: n8nio/n8n:1.70.0
-    container_name: alphapartner_n8n
-    restart: unless-stopped
-    ports:
-      - "5678:5678"
-    depends_on:
-      - backend
+    # mongod flushes its journal and closes storage files on SIGTERM. Cutting it
+    # short with SIGKILL forces a recovery pass on next start, and on an
+    # unlucky write can require a repair.
+    stop_grace_period: 30s
+
+    # NO `ports:` — deliberately. The database is reachable only from other
+    # containers on the `data` network. Every publicly-reachable MongoDB in the
+    # 2017-2020 ransom-wave incidents got there through exactly this line, added
+    # for a five-minute debugging session and never removed. The dev override
+    # publishes it on loopback for developers; production never does.
+    networks:
+      - data
+
+  # ============================================================================
+  # REDIS — shared cache and cross-process realtime fan-out
+  # ============================================================================
+  # WHY IT IS IN THE BASE STACK AND NOT AN OPTIONAL EXTRA:
+  # services/cache.py degrades to a per-process in-memory dict when REDIS_URL is
+  # unset. That is correct for one process and silently wrong for two: two
+  # replicas would hold divergent caches and a WebSocket broadcast published by
+  # replica A would never reach clients connected to replica B. Including Redis
+  # in the production-shaped stack means the local stack has the same
+  # cross-process semantics as a scaled deployment, so the class of bug only
+  # visible above one replica is visible here too.
+  redis:
+    <<: *service-defaults
+    image: redis:${REDIS_IMAGE_TAG:-7.2-alpine}
+    container_name: stockassist-redis
+
+    # Configuration by flags rather than a mounted redis.conf: the settings that
+    # matter here are few, and every one of them is visible in this file next to
+    # the rationale for it. A conf file would move them somewhere a reader of
+    # the compose stack does not look.
+    command:
+      - redis-server
+      # No default. An unauthenticated Redis reachable from any container on the
+      # network is a remote-code-execution primitive, not merely a data leak:
+      # CONFIG SET dir + SAVE lets a caller write arbitrary files as the redis
+      # user, which is the standard path to a cron entry or an SSH key.
+      - --requirepass
+      - ${REDIS_PASSWORD:?set REDIS_PASSWORD in .env — see compose.env.example}
+      # Persistence. AOF (append-only file) rather than RDB snapshots: an AOF
+      # loses at most one second of writes (`everysec`), an RDB snapshot loses
+      # everything since the last checkpoint. `--save ""` disables RDB so the
+      # two mechanisms do not both write to the same volume.
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --save
+      - ""
+      # A cache without a memory ceiling is an OOM waiting to happen: Redis will
+      # consume everything it is given and then be killed by the kernel, taking
+      # the AOF's clean shutdown with it. With a ceiling it evicts instead —
+      # `allkeys-lru` because everything stored here is reconstructible cache or
+      # transient pub/sub state, so evicting the least-recently-used key is
+      # always preferable to refusing a write.
+      - --maxmemory
+      - ${REDIS_MAXMEMORY:-256mb}
+      - --maxmemory-policy
+      - ${REDIS_MAXMEMORY_POLICY:-allkeys-lru}
+
     environment:
-      # Basic auth for the n8n editor UI. No hard-coded credential: the password
-      # is externalized and required (compose fails fast if it is unset).
-      N8N_BASIC_AUTH_ACTIVE: "true"
-      N8N_BASIC_AUTH_USER: ${N8N_BASIC_AUTH_USER:-admin}
-      N8N_BASIC_AUTH_PASSWORD: ${N8N_BASIC_AUTH_PASSWORD:?N8N_BASIC_AUTH_PASSWORD is required — set it in a local .env}
-      # Run workflow crons in IST so schedules match NSE market hours
-      GENERIC_TIMEZONE: Asia/Kolkata
-      TZ: Asia/Kolkata
-      # Reach the backend over the compose network
-      WEBHOOK_API_KEY: ${WEBHOOK_API_KEY:-}
+      # redis-cli reads REDISCLI_AUTH automatically, so the health check below
+      # authenticates without the password ever appearing in a command line
+      # (where it would show up in `ps` output inside the container and in
+      # `docker inspect`'s healthcheck definition).
+      REDISCLI_AUTH: ${REDIS_PASSWORD:?set REDIS_PASSWORD in .env — see compose.env.example}
+
     volumes:
-      - n8n_data:/home/node/.n8n
+      - redis_data:/data
 
+    healthcheck:
+      # `| grep -q PONG` is load-bearing: redis-cli exits 0 even when the server
+      # answers "NOAUTH Authentication required", so testing the exit code alone
+      # would report a locked-out Redis as healthy.
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+    # Time to rewrite and fsync the AOF before exit.
+    stop_grace_period: 15s
+
+    # No `ports:` — same reasoning as MongoDB, and Redis is worse: it has no
+    # user model, so a single leaked password is total access.
+    networks:
+      - data
+
+# ==============================================================================
+# NETWORKS
+#
+# Two tiers, not one flat network, because a flat network makes every service
+# reachable from every other service — including from anything added later for
+# an unrelated reason. Segmentation is what keeps "we added a small internal
+# tool" from silently becoming "the small internal tool can reach the database".
+#
+#     host ──▶ 127.0.0.1:8000
+#                 │
+#          ┌──────┴────────┐
+#          │   edge        │  bridge, egress allowed
+#          │   backend     │
+#          └──────┬────────┘
+#                 │  (backend is the ONLY member of both)
+#          ┌──────┴──────────────────┐
+#          │   data   internal:true  │  no route to or from the outside world
+#          │   backend mongo redis   │
+#          └─────────────────────────┘
+# ==============================================================================
+networks:
+  # Services that need to talk to the outside world: the backend calls Anthropic,
+  # Gemini, Yahoo, Alpha Vantage and the broker APIs, so it needs egress.
+  edge:
+    driver: bridge
+
+  # `internal: true` removes the gateway from this network entirely. Containers
+  # attached ONLY to it (mongo, redis) can therefore neither reach the internet
+  # nor be reached from it, no matter what is misconfigured elsewhere — a
+  # database container cannot exfiltrate to a remote host and cannot pull a
+  # payload down. Inter-container DNS and traffic within the network are
+  # unaffected.
+  data:
+    driver: bridge
+    internal: true
+
+# ==============================================================================
+# VOLUMES
+#
+# All named, never host bind mounts (see the mongo service for why). Named
+# volumes survive `docker compose down`; they are removed only by an explicit
+# `docker compose down -v`, which is the one command in this document that
+# destroys data.
+#
+# Because `name: stockassist` is set at the top of this file, these appear on
+# the host as `stockassist_mongo_data`, `stockassist_redis_data`, and so on —
+# stable regardless of the checkout directory's name.
+# ==============================================================================
 volumes:
   mongo_data:
     driver: local
-  n8n_data:
+  mongo_config:
+    driver: local
+  redis_data:
+    driver: local
+  # Declared now, mounted later. See the commented block in the backend service:
+  # mounting it requires the image to pre-create the directory owned by uid
+  # 10001. Declaring it here reserves the name and records the intent.
+  backend_uploads:
     driver: local

@@ -35,10 +35,15 @@ STRONG_JWT = "Zt7Qv3La9Rb2Nc8Kd1Pe6Mf4Sg0Wh5Yj-strong-key"  # > 32 chars, no pla
 
 
 def base_prod_env(**overrides):
-    """A minimal, VALID production environment; override to break one thing."""
+    """A minimal, VALID production environment; override to break one thing.
+
+    ``MONGO_URL`` carries credentials because PH2.3 requires it to in production:
+    a credential-free URI means the database is either unauthenticated or every
+    query fails auth. See ``test_production_mongo_url_without_credentials``.
+    """
     env = {
         "APP_ENV": "production",
-        "MONGO_URL": "mongodb://db:27017",
+        "MONGO_URL": "mongodb://app_user:t9Wq2Lm5Rv8Bn3Xz@db:27017/alpha_stock_db?authSource=alpha_stock_db",
         "DB_NAME": "alpha_stock_db",
         "JWT_SECRET": STRONG_JWT,
         "FRONTEND_URL": "https://app.stockassist.ai",

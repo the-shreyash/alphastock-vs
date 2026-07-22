@@ -1,5 +1,12 @@
 # StockAssist AI — Secrets & Supply-Chain Runbook
-Owner: Security Engineering · Introduced: PH1.9 (2026-07-22)
+Owner: Security Engineering · Introduced: PH1.9 (2026-07-22) · Extended: PH2.3 (2026-07-22)
+
+> **This document is the secret *inventory* and *runbook* — what each secret is,
+> who owns it, when it rotates, and what to do when one leaks.
+> [`docs/deployment/SECRETS.md`](../docs/deployment/SECRETS.md) is the secret
+> *delivery mechanism* — Docker Secrets, the `_FILE` convention, the loader's
+> precedence order, and the container-side workflows. Read that one when you are
+> deploying; read this one when you are operating.**
 
 This is the authoritative operational document for **secret management** and
 **software supply-chain security**. It complements SECURITY.md (policy) and
@@ -14,9 +21,15 @@ are generated to match that registry; if they disagree, the registry wins.
 
 ## 1. Principles
 
-1. **Secrets live only in the environment.** Never in source, never in git,
-   never in a log, never in a client bundle. Loaded from `backend/.env` locally
-   (git-ignored) and from the platform secret store in staging/production.
+1. **Secrets live only in the environment — and preferably not even there.**
+   Never in source, never in git, never in a log, never in a client bundle.
+   Loaded from `backend/.env` locally (git-ignored) and, in staging/production,
+   from a **file-backed source**: a Docker/Swarm/Kubernetes secret, or a
+   `<NAME>_FILE` pointer (PH2.3). Plaintext environment variables remain
+   supported — they are the development path and the migration fallback — but a
+   sensitive value delivered that way is reported at every production boot,
+   because it is visible in `docker inspect` and inherited by every child
+   process.
 2. **Fail closed.** The process refuses to start when a critical secret is
    missing or weak. `security.secrets.validate_config()` runs at boot, before
    the database client or any route. See §5.
@@ -38,13 +51,26 @@ are generated to match that registry; if they disagree, the registry wins.
 | Environment | `APP_ENV` | Secret source | Cookie `Secure` | Validation severity |
 |-------------|-----------|---------------|-----------------|---------------------|
 | Development | `development` (default) | `backend/.env` (git-ignored) | optional (`COOKIE_SECURE`) | lenient — only the core trio is fatal; weak/placeholder optionals warn |
-| Staging     | `staging` | platform secret store | forced by deploy | strict for required set; mirrors production |
-| Production  | `production` | platform secret store / vault | **forced true** | strict — missing required, short signing keys, and placeholder values are fatal |
+| Staging     | `staging` | Docker secrets / platform secret store | forced by deploy | strict for required set; mirrors production |
+| Production  | `production` | Docker/Swarm/K8s secrets, or a vault-injected `SECRETS_DIR` | **forced true** | strict — missing required, short or low-entropy signing keys, placeholder values, credential-free `MONGO_URL`, and passwordless `REDIS_URL` are all fatal |
 
 `APP_ENV` selects severity. An unrecognized value aborts startup rather than
 silently defaulting. Environment detection has exactly one definition
 (`security.cookies.is_production`), reused by cookies, CORS, and secret
 validation so they can never disagree.
+
+**Production never silently degrades.** There is no code path in which a missing
+production secret resolves to a default, and none in which an unreadable secret
+file falls back to a plaintext environment variable — that downgrade is exactly
+how a rotation appears to succeed while the old value stays in use. Both are hard
+boot failures.
+
+### Delivery control variables (PH2.3)
+
+| Variable | Default | Effect |
+|---|---|---|
+| `SECRETS_DIR` | `/run/secrets` | Directory scanned for file-backed secrets. Point it at a secret-manager sidecar's output path (e.g. `/vault/secrets`) to adopt one with no code change |
+| `REQUIRE_FILE_SECRETS` | `false` | When true, a *sensitive* secret arriving as a plaintext env var is a boot **error** rather than a warning. Turn it on once a deployment has finished migrating, so the posture cannot silently regress |
 
 ---
 
@@ -61,6 +87,8 @@ inventory below is the human summary; the registry is authoritative.
 | `JWT_SECRET` | auth-signing | yes | all (min 32) | JWT signing; fallback HMAC for CSRF/recovery | Quarterly; invalidates sessions |
 | `FRONTEND_URL` | app-config | no | staging, prod | SPA origin for redirects/links | N/A |
 | `CORS_ALLOWED_ORIGINS` | app-config | no | prod | Exact-match CORS allowlist (never `*`) | N/A |
+| `SECRETS_DIR` | app-config | no | — | Directory scanned for file-backed secrets (PH2.3); default `/run/secrets` | N/A |
+| `REQUIRE_FILE_SECRETS` | app-config | no | — | Make plaintext delivery of a sensitive secret a boot error (PH2.3) | N/A |
 | `CSRF_SECRET` | auth-signing | yes | optional (min 32) | Dedicated CSRF HMAC key | Quarterly; invalidates CSRF tokens |
 | `RECOVERY_SECRET` | auth-signing | yes | optional (min 32) | Dedicated recovery-token HMAC key | Quarterly; invalidates recovery links |
 | `ANTHROPIC_API_KEY` | ai-provider | yes | ≥1 AI in prod | Claude API | 90 days / on exposure |
@@ -91,25 +119,58 @@ completeness but are not secrets.
    `min_length` for signing keys.
 2. Regenerate the template: `python scripts/generate_env_example.py`.
 3. Read the value **only** via `security.secrets.get()` / `require()` (or, for
-   existing modules, `os.environ` guarded by the boot validator).
+   existing modules, `os.environ` guarded by the boot validator). Either is safe
+   for a file-backed secret: `load_secrets()` has already hydrated `os.environ`
+   before any module is imported.
 4. Update this document's inventory row.
 5. CI (`config-sync` job) enforces that the template matches the registry.
 
+**Registry membership is what makes a variable discoverable as a Docker secret.**
+Auto-discovery from `$SECRETS_DIR` is limited to registered names — deliberately,
+so a stray file in the secrets mount cannot invent an environment variable. A
+variable added to the code but not to the registry therefore silently loses file
+support, on top of losing validation. (The `<NAME>_FILE` pointer form works for
+any name, registered or not, as an escape hatch.)
+
 ---
 
-## 5. Boot-time validation (fail-fast)
+## 5. Boot-time loading & validation (fail-fast)
 
 `server.py` calls `security.secrets.validate_config()` immediately after
-`load_dotenv`, before the Mongo client. It:
+`load_dotenv` and **before any other application module is imported**. That call
+does two things in order:
 
-- collects **all** problems into one aggregated, value-free error,
+**1. Load (PH2.3).** `load_secrets()` resolves every variable from its
+highest-precedence source — `<NAME>_FILE` pointer, then `$SECRETS_DIR/<name>`,
+then a plaintext environment variable — and materializes the result into
+`os.environ`. Hydrating before the other modules import is what lets ~30
+existing `os.environ` consumers read a Docker secret without a call-site change.
+Precedence, conflict handling and the file-source failure modes are documented in
+[`docs/deployment/SECRETS.md`](../docs/deployment/SECRETS.md) §3.
+
+**2. Validate.** It then:
+
+- collects **all** problems — source failures and value failures alike — into one
+  aggregated, value-free error, so an operator fixes the whole environment in one
+  pass rather than one variable per crash-loop,
 - treats the core trio (`MONGO_URL`, `DB_NAME`, `JWT_SECRET`) as fatal in every
   environment,
 - in production, additionally makes fatal: any missing required secret, a
-  signing key shorter than 32 chars, any placeholder/weak value, a half-
-  configured OAuth or broker pair, `ENABLE_AUTO_LOGIN=true`, a weak
+  signing key shorter than 32 chars, any placeholder/weak value, a **low-entropy**
+  sensitive value (PH2.3 — `aaaa…` clears a length check but not an offline
+  attack), a `MONGO_URL` with no credentials, a `REDIS_URL` with no password, a
+  half-configured OAuth or broker pair, `ENABLE_AUTO_LOGIN=true`, a weak
   `ADMIN_PASSWORD`, and the absence of any AI provider,
-- logs a **presence-only** summary (variable names + counts, never values).
+- makes fatal **in every environment** an invalid `BROKER_TOKEN_KEY` (PH2.3 — a
+  malformed Fernet key does not fail at boot, it fails the first time a user
+  connects a broker, weeks later),
+- logs a **presence-only** summary (variable names, sources, and counts — never
+  values), including how many secrets are still delivered as plaintext.
+
+`docker/entrypoint.sh` runs the same validation as a throwaway dry run before
+starting uvicorn, so the operator sees the clean aggregated report instead of a
+traceback from inside the server. The resolved values do not cross that process
+boundary.
 
 Verify locally: set `APP_ENV=production` with an incomplete `.env` and start the
 server — it must abort with the aggregated error and touch nothing.
@@ -129,6 +190,24 @@ server — it must abort with the aggregated error and touch nothing.
 
 General rule: prefer **overlap** (new key valid before old is revoked) to avoid
 downtime; restart the app after updating the store so the new value is read.
+
+**Which rotations actually need a restart (PH2.3).** File-backed secrets update
+in place — a rotated Docker config or Kubernetes projected volume rewrites the
+same path — and nearly every consumer in this codebase reads `os.environ` at call
+time rather than capturing it at import. So `security.secrets.reload_secrets()`
+propagates a new value to live code and reports what changed *by fingerprint*,
+never by value. It also **drops a revoked secret** from the environment: if the
+file disappears, the previously-loaded value is removed rather than left working.
+
+Provider API keys and `WEBHOOK_API_KEY` therefore rotate without a restart.
+`MONGO_URL` and `REDIS_URL` still need one — their client pools are built once at
+startup. `JWT_SECRET`, `CSRF_SECRET` and `RECOVERY_SECRET` do not need a restart,
+but rotating them invalidates the corresponding live tokens regardless of how the
+new value arrived — that is a property of changing a signing key, not of the
+loader. Per-secret blast radius: `docs/deployment/SECRETS.md` §6.
+
+⚠ Nothing calls `reload_secrets()` automatically yet — no watcher, no endpoint.
+Until that exists (SECRETS.md §8, L5), rotation in practice means restart.
 
 ---
 

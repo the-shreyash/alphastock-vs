@@ -5,12 +5,24 @@ from pathlib import Path
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env', override=True)
 
-# Boot-time secret & configuration validation (PH1.9). Fail fast, fail closed:
-# a missing/weak critical secret aborts startup here — before the Mongo client,
-# any router, or a single request — with one aggregated, value-free error rather
-# than a raw KeyError surfacing later. Non-fatal issues are logged as warnings.
-# security.secrets is the single source of truth for the config surface; see
-# .claude/SECRETS.md and SECURITY_ARCHITECTURE.md §23–§24.
+# Boot-time secret loading + configuration validation (PH1.9, PH2.3).
+#
+# `validate_config()` first calls `load_secrets()`, which resolves every
+# configuration input from its highest-precedence source — a Docker/Kubernetes
+# secret file, a `<NAME>_FILE` pointer, or a plaintext environment variable — and
+# materializes the result into `os.environ`. That happens HERE, before any other
+# application module is imported, because roughly thirty modules read their
+# configuration through call-time `os.environ` lookups; hydrating first is what
+# lets all of them see a file-backed secret without knowing files exist.
+#
+# Then: fail fast, fail closed. A missing/weak critical secret, or a secret file
+# that cannot be read, aborts startup — before the Mongo client, any router, or a
+# single request — with one aggregated, value-free error rather than a raw
+# KeyError surfacing later. Non-fatal issues are logged as warnings.
+#
+# security.secrets is the single source of truth for the config surface and for
+# where its values come from; see docs/deployment/SECRETS.md, .claude/SECRETS.md
+# and SECURITY_ARCHITECTURE.md §23–§24.
 from security import secrets as _secret_config
 
 _config_report = _secret_config.validate_config()
