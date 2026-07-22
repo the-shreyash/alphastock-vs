@@ -1,0 +1,262 @@
+# ==============================================================================
+# StockAssist AI — Supply-chain audit (PH2.4)
+#
+# WHAT PROBLEM THIS SOLVES
+# ------------------------
+# Most of the code shipped to production was not written by this team. The
+# backend pins ~120 Python packages and the frontend pulls a far larger npm
+# tree; a vulnerability in any of them is a vulnerability in StockAssist AI, and
+# the customer will not care whose repository it came from.
+#
+# WHY THIS IS A SEPARATE WORKFLOW FROM backend-ci.yml
+# ---------------------------------------------------
+# Because it is the one class of check whose result changes WITHOUT the code
+# changing. A commit-triggered pipeline answers "is this change safe?". That
+# question is necessary and insufficient: a dependency set that was clean on
+# Monday is vulnerable on Thursday because an advisory was published, not
+# because anyone pushed. Hence the weekly `schedule:` trigger — the single most
+# important line in this file, and the reason these jobs do not simply live
+# inside backend-ci.yml.
+#
+# RELATIONSHIP TO THE REST OF THE SUPPLY-CHAIN CONTROLS
+#   * .github/dependabot.yml     — opens the PR that FIXES a finding
+#   * this workflow              — DETECTS the finding and blocks the merge
+#   * security-audit.yml         — secret hygiene (gitleaks, config drift)
+#   * backend-ci.yml `build` job — dependency-graph consistency (`pip check`),
+#                                  which is why there is no separate job for it
+#                                  here any more
+#
+# TRIAGE POLICY (authoritative copy: .claude/SECRETS.md §7, .claude/TESTING.md)
+#   Critical → immediate, blocks merge and release
+#   High     → 7 days, else a recorded accepted-risk entry
+#   Medium   → 30 days      Low → 90 days
+#
+# Full documentation: docs/deployment/GITHUB_ACTIONS.md §7
+# ==============================================================================
+name: dependency-audit
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Mondays 06:00 UTC. Deliberately early in the week: a finding surfaced on a
+    # Monday morning has five working days of runway before it becomes a
+    # weekend problem.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  # ── SUPPRESSED ADVISORIES — READ BEFORE ADDING TO THIS LIST ────────────────
+  #
+  # Every ID here is a KNOWN, UNFIXED vulnerability in a dependency that ships
+  # to production. They are suppressed so the gate can distinguish "the debt we
+  # have already decided about" from "something new arrived today" — a gate that
+  # is red for fifteen old reasons cannot report the sixteenth, new one, which
+  # is the entire reason the gate exists.
+  #
+  # Suppression is NOT remediation. Each of these is accepted risk with an
+  # owner and a review date, enforced mechanically by the "suppression expiry"
+  # step below — this list cannot quietly become permanent.
+  #
+  #   ecdsa 0.19.2      PYSEC-2026-1325
+  #       Minerva timing side-channel in scalar multiplication. NO FIX RELEASED
+  #       upstream. Reachability: `ecdsa` is a transitive dependency of
+  #       python-jose; this application signs JWTs with HS256 (HMAC), which does
+  #       not use ECDSA at all. Exploitation requires the attacker to be
+  #       co-resident and measuring signature timing on a curve operation this
+  #       code path never performs.
+  #
+  #   starlette 0.37.2  PYSEC-2026-161, -249, -248, -1943, -1941, -2281, -2280
+  #       Fixes exist (0.40.0 → 1.3.1). The pin is held by `fastapi==0.110.1`,
+  #       which requires `starlette>=0.36.3,<0.37.0`-era compatibility; moving
+  #       starlette alone breaks the FastAPI contract, so this is a coordinated
+  #       FastAPI + Starlette upgrade, not a version bump. HIGHEST PRIORITY of
+  #       the three: starlette is the ASGI layer every request traverses.
+  #
+  #   litellm 1.80.0    PYSEC-2026-390, -388, -2597, -2599, -2598, -2600,
+  #                     GHSA-69x8-hrgq-fjj8
+  #       Fixes exist (1.83.0 → 1.84.0). litellm is a multi-provider LLM router
+  #       that, per PH2.1's image analysis, is NOT IMPORTED BY ANY APPLICATION
+  #       CODE — it is 55 MB of unused dependency. The correct remediation is
+  #       removal from requirements.txt, not an upgrade.
+  #
+  # Full triage entries, severities and owners: .claude/SECRETS.md §8.
+  PIP_AUDIT_IGNORES: >-
+    --ignore-vuln PYSEC-2026-1325
+    --ignore-vuln PYSEC-2026-161 --ignore-vuln PYSEC-2026-249 --ignore-vuln PYSEC-2026-248
+    --ignore-vuln PYSEC-2026-1943 --ignore-vuln PYSEC-2026-1941 --ignore-vuln PYSEC-2026-2281
+    --ignore-vuln PYSEC-2026-2280
+    --ignore-vuln PYSEC-2026-390 --ignore-vuln PYSEC-2026-388 --ignore-vuln PYSEC-2026-2597
+    --ignore-vuln PYSEC-2026-2599 --ignore-vuln PYSEC-2026-2598 --ignore-vuln PYSEC-2026-2600
+    --ignore-vuln GHSA-69x8-hrgq-fjj8
+
+  # Date the accepted risk above must be re-argued. From this date the job warns
+  # on every run; 30 days later it FAILS. See the "suppression expiry" step.
+  SUPPRESSION_REVIEW_BY: "2026-08-22"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Python — pip-audit against the pinned requirement files
+  #
+  # pip-audit resolves the pinned set against the Python Packaging Advisory
+  # Database and the OSV feed. It reads the requirements files directly: no
+  # installation, no virtualenv, and no arbitrary setup.py execution from a
+  # package that may itself be the problem.
+  #
+  # `--strict` is what makes this a gate rather than a report. Without it,
+  # pip-audit exits 0 when it merely FAILS TO RESOLVE a package — so a typo, a
+  # yanked release or a registry outage would present as a clean audit. Silent
+  # success is the worst possible failure mode for a security check.
+  # ---------------------------------------------------------------------------
+  backend-advisories:
+    name: Backend dependencies (pip-audit)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: backend/requirements*.txt
+
+      - name: Install pip-audit
+        # Pinned like everything else. An unpinned security tool is an unpinned
+        # dependency holding root over the build's verdict.
+        run: python -m pip install --upgrade pip pip-audit==2.7.3
+
+      # THE ratchet that keeps suppression honest. Without a mechanism like
+      # this, `--ignore-vuln` is where vulnerabilities go to be forgotten: the
+      # engineer who added the flag remembers why, leaves the company, and three
+      # years later nobody can say whether the risk was ever real. Two stages so
+      # an expiry never ambushes an unrelated PR — a month of warnings first,
+      # then the build goes red and someone must re-argue the case.
+      - name: Check suppression expiry
+        run: |
+          set -euo pipefail
+          review='${{ env.SUPPRESSION_REVIEW_BY }}'
+          today=$(date -u +%F)
+          hard=$(date -u -d "${review} +30 days" +%F)
+          count=$(grep -o -- '--ignore-vuln' <<<'${{ env.PIP_AUDIT_IGNORES }}' | wc -l | tr -d ' ')
+
+          echo "${count} advisories suppressed · review by ${review} · hard stop ${hard}"
+          if [[ "${today}" > "${hard}" ]]; then
+            echo "::error::${count} advisory suppressions passed their hard stop (${hard}). Re-triage them in .claude/SECRETS.md §8, remediate, or move the review date with a written justification."
+            exit 1
+          elif [[ "${today}" > "${review}" ]]; then
+            echo "::warning::${count} advisory suppressions are past their review date (${review}). The build fails from ${hard}."
+          fi
+
+      - name: Audit runtime requirements
+        # These packages ship inside the production image, so a finding here is
+        # a finding in production. New advisories fail the build; the suppressed
+        # set is enumerated (with reasons) in the env block at the top of this
+        # file and tracked in .claude/SECRETS.md §8.
+        run: pip-audit --strict --requirement backend/requirements.txt ${{ env.PIP_AUDIT_IGNORES }}
+
+      - name: Audit development / CI requirements
+        # No suppressions here, and none should ever be needed: dev tooling
+        # never reaches production (PH1.11 finding M14), but it runs on this
+        # runner with access to the checkout and the workflow token — so a
+        # compromised linter is a compromise of the pipeline itself, which is a
+        # well-travelled attack path.
+        run: pip-audit --strict --requirement backend/requirements-dev.txt
+
+      # Suppressed findings must stay VISIBLE. A list of accepted risks that
+      # only exists inside a YAML comment is a list nobody re-reads.
+      - name: Publish supply-chain summary
+        if: always()
+        run: |
+          set -uo pipefail
+          count=$(grep -o -- '--ignore-vuln' <<<'${{ env.PIP_AUDIT_IGNORES }}' | wc -l | tr -d ' ')
+          {
+            echo "## Backend supply chain"
+            echo
+            echo "No **new** advisories against \`backend/requirements.txt\` or \`backend/requirements-dev.txt\`."
+            echo
+            echo "⚠️ **${count} advisories are suppressed as accepted risk** — review by \`${{ env.SUPPRESSION_REVIEW_BY }}\`."
+            echo
+            echo "| Package | Advisories | Fix available | Remediation |"
+            echo "|---|---|---|---|"
+            echo "| \`starlette 0.37.2\` | 7 | 0.40.0 → 1.3.1 | Coordinated FastAPI + Starlette upgrade (highest priority — ASGI request path) |"
+            echo "| \`litellm 1.80.0\` | 7 | 1.83.0 → 1.84.0 | **Remove** — not imported by any application code (PH2.1 finding) |"
+            echo "| \`ecdsa 0.19.2\` | 1 | none released | Not reachable: JWTs are HS256, no ECDSA code path |"
+            echo
+            echo "Rationale per advisory: see the \`PIP_AUDIT_IGNORES\` block in this workflow."
+            echo "Triage entries: \`.claude/SECRETS.md\` §8."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # JavaScript — npm audit against the lockfile
+  #
+  # `--audit-level=high` fails on high and critical only. Not laziness: the npm
+  # advisory database reports a large volume of low/moderate findings in
+  # build-time-only transitive packages, and a gate that is red every morning
+  # for reasons nobody can act on is a gate the team learns to bypass. Lower
+  # severities still appear in the summary below and in Dependabot's queue.
+  # ---------------------------------------------------------------------------
+  frontend-advisories:
+    name: Frontend dependencies (npm audit)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Audit frontend dependencies (high severity and above)
+        working-directory: frontend
+        run: npm audit --audit-level=high
+
+      - name: Report the full advisory picture (advisory)
+        # Never fails. Its job is to keep the moderate/low backlog visible so
+        # deferring stays a decision rather than an oversight.
+        if: always()
+        continue-on-error: true
+        working-directory: frontend
+        run: |
+          set -uo pipefail
+          npm audit --json > audit.json 2>/dev/null || true
+          node -e '
+            let a = {};
+            try { a = require("./audit.json").metadata.vulnerabilities || {}; } catch (e) {}
+            const rows = ["critical","high","moderate","low","info"]
+              .map(s => `| ${s} | ${a[s] ?? 0} |`).join("\n");
+            console.log(`## Frontend advisories\n\n| Severity | Count |\n|---|---|\n${rows}\n`);
+          ' >> "$GITHUB_STEP_SUMMARY"
+          rm -f audit.json
+
+  # ---------------------------------------------------------------------------
+  # Aggregate gate — one stable check name for branch protection (PH2.5).
+  # ---------------------------------------------------------------------------
+  dependency-audit:
+    name: dependency-audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [backend-advisories, frontend-advisories]
+    if: always()
+    steps:
+      - name: Verify every required job succeeded
+        run: |
+          set -euo pipefail
+          backend='${{ needs.backend-advisories.result }}'
+          frontend='${{ needs.frontend-advisories.result }}'
+          printf 'backend=%s frontend=%s\n' "$backend" "$frontend"
+          for r in "$backend" "$frontend"; do
+            [ "$r" = "success" ] || {
+              echo "::error::dependency-audit gate failed — triage policy in .claude/SECRETS.md §7."
+              exit 1
+            }
+          done
+          echo "✓ no blocking advisories"

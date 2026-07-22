@@ -7,6 +7,7 @@ To document how StockAssist AI is packaged, containerized, configured and shippe
 - [DOCKER.md](DOCKER.md) — Backend production container architecture: multi-stage build strategy, container security posture, runtime configuration, entrypoint and health-check design, build/run instructions, troubleshooting.
 - [DOCKER_COMPOSE.md](DOCKER_COMPOSE.md) — Service orchestration: the production-shaped backend/MongoDB/Redis stack and its development overlay. Network segmentation, volume design, the two-file environment split, startup ordering via health checks, measured startup timings, known limitations, troubleshooting.
 - [SECRETS.md](SECRETS.md) — Production secrets architecture: how a credential reaches the code that uses it. Docker Secrets, the `_FILE` convention, the central loader and its precedence order, boot-time validation, rotation and blast radius per secret, and the migration path to Swarm / Kubernetes / cloud secret managers.
+- [GITHUB_ACTIONS.md](GITHUB_ACTIONS.md) — Continuous Integration: the five workflows that verify every push and pull request, what each one proves, the lint adoption model, cache strategy, the accepted-risk register for suppressed advisories, troubleshooting, and the boundary with continuous *deployment* (not implemented).
 
 ## Who should read it
 - Platform and DevOps Engineers

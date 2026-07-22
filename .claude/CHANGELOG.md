@@ -5,6 +5,146 @@ This file records documentation-system versions and, from v1.0 launch onward, pr
 
 ---
 
+# Sprint PH2.4 — Production GitHub Actions CI — 2026-07-22
+
+**Every push and every pull request is now verified by a machine. Five
+workflows answer five separate questions — is the source correct, is the
+*artifact* correct, is someone else's code safe, did we leak configuration, is
+our own code vulnerable — and no check runs in more than one of them. CI only:
+nothing in this sprint pushes an image, touches a registry, or contacts a
+server.**
+
+> **Design note — why some lint gates are advisory, and why that is not
+> sloppiness.** The backend predates its linters: `black` would reformat 116 of
+> 119 files, `isort` disagrees with 70, full `flake8` reports 462 findings.
+> There were three options. Land a 116-file mechanical reformat in the same PR
+> as the pipeline — unreviewable, and it destroys `git blame` across every
+> security module PH1 just hardened. Turn the gates on anyway and accept a
+> permanently red `main` — worse than no build, because a red build everyone
+> ignores trains the team that red means nothing, and the *next* failure, a real
+> one, gets ignored too. Or: gate what can genuinely be held at zero, measure
+> the rest in the open, and hold new files to the full standard so the backlog
+> can only shrink. The third is what shipped. The **correctness** subset
+> (`E9,F63,F7,F82,F811,F632` — syntax errors, undefined names, redefinitions,
+> `is` against a literal) is blocking repo-wide and sits at **zero findings**;
+> files *added* by a pull request are blocking under the full standard;
+> everything else reports into the job summary with a documented exit path.
+
+Added
+
+- **`.github/workflows/backend-ci.yml`** — three parallel jobs behind one
+  aggregate gate. `quality` (lint/format/static analysis, per the adoption
+  model above). `build` — three widening circles: `compileall` over every
+  shipped source, `import server` **with runtime dependencies only** (so a
+  module that imports a dev-only package fails here rather than in the
+  production image), and the startup validator exercised across all three
+  environments *including a negative case*. That negative case is the half
+  teams omit: a validator accidentally reduced to `return True` passes every
+  positive test perfectly. `test` — `pytest -m "not integration"`, 695 tests,
+  with JUnit XML uploaded `if: always()`.
+- **`.github/workflows/docker-build.yml`** — builds the real production image
+  and then does the one thing a build never does: **starts it**. hadolint,
+  buildx with a GHA layer cache, static assertions on the artifact (non-root
+  uid 10001, no `pip`, no compiler, `/app` unwritable by the app user,
+  `HEALTHCHECK` present, revision label carrying the building SHA), then three
+  smoke tests — **A** the container refuses to start with no configuration and
+  names every missing secret; **B** a full synthetic production configuration
+  validates via the entrypoint's `exec "$@"` escape hatch, and no secret *value*
+  appears in the log; **C** it boots against real MongoDB and Redis, serves
+  `/api` with the expected payload, passes its own health-check script, and
+  exits 0 on SIGTERM. Nothing is pushed and the token cannot write packages.
+- **`.github/workflows/dependency-audit.yml`** — `pip-audit --strict` and
+  `npm audit`, moved out of `security-audit.yml`, plus a **suppression-expiry
+  ratchet**. The 15 currently-suppressed advisories (see below) now carry a
+  review date: from `2026-08-22` every run warns, and 30 days later the build
+  fails until someone re-argues the case. Without a mechanism like this,
+  `--ignore-vuln` is where vulnerabilities go to be forgotten.
+- **`.github/workflows/codeql.yml`** — taint-tracking SAST for Python and
+  JavaScript/TypeScript. An `eligibility` job reads
+  `github.event.repository.private` at run time and **skips cleanly** on a
+  private repository without Advanced Security, rather than failing every run
+  with a licensing error — a permanently red check trains people to ignore red
+  checks. It activates automatically if the repository is made public.
+- **`.github/actions/setup-backend/`** — composite action providing the seven
+  steps four jobs share. A composite action rather than a reusable workflow
+  because this is shared *steps*, not a shared *job*: a `workflow_call` would
+  add a runner and a checkout to four jobs for nothing. It caches the **built
+  virtualenv** keyed on the requirements hash, not pip's download cache — the
+  latter still pays for resolution and unpacking, roughly 60-70% of the wall
+  clock. There is deliberately **no `restore-keys` fallback**: a partial-match
+  restore hands a job an environment that does not match its lockfile, and a
+  miss costs two minutes where a wrong hit costs an afternoon.
+- **`backend/pyproject.toml` + `backend/.flake8`** — pytest, black, isort and
+  mypy configuration. The point is not tidiness: CI cannot be built on an
+  invocation that lives in someone's shell history, and a pipeline that selects
+  tests differently from the developer who wrote them will disagree with that
+  developer at the worst possible moment. `--strict-markers` turns a typo'd
+  marker into a collection error rather than a silently-ignored decorator.
+- **`.hadolint.yaml`** — Dockerfile lint policy. Two rules ignored, each with a
+  written reason; an unexplained ignore is a defect.
+- **`docs/deployment/GITHUB_ACTIONS.md`** — workflow architecture, triggers,
+  job order, the lint adoption model and its exit path, cache strategy, the
+  accepted-risk register, verification results, troubleshooting table, known
+  limitations L1-L10, and the CD boundary.
+
+Changed
+
+- **`backend/tests/conftest.py`** — a `pytest_collection_modifyitems` hook marks
+  the six live-server suites (`test_backend.py`, `test_phase2.py`,
+  `test_phase4-7.py`) as `integration`, so CI selects with
+  `-m "not integration"`. The list lives **in the test tree, not in YAML**: put
+  it in a workflow file and the next person to add a live-server suite never
+  finds it, their suite runs in CI, reaches no server, and fails for a reason
+  that looks nothing like the cause.
+- **`.github/workflows/security-audit.yml`** — re-scoped to secret and
+  configuration hygiene. `pip-audit`/`npm audit` moved to `dependency-audit.yml`;
+  the standalone `pip check` job was deleted because the composite action runs
+  `pip check` in every job that installs dependencies. No check now runs twice
+  anywhere in the pipeline. `config-sync` uses the composite action, which also
+  fixes its missing-dependency install.
+- **`.claude/TESTING.md`** — the CI/CD section now separates the target pipeline
+  from what is actually implemented, with owners for each gap.
+- **`.gitignore`** — `.venv-ci/`, `.mypy_cache/`, `test-results/`.
+
+Fixed
+
+- **`backend/tests/test_trading_engine.py::test_run_cycle_trails_and_books_targets`**
+  — a stale exact-equality assertion. `run_cycle` gained a `closed_trades` key
+  in its return contract and the test was never updated, so the hermetic suite
+  had a standing failure (694 passed / 1 failed, carried since PH2.3). Landing
+  CI over a known-failing suite would have meant a red `main` on day one. The
+  product code was correct; the assertion was not. Suite is now **695 passed**.
+
+Known limitations
+
+- **L1 — `docker-build.yml` has never been executed.** The Docker daemon was
+  unavailable on the development machine during this sprint. The workflow is
+  verified by YAML parse, `bash -n` over every `run:` block, and review against
+  the PH2.1 Dockerfile contract, but its build and three smoke tests will run
+  for the first time on the first push. Treat a fix-up commit as expected.
+- **L2 — 15 dependency advisories are suppressed**, and this is the sprint's
+  most significant *finding* rather than its work: `starlette 0.37.2` (7
+  advisories, fixes available, held by the `fastapi==0.110.1` pin — highest
+  priority, it is the ASGI layer every request traverses), `litellm 1.80.0` (7
+  advisories; PH2.1 established it is **not imported by any application code**,
+  so the fix is removal, not an upgrade), `ecdsa 0.19.2` (1, no fix released,
+  not reachable — JWTs are HS256). Previously suppressed as a bare flag list;
+  now each carries a written reachability argument and a dated review.
+- **L3** — 98 integration tests excluded (PH3.1 / PH2.6 own the conversion).
+- **L4** — no frontend build/lint/test job (PH3.3).
+- **L5** — no coverage measurement; needs `pytest-cov` pinned into
+  `requirements-dev.txt`.
+- **L6** — **branch protection is not configured.** Every gate in this sprint is
+  advisory until `main` requires it; a red pipeline can still be merged today.
+  PH2.5 owns it, and the aggregate job names (`backend-ci`, `docker-build`,
+  `dependency-audit`, `codeql`) exist so that configuration never needs to
+  change again.
+- **L7-L10** — no PR template, actions pinned by tag rather than commit SHA, no
+  image vulnerability scan. Full table in `docs/deployment/GITHUB_ACTIONS.md`
+  §13.
+
+---
+
 # Sprint PH2.3 — Production Secrets Management — 2026-07-22
 
 **Credentials no longer have to be plaintext environment variables. `security/

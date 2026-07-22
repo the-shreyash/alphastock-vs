@@ -1,0 +1,181 @@
+# ==============================================================================
+# StockAssist AI — CodeQL static application security testing (PH2.4)
+#
+# WHAT PROBLEM THIS SOLVES
+# ------------------------
+# flake8 and hadolint answer "is this written well?". pip-audit answers "is
+# someone else's code vulnerable?". Neither answers the question that actually
+# ends up in an incident report: **is OUR code vulnerable?**
+#
+# CodeQL compiles the repository into a relational database of its own control
+# and data flow, then queries it for the shapes of real vulnerability classes —
+# a request parameter reaching a database query without sanitisation, user input
+# reaching `subprocess`, a path from an HTTP handler to the filesystem, a hard-
+# coded credential used in a comparison. It is TAINT TRACKING, not pattern
+# matching: it follows a value across function and module boundaries, which is
+# why it finds the injection that a grep for `eval(` never will.
+#
+# For this product specifically that matters more than average. The backend
+# handles brokerage credentials, executes trades, and processes payment
+# webhooks. The vulnerability classes CodeQL is best at — injection, SSRF, path
+# traversal, unsafe deserialization, missing authorization on a route — are
+# precisely the ones with financial consequences here.
+#
+# WHY IT RUNS ON A SCHEDULE AS WELL AS ON PUSH
+# --------------------------------------------
+# The query packs are updated continuously by GitHub's security research team.
+# A weekly run re-analyses unchanged code with this week's queries, so a newly
+# published query class finds an old bug without anyone touching the file.
+#
+# ⚠ AVAILABILITY: CodeQL is free for PUBLIC repositories. On a PRIVATE
+#   repository it requires GitHub Advanced Security. This repository is
+#   currently private, so the analysis is GATED (see the `eligibility` job) and
+#   SKIPS cleanly rather than failing every run with a licensing error — a
+#   permanently red check trains people to ignore red checks. To enable it on a
+#   private repo, turn on Advanced Security and set the repository variable
+#   ENABLE_CODEQL=true (Settings → Secrets and variables → Actions → Variables).
+#
+# Full documentation: docs/deployment/GITHUB_ACTIONS.md §8
+# ==============================================================================
+name: codeql
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Wednesdays 04:00 UTC — deliberately NOT Monday 06:00 alongside the
+    # dependency and secret audits. Three heavy scheduled workflows firing into
+    # the same minute contend for the same concurrent-runner budget and all
+    # three finish later than any of them would alone.
+    - cron: "0 4 * * 3"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Gate — decide whether CodeQL can run here at all.
+  #
+  # Reading `github.event.repository.private` at run time (rather than assuming)
+  # means this workflow starts working automatically the day the repository is
+  # made public, with no edit required. That property matters: a workflow that
+  # needs a human to remember to enable it is a workflow that stays disabled.
+  # ---------------------------------------------------------------------------
+  eligibility:
+    name: Check CodeQL availability
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      enabled: ${{ steps.check.outputs.enabled }}
+    steps:
+      - id: check
+        run: |
+          set -euo pipefail
+          private='${{ github.event.repository.private }}'
+          override='${{ vars.ENABLE_CODEQL }}'
+
+          if [ "$private" != "true" ] || [ "$override" = "true" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "CodeQL will run (private=${private}, ENABLE_CODEQL=${override:-unset})."
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::CodeQL skipped — private repository without GitHub Advanced Security. Enable Advanced Security and set the repository variable ENABLE_CODEQL=true to activate it."
+          fi
+
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    needs: eligibility
+    if: needs.eligibility.outputs.enabled == 'true'
+    runs-on: ubuntu-latest
+    # 6 hours is CodeQL's documented ceiling for a large repository. This one is
+    # far smaller, but an analysis that hangs should be killed by a timeout
+    # rather than burning the account's runner minutes for a full day.
+    timeout-minutes: 60
+
+    permissions:
+      contents: read
+      # The ONLY job in this pipeline granted a write scope, and it is the
+      # narrowest one that exists: `security-events: write` permits writing SARIF
+      # results into the Security tab and nothing else. It cannot push code,
+      # publish packages or edit issues.
+      security-events: write
+
+    strategy:
+      # One language's analysis failing must not cancel the other's — a broken
+      # JavaScript extraction should still leave a complete Python report.
+      fail-fast: false
+      matrix:
+        include:
+          - language: python
+            paths: backend
+          - language: javascript-typescript
+            paths: frontend/src
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          # `security-and-quality` over the default `security-extended`:
+          # it adds maintainability and correctness queries (unused values,
+          # inconsistent equality, unreachable code) on top of the full security
+          # set. On a codebase adopting static analysis for the first time, the
+          # correctness queries tend to find the more immediately actionable
+          # bugs, and they cost nothing extra to run.
+          queries: security-and-quality
+          config: |
+            paths:
+              - ${{ matrix.paths }}
+            paths-ignore:
+              # Vendored, generated or third-party trees. Analysing them
+              # produces findings nobody in this repository can fix, and the
+              # noise is what makes teams stop reading the Security tab.
+              - '**/node_modules'
+              - '**/venv'
+              - '**/.venv'
+              - '**/__pycache__'
+              - 'frontend/build'
+
+      # No `autobuild` step and no manual build. Python and JavaScript are
+      # interpreted languages: CodeQL extracts them straight from source. An
+      # autobuild step here would install the whole dependency tree for no
+      # additional signal and add minutes to every run.
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: /language:${{ matrix.language }}
+
+  # ---------------------------------------------------------------------------
+  # Aggregate gate — one stable check name for branch protection (PH2.5).
+  #
+  # Reports success when the analysis is legitimately unavailable, so branch
+  # protection can require `codeql` today and gain real enforcement the moment
+  # Advanced Security is enabled — without anyone having to remember to add a
+  # new required check at that point.
+  # ---------------------------------------------------------------------------
+  codeql:
+    name: codeql
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [eligibility, analyze]
+    if: always()
+    steps:
+      - run: |
+          set -euo pipefail
+          if [ '${{ needs.eligibility.outputs.enabled }}' != 'true' ]; then
+            echo "✓ CodeQL unavailable on this repository — skipped, not failed."
+            exit 0
+          fi
+          [ '${{ needs.analyze.result }}' = 'success' ] || {
+            echo "::error::CodeQL analysis failed — see the Security tab."; exit 1;
+          }
+          echo "✓ CodeQL analysis complete"

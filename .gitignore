@@ -51,6 +51,15 @@ __pycache__/
 *pyc*
 venv/
 .venv/
+# CI-managed virtualenv (.github/actions/setup-backend). Restored from the
+# Actions cache on every run and rebuilt from the pinned requirements on a miss
+# — never a source artifact, and never something a developer should commit.
+.venv-ci/
+.mypy_cache/
+
+# CI test reports (JUnit XML). Produced by backend-ci.yml and uploaded as a
+# build artifact; the run page is where they belong, not the repository.
+test-results/
 
 # Development tools
 chainlit.md

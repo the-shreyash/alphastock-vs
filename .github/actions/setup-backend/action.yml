@@ -1,0 +1,141 @@
+# ==============================================================================
+# StockAssist AI — composite action: Python backend environment (PH2.4)
+#
+# WHY THIS EXISTS
+# ---------------
+# Four jobs across three workflows need the same seven steps: pick an
+# interpreter, restore a cache, build a virtualenv, install pinned
+# dependencies, put it on PATH. Copy-pasting that block four times means four
+# places to update when the Python version moves — and, far worse, four places
+# that can silently disagree. A pipeline whose lint job runs on 3.11 and whose
+# test job runs on 3.12 will eventually pass a lint that the tests contradict.
+#
+# A composite action is the right tool rather than a reusable *workflow*
+# (`workflow_call`), because a reusable workflow is a whole separate job: it
+# gets its own runner, its own checkout and its own 10-30 s of scheduling
+# latency, and it cannot contribute steps to the caller's job. Composite actions
+# inline into the calling job. Rule of thumb: reusable workflow = shared JOB,
+# composite action = shared STEPS. This is shared steps.
+#
+# CACHING STRATEGY — cache the virtualenv, not the pip download cache
+# -------------------------------------------------------------------
+# `actions/setup-python` offers `cache: pip`, which caches ~/.cache/pip. That
+# saves the DOWNLOAD but still pays for resolution, wheel unpacking and the
+# ~1.2 GB of writes that pandas/numpy/grpcio/protobuf cost — roughly 60-70% of
+# the wall clock. Caching the built venv skips all of it and turns a ~2 minute
+# install into a ~10 second restore.
+#
+# The cache key is the SHA of the requirements files. That is the whole safety
+# argument: the pins are exact, so identical requirements files mean a byte-
+# identical dependency set, so a stale environment is not reachable. There is
+# deliberately NO `restore-keys` fallback — a partial-match restore would hand a
+# job an environment that does not match its lockfile, and the resulting failure
+# ("this worked yesterday") is one of the most expensive kinds of CI bug there
+# is. A miss here costs two minutes; a wrong hit costs an afternoon.
+# ==============================================================================
+name: Set up backend Python environment
+description: >-
+  Provision a cached, pinned Python virtualenv for the StockAssist AI backend
+  and put it on PATH.
+
+inputs:
+  python-version:
+    description: >-
+      Interpreter version. Must match backend/Dockerfile's PYTHON_VERSION ARG —
+      CI testing 3.11 while the image ships 3.12 would make the pipeline's
+      verdict meaningless.
+    required: false
+    default: "3.11"
+  requirements:
+    description: >-
+      Which dependency set to install: "dev" (requirements-dev.txt — runtime
+      plus pytest/black/flake8/isort/mypy) or "runtime" (requirements.txt only,
+      i.e. exactly what the production image contains).
+    required: false
+    default: "dev"
+
+outputs:
+  cache-hit:
+    description: "'true' when the virtualenv was restored from cache rather than built."
+    value: ${{ steps.venv-cache.outputs.cache-hit }}
+  python-path:
+    description: "Absolute path to the interpreter inside the provisioned virtualenv."
+    value: ${{ steps.venv.outputs.python-path }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Python ${{ inputs.python-version }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    - name: Resolve dependency set
+      id: reqs
+      shell: bash
+      run: |
+        set -euo pipefail
+        case "${{ inputs.requirements }}" in
+          dev)     file="requirements-dev.txt" ;;
+          runtime) file="requirements.txt" ;;
+          *)
+            echo "::error::requirements input must be 'dev' or 'runtime', got '${{ inputs.requirements }}'"
+            exit 1
+            ;;
+        esac
+        echo "file=${file}" >> "$GITHUB_OUTPUT"
+
+    # Both requirements files are hashed regardless of which set is installed:
+    # requirements-dev.txt starts with `-r requirements.txt`, so the runtime
+    # pins are an input to the dev environment too. Hashing only one would let a
+    # runtime bump be served a stale dev venv.
+    - name: Restore virtualenv cache
+      id: venv-cache
+      uses: actions/cache@v4
+      with:
+        path: backend/.venv-ci
+        key: >-
+          venv-${{ runner.os }}-${{ runner.arch }}-py${{ inputs.python-version }}-${{ inputs.requirements }}-${{ hashFiles('backend/requirements.txt', 'backend/requirements-dev.txt') }}
+
+    - name: Build virtualenv (cache miss only)
+      if: steps.venv-cache.outputs.cache-hit != 'true'
+      shell: bash
+      working-directory: backend
+      run: |
+        set -euo pipefail
+        python -m venv .venv-ci
+        # --no-cache-dir: the venv itself is the cache. Keeping pip's download
+        # cache as well would mean uploading the same wheels twice, once
+        # unpacked and once compressed, for no restore-time benefit.
+        ./.venv-ci/bin/python -m pip install --upgrade --no-cache-dir pip
+        ./.venv-ci/bin/python -m pip install --no-cache-dir -r "${{ steps.reqs.outputs.file }}"
+
+    # Prepending to PATH (rather than exporting VIRTUAL_ENV or asking every
+    # caller to type ./.venv-ci/bin/python) means the calling workflow's steps
+    # read exactly like the commands an engineer runs locally: `pytest`,
+    # `flake8`, `black`. A CI script that does not look like the local command
+    # is a CI script people stop being able to reproduce.
+    - name: Activate virtualenv for subsequent steps
+      id: venv
+      shell: bash
+      working-directory: backend
+      run: |
+        set -euo pipefail
+        venv_bin="$(pwd)/.venv-ci/bin"
+        echo "${venv_bin}" >> "$GITHUB_PATH"
+        echo "VIRTUAL_ENV=$(pwd)/.venv-ci" >> "$GITHUB_ENV"
+        echo "python-path=${venv_bin}/python" >> "$GITHUB_OUTPUT"
+
+    # A one-line proof that the environment is coherent before any job logic
+    # runs. `pip check` catches an incompatible-pin combination that installed
+    # without error but cannot import — the failure otherwise surfaces halfway
+    # through the test suite as an unrelated-looking ImportError.
+    - name: Verify environment integrity
+      shell: bash
+      working-directory: backend
+      run: |
+        set -euo pipefail
+        echo "Interpreter : $(python -c 'import sys; print(sys.version.split()[0])')"
+        echo "Cache       : ${{ steps.venv-cache.outputs.cache-hit == 'true' && 'HIT (restored)' || 'MISS (built)' }}"
+        echo "Packages    : $(python -m pip list --format=freeze | wc -l | tr -d ' ')"
+        python -m pip check

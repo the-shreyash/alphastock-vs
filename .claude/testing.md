@@ -713,6 +713,8 @@ Never test on production user data.
 
 # CI/CD Testing
 
+## Target pipeline
+
 Every Pull Request
 
 ↓
@@ -746,6 +748,32 @@ Security Scan
 ↓
 
 Deploy Staging
+
+## Implemented today (PH2.4)
+
+Five GitHub Actions workflows run on every push to `main`, every pull request,
+and (for the three security workflows) weekly. Authoritative documentation:
+`docs/deployment/GITHUB_ACTIONS.md`.
+
+| Workflow | Verifies | Status |
+|----------|----------|--------|
+| `backend-ci` | Lint (correctness subset, blocking; full style advisory), static analysis (mypy on `backend/security`), compile + import + startup-validation, **695 hermetic tests** | Implemented |
+| `docker-build` | hadolint; production image builds; image refuses to start unconfigured; production config validates; boots against real MongoDB + Redis; graceful SIGTERM | Implemented |
+| `dependency-audit` | `pip-audit --strict` (runtime + dev), `npm audit --audit-level=high`, suppression-expiry ratchet | Implemented |
+| `security-audit` | gitleaks over full history, no tracked `.env`, `.env.example` in sync with the secret registry | Implemented |
+| `codeql` | Taint-tracking SAST for Python and JavaScript/TypeScript | Gated — requires a public repo or GitHub Advanced Security |
+
+Test selection is mechanical: `pytest -m "not integration"`. The `integration`
+marker is applied automatically to the live-server suites by
+`backend/tests/conftest.py` — never by a flag in a workflow file.
+
+Not yet implemented, with owners:
+
+- Integration tests against a booted stack — PH2.6
+- Frontend build / lint / test job — PH3.3
+- Coverage measurement (needs `pytest-cov` pinned) — unowned
+- Branch protection requiring these checks — PH2.5
+- Deploy Staging — PH2.7 (CD; no workflow in this repository deploys anything)
 
 ---
 

@@ -1,0 +1,476 @@
+# ==============================================================================
+# StockAssist AI — Backend CI (PH2.4)
+#
+# WHAT PROBLEM THIS SOLVES
+# ------------------------
+# Until this workflow, "does the backend still work?" was answered by whoever
+# remembered to run pytest before pushing. That is not a process, it is a habit,
+# and habits fail exactly when the pressure is highest — the Friday hotfix, the
+# 200-line refactor, the dependency bump nobody expected to matter. This
+# workflow converts the habit into a mechanical property of the repository: no
+# change reaches main without a machine having proved that the code parses, the
+# application imports, the configuration validator still accepts a valid
+# environment, and 695 tests still pass.
+#
+# JOB LAYOUT
+#
+#     ┌────────────┐  ┌────────────┐  ┌────────────┐
+#     │  quality   │  │   build    │  │    test    │      (parallel)
+#     │ format/    │  │ compile +  │  │  pytest    │
+#     │ lint/types │  │ import +   │  │  -m "not   │
+#     │            │  │ startup    │  │ integration"│
+#     └─────┬──────┘  └─────┬──────┘  └─────┬──────┘
+#           └───────────────┼───────────────┘
+#                           ▼
+#                    ┌────────────┐
+#                    │  backend-  │   ← the single required status check
+#                    │    ci      │
+#                    └────────────┘
+#
+# The three jobs are INDEPENDENT and run in parallel deliberately. A serial
+# chain (lint → build → test) is the more common layout and it is a mistake for
+# a suite this size: a developer with a lint error and a broken test learns
+# about the lint error, fixes it, pushes, waits another four minutes, and only
+# then learns about the test. Parallel jobs report every category of failure in
+# one round trip. The cost is a few runner-minutes; the saving is developer
+# hours.
+#
+# The `backend-ci` aggregate job exists so branch protection (PH2.5) has ONE
+# check name to require. Requiring `quality`, `build` and `test` individually
+# means editing the repository's protection settings every time a job is added
+# or renamed — a settings change nobody remembers to make, which silently
+# un-gates the new job.
+#
+# Full documentation: docs/deployment/GITHUB_ACTIONS.md
+# ==============================================================================
+name: backend-ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# NO `paths:` FILTER — and that is on purpose. A path-filtered workflow does not
+# run at all when a PR touches nothing under its filter, and GitHub reports a
+# never-started required check as "Expected — waiting for status" forever, which
+# blocks the PR with no way to clear it short of an admin override. The
+# documented workaround (a second "skipped" workflow with the same job names) is
+# more machinery than it is worth here: the virtualenv cache makes a no-op run
+# cost well under a minute. See GITHUB_ACTIONS.md §9 "Common mistakes".
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Cancel superseded runs on a PR — only the latest push matters there. Never
+  # cancel on main: every commit on the default branch must have its own
+  # complete, attributable verdict, or bisecting a regression later means
+  # bisecting through commits that were never actually tested.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Least privilege, declared at the top level so every job inherits it. The
+# default for a repository without this block can be read/WRITE, which hands a
+# compromised dependency in the test suite a token that can push to main. This
+# workflow only ever needs to read the code.
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. QUALITY — formatting, imports, linting, static analysis
+  #
+  # ADOPTION MODEL (read this before assuming a check is broken)
+  # The backend predates its linters: at the time this pipeline was written
+  # `black` would reformat 116 of 119 files, `isort` disagrees with 70, and full
+  # flake8 reports 462 findings. There were three options and only one of them
+  # is honest:
+  #
+  #   a) Land a 116-file mechanical reformat in the same PR as the CI pipeline.
+  #      Unreviewable, and it destroys `git blame` for every security module
+  #      that PH1 just hardened.
+  #   b) Turn the gates on anyway and accept a permanently red main branch.
+  #      A red build that everyone ignores is worse than no build at all — it
+  #      trains the team that red means nothing.
+  #   c) Gate what can genuinely be held at zero, MEASURE the rest in the open,
+  #      and hold NEW files to the full standard so the backlog can only shrink.
+  #
+  # This job implements (c). The blocking gates are marked BLOCKING below.
+  # ---------------------------------------------------------------------------
+  quality:
+    name: Code quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Two commits minimum so a pull_request run can diff against its base
+          # to find newly-added files. `fetch-depth: 0` (full history) would be
+          # ~30 s of needless clone on a repo of this size.
+          fetch-depth: 0
+
+      - uses: ./.github/actions/setup-backend
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          requirements: dev
+
+      # ── BLOCKING ────────────────────────────────────────────────────────────
+      # The correctness subset of pyflakes/pycodestyle. Every code here is a
+      # defect, not a preference:
+      #   E9   syntax errors and indentation the parser rejects
+      #   F63  comparisons that are always true/false (`==` on a tuple literal)
+      #   F7   `break` outside a loop, and friends
+      #   F82  UNDEFINED NAME — a typo'd variable that raises NameError at
+      #        runtime, on whichever branch nobody tested
+      #   F811 a function redefined over an earlier one: the first definition,
+      #        and any test written against it, is silently dead
+      #   F632 `is` used against a str/int/tuple literal — works by accident
+      #        today via interning, breaks without warning on other values
+      # The backend has ZERO of these. This gate keeps it that way and is the
+      # one lint check that is strict from day one.
+      - name: Lint — correctness (BLOCKING)
+        working-directory: backend
+        run: |
+          set -euo pipefail
+          flake8 --select=E9,F63,F7,F82,F811,F632 --show-source --statistics .
+          echo "✓ zero correctness-class lint findings"
+
+      # ── BLOCKING ────────────────────────────────────────────────────────────
+      # The ratchet. Files ADDED by this pull request must be born clean, under
+      # the full standard. Files merely MODIFIED are exempt: forcing a
+      # contributor to reformat 400 unrelated lines because they fixed a typo is
+      # how a style policy gets a reputation for obstruction, and reviewers stop
+      # being able to see the actual change.
+      - name: Lint — new files must be clean (BLOCKING, pull requests only)
+        if: github.event_name == 'pull_request'
+        working-directory: backend
+        run: |
+          set -euo pipefail
+          # The base SHA from the event payload, not `origin/<branch>`: the
+          # remote branch may have moved since the PR was opened, and diffing
+          # against a moved base attributes someone else's new files to this PR.
+          base='${{ github.event.pull_request.base.sha }}'
+
+          # --diff-filter=A → added only. The trailing `|| true`: an empty
+          # result is a normal PR (one that adds no Python files), not a
+          # failure, and `set -e` would otherwise treat it as one.
+          mapfile -t added < <(
+            git diff --name-only --diff-filter=A "${base}...HEAD" -- '*.py' \
+              | sed -n 's|^backend/||p' || true
+          )
+
+          if [ "${#added[@]}" -eq 0 ]; then
+            echo "No new Python files in this pull request — nothing to gate."
+            exit 0
+          fi
+
+          printf 'Holding %d newly-added file(s) to the full standard:\n' "${#added[@]}"
+          printf '  %s\n' "${added[@]}"
+
+          black --check --diff -- "${added[@]}"
+          isort --check-only --diff -- "${added[@]}"
+          flake8 -- "${added[@]}"
+          echo "✓ new files meet the full formatting and lint standard"
+
+      # ── ADVISORY ────────────────────────────────────────────────────────────
+      # Everything below reports into the job summary and does not fail the
+      # build. `continue-on-error` on the STEP (not the job) is what makes the
+      # distinction visible: the step shows a warning annotation in the UI, so
+      # the debt is impossible to miss while remaining impossible to trip over.
+      # `set -o pipefail` is load-bearing in both steps below, not decoration.
+      # Without it a pipeline's exit status is the LAST command's — `tail` always
+      # succeeds — so the step would report success no matter what black found,
+      # and the summary table below would report "clean" forever. An advisory
+      # check that cannot go yellow is not a check.
+      - name: Format — black (advisory)
+        id: black
+        continue-on-error: true
+        working-directory: backend
+        run: |
+          set -o pipefail
+          black --check --diff . 2>&1 | tail -60
+
+      - name: Imports — isort (advisory)
+        id: isort
+        continue-on-error: true
+        working-directory: backend
+        run: |
+          set -o pipefail
+          isort --check-only --diff . 2>&1 | tail -40
+
+      - name: Lint — full style (advisory)
+        id: flake8
+        continue-on-error: true
+        working-directory: backend
+        run: flake8 --statistics --count .
+
+      # Static analysis, scoped to backend/security/ — the newest, most
+      # annotated, and highest-consequence package in the tree. Type-checking
+      # 250k unannotated lines would emit an error list nobody reads, and a
+      # quality signal nobody reads is not a quality signal. The `files` scope
+      # lives in backend/pyproject.toml and is meant to grow.
+      - name: Static analysis — mypy on security/ (advisory)
+        id: mypy
+        continue-on-error: true
+        working-directory: backend
+        run: mypy
+
+      # One place a reviewer can read the whole quality picture without opening
+      # four collapsed log groups. GITHUB_STEP_SUMMARY renders markdown directly
+      # on the run page — the cheapest high-value thing a pipeline can do.
+      - name: Publish quality summary
+        if: always()
+        working-directory: backend
+        run: |
+          set -uo pipefail
+          status() { [ "$1" = "success" ] && echo "✅ clean" || echo "⚠️ findings (advisory)"; }
+          {
+            echo "## Backend code quality"
+            echo
+            echo "| Check | Scope | Gate | Result |"
+            echo "|---|---|---|---|"
+            echo "| flake8 correctness (E9,F63,F7,F82,F811,F632) | repo-wide | **blocking** | ✅ zero |"
+            echo "| black / isort / flake8 (full) | files added by this PR | **blocking** | see step above |"
+            echo "| black --check | repo-wide | advisory | $(status "${{ steps.black.outcome }}") |"
+            echo "| isort --check-only | repo-wide | advisory | $(status "${{ steps.isort.outcome }}") |"
+            echo "| flake8 (full style) | repo-wide | advisory | $(status "${{ steps.flake8.outcome }}") |"
+            echo "| mypy | backend/security | advisory | $(status "${{ steps.mypy.outcome }}") |"
+            echo
+            echo "Advisory checks are tracked debt, not failures — see"
+            echo "\`docs/deployment/GITHUB_ACTIONS.md\` §6 for the adoption plan."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # 2. BUILD — does this source actually produce a working application?
+  #
+  # Python has no compile step, which tempts teams to skip "build" entirely and
+  # rely on the tests. That leaves a real gap: a syntax error or a bad top-level
+  # import in a module NO TEST IMPORTS is invisible to pytest and fatal at
+  # deploy time. This job closes it in three widening circles — every file
+  # parses, the application object constructs, the configuration validator
+  # behaves.
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build & startup validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      # RUNTIME dependencies only — deliberately not the dev set. This job
+      # answers "would the production image boot?", and the production image is
+      # built from requirements.txt alone (PH1.11 finding M14). Installing the
+      # dev set here would let a module import pytest at runtime and still pass.
+      - uses: ./.github/actions/setup-backend
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          requirements: runtime
+
+      # Circle 1 — every file the image ships parses. This is the closest thing
+      # Python has to a compile step, and it is the same command the Dockerfile
+      # runs to precompile bytecode, so a file that fails here fails the image
+      # build too. `-q` twice: report errors only.
+      - name: Compile all application sources
+        working-directory: backend
+        run: python -m compileall -q -q -x '(venv|\.venv-ci|__pycache__|tests)' . && echo "✓ all sources compile"
+
+      # Circle 2 — the FastAPI application object actually constructs, with the
+      # runtime dependency set and nothing else. This exercises every top-level
+      # import in the tree and every module-scope side effect. It needs no
+      # database: the Motor client connects lazily, on first query.
+      - name: Import the application (runtime dependencies only)
+        working-directory: backend
+        env:
+          APP_ENV: development
+          MONGO_URL: mongodb://ci:ci@127.0.0.1:27017
+          DB_NAME: stockassist_ci
+          JWT_SECRET: ci-import-check-only-not-a-real-secret-000000000000
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import server
+          routes = [r for r in server.app.routes if getattr(r, "methods", None)]
+          print(f"✓ server:app imported — {len(routes)} routed endpoints")
+          PY
+
+      # Circle 3 — the startup validator. docker/entrypoint.sh refuses to start
+      # the server when configuration is invalid; this proves that gate is
+      # intact in BOTH directions, which is the part teams forget. A validator
+      # that accepts everything passes the positive test perfectly.
+      #
+      # Every value below is synthetic and generated in-process. No real
+      # credential is ever needed to test a validator, and a workflow that
+      # required one could not run on a fork's pull request.
+      - name: Startup configuration validation (accept valid, reject invalid)
+        working-directory: backend
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import secrets as pysecrets
+          from cryptography.fernet import Fernet
+          from security import secrets
+
+          def env_for(app_env: str) -> dict:
+              token = lambda: pysecrets.token_urlsafe(48)
+              return {
+                  "APP_ENV": app_env,
+                  "MONGO_URL": f"mongodb://ci_user:{token()}@mongo.internal:27017/db?authSource=admin",
+                  "DB_NAME": "stockassist_ci",
+                  "JWT_SECRET": token(),
+                  "CSRF_SECRET": token(),
+                  "RECOVERY_SECRET": token(),
+                  "REDIS_URL": f"redis://:{token()}@redis.internal:6379/0",
+                  "BROKER_TOKEN_KEY": Fernet.generate_key().decode(),
+                  "FRONTEND_URL": "https://app.example.invalid",
+                  "CORS_ALLOWED_ORIGINS": "https://app.example.invalid",
+                  # Production requires at least one AI provider. Synthetic, but
+                  # shaped like the real thing so the prefix check is exercised.
+                  "ANTHROPIC_API_KEY": "sk-ant-" + token(),
+              }
+
+          failures = []
+
+          # -- positive: a well-formed environment validates in every env ------
+          for app_env in ("development", "staging", "production"):
+              try:
+                  report = secrets.validate_config(environ=env_for(app_env),
+                                                   raise_on_error=True)
+              except secrets.SecretValidationError as exc:
+                  failures.append(f"{app_env}: valid config was REJECTED\n{exc}")
+                  continue
+              print(f"✓ {app_env:<12} accepted — {report.summary_line()}")
+              for w in report.warnings:
+                  print(f"    warning: {w}")
+
+          # -- negative: an empty environment must be refused in production ----
+          # This is the direction that actually protects production. Without it,
+          # a validator that had been accidentally reduced to `return True`
+          # would sail through the positive cases above.
+          try:
+              secrets.validate_config(environ={"APP_ENV": "production"},
+                                      raise_on_error=True)
+          except secrets.SecretValidationError as exc:
+              missing = [n for n in ("MONGO_URL", "DB_NAME", "JWT_SECRET") if n in str(exc)]
+              if len(missing) == 3:
+                  print("✓ production   rejected an empty configuration, naming every missing core secret")
+              else:
+                  failures.append(f"empty config rejected, but did not name {set(('MONGO_URL','DB_NAME','JWT_SECRET')) - set(missing)}")
+          else:
+              failures.append("FAIL-OPEN: an EMPTY production configuration was ACCEPTED")
+
+          if failures:
+              raise SystemExit("\n".join(["startup validation failed:"] + failures))
+          PY
+
+  # ---------------------------------------------------------------------------
+  # 3. TEST — the hermetic suite
+  #
+  # `-m "not integration"` selects the in-process suites (FastAPI TestClient +
+  # an in-memory FakeDB). The excluded suites drive a live server over HTTP at
+  # $REACT_APP_BACKEND_URL and would fail here for want of one — the marker is
+  # applied automatically in backend/tests/conftest.py, not listed in this file,
+  # so adding a new live-server suite never requires touching CI.
+  #
+  # Those integration suites are NOT abandoned: PH3.1 owns converting them, and
+  # the roadmap's PH2.6 stage will boot the real compose stack and run
+  # `pytest -m integration` against it. Excluding them here is the documented,
+  # temporary state — not a decision to stop testing that layer.
+  # ---------------------------------------------------------------------------
+  test:
+    name: Tests (hermetic)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup-backend
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          requirements: dev
+
+      # The suite is hermetic, but a few modules read configuration at import
+      # time. Supplying an obviously-synthetic environment keeps the run
+      # deterministic instead of dependent on what the runner happens to have.
+      - name: Run hermetic test suite
+        working-directory: backend
+        env:
+          APP_ENV: development
+          MONGO_URL: mongodb://ci:ci@127.0.0.1:27017
+          DB_NAME: stockassist_ci
+          JWT_SECRET: ci-test-suite-only-not-a-real-secret-0000000000000
+          # Belt and braces: even if a live-server suite escaped the marker, it
+          # would try to reach an address that refuses connections immediately
+          # rather than hanging for a 30 s timeout × 98 tests.
+          REACT_APP_BACKEND_URL: http://127.0.0.1:1
+        run: |
+          set -euo pipefail
+          pytest -m "not integration" \
+                 --junit-xml=test-results/junit.xml \
+                 --durations=10 \
+                 -q
+
+      # JUnit XML is the interchange format every CI system, dashboard and
+      # flake-tracker understands. Uploading it now — before anything consumes
+      # it — is what makes PH2.5's flaky-test detection and PH2.5+ trend
+      # reporting possible without re-instrumenting the pipeline later.
+      # `if: always()` so a FAILING run still publishes its results; an artifact
+      # you only get when the build is green is an artifact you never need.
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-test-results-${{ github.run_id }}
+          path: backend/test-results/
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Publish test summary
+        if: always()
+        run: |
+          set -uo pipefail
+          python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import xml.etree.ElementTree as ET, pathlib
+          p = pathlib.Path("backend/test-results/junit.xml")
+          print("## Backend tests (hermetic)\n")
+          if not p.exists():
+              print("_No JUnit report produced — the suite did not reach completion._")
+              raise SystemExit(0)
+          s = ET.parse(p).getroot()
+          s = s.find("testsuite") if s.tag == "testsuites" else s
+          g = lambda k: int(s.get(k, 0))
+          total, fail, err, skip = g("tests"), g("failures"), g("errors"), g("skipped")
+          print(f"**{total - fail - err - skip} passed**, {fail} failed, {err} errors, "
+                f"{skip} skipped in {float(s.get('time', 0)):.1f}s\n")
+          for case in s.iter("testcase"):
+              for bad in list(case.findall("failure")) + list(case.findall("error")):
+                  print(f"- ❌ `{case.get('classname')}::{case.get('name')}` — "
+                        f"{(bad.get('message') or '').splitlines()[0][:160]}")
+          PY
+
+  # ---------------------------------------------------------------------------
+  # 4. GATE — the single required status check
+  #
+  # `needs` alone is NOT sufficient: a needed job that is skipped or cancelled
+  # leaves this one skipped too, and GitHub counts a skipped required check as
+  # PASSING. That is a real and frequently-exploited hole — it is how a
+  # cancelled test job merges a broken PR. `if: always()` forces this job to run
+  # regardless, and the step below asserts on the actual result strings.
+  # ---------------------------------------------------------------------------
+  backend-ci:
+    name: backend-ci
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [quality, build, test]
+    if: always()
+    steps:
+      - name: Verify every required job succeeded
+        run: |
+          set -euo pipefail
+          quality='${{ needs.quality.result }}'
+          build='${{ needs.build.result }}'
+          test='${{ needs.test.result }}'
+          printf 'quality=%s build=%s test=%s\n' "$quality" "$build" "$test"
+          for r in "$quality" "$build" "$test"; do
+            [ "$r" = "success" ] || { echo "::error::backend-ci gate failed — a required job did not succeed."; exit 1; }
+          done
+          echo "✓ backend CI green"

@@ -1,0 +1,456 @@
+# ==============================================================================
+# StockAssist AI — Docker image verification (PH2.4)
+#
+# WHAT PROBLEM THIS SOLVES
+# ------------------------
+# backend-ci.yml proves the SOURCE is good. It says nothing about the ARTIFACT.
+# Those are different questions, and the gap between them is where the most
+# embarrassing production incidents live: a new dependency that needs a compiler
+# the runtime stage does not have, a file excluded by .dockerignore that the app
+# imports at startup, a chmod that was only ever correct on the author's laptop.
+# Every one of those passes pytest perfectly and fails at `docker run`.
+#
+# This workflow closes the gap by building the real production image and then
+# doing the one thing a build alone never does: STARTING it.
+#
+#     Dockerfile ──▶ hadolint ──▶ buildx (GHA layer cache) ──▶ image
+#                                                               │
+#                          ┌────────────────────────────────────┤
+#                          ▼                  ▼                 ▼
+#                    A. fail-closed     B. production      C. boot smoke
+#                    empty env must     config validates   real Mongo+Redis,
+#                    REFUSE to start    (no server boot)   /api healthy,
+#                                                          graceful SIGTERM
+#
+# NOTHING IS PUSHED. There is no registry login, no `push: true`, and the
+# workflow's token cannot write packages (see `permissions` below). Publishing
+# images is PH2.7 (CD) and deliberately out of scope: an artifact that CI can
+# push is an artifact a compromised pull request can push.
+#
+# Full documentation: docs/deployment/GITHUB_ACTIONS.md §5
+# ==============================================================================
+name: docker-build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: stockassist-backend:ci
+  # Kept in lockstep with the Dockerfile's ARG and with backend-ci.yml. Three
+  # copies is two too many, but GitHub Actions has no cross-workflow constant;
+  # the drift is caught by the "interpreter matches Dockerfile" assertion below.
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. HADOLINT — static analysis for the Dockerfile itself
+  #
+  # A Dockerfile is code that runs as root on every build. hadolint is to it
+  # what flake8 is to Python: it catches `apt-get install` without
+  # --no-install-recommends, unpinned base images, `cd` instead of WORKDIR, and
+  # a dozen other patterns that quietly bloat the image or break its cache.
+  #
+  # Split into its own job so it reports in ~10 seconds instead of waiting
+  # behind a 3-minute image build — a Dockerfile typo should not cost a coffee
+  # break to discover.
+  # ---------------------------------------------------------------------------
+  dockerfile-lint:
+    name: Dockerfile lint (hadolint)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Lint backend/Dockerfile
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: backend/Dockerfile
+          config: .hadolint.yaml
+          # `error` and above fails the build; warnings and info are printed as
+          # annotations. Failing on `info` would block on stylistic advice that
+          # this Dockerfile deliberately deviates from with a written rationale
+          # — see .hadolint.yaml for every rule that is ignored and why.
+          failure-threshold: error
+
+  # ---------------------------------------------------------------------------
+  # 2. BUILD & SMOKE — the real image, actually started
+  # ---------------------------------------------------------------------------
+  build-and-smoke:
+    name: Build image & smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      # buildx (BuildKit) rather than the legacy builder, for two reasons that
+      # both matter here: it can export/import a layer cache to an external
+      # backend (the classic builder cannot, so a fresh runner would rebuild
+      # from scratch every single time), and it honours the
+      # `# syntax=docker/dockerfile:1.7` directive the Dockerfile opens with.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # --- provenance metadata -------------------------------------------------
+      # The Dockerfile accepts APP_VERSION / VCS_REF / BUILD_DATE and stamps them
+      # into OCI labels. Passing them from CI is what makes an image
+      # self-describing: `docker inspect` answers "which commit is this?" during
+      # an incident, without anyone having to find a deploy log.
+      - name: Compute build metadata
+        id: meta
+        run: |
+          set -euo pipefail
+          {
+            echo "version=0.0.0-ci.${{ github.run_number }}"
+            echo "revision=${{ github.sha }}"
+            echo "created=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          } >> "$GITHUB_OUTPUT"
+
+      # CACHE STRATEGY — `type=gha`, mode=max
+      #
+      # Docker layer caching on ephemeral runners is not automatic: every job
+      # starts with an empty daemon, so without an external cache backend the
+      # ~120-package dependency layer is rebuilt on every run (~3 min). type=gha
+      # stores layers in the same GitHub Actions cache the Python venv uses.
+      #
+      # mode=max exports intermediate layers too, not just the final stage's.
+      # For a MULTI-STAGE build that distinction is the whole point: the
+      # expensive work (apt, pip install, the prune) all happens in the discarded
+      # `builder` stage, whose layers `mode=min` would not store at all — leaving
+      # the cache technically working and practically useless.
+      #
+      # `load: true` imports the result into the local daemon so the smoke tests
+      # below can run it. It requires a single platform; multi-arch builds are a
+      # CD concern (PH2.7) and would double this job's runtime for no CI signal.
+      - name: Build production image
+        uses: docker/build-push-action@v6
+        with:
+          context: backend
+          file: backend/Dockerfile
+          push: false
+          load: true
+          tags: ${{ env.IMAGE }}
+          build-args: |
+            PYTHON_VERSION=${{ env.PYTHON_VERSION }}
+            APP_VERSION=${{ steps.meta.outputs.version }}
+            VCS_REF=${{ steps.meta.outputs.revision }}
+            BUILD_DATE=${{ steps.meta.outputs.created }}
+          cache-from: type=gha,scope=backend
+          cache-to: type=gha,mode=max,scope=backend
+
+      # --- static assertions on the built artifact ----------------------------
+      # Each of these encodes a security property that PH2.1 established in the
+      # Dockerfile. A property nobody re-checks is a property that regresses the
+      # first time someone refactors the file "harmlessly".
+      - name: Verify image structure and security posture
+        run: |
+          set -euo pipefail
+          img='${{ env.IMAGE }}'
+          fail=0
+          check() { # check <description> <expected> <actual>
+            if [ "$2" = "$3" ]; then printf '  ✓ %-46s %s\n' "$1" "$3"
+            else printf '  ✗ %-46s expected %-24s got %s\n' "$1" "$2" "$3"; fail=1; fi
+          }
+
+          echo "── image facts ────────────────────────────────────────────────"
+          size_bytes=$(docker image inspect "$img" --format '{{.Size}}')
+          printf '  size: %s MB\n' "$((size_bytes / 1000000))"
+          printf '  layers: %s\n' "$(docker image inspect "$img" --format '{{len .RootFS.Layers}}')"
+
+          echo "── security posture ───────────────────────────────────────────"
+          # Runs as the unprivileged appuser, never root. This is the single
+          # highest-value container control there is: it turns a container-escape
+          # CVE from "host root" into "host nobody".
+          check "runs as non-root uid" "10001" "$(docker run --rm --entrypoint id "$img" -u)"
+          check "runs as non-root gid" "10001" "$(docker run --rm --entrypoint id "$img" -g)"
+
+          # No package installer in the shipped image. pip is the tool an
+          # attacker who lands a shell reaches for first to pull a second stage.
+          for binary in pip pip3; do
+            if docker run --rm --entrypoint sh "$img" -c "command -v $binary" >/dev/null 2>&1; then
+              printf '  ✗ %-46s %s is present and must not be\n' "no package installer" "$binary"; fail=1
+            fi
+          done
+          [ "$fail" -eq 0 ] && printf '  ✓ %-46s pip/pip3 absent\n' "no package installer"
+
+          # No compiler: the builder stage's toolchain must not have crossed the
+          # stage boundary. Its presence would mean the multi-stage split silently
+          # stopped working, costing ~300 MB and a native-payload staging ground.
+          if docker run --rm --entrypoint sh "$img" -c 'command -v gcc || command -v cc' >/dev/null 2>&1; then
+            printf '  ✗ %-46s a C compiler is present in the runtime stage\n' "no build toolchain"; fail=1
+          else
+            printf '  ✓ %-46s gcc/cc absent\n' "no build toolchain"
+          fi
+
+          echo "── contract ───────────────────────────────────────────────────"
+          check "healthcheck declared" "true" \
+                "$([ "$(docker image inspect "$img" --format '{{if .Config.Healthcheck}}true{{else}}false{{end}}')" = true ] && echo true || echo false)"
+          check "exposes only 8000" "8000/tcp" \
+                "$(docker image inspect "$img" --format '{{range $p,$_ := .Config.ExposedPorts}}{{$p}} {{end}}' | xargs)"
+          check "interpreter matches CI" "${{ env.PYTHON_VERSION }}" \
+                "$(docker run --rm --entrypoint python "$img" -c 'import sys;print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+          check "revision label stamped" "${{ github.sha }}" \
+                "$(docker image inspect "$img" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')"
+
+          # Application source must NOT be writable by the process that runs it —
+          # that is what closes "attacker writes a webshell into a route handler".
+          if docker run --rm --entrypoint sh "$img" -c 'touch /app/.ci-write-probe' 2>/dev/null; then
+            printf '  ✗ %-46s /app is writable by appuser\n' "source tree read-only to app user"; fail=1
+          else
+            printf '  ✓ %-46s /app not writable by appuser\n' "source tree read-only to app user"
+          fi
+
+          exit "$fail"
+
+      # --- A. FAIL-CLOSED -----------------------------------------------------
+      # The most important container test in this file, and the one teams skip.
+      # Everything else asks "does it start?". This asks "does it REFUSE to start
+      # when it should?" — because the failure that actually reaches customers is
+      # not a container that won't boot, it is a container that boots happily with
+      # a missing JWT_SECRET and only misbehaves under real traffic.
+      - name: 'Smoke A — container refuses to start without configuration'
+        run: |
+          set -euo pipefail
+          set +e
+          output=$(docker run --rm --env APP_ENV=production '${{ env.IMAGE }}' 2>&1)
+          status=$?
+          set -e
+
+          if [ "$status" -eq 0 ]; then
+            echo "::error::FAIL-OPEN — the container started with NO configuration."
+            echo "$output"
+            exit 1
+          fi
+
+          echo "$output"
+          for required in MONGO_URL DB_NAME JWT_SECRET; do
+            grep -q "$required" <<<"$output" \
+              || { echo "::error::refusal message never mentions $required — the operator cannot act on it"; exit 1; }
+          done
+          echo "✓ refused to start (exit ${status}) and named every missing core secret"
+
+      # --- B. PRODUCTION CONFIG VALIDATION ------------------------------------
+      # Exercises the entrypoint's full production validator — including the
+      # cross-field invariants (Mongo credentials present, Redis password
+      # present, valid Fernet key, an AI provider configured) — WITHOUT booting
+      # the server, via the entrypoint's documented `exec "$@"` escape hatch.
+      #
+      # Separated from the boot test below on purpose: this proves the strictest
+      # configuration profile is satisfiable, while the boot test proves the
+      # application actually runs. Conflating them would mean a production-only
+      # validator change could only be caught by a full stack boot.
+      #
+      # Every value is CSPRNG-generated in this step and dies with the runner.
+      # No real credential is required, which is what lets this workflow run
+      # unchanged on a pull request from a fork.
+      - name: 'Smoke B — production configuration validates'
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' > ci-production.env
+          import secrets, base64, os
+          t = lambda: secrets.token_urlsafe(48)
+          fernet = base64.urlsafe_b64encode(os.urandom(32)).decode()
+          print("\n".join([
+              "APP_ENV=production",
+              f"MONGO_URL=mongodb://ci_user:{t()}@mongo.internal:27017/stockassist?authSource=admin",
+              "DB_NAME=stockassist_ci",
+              f"JWT_SECRET={t()}",
+              f"CSRF_SECRET={t()}",
+              f"RECOVERY_SECRET={t()}",
+              f"REDIS_URL=redis://:{t()}@redis.internal:6379/0",
+              f"BROKER_TOKEN_KEY={fernet}",
+              f"WEBHOOK_API_KEY={t()}",
+              "FRONTEND_URL=https://app.example.invalid",
+              "CORS_ALLOWED_ORIGINS=https://app.example.invalid",
+              f"ANTHROPIC_API_KEY=sk-ant-{t()}",
+          ]))
+          PY
+
+          # The trailing `python -c` is the override command: the entrypoint
+          # validates configuration first, then execs it instead of uvicorn.
+          output=$(docker run --rm --env-file ci-production.env '${{ env.IMAGE }}' \
+                     python -c 'print("override command executed")' 2>&1)
+          echo "$output"
+          grep -q "Configuration OK." <<<"$output" \
+            || { echo "::error::entrypoint did not report a valid production configuration"; exit 1; }
+          grep -q "override command executed" <<<"$output" \
+            || { echo "::error::entrypoint validated but never exec'd the override command"; exit 1; }
+
+          # The validator is allowed to read secrets; the log is not allowed to
+          # print them. A regression here leaks every credential into CI logs,
+          # which are retained for 90 days and readable by anyone with repo access.
+          if grep -Eq 'sk-ant-[A-Za-z0-9_-]{20,}|JWT_SECRET=[A-Za-z0-9_-]{20,}' <<<"$output"; then
+            echo "::error::a secret VALUE appeared in the startup log"; exit 1
+          fi
+          echo "✓ production configuration accepted; no secret values in the log"
+
+      # --- C. BOOT SMOKE ------------------------------------------------------
+      # Datastores are started with plain `docker run` rather than as workflow
+      # `services:` containers, because a service container cannot be given a
+      # custom command — and Redis needs `--requirepass` for the backend's own
+      # validator to accept its URL (an unauthenticated Redis is an RCE
+      # primitive via CONFIG SET dir + SAVE, not merely a cache leak).
+      - name: Start MongoDB and Redis
+        run: |
+          set -euo pipefail
+          {
+            echo "MONGO_PASSWORD=$(python3 -c 'import secrets;print(secrets.token_urlsafe(24))')"
+            echo "REDIS_PASSWORD=$(python3 -c 'import secrets;print(secrets.token_urlsafe(24))')"
+          } >> "$GITHUB_ENV"
+
+      - name: 'Smoke C — the image boots, serves and shuts down cleanly'
+        run: |
+          set -euo pipefail
+
+          docker run -d --name ci-mongo -p 27017:27017 \
+            -e MONGO_INITDB_ROOT_USERNAME=ci_root \
+            -e MONGO_INITDB_ROOT_PASSWORD="${MONGO_PASSWORD}" \
+            mongo:7 >/dev/null
+          docker run -d --name ci-redis -p 6379:6379 \
+            redis:7-alpine redis-server --requirepass "${REDIS_PASSWORD}" >/dev/null
+
+          # Poll rather than sleep. A fixed `sleep 15` is either too short (a
+          # flaky pipeline nobody trusts) or too long (minutes burned on every
+          # run, forever). Polling is both faster and deterministic.
+          for i in $(seq 1 30); do
+            docker exec ci-mongo mongosh --quiet --eval 'db.runCommand({ping:1})' >/dev/null 2>&1 && break
+            [ "$i" -eq 30 ] && { echo "::error::MongoDB never became ready"; docker logs ci-mongo; exit 1; }
+            sleep 2
+          done
+          echo "✓ datastores ready"
+
+          # APP_ENV=staging, not production: staging exercises the same
+          # fail-closed startup path against REAL datastores, without demanding a
+          # third-party AI credential that CI has no business holding. The
+          # production profile is covered by Smoke B above, where it belongs —
+          # as a configuration assertion, not a live-service dependency.
+          python3 - <<PY > ci-boot.env
+          import secrets
+          t = lambda: secrets.token_urlsafe(48)
+          print("\n".join([
+              "APP_ENV=staging",
+              "MONGO_URL=mongodb://ci_root:${MONGO_PASSWORD}@127.0.0.1:27017/stockassist_ci?authSource=admin",
+              "DB_NAME=stockassist_ci",
+              f"JWT_SECRET={t()}",
+              "REDIS_URL=redis://:${REDIS_PASSWORD}@127.0.0.1:6379/0",
+              "FRONTEND_URL=http://127.0.0.1:3000",
+              "PORT=8000",
+          ]))
+          PY
+
+          # --network host so the container reaches the datastores published on
+          # the runner's loopback. Acceptable in a throwaway CI job; it is NOT
+          # how the stack runs for real — docker-compose.yml puts the datastores
+          # on an `internal: true` network with no egress at all.
+          docker run -d --name ci-backend --network host \
+            --env-file ci-boot.env '${{ env.IMAGE }}' >/dev/null
+
+          # 90 s budget: the image's own HEALTHCHECK allows a 45 s start period
+          # for config validation, the pandas/numpy/grpc import tree, the Mongo
+          # connection and ~20 index creations. Double it for a cold CI runner.
+          ready=0
+          for i in $(seq 1 45); do
+            if curl -fsS --max-time 3 http://127.0.0.1:8000/api >/dev/null 2>&1; then ready=1; break; fi
+            if [ "$(docker inspect -f '{{.State.Running}}' ci-backend)" != "true" ]; then
+              echo "::error::container exited during startup"; break
+            fi
+            sleep 2
+          done
+          [ "$ready" -eq 1 ] || { echo "::error::backend never answered on /api within 90s"; exit 1; }
+          echo "✓ answered /api after ~$((i * 2))s"
+
+          # Assert the PAYLOAD, not just the status code. A misrouted proxy or a
+          # stale process happily returns 200 with an unrelated body.
+          body=$(curl -fsS http://127.0.0.1:8000/api)
+          echo "  /api → ${body}"
+          python3 -c "
+          import json,sys
+          d = json.loads('''${body}''')
+          sys.exit(0 if d.get('status') == 'running' else 'unexpected /api payload: %r' % d)
+          "
+
+          # Run the image's OWN health-check script. Docker's --start-period
+          # means the daemon's health verdict may not have landed yet; invoking
+          # the script directly tests the actual probe that every orchestrator
+          # above this container will depend on.
+          docker exec ci-backend /app/docker/healthcheck.sh
+          echo "✓ bundled health check reports healthy"
+
+          # Graceful shutdown. `docker stop` sends SIGTERM; the entrypoint's
+          # `exec` hands PID 1 to uvicorn, so it should drain in-flight requests,
+          # run FastAPI's shutdown event and exit 0. A non-zero exit here means
+          # the process was SIGKILLed after the timeout — which in production is
+          # a severed connection on every rolling deploy.
+          start=$(date +%s)
+          docker stop --timeout 30 ci-backend >/dev/null
+          elapsed=$(( $(date +%s) - start ))
+          code=$(docker inspect -f '{{.State.ExitCode}}' ci-backend)
+          [ "$code" = "0" ] || { echo "::error::unclean shutdown: exit ${code} after ${elapsed}s (SIGKILL?)"; exit 1; }
+          echo "✓ graceful shutdown in ${elapsed}s (exit 0)"
+
+      # Container logs are the only forensic record of a failed boot, and they
+      # vanish with the runner. `if: failure()` keeps the happy path quiet.
+      - name: Dump container logs on failure
+        if: failure()
+        run: |
+          for c in ci-backend ci-mongo ci-redis; do
+            echo "───── ${c} ─────"
+            docker logs --tail 200 "$c" 2>&1 || echo "(no such container)"
+          done
+
+      - name: Clean up
+        if: always()
+        run: |
+          docker rm -f ci-backend ci-mongo ci-redis >/dev/null 2>&1 || true
+          # Files holding generated credentials. Short-lived and synthetic, but
+          # the runner's workspace is also what actions/upload-artifact reads.
+          rm -f ci-production.env ci-boot.env
+
+      - name: Publish image summary
+        if: always()
+        run: |
+          set -uo pipefail
+          size=$(docker image inspect '${{ env.IMAGE }}' --format '{{.Size}}' 2>/dev/null || echo 0)
+          {
+            echo "## Backend image verification"
+            echo
+            echo "| Property | Value |"
+            echo "|---|---|"
+            echo "| Tag | \`${{ env.IMAGE }}\` (not pushed) |"
+            echo "| Size | $((size / 1000000)) MB |"
+            echo "| Revision | \`${{ github.sha }}\` |"
+            echo "| Python | ${{ env.PYTHON_VERSION }} |"
+            echo
+            echo "Smoke tests: **A** refuses an empty configuration · "
+            echo "**B** validates a full production configuration · "
+            echo "**C** boots against real MongoDB + Redis, serves \`/api\`, shuts down gracefully."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # Aggregate gate — one stable check name for branch protection (PH2.5).
+  # ---------------------------------------------------------------------------
+  docker-build:
+    name: docker-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [dockerfile-lint, build-and-smoke]
+    if: always()
+    steps:
+      - name: Verify every required job succeeded
+        run: |
+          set -euo pipefail
+          lint='${{ needs.dockerfile-lint.result }}'
+          smoke='${{ needs.build-and-smoke.result }}'
+          printf 'dockerfile-lint=%s build-and-smoke=%s\n' "$lint" "$smoke"
+          for r in "$lint" "$smoke"; do
+            [ "$r" = "success" ] || { echo "::error::docker-build gate failed."; exit 1; }
+          done
+          echo "✓ image verification green"

@@ -1,0 +1,48 @@
+# ==============================================================================
+# StockAssist AI — hadolint configuration (PH2.4)
+#
+# hadolint is flake8 for Dockerfiles. It runs in .github/workflows/docker-build.yml
+# with `failure-threshold: error`, so `error`-level rules block a merge and
+# `warning`/`info`/`style` rules appear as annotations.
+#
+# WHY A THRESHOLD RATHER THAN "FAIL ON EVERYTHING"
+# ------------------------------------------------
+# hadolint's default rule set encodes good general advice, some of which this
+# image deliberately contradicts for reasons written into backend/Dockerfile.
+# Silencing those rules HERE, with a rationale, is the honest way to disagree
+# with a linter: the deviation stays visible and reviewable in version control,
+# instead of being scattered across inline `# hadolint ignore=` comments that
+# accumulate until nobody knows which are still load-bearing.
+#
+# Every entry below must carry a reason. An unexplained ignore is a defect.
+# ==============================================================================
+
+ignored:
+  # DL3008 — "Pin versions in apt-get install".
+  # The only apt package installed is `build-essential`, in the BUILDER stage,
+  # which is discarded and never ships. Pinning it would mean a Debian point
+  # release could break the build with no security benefit whatsoever, since
+  # nothing apt installs crosses the stage boundary. The dependencies that DO
+  # ship are pinned exactly, in backend/requirements.txt.
+  - DL3008
+
+  # DL3059 — "Multiple consecutive RUN instructions".
+  # backend/Dockerfile splits RUNs deliberately and documents each split: the
+  # dependency install is kept in its own layer so a source-only change reuses
+  # it (the single largest build-time saving available), and the prune step is
+  # separated so its effect on image size is measurable in `docker history`.
+  # Collapsing them would trade a documented, measured cache strategy for one
+  # fewer layer.
+  - DL3059
+
+# `label-schema` is not used: the image's OCI labels are validated in CI by an
+# explicit assertion (docker-build.yml, "Verify image structure"), which checks
+# that the revision label actually carries the building commit's SHA — something
+# a schema check cannot do.
+
+# Only these registries may appear in a FROM. The Dockerfile builds from
+# `python:3.11-slim-bookworm` on Docker Hub; anything else is either a typo or a
+# supply-chain substitution, and both should fail loudly.
+allowed-registries:
+  - ""            # official Docker Hub library images (unqualified `python:...`)
+  - docker.io

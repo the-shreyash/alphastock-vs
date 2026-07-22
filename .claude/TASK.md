@@ -2075,17 +2075,31 @@ and Phase 3 (QA/frontend tests).**
 
 **PHASE 1 (PRODUCTION SECURITY HARDENING) IS COMPLETE.** Current phase:
 **PH2 — Production Infrastructure & DevOps**. PH2.1 (Backend Production
-Dockerfile), PH2.2 (Production Docker Compose) and PH2.3 (Secrets Management) are
-complete — the backend stack boots healthy from a single command with segmented
-networks, named volumes, no hardcoded credentials, and credentials deliverable as
-file-mounted Docker secrets rather than plaintext environment variables. Next:
-**PH2.4 (Environment & Configuration Framework)**, with **PH2.2b (Frontend
-Production Dockerfile)** outstanding and parallelizable.
+Dockerfile), PH2.2 (Production Docker Compose), PH2.3 (Secrets Management) and
+PH2.4 (Production GitHub Actions CI) are complete — the backend stack boots
+healthy from a single command with segmented networks, named volumes, no
+hardcoded credentials, credentials deliverable as file-mounted Docker secrets,
+and every push and pull request now mechanically verified: 695 hermetic tests, a
+correctness lint gate at zero findings, an application-import and
+startup-validation check, a production image that is built *and started* in CI,
+and supply-chain plus secret-hygiene gates.
+
+Next, in priority order:
+1. **PH2.5 branch protection** — the highest-leverage remaining item, and small.
+   Every gate PH2.4 built is advisory until `main` requires it; a red pipeline
+   can still be merged today.
+2. **Dependency remediation** (surfaced by PH2.4): the `fastapi`/`starlette`
+   upgrade and the `litellm` removal close 14 of 15 suppressed advisories and
+   ~55 MB of image size. CI will fail on 2026-09-21 if this is not triaged.
+3. **PH2.4b (Environment & Configuration Framework)** — roadmap PH2.4.
+4. **PH2.2b (Frontend Production Dockerfile)** — outstanding and parallelizable.
+
 Deferred-within-PH1 items to schedule in the PH1 tail or
 alongside PH2: PH1.9 Real-Time/WebSocket Security (Socket.IO auth, R-15) and
-PH1.10b Admin Hardening & Session Management. PH3.1 (Backend Test Suite Repair —
-the pre-existing `test_trading_engine::test_run_cycle_trails_and_books_targets`
-failure + legacy live-server test migration) may run in parallel.
+PH1.10b Admin Hardening & Session Management. PH3.1 (Backend Test Suite Repair)
+may run in parallel — note its `test_trading_engine` item was **closed by PH2.4**
+(stale assertion fixed; the hermetic suite is now 695/695), leaving the legacy
+live-server test migration, which also unblocks PH2.6's integration stage.
 
 Authoritative documents: PRODUCTION_HARDENING.md and PRODUCTION_ROADMAP.md.
 Task tracking below under "Production Hardening Program".
@@ -2125,9 +2139,10 @@ rollback, estimates) live in PRODUCTION_ROADMAP.md. Status tracker:
 - [x] PH2.2 Production Docker Compose — COMPLETE (2026-07-22) — Critical — *Re-sequenced: the sprint as commissioned assigned PH2.2 to compose orchestration and PH2.3 to secrets; PRODUCTION_ROADMAP.md v1.2 still lists PH2.2 as the frontend image (now outstanding, see below) and PH2.3 as the compose split. Delivered: `docker-compose.yml` (production-shaped base — backend/mongo/redis, `name: stockassist`, YAML-anchored restart + `no-new-privileges` + bounded logging, `stop_grace_period: 30s`, loopback port binding, backend healthcheck inherited from the image rather than restated), `docker-compose.override.yml` (dev overlay — Mongo Express, Redis Insight `--profile tools`, n8n `--profile automation`, loopback DB ports, `APP_ENV=development`), `docker/mongodb/init-app-user.js` (least-privilege app user; root password never reaches the backend), `compose.env.example` (two-file env split: infra credentials vs application secrets), `docs/deployment/DOCKER_COMPOSE.md`. Two networks: `edge` (bridge) + `data` (`internal: true`, no egress). Named volumes only. 16/16 verification checks pass; cold start to all-healthy 13–32s, warm 12–14s. Security: MongoDB auth enabled and unpublished (was anonymous on `0.0.0.0:27017`), Redis password-protected, n8n basic-auth found dead upstream since n8n 1.0 and replaced with documented controls. Known limitation L1: the Redis pub/sub listener stops after ~3s — pre-existing defect at `backend/services/cache.py:47`, no functional regression at 1 worker/1 replica, fix owned by PH2.8.*
 - [ ] PH2.2b Frontend Production Dockerfile — NOT_STARTED — Critical — *`frontend/Dockerfile` has never existed in this repository; the pre-PH2.2 compose file declared a frontend service that could not build. Multi-stage node → nginx per PRODUCTION_ROADMAP.md.*
 - [x] PH2.3 Secrets Management — COMPLETE (2026-07-22) — Critical — *Source-resolution layer added to `backend/security/secrets.py`: one precedence order (`<NAME>_FILE` pointer → `$SECRETS_DIR/<name>` Docker/Swarm/K8s mount → plaintext env) applied to every variable, materialized into `os.environ` once at boot by `load_secrets()` — which is why ~30 existing `os.environ` consumers gained file-backed secret support with zero call-site changes. Fails closed: an unreadable pointer never falls back to the plaintext variable, and two sources for one secret is a boot error. `reload_secrets()` re-reads for rotation, reports changes by fingerprint (never value), and drops a revoked secret from the environment. Delivered: `docker-compose.secrets.yml` (opt-in overlay; retracts base values with `""` not `~`, since `~` inherits from the invoking shell), `secrets/generate.sh` + `secrets/README.md` + deny-by-default `secrets/.gitignore`, `docs/deployment/SECRETS.md`. Validation extended to credential *shape*: Mongo credentials, Redis password, Fernet-key format (error in every env), provider key shapes, and low-entropy detection (`aaaa…` clears a length check but not an offline attack). `REQUIRE_FILE_SECRETS=true` promotes plaintext delivery from warning to boot error. 68 new hermetic tests; full hermetic suite 694 passed / 1 pre-existing unrelated failure. Closes PH2.2 limitation **L3**. Bug found and fixed in-sprint: a `_FILE` pointer aimed inside `$SECRETS_DIR` conflicted with itself, which would have broken the documented configuration on every deploy. **Does NOT close PH2.2 L2** (in-container hot reload) — out of this sprint's scope, and now sharper: a bind-mounted `.env` would be a competing source. Residual limitations L1–L7 in docs/deployment/SECRETS.md §8.*
-- [ ] PH2.4 Environment & Configuration Framework — NOT_STARTED — High
-- [ ] PH2.5 CI Pipeline Foundation — NOT_STARTED — Critical
-- [ ] PH2.6 CI Extended: Docker, Security & Integration — NOT_STARTED — High
+- [x] PH2.4 Production GitHub Actions CI — COMPLETE (2026-07-22) — Critical — ***Re-sequenced, same drift as PH2.2/PH2.3:** the sprint as commissioned assigned PH2.4 to GitHub Actions CI; PRODUCTION_ROADMAP.md v1.2 still lists PH2.4 as the Environment & Configuration Framework (now outstanding, see PH2.4b below) and CI as PH2.5/PH2.6. This sprint delivers **all of roadmap PH2.5** plus the Docker, supply-chain and secret-scanning stages of **PH2.6** — but not PH2.6's integration-test-against-Compose stage or image vulnerability scanning, and not PH2.5's branch protection or PR template. Delivered: `.github/workflows/backend-ci.yml` (parallel quality/build/test behind one aggregate gate; `build` runs compileall → `import server` with **runtime deps only** → startup validation across all three environments *including a negative case*; `test` runs 695 hermetic tests with JUnit XML uploaded `if: always()`), `docker-build.yml` (hadolint + buildx with GHA layer cache `mode=max` + artifact assertions + three smoke tests: **A** refuses to start unconfigured, **B** production config validates with no secret values in the log, **C** boots against real MongoDB/Redis, serves `/api`, exits 0 on SIGTERM — nothing is pushed), `dependency-audit.yml` (pip-audit/npm audit moved out of security-audit.yml, plus a **suppression-expiry ratchet**), `codeql.yml` (skips cleanly on a private repo without Advanced Security rather than failing red), `.github/actions/setup-backend/` (composite action; caches the built venv keyed on the requirements hash, **no `restore-keys`** — a partial-match restore is worse than a miss), `backend/pyproject.toml` + `.flake8` + `.hadolint.yaml`, `docs/deployment/GITHUB_ACTIONS.md`. **Lint adoption is deliberately two-tier**: the correctness subset (`E9,F63,F7,F82,F811,F632`) is blocking repo-wide at **zero findings** and files *added* by a PR are blocking under the full standard, while `black` (116/119 files), `isort` (70) and full flake8 (462) are advisory with a documented exit path — landing a 116-file reformat inside the CI PR would be unreviewable, and a permanently red `main` is worse than no build. Fixed in-sprint: a stale exact-equality assertion in `test_trading_engine.py` (`run_cycle` gained a `closed_trades` key), which had left the suite at 694/1 since PH2.3 and would have made `main` red on day one. **L1: `docker-build.yml` has never been executed** — no Docker daemon on the development machine; verified by YAML parse, `bash -n` over every run block, and review against the PH2.1 contract. **L2 (significant finding): 15 dependency advisories are suppressed** — `starlette 0.37.2` ×7 (fixes exist, held by the `fastapi==0.110.1` pin; highest priority, it is the ASGI request path), `litellm 1.80.0` ×7 (not imported by any application code — remove, do not upgrade), `ecdsa 0.19.2` ×1 (no fix, not reachable: JWTs are HS256). Each now carries a written reachability argument and a review date of 2026-08-22 enforced by CI. **L6: branch protection is not configured**, so every gate is advisory until PH2.5 requires it. Full L1–L10 in docs/deployment/GITHUB_ACTIONS.md §13.*
+- [ ] PH2.4b Environment & Configuration Framework — NOT_STARTED — High — *Roadmap PH2.4. Env matrix (every var × every env) in DEPLOYMENT.md, consistent `APP_ENV` handling, staging env templates, config drift check. Note: the drift check largely exists already — `scripts/generate_env_example.py --check`, wired into `security-audit.yml` `config-sync`.*
+- [ ] PH2.5 CI: Branch Protection & PR Template — PARTIAL — Critical — *Pipeline delivered by PH2.4 above. Outstanding: branch protection on `main` requiring `backend-ci`, `docker-build` and `dependency-audit`; PR template carrying the PRODUCTION_HARDENING.md §15 checklist.*
+- [ ] PH2.6 CI Extended: Integration & Image Scanning — PARTIAL — High — *Docker build, supply-chain gates and secret scanning delivered by PH2.4 above. Outstanding: integration job booting the prod Compose stack and running `pytest -m integration` (98 tests, blocked on PH3.1), image vulnerability scanning (Trivy/Grype), frontend test job (PH3.3).*
 - [ ] PH2.7 CD & Release Automation — NOT_STARTED — High
 - [ ] PH2.8 Database & Redis Production Configuration — NOT_STARTED — High
 - [ ] PH2.9 Structured Logging — NOT_STARTED — High
