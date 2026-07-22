@@ -29,6 +29,47 @@ from server import app, create_access_token  # noqa: E402
 from tests._fakedb import FakeDB  # noqa: E402
 
 
+# --------------------------------------------------------------------------- #
+# Suite selection (PH2.4)                                                       #
+# --------------------------------------------------------------------------- #
+# The backend has two kinds of test file living side by side:
+#
+#   * hermetic     — in-process TestClient + FakeDB. No server, no database, no
+#                    network. These are the ones CI runs on every push and PR.
+#   * live-server  — the older `requests`/`websockets` suites, which drive a
+#                    running backend at $REACT_APP_BACKEND_URL and, through it,
+#                    a real MongoDB and real market-data providers.
+#
+# CI needs to select the first set MECHANICALLY. Doing that with `--ignore`
+# flags in the workflow file would put the list of live-server suites in YAML,
+# far away from the tests themselves, where the next person to add one would
+# never find it — and their suite would then run in CI, hit no server, and fail
+# for a reason that looks nothing like the cause.
+#
+# So the marker is applied HERE, from the one fact that actually distinguishes
+# them, and CI just says `-m "not integration"`. Adding a new live-server suite
+# means adding its filename to this tuple; nothing in .github/ changes.
+#
+# PH3.1 owns converting these suites to hermetic equivalents. Until then they
+# remain runnable on demand (`pytest -m integration` against a live stack).
+_LIVE_SERVER_SUITES = frozenset({
+    "test_backend.py",
+    "test_phase2.py",
+    "test_phase4.py",
+    "test_phase5.py",
+    "test_phase6.py",
+    "test_phase7.py",
+})
+
+
+def pytest_collection_modifyitems(items):
+    """Mark every test in a live-server suite as ``integration``."""
+    integration = pytest.mark.integration
+    for item in items:
+        if Path(str(item.fspath)).name in _LIVE_SERVER_SUITES:
+            item.add_marker(integration)
+
+
 @pytest.fixture
 def client():
     return TestClient(app)

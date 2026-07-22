@@ -622,7 +622,7 @@ def test_invalid_fernet_key_is_rejected_in_every_environment():
 
 def test_valid_fernet_key_is_accepted():
     report = sc.validate_config(
-        base_prod_env(BROKER_TOKEN_KEY="c3RvY2thc3Npc3Qtc2VjcmV0LWtleS0zMi1ieXRlcyE="),
+        base_prod_env(BROKER_TOKEN_KEY="c3RvY2thc3Npc3Qtc2VjcmV0LWtleS0zMi1ieXRlcyE="),  # gitleaks:allow
         raise_on_error=False)
     assert report.ok, report.errors
 
@@ -633,7 +633,7 @@ def test_swapped_provider_keys_are_flagged_as_warnings_not_errors():
     surfaces as a third-party 401 hours later."""
     report = sc.validate_config(
         base_prod_env(ANTHROPIC_API_KEY="AIzaSyDx-google-style-key-pasted-here",
-                      GOOGLE_CLIENT_ID="123456789", GOOGLE_CLIENT_SECRET="GOCSPX-abc123xyz"),
+                      GOOGLE_CLIENT_ID="123456789", GOOGLE_CLIENT_SECRET="GOCSPX-abc123xyz"),  # gitleaks:allow
         raise_on_error=False)
     assert report.ok, report.errors
     assert any("sk-ant-" in w for w in report.warnings)

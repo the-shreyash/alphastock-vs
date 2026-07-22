@@ -1,0 +1,70 @@
+# ==============================================================================
+# StockAssist AI — flake8 configuration (PH2.4)
+#
+# flake8 is the only tool in the backend toolchain that cannot read
+# pyproject.toml (upstream refuses on the grounds that TOML parsing is not in
+# the stdlib for the Python versions it supports). Everything else lives in
+# backend/pyproject.toml.
+#
+# HOW THIS FILE IS USED BY CI — two passes, one config
+# ----------------------------------------------------
+#   1. BLOCKING, repo-wide:  flake8 --select=E9,F63,F7,F82,F811,F632
+#      The correctness subset — syntax errors, undefined names, redefinitions,
+#      `is` against a literal. These are bugs, not style opinions, and the
+#      backend has ZERO of them today. This gate can therefore be strict from
+#      day one and must stay at zero forever.
+#
+#   2. ADVISORY, repo-wide:  flake8 (this config, all selected codes)
+#      462 findings at the time of writing. Reported into the job summary as a
+#      tracked number, not a merge blocker. Turning it blocking today would mean
+#      either a 116-file mechanical commit landing in the same PR as the CI
+#      pipeline, or a permanently red main branch. Both are worse than a
+#      measured, visible backlog. See docs/deployment/GITHUB_ACTIONS.md §6.
+#
+# New FILES added in a pull request are held to the full standard (blocking) —
+# that is the ratchet: the backlog can only shrink.
+# ==============================================================================
+[flake8]
+
+# 120 to match the width the code is already written to, and to match
+# [tool.black] line-length in pyproject.toml. A mismatch between the two means
+# black produces lines flake8 then rejects — the tools must agree exactly.
+max-line-length = 120
+
+extend-ignore =
+    # E203 whitespace before ':' — black deliberately emits `x[1 :2]`-style
+    # slices that PEP 8 (and therefore pycodestyle) considers wrong. This is a
+    # known, documented conflict; black is the authority on formatting here.
+    E203,
+    # W503 line break before binary operator — pycodestyle ships W503 and W504
+    # as a mutually exclusive pair and black picks the W503 style. Leaving both
+    # enabled makes every multi-line boolean expression unfixable.
+    W503,
+
+exclude =
+    .git,
+    __pycache__,
+    .pytest_cache,
+    venv,
+    .venv,
+    node_modules,
+    # Generated / vendored trees have no author to fix them.
+    .mypy_cache
+
+# The complexity ceiling is reported but not enforced repo-wide (see the
+# advisory pass above). 15 is the threshold at which a function stops fitting in
+# a reviewer's head; it is not currently met everywhere.
+max-complexity = 15
+
+per-file-ignores =
+    # Scripts bootstrap sys.path before importing the application package, so
+    # their imports legitimately cannot all sit at the top of the file. The
+    # alternative is an installed package, which the container build does not
+    # use (see the note in pyproject.toml).
+    scripts/*:E402
+    # The hermetic test suites do the same sys.path insert via conftest, and
+    # some assert on deliberately long literal payloads.
+    tests/*:E402,E501
+    # Re-export surface: a package __init__ exists to make names importable
+    # from one place, which flake8 reads as unused imports.
+    security/__init__.py:F401

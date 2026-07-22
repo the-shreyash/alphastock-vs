@@ -1,0 +1,113 @@
+# ==============================================================================
+# StockAssist AI — backend tool configuration (PH2.4)
+#
+# WHY THIS FILE EXISTS
+# --------------------
+# Before this sprint, "run the tests" and "run the linter" meant whatever the
+# engineer typed. CI cannot be built on a convention that lives in someone's
+# shell history: a pipeline that selects tests differently from the developer
+# who wrote them will disagree with that developer, and the disagreement will
+# always be discovered at the worst possible moment. This file makes the
+# invocation the SAME everywhere — `pytest`, `black`, `isort` and `mypy` read it
+# whether they are started by a human in backend/ or by a GitHub Actions runner.
+#
+# NOT a packaging manifest. There is deliberately no [build-system] and no
+# [project] table: the backend is deployed as a container image built from
+# source (backend/Dockerfile), not as an installable wheel. Adding those tables
+# would invite `pip install .` and create a second, competing description of the
+# dependency set that would drift from requirements.txt.
+#
+# flake8 is configured separately in .flake8 — it is the one tool in this set
+# that still refuses to read pyproject.toml (upstream issue, open since 2018).
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# pytest
+# ------------------------------------------------------------------------------
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+
+# --strict-markers turns a typo'd marker into a collection ERROR instead of a
+# silently-ignored decorator. Without it, `@pytest.mark.integraton` (one letter
+# wrong) means the test quietly runs in the "not integration" selection — which
+# is precisely the failure mode this config exists to prevent.
+# -ra prints a short reason for every non-passing outcome at the end of the run,
+# so a CI log answers "what was skipped and why?" without re-running verbosely.
+addopts = [
+    "--strict-markers",
+    "--strict-config",
+    "-ra",
+]
+
+markers = [
+    "integration: requires a live backend server at $REACT_APP_BACKEND_URL (and, transitively, MongoDB, Redis and network access to real market-data providers). Excluded from the default CI selection via `-m 'not integration'`. Applied automatically by tests/conftest.py to the legacy `requests`-based suites — do not hand-apply it.",
+]
+
+# Third-party deprecation noise (FastAPI's on_event, starlette's per-request
+# cookies, aiohttp inheritance) is filtered so a real warning from OUR code is
+# visible in the CI log rather than buried under ten known ones. Deliberately
+# NOT `filterwarnings = ["error"]`: promoting every warning to a failure would
+# make an upstream release able to break this pipeline overnight.
+filterwarnings = [
+    "default",
+    "ignore::DeprecationWarning:fastapi.*",
+    "ignore::DeprecationWarning:starlette.*",
+    "ignore::PendingDeprecationWarning:starlette.*",
+]
+
+# ------------------------------------------------------------------------------
+# black
+#
+# 120 rather than black's default 88. The default is a good choice for a fresh
+# codebase; this one is 250k lines old and written to a wider column, and
+# re-wrapping it to 88 would be a diff nobody can review. 120 matches the width
+# the code is already written to, so the eventual formatting commit is as small
+# as it can be. See docs/deployment/GITHUB_ACTIONS.md §6 for why `black --check`
+# is advisory today and what has to happen before it becomes a merge gate.
+# ------------------------------------------------------------------------------
+[tool.black]
+line-length = 120
+target-version = ["py311"]
+extend-exclude = '''
+/(
+    venv
+  | \.venv
+  | __pycache__
+  | \.pytest_cache
+)/
+'''
+
+# ------------------------------------------------------------------------------
+# isort
+#
+# profile = "black" is not optional when both tools run: without it isort's
+# default multi-line style and black's disagree, each reformats what the other
+# just wrote, and `--check` fails forever no matter how many times you run them.
+# ------------------------------------------------------------------------------
+[tool.isort]
+profile = "black"
+line_length = 120
+skip_glob = ["venv/*", ".venv/*", "**/__pycache__/*"]
+known_first_party = ["security", "services", "server", "models", "tests", "scripts"]
+
+# ------------------------------------------------------------------------------
+# mypy
+#
+# Scoped to backend/security/ for now (14 files, 2 findings — both false
+# positives from `bool(x) and ...` not narrowing Optional). Type-checking the
+# whole backend today would emit thousands of errors against a codebase written
+# without annotations, and an error list nobody reads is not a quality gate.
+# The security package is the right first perimeter: it is the newest code, the
+# most annotated, and the code where a type confusion has the highest cost.
+# Expand the `files` list as packages are annotated.
+# ------------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.11"
+files = ["security"]
+ignore_missing_imports = true          # no stubs published for motor/litellm/etc.
+warn_unused_ignores = true
+warn_redundant_casts = true
+show_error_codes = true
+pretty = true
+exclude = "(venv|\\.venv|__pycache__)/"

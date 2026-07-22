@@ -449,8 +449,12 @@ def test_run_cycle_trails_and_books_targets():
             "trailing_stop": {"enabled": True, "type": "percent", "value": 5},
         })
         stats = await te.run_cycle(db, {"TCS": {"price": 112.0}})
+        # `closed_trades` was added to run_cycle's return contract
+        # (services/trading_engine.py) after this assertion was written; the
+        # exact-equality check went stale. Nothing closes in this scenario
+        # (alert-only targets), so the list is empty.
         assert stats == {"checked": 1, "trailed": 1, "targets_hit": 1,
-                         "sl_exits": 0, "auto_orders": 0}
+                         "sl_exits": 0, "auto_orders": 0, "closed_trades": []}
         doc = db.trades.docs[0]
         assert doc["stop_loss"] == 106.4                  # 112 × 0.95 > 95
         assert doc["best_price"] == 112.0

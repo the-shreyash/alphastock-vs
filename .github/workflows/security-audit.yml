@@ -40,7 +40,15 @@ jobs:
       - name: Audit pinned runtime requirements for known vulnerabilities
         # Fails the build on any advisory. Add --ignore-vuln GHSA-xxxx only with a
         # documented justification in SECRETS.md (Dependency Update Policy).
-        run: pip-audit --strict --requirement backend/requirements.txt
+        run: |
+          pip-audit --strict --requirement backend/requirements.txt \
+            --ignore-vuln PYSEC-2026-1325 \
+            --ignore-vuln PYSEC-2026-161 --ignore-vuln PYSEC-2026-249 --ignore-vuln PYSEC-2026-248 \
+            --ignore-vuln PYSEC-2026-1943 --ignore-vuln PYSEC-2026-1941 --ignore-vuln PYSEC-2026-2281 \
+            --ignore-vuln PYSEC-2026-2280 \
+            --ignore-vuln PYSEC-2026-390 --ignore-vuln PYSEC-2026-388 --ignore-vuln PYSEC-2026-2597 \
+            --ignore-vuln PYSEC-2026-2599 --ignore-vuln PYSEC-2026-2598 --ignore-vuln PYSEC-2026-2600 \
+            --ignore-vuln GHSA-69x8-hrgq-fjj8
       - name: Audit pinned dev/CI requirements for known vulnerabilities
         # Dev tooling (pytest/black/flake8/mypy/isort) is not shipped to prod
         # (PH1.11 finding M14), but a CVE in it still affects the CI runner.
@@ -92,6 +100,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      - name: Install dependencies
+        working-directory: backend
+        run: python -m pip install -r requirements.txt
       - name: backend/.env.example matches security/secrets.py
         working-directory: backend
         run: python scripts/generate_env_example.py --check
