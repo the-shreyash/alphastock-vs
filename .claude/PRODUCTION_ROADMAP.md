@@ -363,7 +363,7 @@ Goal: the platform can be built, deployed, observed, and recovered mechanically.
 
 ---
 
-## PH2.1 — Backend Production Dockerfile
+## PH2.1 — Backend Production Dockerfile ✅ COMPLETE (2026-07-22)
 
 - **Objective:** Reproducible backend image.
 - **Scope:** Multi-stage `backend/Dockerfile`: builder (deps compile) → slim runtime; non-root user; `requirements.txt` only (dev deps excluded per PH1.11); uvicorn with explicit `--workers`, **no `--reload`**, no bind mounts; HEALTHCHECK instruction; `.dockerignore`.
@@ -375,6 +375,12 @@ Goal: the platform can be built, deployed, observed, and recovered mechanically.
 - **Rollback Plan:** Additive file; nothing depends on it until PH2.3.
 - **Estimated Difficulty:** Medium. **Estimated Time:** 1 day.
 - **Success Metrics:** Deterministic image build from clean checkout.
+- **Delivered (2026-07-22):** `backend/Dockerfile` (two-stage, builder toolchain discarded), `backend/.dockerignore`, `backend/docker/entrypoint.sh`, `backend/docker/healthcheck.sh`, `production.env.example`, `docs/deployment/DOCKER.md`. Scope was extended beyond the plan with an **entrypoint** (startup validation delegated to `security/secrets.py`, a `pre-start.d/` hook directory for future migrations, `exec` signal handoff) and a **stdlib-only health probe** (so `curl` never enters the runtime image).
+  - **Met:** build succeeds; runs as uid 10001 non-root and cannot write its own source; health check passes against live Mongo; no dev deps, no `.env`, no `pip`/`curl`/`wget`/`gcc` in the image; graceful SIGTERM → exit 0 in 1.2 s; healthy under `--read-only --cap-drop=ALL --security-opt no-new-privileges`.
+  - **Missed:** image is **1.03 GB** vs the < 400 MB target. Every image-level lever was applied (multi-stage −300 MB, bundled test suites −66 MB, pip −16 MB; `strip` measured at 0 MB and `--no-compile` rejected on startup-cost grounds). The residual is the dependency set: `googleapiclient` (97 MB), `litellm` (55 MB), `boto3`/`botocore` (32 MB), `stripe` (24 MB), `s5cmd` (15 MB) are **not imported by any application code** — ≈220 MB. Closing the gap requires a `requirements.txt` prune, not a Dockerfile change. **Recommended follow-up sprint.**
+  - **Deviation:** validated against `/api` (public, rate-limit-exempt, dependency-free) rather than the planned `/api/monitor/health`, which requires authentication and hits Mongo — unsuitable for a liveness probe. Rationale in `docs/deployment/DOCKER.md` §8.
+  - **Defect surfaced (not fixed — out of sprint scope):** `pytz` is imported by `services/market_engine/validator.py` but pinned in neither requirements file, so the Market Engine fails to initialize. Pre-existing; equally broken outside Docker.
+  - **Constraint:** `WEB_CONCURRENCY` must stay at 1 until PH2.8 (in-process scheduler + in-memory WebSocket registry are not multi-process safe). Enforced by a startup warning and documented.
 
 ## PH2.2 — Frontend Production Dockerfile
 

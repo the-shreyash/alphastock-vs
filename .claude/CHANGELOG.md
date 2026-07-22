@@ -5,6 +5,127 @@ This file records documentation-system versions and, from v1.0 launch onward, pr
 
 ---
 
+# Sprint PH2.1 — Backend Production Dockerfile — 2026-07-22
+
+**First PH2 sprint. The backend is now a reproducible, non-root, fail-closed
+container image. This is the deployment primitive every later PH2 sprint builds
+on: Compose (PH2.3), CI image builds (PH2.6), and CD (PH2.7) all consume it.
+Backend containerization only — no Compose, no CI, no Redis, no Kubernetes.**
+
+Added
+
+- `backend/Dockerfile` — two-stage production build.
+  **Stage 1 (builder):** `python:3.11-slim-bookworm` + `build-essential`,
+  installs `requirements.txt` (runtime deps only — `requirements-dev.txt` is
+  never installed, per PH1.11/M14) into a relocatable venv at `/opt/venv`, then
+  prunes bundled library test suites and `pip`.
+  **Stage 2 (runtime):** the same slim base with **no compiler, no headers, no
+  package installer**; copies `/opt/venv` and the application source; creates a
+  dedicated `appuser` (fixed uid/gid **10001**, `nologin`, no password); source
+  and venv stay **root-owned** so the running process can read and execute its
+  code but **cannot modify it**; OCI provenance labels (`APP_VERSION`,
+  `VCS_REF`, `BUILD_DATE` build args); `EXPOSE 8000`; `HEALTHCHECK`;
+  exec-form `ENTRYPOINT` with empty `CMD`.
+  `slim` over `alpine` is deliberate: musl invalidates the manylinux wheels for
+  pandas/numpy/cryptography/grpcio, turning a ~1-minute dependency install into
+  15–30 minutes of source compilation for a slower runtime.
+- `backend/.dockerignore` — the single auditable boundary between repo and
+  image. Excludes **every** dotenv file, `venv/`, `tests/`, `.git/`, caches and
+  build output. The dotenv exclusion is a correctness control as much as a
+  secret-leak control: `server.py` calls `load_dotenv(..., override=True)`, so a
+  `.env` inside the image would silently **override the environment variables
+  injected by the orchestrator at runtime**. Reduces the shipped build context
+  from **620 MB → 2.5 MB**.
+- `backend/docker/entrypoint.sh` — PID 1. POSIX `sh` (the runtime image has no
+  bash). Reads all configuration from the environment with production-safe
+  defaults; performs structural validation (`APP_ENV`, `PORT`,
+  `WEB_CONCURRENCY`); then delegates full validation to the application's own
+  authority, `security/secrets.py` `validate_config()` (PH1.8), printing its
+  aggregated, value-free report and **exiting 1** rather than starting
+  misconfigured — no second source of truth in shell. Runs any executable in
+  `docker/pre-start.d/` (the `postgres`/`nginx` convention) as a working
+  extension point for future migrations, then **`exec`s** uvicorn so the server
+  becomes PID 1 and receives `SIGTERM` directly. Explicit-args mode
+  (`docker run <image> <cmd>`) runs one-shot jobs against the same validated
+  configuration. Launches with `--no-server-header`, `--proxy-headers`,
+  `--forwarded-allow-ips`, `--timeout-graceful-shutdown`; **never** `--reload`.
+- `backend/docker/healthcheck.sh` — liveness probe honouring Docker's exit-code
+  contract (0 healthy / 1 unhealthy, nothing else). Written against the Python
+  **standard library** specifically so `curl`/`wget` never enter the runtime
+  image. Probes `127.0.0.1` (measures the application, not the network path to
+  it) at `/api` — unauthenticated, already rate-limit-exempt in
+  `security/rate_limit.py`, and **dependency-free by design**: a Mongo round-trip
+  in a *liveness* probe would mark every replica unhealthy during a database
+  blip and restart the whole fleet. Validates the response body, not just the
+  status code.
+- `production.env.example` (repo root) — operator-facing runtime environment
+  template; the deployment-time counterpart to the developer-facing,
+  registry-generated `backend/.env.example`. Placeholders only. Documents the
+  container-runtime variables, the required core set, and — explicitly, commented
+  out — the variables that must **not** appear in production.
+- `docs/deployment/DOCKER.md` — full container architecture document: rationale,
+  diagrams, multi-stage strategy, layer-caching and size analysis with measured
+  numbers, security decisions, runtime configuration, health-check design,
+  operator guide, known limitations, PH2.2–PH2.10 forward path, and a
+  troubleshooting matrix.
+- `docs/deployment/README.md`, and a `deployment/` entry in `docs/README.md`.
+
+Changed
+
+- `.claude/PRODUCTION_ROADMAP.md`, `.claude/TASK.md` — PH2.1 marked COMPLETE
+  with delivered/met/missed detail.
+
+Verification
+
+- Cold build **2m 44s** (first build, incl. base-image pull) / **3m 21s**
+  (`--no-cache`); **4.5s** rebuild after a source-only change — the dependency
+  layer cache holds, which is the whole point of `COPY requirements.txt` before
+  `COPY . .`. Final image **1.03 GB**, `/app` 2.8 MB.
+- Boots healthy against live MongoDB in **2.5s**; Docker reports `healthy`.
+- Fail-closed proven: missing secrets, placeholder-looking secrets, invalid
+  `APP_ENV` and non-numeric `PORT` each abort with a clean operator-facing
+  message and **exit 1**.
+- Non-root confirmed (`uid=10001`); the process **cannot** write `/app` or
+  `/opt/venv`; `pip`, `curl`, `wget` and `gcc` all absent; no `.env`, `tests/`
+  or `venv/` in the image (`/app` totals 2.8 MB).
+- Graceful shutdown: `docker stop` → **exit 0 in 1.2s**, FastAPI `shutdown` event
+  ran (scheduler stopped, Mongo client closed) — signals reach PID 1.
+- Runs healthy under `--read-only --tmpfs /tmp --cap-drop=ALL
+  --security-opt no-new-privileges:true`.
+- PH1.4 security headers verified intact through the container; no `server:`
+  header leaked.
+
+Known limitations
+
+- **Image is 1.03 GB against the roadmap's < 400 MB target.** Every image-level
+  lever was applied and measured (multi-stage −300 MB, bundled test suites
+  −66 MB, `pip` −16 MB; `strip` measured at **0 MB** because manylinux wheels
+  ship pre-stripped, and `--no-compile` was rejected because it trades 158 MB of
+  image for a permanent per-start compile cost). The residual is the dependency
+  set, not the Dockerfile: `googleapiclient` (97 MB), `litellm` (55 MB),
+  `boto3`/`botocore`/`s3transfer` (~32 MB), `stripe` (24 MB) and `s5cmd` (15 MB)
+  are **imported by zero application code** — ≈220 MB, plus the CVE surface.
+  `s5cmd` in particular is a standalone S3 CLI, an ideal exfiltration tool.
+  **A dependency-pruning sprint is the recommended follow-up.**
+- **`pytz` is missing from `requirements.txt`** — `services/market_engine/`
+  `validator.py` imports it, so the Market Engine fails to initialize
+  (`Market Engine init error: No module named 'pytz'`). **Pre-existing and
+  equally broken outside Docker**; surfaced by the clean-room build. Left unfixed
+  as an application dependency change outside this sprint's scope. Should be
+  fixed before any production deploy.
+- **`WEB_CONCURRENCY` must remain 1** until PH2.8: the in-process APScheduler,
+  heartbeat engine and in-memory WebSocket registry are not multi-process safe
+  (N workers = N duplicate scheduled jobs; broadcasts reach only one worker's
+  clients). Scale by replicas, not workers. The entrypoint warns loudly.
+- Base image pinned by **tag**, not digest (picks up Debian patches on rebuild;
+  digest pinning lands with image scanning in PH2.6). No vulnerability scanning
+  yet (PH2.6). Built and verified on **linux/arm64** only — multi-arch in PH2.6.
+- The existing root `docker-compose.yml` remains **development-oriented** (bind
+  mounts, `--reload`, overrides the entrypoint) and is intentionally untouched;
+  splitting dev/prod is PH2.3.
+
+---
+
 # Sprint PH1.12 — Security Certification (PHASE 1 EXIT GATE) — 2026-07-22
 
 **Production Hardening PH1.12 complete — and with it, PH1.11. This is the final

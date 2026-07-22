@@ -1,0 +1,134 @@
+# ==============================================================================
+# StockAssist AI — Backend Docker build-context exclusions (PH2.1)
+#
+# This file is the SINGLE AUDITABLE BOUNDARY between the repository and the
+# container image. The Dockerfile uses `COPY . .` deliberately: rather than
+# maintaining a per-file allowlist inside the Dockerfile (which silently breaks
+# whenever a new module is added), everything that must NEVER reach the image is
+# denied here, in one reviewable place.
+#
+# Two independent things are achieved by every line below:
+#
+#   1. SECURITY — anything excluded here cannot be baked into an image layer.
+#      Deleting a file in a later layer does NOT remove it: every layer is
+#      retained and readable by anyone who pulls the image. The only reliable
+#      way to keep a secret out of an image is to keep it out of the build
+#      context in the first place.
+#
+#   2. CACHE + SIZE — the build context is tarred and shipped to the Docker
+#      daemon on every build. A stray `venv/` or `node_modules/` adds hundreds
+#      of megabytes of transfer and invalidates the `COPY` layer on every
+#      unrelated file change, destroying layer caching.
+#
+# Rule of thumb: deny by default, allow deliberately. When in doubt, exclude it
+# — a missing runtime file fails loudly at startup; a leaked secret fails
+# silently and permanently.
+# ==============================================================================
+
+# ── SECRETS (highest priority — never relax these) ────────────────────────────
+# server.py calls `load_dotenv(ROOT_DIR/'.env', override=True)`. The `override=True`
+# means a `.env` present inside the image would SILENTLY WIN over the environment
+# variables injected by Docker/Kubernetes/Railway at runtime. Excluding it here
+# is therefore both a secret-leak control AND a correctness control: with no
+# `.env` in the image, load_dotenv is a no-op and real container env vars apply.
+#
+# `.env.example` is committed and placeholder-only, but it is documentation, not
+# runtime input — it is excluded too, so the image contains no dotenv file of
+# any kind and there is no ambiguity about where configuration comes from.
+.env
+.env.*
+*.env
+*.pem
+*.key
+credentials.json
+*credentials.json*
+*token.json*
+.credentials
+
+# ── Python virtual environments ───────────────────────────────────────────────
+# Host venvs are platform-specific (macOS/arm64 wheels here) and would be both
+# useless and actively harmful inside a linux image. Dependencies are installed
+# from requirements.txt in the builder stage instead.
+venv/
+.venv/
+env/
+ENV/
+
+# ── Python caches & compiled artifacts ────────────────────────────────────────
+# Bytecode compiled by a different interpreter/platform is invalid in the image;
+# the Dockerfile precompiles fresh bytecode with the image's own interpreter.
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.mypy_cache/
+.pytype/
+.ruff_cache/
+.pytest_cache/
+.coverage
+.coverage.*
+coverage/
+htmlcov/
+.tox/
+.nox/
+
+# ── Tests & dev-only tooling ──────────────────────────────────────────────────
+# The runtime image installs requirements.txt ONLY (pytest/black/flake8/mypy live
+# in requirements-dev.txt — PH1.11 finding M14). Shipping tests without their
+# dependencies would produce a directory that cannot run; shipping the
+# dependencies would enlarge the attack surface of a production server for no
+# operational benefit. Tests run in CI (PH2.5/PH2.6), not in production.
+tests/
+test_*.py
+*_test.py
+conftest.py
+pytest.ini
+requirements-dev.txt
+
+# ── VCS & CI metadata ─────────────────────────────────────────────────────────
+# `.git` in particular can be enormous and contains the FULL history — including
+# any secret ever committed and later removed from the working tree.
+.git/
+.gitignore
+.gitattributes
+.github/
+.gitconfig
+
+# ── Editor / IDE / OS noise ───────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ── Build outputs & JS toolchain (never part of the backend image) ────────────
+node_modules/
+dist/
+build/
+*.egg-info/
+
+# ── Logs, temp files, local databases ─────────────────────────────────────────
+logs/
+*.log
+tmp/
+temp/
+dump.rdb
+*.sqlite
+*.sqlite3
+*.db
+
+# ── Documentation & local notes ───────────────────────────────────────────────
+# Docs are valuable in the repo and dead weight in a server image. Excluding
+# them keeps the `COPY . .` layer stable: editing a Markdown file must not
+# invalidate the application layer and force a rebuild + redeploy.
+*.md
+docs/
+
+# ── Container tooling that is not needed INSIDE the container ─────────────────
+# docker/entrypoint.sh and docker/healthcheck.sh ARE needed and are NOT excluded.
+Dockerfile
+.dockerignore
+docker-compose*.yml

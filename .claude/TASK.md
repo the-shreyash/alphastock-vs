@@ -2115,7 +2115,7 @@ rollback, estimates) live in PRODUCTION_ROADMAP.md. Status tracker:
 
 ## PH2 — Production Infrastructure & DevOps
 
-- [ ] PH2.1 Backend Production Dockerfile — NOT_STARTED — Critical
+- [x] PH2.1 Backend Production Dockerfile — COMPLETE (2026-07-22) — Critical — *Two-stage `backend/Dockerfile` (builder → slim runtime), non-root uid 10001, `docker/entrypoint.sh` (fail-closed config validation + pre-start hooks + `exec` signal handoff), stdlib-only `docker/healthcheck.sh`, `.dockerignore`, `production.env.example`. Verified: builds in 2m44s cold / 4.5s on a code change, boots healthy in 2.5s, graceful SIGTERM exit 0, runs under `--read-only --cap-drop=ALL`. Image 1.03 GB — misses the <400 MB target because ~220 MB of declared dependencies are never imported (see docs/deployment/DOCKER.md §10). Also surfaced: `pytz` missing from `requirements.txt`.*
 - [ ] PH2.2 Frontend Production Dockerfile — NOT_STARTED — Critical
 - [ ] PH2.3 Compose Split: Dev vs Prod — NOT_STARTED — Critical
 - [ ] PH2.4 Environment & Configuration Framework — NOT_STARTED — High
