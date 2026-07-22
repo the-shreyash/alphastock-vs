@@ -3,7 +3,7 @@
 
 Version: 1.2
 
-Status: PH1 In Progress — PH1.1 complete (2026-07-17): findings B1/B2 closed, risks R-01/R-02 closed; startup admin seeding (default password + plaintext credentials file) also removed under PH1.1. PH1.2 complete (2026-07-17): Google OAuth hardened — CSRF `state`, id_token verification, `email_verified` gate, redirect_uri allowlist, safe account linking; risk R-02 fully closed. PH1.3 complete (2026-07-18): authentication cookies production-hardened and centralized in `backend/security/cookies.py` — `Secure` forced in production, `HttpOnly`+`SameSite` on all cookies, matched-attribute clearing, unified OAuth-state cookie posture; finding B4 closed, risk R-04 closed. PH1.4 complete (2026-07-18): CORS production-hardened and centralized in `backend/security/cors.py` — wildcard-with-credentials default removed, environment-driven exact-match origin allowlist (`CORS_ALLOWED_ORIGINS`), restricted methods/headers, fail-closed in production; finding B3 closed, risk R-03 closed. Security headers de-scoped to PH1.4b. PH1.5 complete (2026-07-19): production password policy centralized in `backend/security/passwords.py` — model-layer 422 enforcement (12–64 chars, character classes, common/sequential/repeated/identity-derived rejection), explicit bcrypt cost 12, never-raising timing-equalized verification (fixed OAuth-account login 500), sanitized validation errors; finding H10 password-half closed, risk R-05 partially mitigated. Email scope (EmailStr/verification/reset, OR-6) split out to PH1.5b. PH1.5b/Identity Recovery complete (2026-07-22): email verification + password reset + password change centralized in `backend/security/recovery.py` — single-use signed recovery tokens (`<token_id>.<HMAC>` + authoritative `recovery_tokens` record, atomic burn), five new `/api/auth` recovery endpoints, `email_verified`/`email_verified_at`/`verified_by` on the user model, enumeration-safe generic responses, and full session invalidation (`revoke_all_for_user` + `password_changed_at`) on any credential rotation; finding H10 email-verification half closed (only `EmailStr` tightening remains); OR-6 (real SMTP provider) still open — flows run in provider-agnostic simulated mode until credentials are set; login is not yet gated on verification (backward-compatible). PH1.4b complete (2026-07-20): HTTP response security headers centralized in `backend/security/headers.py` and applied via a single pure-ASGI `SecurityHeadersMiddleware` — HSTS (HTTPS/production only), a strict nonce-capable CSP (`default-src 'none'`, no `unsafe-*`), `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Referrer-Policy`, a locked-down `Permissions-Policy`, `Cross-Origin-Opener-Policy`/`Cross-Origin-Resource-Policy` (COEP opt-in), and the deprecated `X-XSS-Protection` neutralized; every value environment-overridable; 35 hermetic tests; "no security headers" gap closed. PH1.9 Secrets & Supply Chain complete (2026-07-22): configuration centralized in `backend/security/secrets.py` (authoritative `SECRET_REGISTRY` + boot-time fail-closed `validate_config`, run before the Mongo client; value-free logging), weak compose defaults removed (`JWT_SECRET` placeholder + hard-coded n8n password now required env vars), `requirements.txt` fully exact-pinned with 7 in-pin CVE patches, CI supply-chain workflow added (`pip-audit`/`pip check`/`npm audit`/`gitleaks`), committed `.env.example` templates (backend generated from the registry) + `.claude/SECRETS.md` rotation/incident runbook; 38 hermetic tests; finding B5 secret-fallback half + "no boot-time validation" gap closed (delivered the roadmap's PH1.8 plus the supply-chain core of PH1.11).
+Status: PH1 In Progress — PH1.1 complete (2026-07-17): findings B1/B2 closed, risks R-01/R-02 closed; startup admin seeding (default password + plaintext credentials file) also removed under PH1.1. PH1.2 complete (2026-07-17): Google OAuth hardened — CSRF `state`, id_token verification, `email_verified` gate, redirect_uri allowlist, safe account linking; risk R-02 fully closed. PH1.3 complete (2026-07-18): authentication cookies production-hardened and centralized in `backend/security/cookies.py` — `Secure` forced in production, `HttpOnly`+`SameSite` on all cookies, matched-attribute clearing, unified OAuth-state cookie posture; finding B4 closed, risk R-04 closed. PH1.4 complete (2026-07-18): CORS production-hardened and centralized in `backend/security/cors.py` — wildcard-with-credentials default removed, environment-driven exact-match origin allowlist (`CORS_ALLOWED_ORIGINS`), restricted methods/headers, fail-closed in production; finding B3 closed, risk R-03 closed. Security headers de-scoped to PH1.4b. PH1.5 complete (2026-07-19): production password policy centralized in `backend/security/passwords.py` — model-layer 422 enforcement (12–64 chars, character classes, common/sequential/repeated/identity-derived rejection), explicit bcrypt cost 12, never-raising timing-equalized verification (fixed OAuth-account login 500), sanitized validation errors; finding H10 password-half closed, risk R-05 partially mitigated. Email scope (EmailStr/verification/reset, OR-6) split out to PH1.5b. PH1.5b/Identity Recovery complete (2026-07-22): email verification + password reset + password change centralized in `backend/security/recovery.py` — single-use signed recovery tokens (`<token_id>.<HMAC>` + authoritative `recovery_tokens` record, atomic burn), five new `/api/auth` recovery endpoints, `email_verified`/`email_verified_at`/`verified_by` on the user model, enumeration-safe generic responses, and full session invalidation (`revoke_all_for_user` + `password_changed_at`) on any credential rotation; finding H10 email-verification half closed (only `EmailStr` tightening remains); OR-6 (real SMTP provider) still open — flows run in provider-agnostic simulated mode until credentials are set; login is not yet gated on verification (backward-compatible). PH1.4b complete (2026-07-20): HTTP response security headers centralized in `backend/security/headers.py` and applied via a single pure-ASGI `SecurityHeadersMiddleware` — HSTS (HTTPS/production only), a strict nonce-capable CSP (`default-src 'none'`, no `unsafe-*`), `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Referrer-Policy`, a locked-down `Permissions-Policy`, `Cross-Origin-Opener-Policy`/`Cross-Origin-Resource-Policy` (COEP opt-in), and the deprecated `X-XSS-Protection` neutralized; every value environment-overridable; 35 hermetic tests; "no security headers" gap closed. PH1.9 Secrets & Supply Chain complete (2026-07-22): configuration centralized in `backend/security/secrets.py` (authoritative `SECRET_REGISTRY` + boot-time fail-closed `validate_config`, run before the Mongo client; value-free logging), weak compose defaults removed (`JWT_SECRET` placeholder + hard-coded n8n password now required env vars), `requirements.txt` fully exact-pinned with 7 in-pin CVE patches, CI supply-chain workflow added (`pip-audit`/`pip check`/`npm audit`/`gitleaks`), committed `.env.example` templates (backend generated from the registry) + `.claude/SECRETS.md` rotation/incident runbook; 38 hermetic tests; finding B5 secret-fallback half + "no boot-time validation" gap closed (delivered the roadmap's PH1.8 plus the supply-chain core of PH1.11). PH1.10 Audit Logging & Security Monitoring complete (2026-07-22): centralized security-event logging in `backend/security/audit.py` — a closed event taxonomy across five categories (authentication/identity/session/security/administration) with per-event `category`+`severity` (info/notice/warning/critical, unknown → fail-safe security/warning), a versioned structured record schema (event, category, severity, outcome, actor/session/ip/user_agent/request_id/target, redacted details, timestamp), recursive secret redaction (a token/password/code/state/hash can never reach a sink), a pluggable `AuditSink` interface with a default composite of durable `MongoAuditSink` (`security_audit_logs`) + SIEM-ready `LoggingAuditSink`, and a fail-safe `AuditLogger` (emitting can never break a security flow); the prior scattered `log_auth_event` is now a thin backward-compatible facade over it, and the auth surface (login ±/registration/session created·revoked/logout·logout-all/refresh rotation/token-replay vs. invalid-refresh/invalid-JWT), the CSRF middleware (`csrf_validation_failure`), and the rate limiter (`rate_limit_triggered`) are instrumented; 20 hermetic tests (`backend/tests/test_audit.py`); "no centralized audit log / no structured security event model / limited security visibility" gap closed (took the PH1.10 slot — Admin Hardening & Session Management moves to PH1.10b). PH1.11 Dependency & Vulnerability Scanning complete (2026-07-22): finished in PH1.12/F-3 — `.github/dependabot.yml` (pip/npm/github-actions; docker staged), `requirements-dev.txt` split (M14), triage-SLA in SECRETS.md §7 + TESTING.md, CI audits both requirements files; risk R-14 closed. PH1.12 Security Certification complete (2026-07-22) — **PHASE 1 EXIT GATE PASSED**: F-1 privilege escalation closed (`backend/security/roles.py` — role allowlist + least-privilege assignment, wired into `admin_update_user`), F-2 unhandled ObjectId parsing closed (`backend/security/identifiers.py` — `parse_object_id` → clean 400 at every untrusted id boundary), F-3 supply-chain automation closed (see PH1.11); 48 new hermetic tests; security checklist executed; re-score Authentication & Authorization 2.0→9.0 and API & Transport Security 3.0→8.5 (both clear the ≥8.0 gate); `docs/security/PH1_CERTIFICATION.md` published; §17 Security row signed off. **Phase 1 (Production Security Hardening) is CERTIFIED COMPLETE; overall production deployment remains NO-GO pending PH2 (Infrastructure & DevOps) and PH3 (Quality Assurance).**
 
 Date: 2026-07-17
 
@@ -107,22 +107,29 @@ Verified in code on branch `sprint-r3-frontend-realtime`:
 
 Scoring: each category graded 0–10 against its authoritative document. Weighted composite.
 
-| Category | Score | Basis |
-|---|---|---|
-| Application functionality | 8.5 | Feature-complete MVP, deep backend test coverage |
-| Authentication & authorization | 2.0 | Two active backdoors; good fundamentals underneath |
-| API & transport security | 3.0 | CORS wildcard, insecure cookies, no rate limiting, no security headers |
-| Secrets & configuration | 6.0 | Good repo hygiene; weak compose fallbacks; no boot-time validation |
-| Packaging & deployability | 1.0 | Docker broken, no Dockerfiles |
-| CI/CD | 0.0 | Does not exist |
-| Testing | 5.0 | Strong backend suite (341), but 6 failures, non-hermetic, zero frontend tests |
-| Observability | 3.5 | Health endpoint only; no structured logging, metrics, or error tracking |
-| Data integrity | 5.5 | Mock data in admin analytics violates ADR-021 |
-| Documentation accuracy | 5.0 | Comprehensive but describes the wrong backend stack |
+Two columns: the 2026-07-17 baseline, and the post-PH1 re-score (2026-07-22).
+Categories in PH1 scope moved; Phase 2 / Phase 3 categories are unchanged and
+remain the launch blockers.
 
-## **Overall Production Readiness Score: 4.2 / 10**
+| Category | Baseline | Post-PH1 | Basis (post-PH1) |
+|---|---|---|---|
+| Application functionality | 8.5 | 8.5 | Feature-complete MVP, deep backend test coverage (unchanged) |
+| Authentication & authorization | 2.0 | **9.0** | Backdoors removed; OAuth hardened; password policy; JWT rotation; recovery; F-1 role least-privilege |
+| API & transport security | 3.0 | **8.5** | CORS hardened; Secure cookies + HSTS; CSP/headers; CSRF; rate limiting; F-2 id validation |
+| Secrets & configuration | 6.0 | **8.5** | `secrets.py` fail-closed boot validation; full pinning; F-3 Dependabot + dev/runtime split |
+| Packaging & deployability | 1.0 | 1.0 | **Still no Dockerfiles** — PH2.1–2.3 (blocks launch) |
+| CI/CD | 0.0 | **2.0** | `security-audit` workflow only; no build/test/deploy pipeline — PH2.5–2.7 (blocks launch) |
+| Testing | 5.0 | 5.5 | Backend suite deepened (626 hermetic pass); still non-hermetic legacy tests + zero frontend tests — PH3.1/3.3 |
+| Observability | 3.5 | **7.0** | Centralized audit logging (PH1.10); metrics/error-tracking still pending — PH2.10 |
+| Data integrity | 5.5 | 5.5 | Mock data in admin analytics still present — PH3.2 |
+| Documentation accuracy | 5.0 | 6.5 | Security docs authoritative & synced; deployment-stack mismatch remains — PH3.10 |
+
+## **Overall Production Readiness Score: 4.2 → ~6.4 / 10** (post-PH1, 2026-07-22)
 
 Definition of launchable: **≥ 9.0 composite with no category below 8.0** (see §22).
+PH1 lifted every security category over the 8.0 bar; the composite is now gated by
+Packaging (1.0), CI/CD (2.0), Testing (5.5), and Data integrity (5.5) — all
+**Phase 2 / Phase 3** work.
 
 ## Priority Matrix
 
@@ -306,14 +313,19 @@ Executed once, immediately before public availability:
 
 Sign-off matrix — each row requires named sign-off and date:
 
-| Area | Evidence Required | Gate |
-|---|---|---|
-| Security | PH1.12 certification report; pen-checklist results | Blocks launch |
-| Infrastructure | PH2.12 report; staging soak (7 days, no Sev-1) | Blocks launch |
-| Quality | PH3.12 report; regression protocol run | Blocks launch |
-| Data | Restore drill record; ADR-021 compliance grep | Blocks launch |
-| Documentation | PH3.10 sync report | Blocks launch |
-| Performance | Baseline report vs targets | Advisory at launch; blocks 10k-user milestone |
+| Area | Evidence Required | Gate | Sign-off |
+|---|---|---|---|
+| Security | PH1.12 certification report; pen-checklist results | Blocks launch | ✅ **CERTIFIED — Principal Release & Security Engineer, 2026-07-22** (`docs/security/PH1_CERTIFICATION.md`; authn 9.0 / API sec 8.5; F-1/F-2/F-3 closed) |
+| Infrastructure | PH2.12 report; staging soak (7 days, no Sev-1) | Blocks launch | ⛔ Pending PH2 |
+| Quality | PH3.12 report; regression protocol run | Blocks launch | ⛔ Pending PH3 |
+| Data | Restore drill record; ADR-021 compliance grep | Blocks launch | ⛔ Pending PH2.8/PH3.2 |
+| Documentation | PH3.10 sync report | Blocks launch | ⛔ Pending PH3.10 |
+| Performance | Baseline report vs targets | Advisory at launch; blocks 10k-user milestone | ⛔ Pending PH3.7 |
+
+> **Phase 1 (Security) is CERTIFIED COMPLETE (2026-07-22).** The remaining rows
+> are Phase 2 / Phase 3 gates; the overall launch decision stays **NO-GO** until
+> all blocking rows are signed off and the composite readiness score reaches ≥ 9.0
+> with no category < 8.0 (§22).
 
 ---
 

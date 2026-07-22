@@ -245,6 +245,22 @@ class RateLimiter:
         # Keep the trip history alive past the block so the next trip can escalate.
         memory = max(policy.window_seconds, policy.max_block_seconds)
         await self._store.set_block(key, until, trips, expires_epoch=until + memory)
+        # Audit the lockout (PH1.10). This is the single choke point where a
+        # policy is actually tripped — inline (login/register/refresh/password)
+        # and middleware paths both land here — so one hook covers every limiter
+        # without per-caller duplication. The identity is stored verbatim (it may
+        # embed an email for ip:account policies — expected in an audit record);
+        # audit.log_event is fail-safe, so a logging error can never break the
+        # throttle. Imported lazily to avoid a hard import-time dependency.
+        try:
+            from security import audit
+            await audit.log_event(
+                audit.RATE_LIMIT_TRIGGERED, target=key,
+                metadata={"policy": policy.name, "scope": policy.scope,
+                          "trips": trips, "retry_after": until - now},
+            )
+        except Exception:  # pragma: no cover - defensive; audit is best-effort
+            pass
         return RateLimitResult(False, policy.limit, 0, until - now, until)
 
     async def peek(self, policy: RateLimitPolicy, identity: str) -> RateLimitResult:

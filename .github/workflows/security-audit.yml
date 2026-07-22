@@ -37,11 +37,18 @@ jobs:
           python-version: "3.11"
       - name: Install pip-audit
         run: python -m pip install --upgrade pip pip-audit==2.7.3
-      - name: Audit pinned requirements for known vulnerabilities
+      - name: Audit pinned runtime requirements for known vulnerabilities
         # Fails the build on any advisory. Add --ignore-vuln GHSA-xxxx only with a
         # documented justification in SECRETS.md (Dependency Update Policy).
         run: pip-audit --strict --requirement backend/requirements.txt
-      - name: Verify dependency graph is internally consistent
+      - name: Audit pinned dev/CI requirements for known vulnerabilities
+        # Dev tooling (pytest/black/flake8/mypy/isort) is not shipped to prod
+        # (PH1.11 finding M14), but a CVE in it still affects the CI runner.
+        run: pip-audit --strict --requirement backend/requirements-dev.txt
+      - name: Verify the RUNTIME dependency graph is internally consistent
+        # Installs the runtime set ONLY. This doubles as proof the M14 split is
+        # complete: if a runtime package needed a dev-only dependency, pip check
+        # would report the missing requirement here.
         run: |
           python -m pip install --requirement backend/requirements.txt
           python -m pip check

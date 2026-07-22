@@ -1,0 +1,39 @@
+# ==============================================================================
+# StockAssist AI — Development & CI-only dependencies (PH1.11 finding M14)
+#
+# These tools (test runner, formatter, linters, type checker) run in local dev
+# and CI ONLY. They must NEVER be installed into the production runtime image —
+# a smaller runtime is a smaller attack surface, and dev tooling has no business
+# on a server (PH2.1 builds the runtime image from requirements.txt alone).
+#
+# Install for development / CI:
+#     pip install -r requirements-dev.txt   # pulls requirements.txt too
+#
+# The pins below are exact and were split out of requirements.txt; each package
+# listed here is (per `pip show ... Required-by`) depended on ONLY by the dev
+# tools, so removing them from the runtime set does not change production.
+# Keep pins in sync with the audit policy in .claude/SECRETS.md.
+# ==============================================================================
+-r requirements.txt
+
+# Test runner
+pytest==9.0.3
+iniconfig==2.3.0        # pytest dep
+pluggy==1.6.0           # pytest dep
+
+# Formatter
+black==26.5.1
+pathspec==1.1.1         # black / mypy dep
+pytokens==0.4.1         # black dep
+platformdirs==4.9.6     # black dep
+
+# Linters
+flake8==7.3.0
+mccabe==0.7.0           # flake8 dep
+pycodestyle==2.14.0     # flake8 dep
+pyflakes==3.4.0         # flake8 dep
+isort==8.0.1
+
+# Type checker
+mypy==2.1.0
+mypy_extensions==1.1.0  # black / mypy dep

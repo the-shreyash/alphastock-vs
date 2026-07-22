@@ -173,6 +173,10 @@ Authorization in StockAssist AI is **coarse-grained and role-based today**, not 
 
 A small number of routes add a third, ad-hoc check for `super_admin` specifically (e.g. `admin_delete_user`) rather than a general permission system — this is the concrete gap described in §8.
 
+3. **`security.roles.validate_role_assignment`** (PH1.12 / F-1) — establishes *what role a staff member may write to another account*. `require_admin` guards who may reach the admin surface; this guards **privilege elevation through it**. Before PH1.12, `PUT /api/admin/users/{id}` accepted `role` as an unchecked passthrough, so any `admin` could promote any account — including themselves — to `admin`/`super_admin`. The helper now (a) allowlists the value against `ASSIGNABLE_ROLES` (unknown → `400`) and (b) permits the admin-tier roles (`admin`, `super_admin`) **only** for a `super_admin` actor (`403` otherwise). It is the single place a role write is authorized; `backend/security/roles.py`.
+
+**Malformed-identifier handling** (PH1.12 / F-2): every untrusted id (path/query/body) is parsed through `security.identifiers.parse_object_id`, which returns a clean `400` instead of the previous uncaught `bson.InvalidId` → `500`. Trusted ids (a verified JWT `sub`, an `_id` read back from Mongo) stay raw. `backend/security/identifiers.py`.
+
 **Resource-level authorization** (a user may only see their own portfolio/trades/watchlist) is enforced implicitly by scoping every query to `user["_id"]` inside each router — there is no central resource-ownership check layer. This is adequate for REST today; it is explicitly **not yet true for Socket.IO** (§9, §29), which is why PH1.9 exists.
 
 ---
@@ -186,12 +190,12 @@ Roles, as stored on `users.role` and checked throughout `server.py`:
 | `user` | Default on registration/OAuth signup | Own portfolio, trades, watchlist, AI features (free tier limits) |
 | `pro` / `premium` | Subscription upgrade (`admin_grant_plan` or payment flow) | Unlimited AI, portfolio review, paper trading, backtesting |
 | `elite` | Subscription upgrade | 24/7 AI monitoring, real-time trade alerts, broker automation |
-| `admin` | Manually assigned (no self-service path) | Full `/api/admin/*` surface except `super_admin`-gated mutations |
-| `super_admin` | Manually assigned | Everything `admin` has, plus destructive operations (user deletion) |
+| `admin` | Assignable **only by a `super_admin`** (PH1.12 / F-1); no self-service path | Full `/api/admin/*` surface except `super_admin`-gated mutations |
+| `super_admin` | Assignable **only by a `super_admin`** (PH1.12 / F-1) | Everything `admin` has, plus destructive operations (user deletion) |
 
 `Guest` (SECURITY.md's unauthenticated tier) exists implicitly as "no session" — there is no `role="guest"` value stored anywhere; unauthenticated requests simply never pass `get_current_user`.
 
-There is no formal role hierarchy object in code (no `ROLE_HIERARCHY` map) — every check is an explicit tuple membership test (`role in (...)`). This is simple and auditable today; it will not scale past a handful of roles without becoming error-prone (tracked as a future-work item, §35).
+The **assignable-role allowlist** and the **least-privilege rule on elevation** now live in one place — `backend/security/roles.py` (`ASSIGNABLE_ROLES`, `ADMIN_TIER_ROLES`, `validate_role_assignment`) — rather than scattered `role in (...)` tuples at the write sites (PH1.12 / F-1). The read-side checks (`require_admin`, ad-hoc `super_admin` gates) remain explicit tuple tests; a full `ROLE_HIERARCHY` / fine-grained permission system is still future work (§35).
 
 ---
 
@@ -724,6 +728,34 @@ Logout now revokes the current session's refresh-token family server-side (PH1.6
 
 ---
 
+# 31b. Security Audit Logging & Monitoring (PH1.10)
+
+**Module:** `backend/security/audit.py`. **Collection:** `security_audit_logs`. This is the one place a security-relevant event is shaped, redacted, and emitted. Before PH1.10, audit writes were scattered across three ad-hoc writers with three record shapes: `log_auth_event` (auth/OAuth/recovery → `security_audit_logs`), `log_admin_action` (admin → `admin_audit_logs`), and the broker engine's `_audit` (broker → `audit_logs`). PH1.10 centralizes the *security-event* path; the prior `log_auth_event` is now a thin backward-compatible facade delegating to this module (its historical record fields are a strict subset of the new schema, so existing queries, indexes, and tests are unaffected). Admin- and broker-action logs are domain audit trails and remain where they are — a future sprint may route them through the same sink.
+
+**Why centralize.** Three writers meant three independent "which fields are safe to log" judgements (one accidental token write is a breach), no shared taxonomy (an investigation is cross-collection archaeology), and no shared severity axis to alert on. One module fixes all three and gives a future SIEM a single, stable contract to read.
+
+**Event taxonomy (closed set).** Every event is one of the named constants in `audit.py`, each mapped to a `category` and default `severity`. An unrecognized event string still records but is classified `SECURITY`/`WARNING` (fail-safe — an unknown security signal is never silently trivialized).
+
+| Category | Events | Default severity |
+|---|---|---|
+| `authentication` | `login_success`, `login_failure`, `logout`, `logout_all` | INFO / WARNING / INFO / NOTICE |
+| `identity` | `registration`, `email_verification_{requested,success,failure}`, `password_change_{success,failure}`, `password_reset_{requested,success,failure}`, `oauth_login_{success,failure}` | INFO / NOTICE / WARNING |
+| `session` | `session_created`, `session_revoked`, `session_expired`, `refresh_rotation`, `token_replay_detected` | INFO / NOTICE / **CRITICAL** (replay) |
+| `security` | `rate_limit_triggered`, `csrf_validation_failure`, `invalid_jwt`, `invalid_refresh`, `invalid_password`, `permission_denied`, `suspicious_activity` | WARNING / **CRITICAL** (suspicious) |
+| `administration` | `admin_login`, `user_role_changed`, `account_disabled`, `account_enabled` | NOTICE |
+
+**Record schema (versioned, `schema_version=1`).** `event`, `category`, `severity`, `outcome`, `email`, `user_id`, `session_id`, `reason`, `ip`, `user_agent`, `request_id`, `target`, `details` (redacted metadata), `timestamp`. `ip` honors the first `X-Forwarded-For` hop (matching `rate_limit.client_ip`); `request_id` reads `X-Request-ID` — the correlation key that joins an audit record to its access log. Indexes: `timestamp`, `event`, `email`, `category`, `severity`, `user_id`, `session_id`.
+
+**Never log a secret.** `_redact` walks the metadata recursively and blanks any value whose key matches a sensitive marker (`password`, `token`, `secret`, `authorization`, `code`, `state`, `csrf`, `hash`, `api_key`, `cookie`, `signature`, …) → `[REDACTED]`. This is defense-in-depth on top of careful call sites: even if an authorization code, OAuth state, refresh token, or password hash is passed by mistake, it can never reach storage (asserted by `test_audit.py`). Depth is bounded so a cyclic/pathological payload degrades instead of spinning.
+
+**Pluggable storage.** An `AuditSink` interface abstracts *where* records go. The configured default is a `CompositeAuditSink` of (1) `MongoAuditSink` — durable, queryable `security_audit_logs`, and (2) `LoggingAuditSink` — one JSON line per event at a severity-mapped log level, the seam a Fluent Bit / Vector / CloudWatch agent tails into a SIEM. Each sink is isolated: a Mongo outage still leaves the structured log line. Swapping backends (syslog, Kafka, a dedicated audit service) is a sink change, not a caller change. The DB handle is resolved lazily via a zero-arg provider (`audit.configure(lambda: db)` at import), the same discipline as `RateLimitMiddleware`.
+
+**Fail safe.** Audit logging is observability, never a gate. Every emit path is wrapped (`AuditLogger.record`) so a storage error degrades to a logged warning and the calling security flow proceeds untouched — losing an audit record must never lock a user out or 500 a request.
+
+**Instrumentation points.** Endpoints in `server.py` (login ±, register, logout/logout-all, refresh rotation, replay detection, invalid/expired-vs-tampered JWT distinction, the recovery flows via the facade) and the security middleware (`csrf.py` → `csrf_validation_failure`; `rate_limit.py` `_trip` → `rate_limit_triggered`, the single choke point covering inline and middleware limiters). Ordinary token *expiry* is deliberately **not** audited (it is routine and would drown the log); a structurally invalid / bad-signature token **is** (`invalid_jwt`).
+
+---
+
 # 32. Future Production Hardening Plan
 
 This section is the authoritative forward-looking security sequence; PRODUCTION_ROADMAP.md owns sprint-level acceptance criteria and PRODUCTION_HARDENING.md owns program-level strategy — this section is what ties them to the architecture described above.
@@ -736,7 +768,8 @@ This section is the authoritative forward-looking security sequence; PRODUCTION_
 | PH1.7 CSRF & Rate Limiting | ✅ Done — §18 rewritten (signed double-submit CSRF, `security/csrf.py`); §21 rewritten (centralized limiter, `security/rate_limit.py`, login-lockout folded in); §26 layout + §27 pipeline updated |
 | PH1.8 Secrets & Env Hardening | ✅ Done (as the "PH1.9 — Secrets & Supply Chain" sprint) — §23, §24 rewritten for `security/secrets.py` + boot-time `validate_config`; §26 layout + tests updated; SECRETS.md added |
 | PH1.9 WebSocket Security | (next) New §"Real-Time Authorization Architecture"; §4 trust-boundary diagram gains a Socket.IO lane |
-| PH1.10 Admin & Sessions | §9 session-listing moves to "current"; ADR-028 MFA design referenced from §14 |
+| PH1.10 Audit Logging & Monitoring | ✅ Done — new §31b (centralized `security/audit.py`: taxonomy, versioned schema, secret redaction, pluggable sinks, fail-safe); §33 rule 4 + Implementation Status updated; `security_audit_logs` indexes extended |
+| PH1.10b Admin & Sessions | §9 session-listing moves to "current"; ADR-028 MFA design referenced from §14 (unscheduled follow-on) |
 | PH1.11 Dependency Scanning | 🟡 Partial — §25 updated with CI scan tooling + full pinning (PH1.9); Dependabot/split/triage still pending |
 | PH1.12 Security Certification | This document is the primary evidence artifact reviewed against the pen-test checklist |
 | Unscheduled: Password reset flow | §17 — recommended to be folded into PH1.5 |
@@ -753,7 +786,7 @@ In addition to CODING_STANDARDS.md and PRODUCTION_HARDENING.md §19 (Engineering
 1. No new authentication, session, cookie, or CORS logic is written outside `backend/security/`. If a route needs cookie or origin behavior, it imports from `security.cookies` / `security.cors` — it does not call `response.set_cookie` or configure `CORSMiddleware` itself.
 2. Every new endpoint declares its auth dependency explicitly (`Depends(get_current_user)` or `Depends(require_admin)`) — there is no "implicitly public" route; public routes are public by the *absence* of a dependency, which must be a deliberate, reviewed choice.
 3. Every new security module ships with a docstring explaining the *why*, matching the style of `cookies.py`/`cors.py` — future engineers should be able to read the module and understand the threat it defends against without external context.
-4. Every OAuth/auth outcome that can fail must call `log_auth_event` with a specific, machine-readable `reason` before returning an error — vague or missing failure reasons defeat the audit trail's purpose.
+4. Every security-relevant outcome (auth success/failure, session lifecycle, CSRF/rate-limit/JWT rejection, admin action) is recorded through `security.audit` — via the `log_auth_event` facade or `audit.log_event` directly — with an event from the closed taxonomy (§31b) and, on failures, a specific machine-readable `reason`. Never build an ad-hoc audit write or pass a raw secret in `metadata`/`detail` (the redactor is a backstop, not a licence). Vague or missing failure reasons defeat the audit trail's purpose.
 5. No security-relevant environment variable ships without a documented default policy (fail-closed vs. dev-convenience) — see §24; PH1.8 will make this mechanically enforced, but the discipline starts now.
 
 ---
@@ -784,7 +817,7 @@ Beyond PH1 (post-certification, informed by SECURITY.md's "Future" markers and t
 
 # Architecture Summary
 
-StockAssist AI's security architecture, as of PH1.9 completion, is **production-hardened across the transport, session-integrity, abuse-prevention, identity-lifecycle, and configuration layers**: cookies and CORS are centrally owned (§10, §19); OAuth is fail-closed with real cryptographic verification (§13); JWTs rotate with reuse detection and revocation (§12); a signed, session-bound CSRF token layer guards cookie-authenticated mutations (§18); centralized, progressive rate limiting protects against brute force and endpoint flooding (§21); the identity lifecycle is recoverable — single-use, expiring, enumeration-safe email verification and password reset/change, each forcing a full sign-out on credential rotation (§16–§17); and configuration is now centralized and validated at boot — `security/secrets.py` fails the process closed on a missing/weak critical secret (§23–§24), with the dependency set fully pinned and continuously audited in CI (§25). The remaining thin spots are authorization-layer (binary rather than fine-grained roles, §8; no Socket.IO connection authorization) and the deferred framework-locked CVEs (SECRETS.md §8). PH1.9 (Real-Time)–PH1.12 close these in a defined order; this document keeps that sequence coherent instead of ad hoc.
+StockAssist AI's security architecture, as of PH1.9 completion, is **production-hardened across the transport, session-integrity, abuse-prevention, identity-lifecycle, and configuration layers**: cookies and CORS are centrally owned (§10, §19); OAuth is fail-closed with real cryptographic verification (§13); JWTs rotate with reuse detection and revocation (§12); a signed, session-bound CSRF token layer guards cookie-authenticated mutations (§18); centralized, progressive rate limiting protects against brute force and endpoint flooding (§21); the identity lifecycle is recoverable — single-use, expiring, enumeration-safe email verification and password reset/change, each forcing a full sign-out on credential rotation (§16–§17); configuration is now centralized and validated at boot — `security/secrets.py` fails the process closed on a missing/weak critical secret (§23–§24), with the dependency set fully pinned and continuously audited in CI (§25); and security-event observability is centralized — `security/audit.py` gives every security-relevant event one taxonomy, one redacted schema, and one pluggable, SIEM-ready sink, so an incident is investigable and a secret can never reach a log (§31b, PH1.10). The remaining thin spots are authorization-layer (binary rather than fine-grained roles, §8; no Socket.IO connection authorization) and the deferred framework-locked CVEs (SECRETS.md §8). PH1.9 (Real-Time)–PH1.12 close these in a defined order; this document keeps that sequence coherent instead of ad hoc.
 
 ---
 
@@ -804,8 +837,9 @@ StockAssist AI's security architecture, as of PH1.9 completion, is **production-
 | CSRF token layer | ✅ Complete | §18, PH1.7 |
 | Rate limiting | ✅ Complete | §21, PH1.7 |
 | Secrets/env validation | ✅ Complete | §23–§24, PH1.9 (`security/secrets.py`, boot-time `validate_config`) |
+| Security audit logging & monitoring | ✅ Complete | §31b, PH1.10 (`security/audit.py`: taxonomy, redaction, pluggable sinks, fail-safe) |
 | WebSocket security | ❌ Not started | §32, PH1.9 (Real-Time — next) |
-| Admin/session management | ❌ Not started | §9, PH1.10 |
+| Admin/session management | ❌ Not started | §9, PH1.10b |
 | Dependency scanning | 🟡 Partial | §25, PH1.9 (CI pip-audit/npm audit/gitleaks + full pinning); PH1.11 for Dependabot/split |
 | Security certification | ❌ Not started | §34, PH1.12 |
 | Fine-grained permissions | ❌ Not started, unscheduled | §8 |

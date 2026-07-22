@@ -285,6 +285,17 @@ class CSRFMiddleware:
 
         request = Request(scope)
         if requires_csrf(request, self.exempt_paths) and not validate(request):
+            # Audit the rejection (PH1.10). Fail-safe: security.audit never raises,
+            # so a logging hiccup can never turn a clean 403 into a 500. Imported
+            # lazily to keep this module free of a hard audit dependency at import.
+            try:
+                from security import audit
+                await audit.log_event(
+                    audit.CSRF_VALIDATION_FAILURE, request=request,
+                    metadata={"path": request.url.path, "method": request.method},
+                )
+            except Exception:  # pragma: no cover - defensive; audit is best-effort
+                pass
             response = JSONResponse(
                 status_code=403,
                 content={"detail": "CSRF token missing or invalid", "code": "CSRF_FAILED"},

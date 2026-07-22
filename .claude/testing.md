@@ -495,6 +495,28 @@ OWASP Top 10
 
 ---
 
+# Dependency Vulnerability Triage (PH1.11)
+
+Supply-chain scanning is continuous: the `security-audit` GitHub Actions
+workflow runs `pip-audit --strict` (runtime + dev requirements), `npm audit`,
+`pip check`, and `gitleaks` on every push/PR and weekly; Dependabot
+(`.github/dependabot.yml`) opens weekly update PRs for pip, npm, and
+github-actions. Every advisory is triaged against this SLA (time from surfaced
+to merged fix or recorded acceptance in SECRETS.md §8):
+
+| Severity | SLA | Merge gate |
+|----------|-----|------------|
+| Critical | Immediate | **Blocks merge and release** — never ship a known critical |
+| High | 7 days | Accepted-risk entry in SECRETS.md §8 if not fixed in time |
+| Medium | 30 days | SECRETS.md §8 backlog |
+| Low | 90 days | SECRETS.md §8 backlog |
+
+Authoritative copy of the policy: SECRETS.md §7 (Dependency & supply-chain
+policy). Dev/CI tooling lives in `requirements-dev.txt` and is never installed
+into the production runtime image.
+
+---
+
 # Accessibility Testing
 
 Verify

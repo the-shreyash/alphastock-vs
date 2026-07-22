@@ -134,22 +134,53 @@ downtime; restart the app after updating the store so the new value is read.
 
 ## 7. Dependency & supply-chain policy
 
-- **Pinning.** `backend/requirements.txt` is **fully exact-pinned** (`==`). No
+- **Pinning.** `backend/requirements.txt` (runtime) and
+  `backend/requirements-dev.txt` (dev/CI) are **fully exact-pinned** (`==`). No
   floating lower bounds — reproducible builds and a stable audit surface.
   Frontend uses a committed lockfile.
+- **Runtime vs. dev split (PH1.11 / M14).** `requirements.txt` contains only
+  what the server imports at runtime. Developer/CI-only tooling — `pytest`,
+  `black`, `flake8`, `isort`, `mypy` and their exclusive transitive deps — lives
+  in `requirements-dev.txt`, which begins with `-r requirements.txt`. Rules:
+  - Install for dev/CI: `pip install -r requirements-dev.txt`.
+  - Install for the production image: `pip install -r requirements.txt` **only**
+    (PH2.1's Dockerfile installs the runtime set — a smaller runtime is a smaller
+    attack surface; dev tooling never ships).
+  - A package belongs in `requirements-dev.txt` iff, per `pip show <pkg>`, it is
+    `Required-by` *only* dev tools. If a runtime package later needs it, move it
+    back — CI's `pip install -r requirements.txt && pip check` fails otherwise.
 - **Auditing.** The `security-audit` GitHub Actions workflow runs on every
   push/PR and weekly:
-  - `pip-audit --strict` against the pinned backend requirements,
-  - `pip check` for graph consistency,
+  - `pip-audit --strict` against **both** pinned requirements files,
+  - `pip check` on the **runtime-only** install (also proves the M14 split),
   - `npm audit --audit-level=high` for the frontend,
   - `gitleaks` history scan + a guard that no `.env` is ever tracked.
   Run the backend checks locally with `python scripts/audit_dependencies.py`.
+- **Automated updates (Dependabot).** `.github/dependabot.yml` opens weekly
+  (Monday 06:00 UTC) update PRs for `pip` (`/backend`), `npm` (`/frontend`), and
+  `github-actions`. The `docker` ecosystem is staged (commented) and activates
+  with PH2.1/PH2.2 when the Dockerfiles land. Non-security minor/patch bumps are
+  grouped into one PR per ecosystem; **security** updates always arrive as their
+  own PRs. Every PR must pass the full CI suite before merge.
+- **Triage SLA (by advisory severity).** From when an advisory is surfaced (by
+  `pip-audit`/`npm audit`/Dependabot) to a merged fix or a recorded acceptance:
+
+  | Severity | SLA | Action if unfixable in time |
+  |----------|-----|-----------------------------|
+  | Critical | Immediate — **blocks merge/release** | Patch, pin around, or remove the dependency; no exceptions to shipping a known-critical to prod |
+  | High | 7 days | Record an accepted-risk entry in §8 with justification + revisit date |
+  | Medium | 30 days | §8 backlog entry |
+  | Low | 90 days | §8 backlog entry |
+
+  The same table is mirrored in `.claude/TESTING.md` (QA gate) and referenced by
+  `.github/dependabot.yml`.
 - **Updating.** Bump one package (or a coherent group) at a time; run the test
   suite; commit with the advisory id in the message. To temporarily accept an
   unfixable advisory, add `--ignore-vuln <ID>` in the workflow **with a
   justification recorded in §8**.
 - **New dependencies.** Justify in the PR (why, maintenance health, transitive
-  weight). Prefer the standard library. Every add must keep `pip check` clean.
+  weight). Prefer the standard library. Every add must keep `pip check` clean and
+  land in the correct file (runtime vs. dev).
 
 ---
 

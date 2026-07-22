@@ -1,5 +1,135 @@
 # StockAssist AI — Production Readiness Report
 
+> **⚠️ LIVING DOCUMENT.** The current status is the **PH1.12 update** immediately
+> below (2026-07-22). The original **Sprint 12 baseline audit** (2026-07-17,
+> verdict *NOT READY*) is preserved unchanged from the divider marked
+> *"Sprint 12 Baseline Audit"* onward, as the historical record that seeded the
+> Production Hardening program. Do not delete it.
+
+---
+
+# PH1.12 Update — End of Phase 1 (Security)
+
+**Date:** 2026-07-22 · **Phase:** PH1 — Production Security Hardening ·
+**Companion report:** `docs/security/PH1_CERTIFICATION.md`
+
+## Release Decision
+
+> **Phase 1 (Security): ✅ CERTIFIED COMPLETE.**
+> **Overall production deployment: ⛔ NO-GO (conditional).**
+
+Phase 1 achieved its security objective. Every baseline critical/high **security**
+finding is closed, and the PH1.11 residuals (F-1, F-2, F-3) are fixed this sprint.
+Security re-score: **Authentication & Authorization 9.0**, **API & Transport
+Security 8.5** — both clear the ≥ 8.0 exit gate.
+
+Deployment is **still blocked**, but by **infrastructure and QA**, not security:
+Phase 2 (Docker, CI/CD, production compose, DB/observability/DR) and Phase 3
+(frontend tests, hermetic integration tests) are **not started**. The composite
+readiness score is not yet at the ≥ 9.0 / no-category-< 8.0 launch bar.
+
+## Status of the original Sprint-12 blockers
+
+| # | Baseline blocker (2026-07-17) | Owning sprint | Status |
+|---|-------------------------------|---------------|--------|
+| 1 | Admin auto-login backdoor | PH1.1 | ✅ Removed |
+| 2 | Google OAuth demo-user bypass | PH1.1/PH1.2 | ✅ Removed & hardened |
+| 3 | CORS wildcard with credentials | PH1.4 | ✅ Fixed (`security/cors.py`) |
+| 4 | Auth cookies not `Secure` | PH1.3 | ✅ Fixed (forced in prod) |
+| 5 | Docker packaging broken | **PH2.1–2.3** | ⛔ **Open** — Dockerfiles/prod compose not yet written |
+| 6 | No CI/CD | **PH2.5–2.7** | 🟡 Partial — `security-audit.yml` exists; no build/test/deploy pipeline |
+| 7 | Mock data in admin analytics | **PH3.2** | ⛔ Open |
+| 8 | Backend test failures / non-hermetic | **PH3.1** | 🟡 1 pre-existing engine test + legacy live-server tests remain |
+| 9 | No frontend tests | **PH3.3** | ⛔ Open |
+| 10 | Password policy + email verification | PH1.5/PH1.5b | ✅ Done (`EmailStr` tightening pending) |
+| 11 | JWT lifetimes / rotation | PH1.6 | ✅ Done |
+| — | Rate limiting | PH1.7 | ✅ Done |
+| — | Dev tooling in runtime requirements | PH1.11 | ✅ Fixed (`requirements-dev.txt`) |
+
+**Remaining release blockers are all Phase 2 / Phase 3** (items 5, 6, 7, 9).
+
+## Final Architecture (security surface)
+
+All cross-cutting security concerns are centralized in one audited package,
+`backend/security/`, each module the single place its concern is enforced:
+
+`cookies` · `cors` · `headers` · `passwords` · `recovery` · `jwt` · `sessions` ·
+`csrf` · `rate_limit` · `secrets` · `audit` · **`roles` (F-1)** ·
+**`identifiers` (F-2)**. Boot-time `secrets.validate_config()` fails closed
+before the Mongo client or any router is constructed. `server.py` wires these in;
+no security posture is set anywhere else. Authoritative design:
+`SECURITY_ARCHITECTURE.md`.
+
+## Operational Prerequisites (before any deployment — mostly Phase 2)
+
+1. **Secrets provisioned** (Phase-aware, from `SECRET_REGISTRY`): `JWT_SECRET`
+   (≥ required strength), `MONGO_URL`, `DB_NAME`, `APP_ENV=production`,
+   `CORS_ALLOWED_ORIGINS`, and any enabled provider keys. Boot fails closed if a
+   critical secret is missing/weak.
+2. **`APP_ENV=production`** — forces `Secure` cookies and enables HSTS.
+3. **TLS termination** in front of the app (HSTS assumes HTTPS).
+4. **Email provider** (SMTP/SendGrid) for recovery flows — currently simulated
+   (OR-6).
+5. **Production Dockerfiles + compose** — *does not exist yet* (PH2.1–2.3).
+6. **CI/CD gates** — build/test/deploy pipeline — *does not exist yet* (PH2.5–2.7).
+7. **Managed MongoDB with backups + Redis** for production scale (PH2.8).
+
+## Deployment Checklist (target — gated on Phase 2)
+
+- [ ] Production Dockerfiles built (no `--reload`, no bind mounts, non-root) — **PH2.1/2.2**
+- [ ] Production compose / orchestration separate from dev — **PH2.3**
+- [ ] All secrets set in the deployment environment; `validate_config()` passes at boot
+- [ ] `APP_ENV=production`; verify `Secure` cookies + HSTS on a live response
+- [ ] TLS certificate valid; HTTP→HTTPS redirect in place
+- [ ] `CORS_ALLOWED_ORIGINS` set to the real frontend origin(s); no `*`
+- [ ] CI green: full backend suite, `pip-audit` (both requirements), `npm audit`, gitleaks
+- [ ] DB migrations/indexes applied; managed backups enabled — **PH2.8**
+- [ ] Health check (`/api/monitor/health`) wired to the orchestrator
+- [ ] Smoke test: register → verify → login → refresh → logout; one admin action audited
+- [ ] Rollback plan rehearsed (below)
+
+## Rollback Checklist
+
+- [ ] Identify last-known-good image tag / release
+- [ ] Redeploy previous image (orchestrator rollback) — **PH2.7 CD provides one-command rollback**
+- [ ] If a schema/index change shipped, apply its documented reverse step
+- [ ] Rotate `JWT_SECRET` **only if** the incident involves token/secret exposure
+      (this invalidates all sessions — intended for that case)
+- [ ] Confirm health check green + smoke test on the rolled-back version
+- [ ] Record incident + root cause; open a fix-forward ticket
+
+## Backup Strategy (target — implemented in PH2.8, not yet in place)
+
+- **MongoDB:** managed automated daily snapshots + point-in-time recovery;
+  retention ≥ 30 days; periodic restore drills. Application data (users, trades,
+  audit logs) is the system of record.
+- **Audit logs** (`security_audit_logs`): retained per policy; append-only in
+  practice; never contain secrets (recursive redaction at the sink).
+- **Secrets:** stored in the platform secret manager, **not** in backups; rotate
+  per `SECRETS.md §6`.
+- **Config templates:** `.env.example` files are generated from the registry and
+  version-controlled (no real values).
+
+## Recovery Strategy (target — PH2.11 DR)
+
+- **RPO/RTO** to be set with the managed-DB tier in PH2.8/2.11; interim target
+  RPO ≤ 24 h (daily snapshot), RTO ≤ 4 h (restore + redeploy).
+- **Restore drill:** restore latest snapshot to a staging DB, boot the app
+  against it, run the smoke test — must be exercised before launch.
+- **Credential-leak recovery:** `SECRETS.md §9` runbook (contain → assess → purge
+  history → rotate). `JWT_SECRET` rotation invalidates all outstanding tokens by
+  design.
+
+## Recommendation
+
+Close **Phase 1**. Begin **Phase 2 — Production Infrastructure & DevOps** at
+PH2.1 (Backend Production Dockerfile). Re-evaluate the composite readiness score
+at the end of Phase 2 and again at PH3.12 (final production certification).
+
+---
+
+# Sprint 12 Baseline Audit (historical — 2026-07-17)
+
 Sprint: 12 — Production Readiness
 Date: 2026-07-17
 Branch: `sprint-r3-frontend-realtime`

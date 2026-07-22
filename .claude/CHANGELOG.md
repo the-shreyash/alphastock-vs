@@ -5,6 +5,188 @@ This file records documentation-system versions and, from v1.0 launch onward, pr
 
 ---
 
+# Sprint PH1.12 — Security Certification (PHASE 1 EXIT GATE) — 2026-07-22
+
+**Production Hardening PH1.12 complete — and with it, PH1.11. This is the final
+Phase 1 sprint: the three PH1.11 verification residuals (F-1, F-2, F-3) are
+fixed, the security verification checklist is executed, the security categories
+are re-scored over the ≥ 8.0 gate, and Phase 1 (Production Security Hardening) is
+formally CERTIFIED COMPLETE. Overall production deployment remains NO-GO — blocked
+now by infrastructure (PH2) and QA (PH3), not by security.**
+
+Added
+
+- `backend/security/roles.py` (**F-1** — privilege escalation) — the single
+  source of truth for the role taxonomy and who may grant each role.
+  `ASSIGNABLE_ROLES` allowlists every legitimate `users.role` value;
+  `validate_role_assignment(new_role, actor_role)` rejects unknown roles (400)
+  and permits the admin-tier roles (`admin`, `super_admin`) **only** for a
+  `super_admin` actor (403 otherwise). Closes the escalation path where
+  `PUT /api/admin/users/{id}` accepted `role` as an unchecked passthrough field
+  (any admin could promote anyone — including themselves — to admin/super_admin).
+- `backend/security/identifiers.py` (**F-2** — unhandled id parsing) —
+  `parse_object_id(value, resource)`, the single boundary where an untrusted
+  identifier becomes a `bson.ObjectId`. Malformed input returns a clean **400**
+  ("Invalid `<resource>` id", never echoing the value) instead of the previous
+  uncaught `InvalidId` → HTTP **500**. Also fixes the surprising `ObjectId(None)`
+  → *new random id* behavior by rejecting non-strings.
+- `backend/tests/test_roles.py` + `backend/tests/test_identifiers.py` — **48
+  hermetic tests**: role allowlist/least-privilege unit coverage plus end-to-end
+  regression proving an `admin` cannot escalate a user or self-promote (403,
+  stored role unchanged), a `super_admin` can, plan roles stay grantable by any
+  admin, and a malformed user id returns 400 (not 500); id parsing across
+  valid/passthrough/malformed/non-string/no-echo cases.
+- `.github/dependabot.yml` (**F-3**) — weekly dependency-update PRs for `pip`
+  (`/backend`), `npm` (`/frontend`), and `github-actions`; `docker` staged
+  (commented) for PH2.1/2.2. Non-security minor/patch bumps grouped per
+  ecosystem; security updates arrive as their own PRs.
+- `backend/requirements-dev.txt` (**F-3 / finding M14**) — dev/CI tooling
+  (`pytest`, `black`, `flake8`, `isort`, `mypy` + their exclusively-dev transitive
+  deps, each verified dev-only via `pip show … Required-by`) split out of the
+  runtime set; begins with `-r requirements.txt`. The production image now ships
+  no dev tooling.
+- `docs/security/PH1_CERTIFICATION.md` — the PH1 Security Certification Report:
+  sprint inventory, F-1/F-2/F-3 detail, controls-verification matrix, OWASP Top 10
+  posture, test summary, re-score, known limitations, and the signed certification
+  decision.
+
+Changed
+
+- `backend/server.py` — wired in `parse_object_id` at every user-facing id
+  boundary (admin user/ticket/feature-flag/announcement editors; trade
+  update/exit/coaching/live-tip, trade-review, notification mark-read, paper
+  close) and `validate_role_assignment` in `admin_update_user`. Trusted ids
+  (verified JWT `sub`, `_id` read back from Mongo) intentionally stay raw.
+- `.github/workflows/security-audit.yml` — audits **both** requirements files and
+  runs `pip check` on the **runtime-only** install (which also proves the M14
+  split is complete).
+- `backend/requirements.txt` — dev tooling removed (moved to `requirements-dev.txt`).
+- `backend/security/__init__.py` — documents the new `roles` and `identifiers`
+  tenants.
+- `.claude/SECRETS.md §7` — runtime/dev split, Dependabot cadence, and the
+  severity triage SLA (critical blocks release · high 7d · medium 30d · low 90d).
+- `.claude/TESTING.md` — new "Dependency Vulnerability Triage" section mirroring
+  the SLA.
+- `.claude/PRODUCTION_HARDENING.md` — §17 Security row **signed off**; readiness
+  re-score (composite 4.2 → ~6.4; authn 9.0, API sec 8.5, secrets 8.5,
+  observability 7.0).
+- `.claude/PRODUCTION_ROADMAP.md` — PH1.11 and PH1.12 marked COMPLETE.
+- `PRODUCTION_READINESS_REPORT.md` — PH1.12 update prepended (release decision,
+  blocker status, final architecture, operational prerequisites, deployment/
+  rollback/backup/recovery checklists); Sprint-12 baseline preserved below.
+- `.claude/TASK.md` — PH1.11/PH1.12 marked complete; **Phase 1 marked COMPLETE**;
+  next phase set to PH2.1.
+
+Security posture / re-score
+
+- No open **critical or high** security findings. F-1 (high) / F-2 (medium) /
+  F-3 (medium) closed.
+- **Authentication & Authorization 2.0 → 9.0**; **API & Transport Security
+  3.0 → 8.5** — both clear the PH1.12 ≥ 8.0 exit gate.
+- Verification checklist: no debug mode, no auth backdoors, no hardcoded/test
+  secrets; cookies (HttpOnly always, Secure forced in prod) / CORS (no
+  wildcard-with-credentials) / HSTS+CSP headers / CSRF / rate limiting / audit
+  logging / fail-closed boot config all confirmed.
+
+Tests
+
+- Hermetic backend suite: **626 passed, 1 failed** — the one failure
+  (`test_trading_engine::test_run_cycle_trails_and_books_targets`) is a
+  pre-existing, documented engine-math test unrelated to this sprint (PH3.1).
+- Legacy `requests`-based integration files (`test_backend.py`, `test_phase*.py`)
+  require a live dev server; their failures/errors in a full run are environmental
+  (ConnectionError), not regressions. Hermetic migration is PH3.1.
+
+Decision
+
+> **Phase 1 (Production Security Hardening): CERTIFIED COMPLETE.** Overall
+> production deployment: **NO-GO** pending Phase 2 (Infrastructure & DevOps) and
+> Phase 3 (Quality Assurance). Recommend transition to **PH2.1 — Backend
+> Production Dockerfile**.
+
+Deferred within PH1 (non-blocking, tracked): PH1.9 Real-Time/WebSocket Security
+(R-15) and PH1.10b Admin Hardening & Session Management.
+
+---
+
+# Sprint PH1.10 — Audit Logging & Security Monitoring — 2026-07-22
+
+**Production Hardening PH1.10 complete. Security-event observability is now
+centralized: every security-relevant event flows through one module with one
+taxonomy, one redacted schema, and one pluggable, SIEM-ready sink. Secrets can
+never reach an audit log, and audit logging can never break a security flow.
+Zero frontend, business-logic, JWT, or OAuth behavior change.**
+
+Before this sprint there was no centralized audit log: security writes were
+scattered across three ad-hoc writers with three record shapes (`log_auth_event`
+→ `security_audit_logs`, `log_admin_action` → `admin_audit_logs`, broker `_audit`
+→ `audit_logs`), each making its own "which fields are safe to log" judgement,
+with no shared severity axis and no structured event model — an incident was a
+cross-collection archaeology project.
+
+Added
+
+- `backend/security/audit.py` — the single source of truth for security-event
+  logging. A **closed event taxonomy** (authentication / identity / session /
+  security / administration) mapping every event to a `category` + default
+  `severity` (info / notice / warning / critical); an unknown event fails safe to
+  `security`/`warning`. A **versioned structured schema** (`schema_version=1`):
+  event, category, severity, outcome, email, user_id, session_id, reason, ip,
+  user_agent, request_id, target, redacted `details`, timestamp. **Recursive
+  secret redaction** blanks any sensitive-keyed value (password, token, secret,
+  authorization, code, state, csrf, hash, api_key, cookie, signature, …) before
+  storage — defense-in-depth over careful call sites; depth-bounded against
+  cyclic payloads. A **pluggable `AuditSink`** interface with a default composite
+  of `MongoAuditSink` (durable `security_audit_logs`) + `LoggingAuditSink` (one
+  JSON line/event — the SIEM/log-shipper seam); each sink isolated so one outage
+  never starves the other. A **fail-safe `AuditLogger`**: emitting can never
+  raise into the caller. Lazy DB provider (`audit.configure(lambda: db)`) so the
+  live handle and the test `FakeDB` are both honored.
+- `backend/tests/test_audit.py` — 20 hermetic tests: taxonomy classification,
+  full-schema records, redaction (flat / nested / listed / depth-bounded),
+  Mongo + logging + composite sinks, fail-safe emission, and live-app
+  integration (login ±, registration, logout→session-revocation, invalid-JWT,
+  refresh rotation, token-replay→CRITICAL, rate-limit trigger), plus a
+  backward-compatibility test pinning the legacy `log_auth_event` record shape.
+
+Changed
+
+- `backend/server.py` — `log_auth_event` is now a thin backward-compatible
+  facade over `security.audit` (identical signature; historical record fields are
+  a strict subset of the new schema, so every existing caller, query, index, and
+  test is unaffected). New fail-safe, control-flow-neutral audit hooks added to
+  the auth surface: `login_success` / `login_failure`, `registration`,
+  `session_created` (in `_issue_session`, covering login/register/OAuth),
+  `logout` + `session_revoked`, `logout_all`, `refresh_rotation`,
+  `token_replay_detected` vs. `invalid_refresh`, and `invalid_jwt` (only for
+  genuinely tampered tokens — ordinary expiry is left unaudited to avoid noise).
+  Startup extends `security_audit_logs` indexes (`category`, `severity`,
+  `user_id`, `session_id`).
+- `backend/security/csrf.py` — the middleware audits `csrf_validation_failure`
+  before the 403 (lazy import, fail-safe).
+- `backend/security/rate_limit.py` — `_trip` audits `rate_limit_triggered` at the
+  single choke point covering inline and middleware limiters (lazy import,
+  fail-safe).
+
+Documentation
+
+- `SECURITY_ARCHITECTURE.md` — new **§31b** (audit taxonomy, schema, redaction,
+  sinks, fail-safe, instrumentation points); §32 plan, §33 rule 4, Architecture
+  Summary, and Implementation Status updated.
+- `SECURITY.md` — Audit Logging section expanded with the centralized model;
+  Monitoring section gains operational alerting + retention guidance.
+- `PRODUCTION_HARDENING.md`, `PRODUCTION_ROADMAP.md`, `TASK.md` — PH1.10 marked
+  complete with the audit-event matrix.
+
+Tests
+
+- Full hermetic backend suite: **578 passed** (1 pre-existing, unrelated
+  `test_trading_engine` failure deselected). All security suites (auth, OAuth,
+  CSRF, rate-limit, JWT/sessions, recovery, cookies, headers) green — no
+  regression from the facade migration.
+
+---
+
 # Sprint PH1.9 — Secrets & Supply Chain Security — 2026-07-22
 
 **Production Hardening PH1.9 complete. Configuration is now centralized and

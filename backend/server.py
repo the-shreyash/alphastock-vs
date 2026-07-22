@@ -77,6 +77,14 @@ from security import rate_limit as ratelimit
 # failures). Policy validation for new passwords lives on the UserCreate model.
 from security.passwords import hash_password, verify_password
 
+# Centralized ObjectId parsing (PH1.12 / F-2) and role-assignment authorization
+# (PH1.12 / F-1). `parse_object_id` turns an untrusted identifier into a clean
+# 400 instead of an accidental 500; `validate_role_assignment` enforces the role
+# allowlist and least privilege on elevation (only super_admin grants admin-tier
+# roles). See SECURITY_ARCHITECTURE.md and backend/security/{identifiers,roles}.py.
+from security.identifiers import parse_object_id
+from security.roles import validate_role_assignment
+
 from models import (
     UserCreate, UserLogin, UserResponse, UserSettingsUpdate,
     VerifyEmailRequest, ForgotPasswordRequest, ResetPasswordRequest, ChangePasswordRequest,
@@ -98,6 +106,16 @@ from market_data import get_stock_meta, search_stocks, STOCK_UNIVERSE
 mongo_url = os.environ['MONGO_URL']
 client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ['DB_NAME']]
+
+# Centralized security audit logging (PH1.10). Wire the process-wide default
+# audit logger to durable storage here — at import time, not in the startup
+# event — with a LAZY db provider (`lambda: db`) so it resolves the live handle
+# on every emit. That matters two ways: (1) security middleware/modules can emit
+# audit events without threading a DB handle, and (2) the test suite's `FakeDB`
+# monkeypatch of `server.db` is honored with no special wiring. See
+# security/audit.py and SECURITY_ARCHITECTURE.md §31.
+from security import audit
+audit.configure(lambda: db)
 
 
 # ============ LIVE MARKET DATA HELPERS ============
@@ -261,6 +279,11 @@ async def _issue_session(user_id: str, email: str, request: Request,
     # Plant a session-bound CSRF token (PH1.7). Non-HttpOnly so a same-origin
     # script can echo it in X-CSRF-Token on cookie-authenticated mutations.
     set_csrf_cookie(response, session_id)
+    # Audit the new refresh-token family (PH1.10). One session_created per login /
+    # register / OAuth — the single place all three converge, so the event is
+    # captured once with no per-endpoint duplication.
+    await audit.log_event(audit.SESSION_CREATED, request=request, email=email,
+                          user_id=user_id, session_id=session_id)
     return access
 
 
@@ -275,8 +298,14 @@ async def get_current_user(request: Request) -> dict:
     try:
         payload = jwt_service.decode_token(token, expected_type="access")
     except jwt_service.TokenExpired:
+        # Ordinary expiry is a routine, expected condition (the client simply
+        # refreshes) — NOT audited, to avoid drowning the security log in benign
+        # noise on every idle poll.
         raise HTTPException(status_code=401, detail="Token expired")
     except jwt_service.TokenError:
+        # A structurally invalid / bad-signature token was actually presented:
+        # the signature of tampering or a forged credential — worth auditing.
+        await audit.log_event(audit.INVALID_JWT, request=request)
         raise HTTPException(status_code=401, detail="Invalid token")
 
     user = await db.users.find_one({"_id": ObjectId(payload["sub"])})
@@ -922,6 +951,7 @@ async def register(data: UserCreate, response: Response, request: Request,
     # delays or fails sign-up (best-effort; see _send_recovery_email).
     background_tasks.add_task(_dispatch_verification_email, user_id, email, data.name)
     access = await _issue_session(user_id, email, request, response)
+    await log_auth_event(audit.REGISTRATION, request, email=email, user_id=user_id)
     return {"id": user_id, "name": data.name, "email": email, "role": "user",
             "capital": 100000, "email_verified": False, "token": access}
 
@@ -949,12 +979,19 @@ async def login(data: UserLogin, response: Response, request: Request):
     password_ok = verify_password(data.password, user.get("password_hash") if user else None)
     if not user or not password_ok:
         await limiter.record_failure(ratelimit.LOGIN, identifier)
+        # Audit the failed attempt. The 401 is deliberately identical whether the
+        # email is unknown or the password is wrong; the audit record keeps the
+        # same discretion (email as typed, generic reason) so it never becomes an
+        # enumeration oracle for anyone reading the log.
+        await log_auth_event(audit.LOGIN_FAILURE, request, email=email,
+                             reason="invalid_credentials")
         raise HTTPException(status_code=401, detail="Invalid email or password")
 
     # Success: clear the failure budget so prior typos don't linger.
     await limiter.reset(ratelimit.LOGIN, identifier)
     user_id = str(user["_id"])
     access = await _issue_session(user_id, email, request, response)
+    await log_auth_event(audit.LOGIN_SUCCESS, request, email=email, user_id=user_id)
     return {
         "id": user_id, "name": user["name"], "email": email,
         "role": user.get("role", "user"), "capital": user.get("capital", 100000),
@@ -977,6 +1014,11 @@ async def logout(request: Request, response: Response):
         try:
             payload = jwt_service.decode_token(token, expected_type="refresh")
             await SessionStore(db).revoke(payload["sid"], reason=REASON_LOGOUT)
+            await log_auth_event(audit.SESSION_REVOKED, request,
+                                 user_id=payload.get("sub"), session_id=payload.get("sid"),
+                                 reason=REASON_LOGOUT)
+            await log_auth_event(audit.LOGOUT, request,
+                                 user_id=payload.get("sub"), session_id=payload.get("sid"))
         except jwt_service.TokenError:
             pass
     clear_auth_cookies(response)
@@ -992,6 +1034,8 @@ async def logout_all(request: Request, response: Response, user: dict = Depends(
     revoked = await SessionStore(db).revoke_all_for_user(user["_id"], reason="logout_all")
     clear_auth_cookies(response)
     clear_csrf_cookie(response)
+    await log_auth_event(audit.LOGOUT_ALL, request, email=user.get("email"),
+                         user_id=user["_id"], detail={"sessions_revoked": revoked})
     return {"message": "Signed out of all devices", "sessions_revoked": revoked}
 
 @auth_router.post("/refresh")
@@ -1002,6 +1046,8 @@ async def refresh_token(request: Request, response: Response):
     try:
         payload = jwt_service.decode_token(token, expected_type="refresh")
     except jwt_service.TokenError:
+        await audit.log_event(audit.INVALID_REFRESH, request=request,
+                              reason="undecodable_token")
         raise HTTPException(status_code=401, detail="Invalid refresh token")
 
     # Token-abuse gate (PH1.7): 20 refreshes / min per session. Keyed by the
@@ -1026,6 +1072,18 @@ async def refresh_token(request: Request, response: Response):
     new_jti = jwt_service.new_jti()
     result = await SessionStore(db).rotate(payload["sid"], payload["jti"], new_jti)
     if not result.ok:
+        # Distinguish token-theft (replaying an already-rotated token against a
+        # still-live family) from a merely stale/revoked/expired token: the
+        # former is a CRITICAL security signal (the whole family was just revoked
+        # in defense), the latter routine. The 401 stays generic either way.
+        if result.outcome == REUSE_DETECTED:
+            await log_auth_event(audit.TOKEN_REPLAY_DETECTED, request,
+                                 user_id=payload.get("sub"), session_id=payload.get("sid"),
+                                 reason="refresh_reuse_detected")
+        else:
+            await log_auth_event(audit.INVALID_REFRESH, request,
+                                 user_id=payload.get("sub"), session_id=payload.get("sid"),
+                                 reason=result.outcome)
         raise HTTPException(status_code=401, detail="Invalid refresh token")
 
     user_id = str(user["_id"])
@@ -1036,6 +1094,8 @@ async def refresh_token(request: Request, response: Response):
     set_auth_cookies(response, access, refresh)
     # Refresh the session-bound CSRF token alongside (same sid → same binding).
     set_csrf_cookie(response, payload["sid"])
+    await log_auth_event(audit.REFRESH_ROTATION, request, user_id=user_id,
+                         session_id=payload["sid"])
     return {"message": "Token refreshed"}
 
 
@@ -2013,8 +2073,9 @@ async def update_trade(trade_id: str, request: Request, background_tasks: Backgr
     and in order; the stop may move ANYWHERE below target 1 (long) — including
     above entry — so profits can be locked in (breakeven+ stops)."""
     from services import trading_engine
+    trade_oid = parse_object_id(trade_id, "trade")
     body = await request.json()
-    trade = await db.trades.find_one({"_id": ObjectId(trade_id), "user_id": user["_id"]})
+    trade = await db.trades.find_one({"_id": trade_oid, "user_id": user["_id"]})
     if not trade:
         raise HTTPException(status_code=404, detail="Trade not found")
 
@@ -2087,8 +2148,8 @@ async def update_trade(trade_id: str, request: Request, background_tasks: Backgr
     if "notes" in body:
         update["notes"] = body["notes"]
 
-    await db.trades.update_one({"_id": ObjectId(trade_id)}, {"$set": update})
-    updated = await db.trades.find_one({"_id": ObjectId(trade_id)})
+    await db.trades.update_one({"_id": trade_oid}, {"$set": update})
+    updated = await db.trades.find_one({"_id": trade_oid})
     updated["_id"] = str(updated["_id"])
 
     # If this update just closed the trade, announce the close and generate
@@ -2112,7 +2173,8 @@ async def exit_trade(trade_id: str, data: TradeExitRequest, background_tasks: Ba
     Broker exits place a LIVE market order through the Broker Engine first;
     if the broker rejects it, nothing is recorded (no simulation)."""
     from services import trading_engine
-    trade = await db.trades.find_one({"_id": ObjectId(trade_id), "user_id": user["_id"]})
+    trade_oid = parse_object_id(trade_id, "trade")
+    trade = await db.trades.find_one({"_id": trade_oid, "user_id": user["_id"]})
     if not trade:
         raise HTTPException(status_code=404, detail="Trade not found")
     if trade.get("status") != "OPEN":
@@ -2160,9 +2222,9 @@ async def exit_trade(trade_id: str, data: TradeExitRequest, background_tasks: Ba
         + (f" via {trade['broker']} (order {broker_order_id})" if broker_order_id else ""),
         exit_price))
     update["events"] = events
-    await db.trades.update_one({"_id": ObjectId(trade_id)}, {"$set": update})
+    await db.trades.update_one({"_id": trade_oid}, {"$set": update})
 
-    updated = await db.trades.find_one({"_id": ObjectId(trade_id)})
+    updated = await db.trades.find_one({"_id": trade_oid})
     updated["_id"] = str(updated["_id"])
     if updated.get("status") != "OPEN":
         from services.trade_review import generate_close_intelligence
@@ -2191,7 +2253,8 @@ async def coaching_summary(user: dict = Depends(get_current_user)):
 @trades_router.get("/{trade_id}/coaching")
 async def get_trade_coaching(trade_id: str, user: dict = Depends(get_current_user)):
     """Get (or generate) AI coaching for a closed trade."""
-    trade = await db.trades.find_one({"_id": ObjectId(trade_id), "user_id": user["_id"]})
+    trade_oid = parse_object_id(trade_id, "trade")
+    trade = await db.trades.find_one({"_id": trade_oid, "user_id": user["_id"]})
     if not trade:
         raise HTTPException(status_code=404, detail="Trade not found")
     if trade.get("status") == "OPEN":
@@ -2213,7 +2276,7 @@ async def get_trade_coaching(trade_id: str, user: dict = Depends(get_current_use
     coaching = await generate_trade_coaching(trade, ai_func=ai_func)
 
     # Cache in DB
-    await db.trades.update_one({"_id": ObjectId(trade_id)}, {"$set": {"coaching": coaching}})
+    await db.trades.update_one({"_id": trade_oid}, {"$set": {"coaching": coaching}})
     from services.activity_logger import log_activity
     log_activity(f"AI coaching generated for {trade['symbol']} trade", "monitor", "done")
     return coaching
@@ -2225,7 +2288,8 @@ async def get_trade_live_tip(trade_id: str, user: dict = Depends(get_current_use
     Lightweight and generated on demand — the frontend polls this every 5 min.
     Not cached (the tip depends on the live price and should stay fresh).
     """
-    trade = await db.trades.find_one({"_id": ObjectId(trade_id), "user_id": user["_id"]})
+    trade_oid = parse_object_id(trade_id, "trade")
+    trade = await db.trades.find_one({"_id": trade_oid, "user_id": user["_id"]})
     if not trade:
         raise HTTPException(status_code=404, detail="Trade not found")
     if trade.get("status") != "OPEN":
@@ -2372,7 +2436,8 @@ async def mark_all_read(user: dict = Depends(get_current_user)):
 
 @notifications_router.put("/{notif_id}/read")
 async def mark_read(notif_id: str, user: dict = Depends(get_current_user)):
-    await db.notifications.update_one({"_id": ObjectId(notif_id), "user_id": user["_id"]}, {"$set": {"read": True}})
+    notif_oid = parse_object_id(notif_id, "notification")
+    await db.notifications.update_one({"_id": notif_oid, "user_id": user["_id"]}, {"$set": {"read": True}})
     return {"message": "Marked as read"}
 
 
@@ -2531,7 +2596,8 @@ async def ai_trade_review(data: TradeReviewRequest, user: dict = Depends(get_cur
 
     trade = None
     if data.trade_id:
-        trade = await db.trades.find_one({"_id": ObjectId(data.trade_id), "user_id": user["_id"]})
+        trade_oid = parse_object_id(data.trade_id, "trade")
+        trade = await db.trades.find_one({"_id": trade_oid, "user_id": user["_id"]})
         if not trade:
             raise HTTPException(status_code=404, detail="Trade not found")
         if trade.get("status") == "OPEN":
@@ -2559,7 +2625,7 @@ async def ai_trade_review(data: TradeReviewRequest, user: dict = Depends(get_cur
                   "symbol": trade.get("symbol")}
         if data.trade_id:
             async with run.step():
-                await db.trades.update_one({"_id": ObjectId(data.trade_id)}, {"$set": {"ai_review": review}})
+                await db.trades.update_one({"_id": trade_oid}, {"$set": {"ai_review": review}})
         log_activity(f"Trade review ready for {trade.get('symbol')}", "monitor", "done")
         await run.complete()
         return {"trade_id": data.trade_id, "cached": False, **review}
@@ -3151,25 +3217,23 @@ async def _consume_oauth_state(state: str) -> Optional[dict]:
 
 async def log_auth_event(event: str, request: Request, *, email: Optional[str] = None,
                          user_id: Optional[str] = None, reason: Optional[str] = None,
-                         detail: Optional[dict] = None) -> None:
-    """Append an immutable authentication security-audit record (mirrors
-    log_admin_action). Records the actor context (ip, user-agent) and outcome,
-    but NEVER tokens, authorization codes, or state values (SECURITY.md logging
-    rule). Best-effort: a logging failure must never break the auth flow."""
-    try:
-        ip = request.client.host if request.client else None
-        await db.security_audit_logs.insert_one({
-            "event": event,
-            "email": email,
-            "user_id": user_id,
-            "reason": reason,
-            "ip": ip,
-            "user_agent": request.headers.get("user-agent"),
-            "details": detail or {},
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        })
-    except Exception as e:
-        logger.warning(f"auth audit log failed for {event}: {e}")
+                         detail: Optional[dict] = None, session_id: Optional[str] = None,
+                         target: Optional[str] = None, outcome: Optional[str] = None) -> None:
+    """Append an immutable security-audit record.
+
+    Thin, backward-compatible facade over the centralized ``security.audit``
+    engine (PH1.10): the taxonomy, structured schema, secret redaction, storage,
+    and fail-safe emission all live there now — this keeps the historical call
+    signature (and the ``event`` / ``email`` / ``user_id`` / ``reason`` /
+    ``ip`` / ``user_agent`` / ``details`` / ``timestamp`` record fields) so every
+    existing call site and query is unchanged, while the redaction guard and the
+    structured/SIEM-ready log sink apply automatically. ``detail`` maps to the
+    record's redacted ``metadata``. Best-effort by construction — a logging
+    failure can never break the calling flow."""
+    await audit.log_event(
+        event, request=request, email=email, user_id=user_id, reason=reason,
+        session_id=session_id, target=target, outcome=outcome, metadata=detail,
+    )
 
 
 async def _exchange_google_code(code: str, redirect_uri: str,
@@ -4576,6 +4640,7 @@ async def paper_trade(data: PaperTradeCreate, user: dict = Depends(get_current_u
 @paper_router.post("/close/{trade_id}")
 async def paper_close(trade_id: str, user: dict = Depends(get_current_user)):
     from services.paper_trade import close_paper_trade
+    parse_object_id(trade_id, "trade")  # reject malformed ids with a clean 400
     try:
         return await close_paper_trade(trade_id, user["_id"], db)
     except ValueError as e:
@@ -4731,7 +4796,8 @@ async def admin_list_users(
 
 @admin_router.get("/users/{user_id}")
 async def admin_get_user(user_id: str, user: dict = Depends(require_admin)):
-    target = await db.users.find_one({"_id": ObjectId(user_id)}, {"password_hash": 0})
+    oid = parse_object_id(user_id, "user")
+    target = await db.users.find_one({"_id": oid}, {"password_hash": 0})
     if not target:
         raise HTTPException(status_code=404, detail="User not found")
     target["_id"] = str(target["_id"])
@@ -4743,26 +4809,34 @@ async def admin_get_user(user_id: str, user: dict = Depends(require_admin)):
 
 @admin_router.put("/users/{user_id}")
 async def admin_update_user(user_id: str, request: Request, user: dict = Depends(require_admin)):
+    oid = parse_object_id(user_id, "user")
     body = await request.json()
     allowed = {"name", "role", "capital", "risk_level", "max_daily_loss", "max_trades_per_day"}
     update = {k: v for k, v in body.items() if k in allowed}
     if not update:
         raise HTTPException(status_code=400, detail="No valid fields to update")
-    await db.users.update_one({"_id": ObjectId(user_id)}, {"$set": update})
+    # F-1: role is validated against the allowlist, and admin-tier roles
+    # (admin / super_admin) may only be granted by a super_admin. This closes the
+    # privilege-escalation path where `role` was an unchecked passthrough field.
+    if "role" in update:
+        validate_role_assignment(update["role"], user.get("role", ""))
+    await db.users.update_one({"_id": oid}, {"$set": update})
     await log_admin_action(user["_id"], "user.updated", user_id, update)
     return {"success": True}
 
 
 @admin_router.post("/users/{user_id}/block")
 async def admin_block_user(user_id: str, user: dict = Depends(require_admin)):
-    await db.users.update_one({"_id": ObjectId(user_id)}, {"$set": {"blocked": True}})
+    oid = parse_object_id(user_id, "user")
+    await db.users.update_one({"_id": oid}, {"$set": {"blocked": True}})
     await log_admin_action(user["_id"], "user.blocked", user_id)
     return {"success": True}
 
 
 @admin_router.post("/users/{user_id}/unblock")
 async def admin_unblock_user(user_id: str, user: dict = Depends(require_admin)):
-    await db.users.update_one({"_id": ObjectId(user_id)}, {"$set": {"blocked": False}})
+    oid = parse_object_id(user_id, "user")
+    await db.users.update_one({"_id": oid}, {"$set": {"blocked": False}})
     await log_admin_action(user["_id"], "user.unblocked", user_id)
     return {"success": True}
 
@@ -4771,13 +4845,15 @@ async def admin_unblock_user(user_id: str, user: dict = Depends(require_admin)):
 async def admin_delete_user(user_id: str, user: dict = Depends(require_admin)):
     if user.get("role") != "super_admin":
         raise HTTPException(status_code=403, detail="Only super_admin can delete users")
-    await db.users.delete_one({"_id": ObjectId(user_id)})
+    oid = parse_object_id(user_id, "user")
+    await db.users.delete_one({"_id": oid})
     await log_admin_action(user["_id"], "user.deleted", user_id)
     return {"success": True}
 
 
 @admin_router.post("/users/{user_id}/grant-plan")
 async def admin_grant_plan(user_id: str, request: Request, user: dict = Depends(require_admin)):
+    oid = parse_object_id(user_id, "user")
     body = await request.json()
     plan = body.get("plan", "pro")
     duration_days = body.get("duration_days", 30)
@@ -4785,7 +4861,7 @@ async def admin_grant_plan(user_id: str, request: Request, user: dict = Depends(
     if plan not in valid_plans:
         raise HTTPException(status_code=400, detail=f"Invalid plan. Choose from: {', '.join(valid_plans)}")
     expires_at = (datetime.now(timezone.utc) + timedelta(days=duration_days)).isoformat() if plan != "lifetime" else None
-    await db.users.update_one({"_id": ObjectId(user_id)}, {"$set": {
+    await db.users.update_one({"_id": oid}, {"$set": {
         "role": plan,
         "plan_granted_by": user["_id"],
         "plan_granted_at": datetime.now(timezone.utc).isoformat(),
@@ -5058,6 +5134,7 @@ async def admin_create_ticket(request: Request, user: dict = Depends(require_adm
 
 @admin_router.put("/support/tickets/{ticket_id}")
 async def admin_update_ticket(ticket_id: str, request: Request, user: dict = Depends(require_admin)):
+    ticket_oid = parse_object_id(ticket_id, "ticket")
     body = await request.json()
     update = {}
     if "status" in body:
@@ -5068,12 +5145,12 @@ async def admin_update_ticket(ticket_id: str, request: Request, user: dict = Dep
         update["assigned_to"] = body["assigned_to"]
     if "reply" in body:
         await db.support_tickets.update_one(
-            {"_id": ObjectId(ticket_id)},
+            {"_id": ticket_oid},
             {"$push": {"messages": {"from": "admin", "admin_id": user["_id"], "text": body["reply"], "at": datetime.now(timezone.utc).isoformat()}}},
         )
     update["updated_at"] = datetime.now(timezone.utc).isoformat()
     if update:
-        await db.support_tickets.update_one({"_id": ObjectId(ticket_id)}, {"$set": update})
+        await db.support_tickets.update_one({"_id": ticket_oid}, {"$set": update})
     await log_admin_action(user["_id"], "ticket.updated", ticket_id, body)
     return {"success": True}
 
@@ -5108,13 +5185,14 @@ async def admin_create_feature_flag(request: Request, user: dict = Depends(requi
 
 @admin_router.put("/feature-flags/{flag_id}")
 async def admin_update_feature_flag(flag_id: str, request: Request, user: dict = Depends(require_admin)):
+    flag_oid = parse_object_id(flag_id, "feature flag")
     body = await request.json()
     update = {}
     for field in ("enabled", "description", "target_plans", "name"):
         if field in body:
             update[field] = body[field]
     update["updated_at"] = datetime.now(timezone.utc).isoformat()
-    await db.feature_flags.update_one({"_id": ObjectId(flag_id)}, {"$set": update})
+    await db.feature_flags.update_one({"_id": flag_oid}, {"$set": update})
     await log_admin_action(user["_id"], "feature_flag.updated", flag_id, update)
     return {"success": True}
 
@@ -5151,20 +5229,22 @@ async def admin_create_announcement(request: Request, user: dict = Depends(requi
 
 @admin_router.put("/announcements/{ann_id}")
 async def admin_update_announcement(ann_id: str, request: Request, user: dict = Depends(require_admin)):
+    ann_oid = parse_object_id(ann_id, "announcement")
     body = await request.json()
     update = {}
     for field in ("title", "body", "type", "target", "status", "scheduled_at"):
         if field in body:
             update[field] = body[field]
     update["updated_at"] = datetime.now(timezone.utc).isoformat()
-    await db.announcements.update_one({"_id": ObjectId(ann_id)}, {"$set": update})
+    await db.announcements.update_one({"_id": ann_oid}, {"$set": update})
     await log_admin_action(user["_id"], "announcement.updated", ann_id, update)
     return {"success": True}
 
 
 @admin_router.delete("/announcements/{ann_id}")
 async def admin_delete_announcement(ann_id: str, user: dict = Depends(require_admin)):
-    await db.announcements.delete_one({"_id": ObjectId(ann_id)})
+    ann_oid = parse_object_id(ann_id, "announcement")
+    await db.announcements.delete_one({"_id": ann_oid})
     await log_admin_action(user["_id"], "announcement.deleted", ann_id)
     return {"success": True}
 
@@ -5314,10 +5394,17 @@ async def startup():
     await db.admin_audit_logs.create_index("admin_id")
     await db.admin_audit_logs.create_index("action")
 
-    # Security audit log (PH1.2) — immutable OAuth/auth security events
+    # Security audit log (PH1.2, centralized PH1.10) — immutable security events.
+    # The centralized security.audit engine writes a structured superset of the
+    # original record; index the new query axes (category / severity / user_id /
+    # session_id) an incident investigation filters on, alongside the originals.
     await db.security_audit_logs.create_index("timestamp")
     await db.security_audit_logs.create_index("event")
     await db.security_audit_logs.create_index("email")
+    await db.security_audit_logs.create_index("category")
+    await db.security_audit_logs.create_index("severity")
+    await db.security_audit_logs.create_index("user_id")
+    await db.security_audit_logs.create_index("session_id")
 
     # Session store (PH1.6) — one document per refresh-token family. The TTL
     # index reaps sessions at their absolute expiry (Mongo purges docs whose

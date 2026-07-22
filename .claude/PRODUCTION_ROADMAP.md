@@ -279,7 +279,14 @@ Architecture reference: every PH1 sprint implements against **SECURITY_ARCHITECT
 - **Estimated Difficulty:** High. **Estimated Time:** 2 days.
 - **Success Metrics:** Risk R-15 closed; zero cross-user event leakage in tests.
 
-## PH1.10 — Admin Hardening & Session Management
+## PH1.10 — Audit Logging & Security Monitoring
+
+- **Status:** ✅ **COMPLETE (2026-07-22).** Centralized security-event logging in `backend/security/audit.py`: a closed event taxonomy across five categories (authentication / identity / session / security / administration) mapping every event to a `category` + default `severity` (info/notice/warning/critical, unknown → security/warning fail-safe); a versioned structured schema (`schema_version=1`: event, category, severity, outcome, email, user_id, session_id, reason, ip, user_agent, request_id, target, redacted details, timestamp); recursive secret redaction (a token/password/code/state/hash can never reach a sink); a pluggable `AuditSink` interface with a default composite of durable `MongoAuditSink` (`security_audit_logs`) + SIEM-ready `LoggingAuditSink`; and a fail-safe `AuditLogger` (emitting can never break a security flow). The prior `log_auth_event` is now a thin backward-compatible facade over it. Instrumented the auth surface (login ±, registration, session created/revoked, logout/logout-all, refresh rotation, token-replay vs. invalid-refresh, invalid-JWT), the CSRF middleware (`csrf_validation_failure`), and the rate limiter (`rate_limit_triggered` at the single `_trip` choke point). Centralized in `backend/security/audit.py`; 20 hermetic tests in `backend/tests/test_audit.py` (taxonomy, schema, redaction, sinks, fail-safe, live-app integration, backward compatibility). Documented in SECURITY_ARCHITECTURE.md §31b. This sprint took the PH1.10 slot; Admin Hardening & Session Management moves to **PH1.10b** below (as the Secrets sprint shifted PH1.8→PH1.9).
+- **Delivered under the PH1.10 label per the sprint brief** (Audit Logging & Security Monitoring). Objective, scope, and acceptance below are recorded as completed.
+- **Objective:** Centralized audit log; all security-sensitive events captured; foundation for future SIEM integration.
+- **Acceptance Criteria (met):** Login success/failure logged; password reset logged; session revocation logged; rate limit logged; replay detection logged; invalid JWT logged; sensitive values never logged (asserted); regression tests pass.
+
+## PH1.10b — Admin Hardening & Session Management
 
 - **Architecture reference:** SECURITY_ARCHITECTURE.md §9 (Session Architecture — session listing/revocation), §14 (Future MFA Architecture — ADR-028), §8 (Permission System — a fine-grained permission system is a separate, unscheduled future item; do not conflate it with this sprint's admin-policy scope).
 - **Objective:** Admin surface meets SECURITY.md admin requirements; users get session visibility.
@@ -295,14 +302,19 @@ Architecture reference: every PH1 sprint implements against **SECURITY_ARCHITECT
 
 ## PH1.11 — Dependency & Vulnerability Scanning
 
-> **STATUS: 🟡 PARTIAL (2026-07-22)** — the core supply-chain deliverables landed
+> **STATUS: ✅ COMPLETE (2026-07-22)** — the core supply-chain deliverables landed
 > in the PH1.9 sprint: `pip-audit` + `pip check` + `npm audit` + `gitleaks` in a
 > `security-audit` GitHub Actions workflow (push + weekly), full exact-pinning of
 > `backend/requirements.txt`, 7 in-pin CVE patches, and
-> `scripts/audit_dependencies.py` for local runs. **Remaining for this sprint:**
-> Dependabot config (`.github/dependabot.yml`), the `requirements.txt` →
-> `requirements-dev.txt` split (finding M14), and the triage-SLA policy in
-> TESTING.md. Deferred CVEs (starlette/litellm/ecdsa) are tracked in SECRETS.md §8.
+> `scripts/audit_dependencies.py` for local runs. **Finished in PH1.12/F-3:**
+> `.github/dependabot.yml` (weekly PRs for pip `/backend`, npm `/frontend`,
+> github-actions; docker staged for PH2.1/2.2), the `requirements.txt` →
+> `requirements-dev.txt` split (finding M14 — dev tools verified dev-only via
+> `pip show … Required-by`), the triage-SLA policy (critical blocks release · high
+> 7d · medium 30d · low 90d) in SECRETS.md §7 + TESTING.md, and a CI change to
+> audit BOTH requirements files and run `pip check` on the runtime-only install.
+> Deferred CVEs (starlette/litellm/ecdsa) remain tracked in SECRETS.md §8.
+> Risk R-14 closed.
 
 - **Architecture reference:** SECURITY_ARCHITECTURE.md §25 (Dependency Security).
 - **Objective:** Supply chain continuously scanned.
@@ -317,6 +329,19 @@ Architecture reference: every PH1 sprint implements against **SECURITY_ARCHITECT
 - **Success Metrics:** Risk R-14 closed; zero unpatched criticals at any time.
 
 ## PH1.12 — Security Certification
+
+> **STATUS: ✅ COMPLETE (2026-07-22)** — Phase 1 exit gate passed. Implemented the
+> three PH1.11 verification residuals: **F-1** privilege escalation
+> (`backend/security/roles.py` — role allowlist + least-privilege
+> `validate_role_assignment`, wired into `admin_update_user`); **F-2** unhandled
+> ObjectId parsing (`backend/security/identifiers.py` — `parse_object_id` returns
+> a clean 400 at every untrusted id boundary); **F-3** supply-chain automation
+> (see PH1.11). 48 new hermetic tests; security checklist executed (no debug/
+> backdoors/hardcoded secrets; cookies/CORS/headers/CSRF/rate-limit/audit/config-
+> validation confirmed). **Re-score: Authentication & Authorization 9.0, API &
+> Transport Security 8.5** (both ≥ 8.0 gate). Report: `docs/security/PH1_CERTIFICATION.md`;
+> sign-off in PRODUCTION_HARDENING.md §17. **Decision: PH1 security CERTIFIED;
+> overall production deployment NO-GO pending PH2 + PH3.**
 
 - **Architecture reference:** SECURITY_ARCHITECTURE.md §34 (Testing Strategy), and the document as a whole — it is the primary evidence artifact the pen-test checklist is executed against (§32).
 - **Objective:** Independent verification that PH1 achieved its goal; formal sign-off.

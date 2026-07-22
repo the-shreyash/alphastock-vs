@@ -700,6 +700,44 @@ Feature Enabled
 
 Audit logs are immutable.
 
+## Centralized Security Audit (PH1.10)
+
+All security-relevant events flow through one module: `backend/security/audit.py`
+(collection `security_audit_logs`). It is the single place a security event is
+shaped, redacted, and stored — no route, middleware, or service writes an ad-hoc
+security-audit record. The prior `log_auth_event` is now a thin facade over it.
+
+**Closed taxonomy, five categories:** `authentication` (login success/failure,
+logout, logout-all), `identity` (registration, email verification, password
+change/reset, OAuth), `session` (created, revoked, expired, refresh rotation,
+token-replay detection), `security` (rate-limit triggered, CSRF failure, invalid
+JWT/refresh, permission denied, suspicious activity), `administration` (admin
+login, role change, account disable/enable). An unknown event fails safe to
+`security`/`warning`.
+
+**Severity** — `info` (routine success), `notice` (expected but noteworthy, e.g.
+logout-all / password change), `warning` (rejected/failed attempt), `critical`
+(active-threat signal: token replay, suspicious activity). Alerting keys off this
+one field.
+
+**Record schema (v1):** event, category, severity, outcome, email, user_id,
+session_id, reason, ip, user_agent, request_id, target, details (redacted),
+timestamp.
+
+**Never logged:** passwords, tokens, authorization codes, OAuth state, hashes,
+API keys, cookies, signatures — a recursive redactor blanks any sensitive-keyed
+value before storage, on top of careful call sites. Verified by tests.
+
+**Storage is pluggable:** durable MongoDB + a structured JSON log line per event
+(the SIEM / log-shipper seam) today; a different backend is a sink swap, not a
+caller change.
+
+**Fail safe:** audit logging is observability, never a gate — a logging error
+degrades to a warning and never breaks the auth/security flow.
+
+**Retention & monitoring:** see SECURITY_ARCHITECTURE.md §31b and the Monitoring
+section below.
+
 ---
 
 # Error Handling
@@ -941,6 +979,31 @@ Payment Failures
 Security Alerts
 
 Suspicious Admin Activity
+
+## Operating the Security Audit Log (PH1.10)
+
+The `security_audit_logs` stream (and its JSON log-sink mirror) is the data
+source for the monitoring above. Recommended operational posture:
+
+- **Alert on `severity: critical`** immediately — `token_replay_detected` and
+  `suspicious_activity` indicate an active threat (a replayed refresh token means
+  the family was just auto-revoked in defense; investigate the account).
+- **Alert on rate/threshold** for `warning` events: a spike of `login_failure`
+  for one `email`/`ip` (credential stuffing), bursts of `rate_limit_triggered`
+  (abuse), `csrf_validation_failure` or `invalid_jwt` clusters (tampering /
+  broken client).
+- **Correlate by `request_id`** (from `X-Request-ID`) to join an audit record to
+  its access log, and by `session_id`/`user_id` to reconstruct a session's
+  lifecycle end-to-end.
+- **Ship the JSON log sink** (one line per event) to the platform SIEM / log
+  aggregator; it is DB-independent, so alerting survives a Mongo hiccup.
+
+**Retention.** Treat security-audit records as an immutable, append-only trail.
+Guidance: keep hot (queryable) for **≥ 90 days**, archive cold for **≥ 1 year**
+(longer where a compliance regime requires it). There is **no TTL index** on
+`security_audit_logs` (unlike sessions/rate-limits/recovery, which are ephemeral
+by design) — expiry is a deliberate, policy-driven archival job, never automatic
+deletion. Records are never mutated after write.
 
 ---
 

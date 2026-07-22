@@ -33,12 +33,30 @@ identically everywhere they are used. Current tenants:
   user) backed by an authoritative `recovery_tokens` record that enforces
   expiry and atomic single-use (replay protection). The stateful counterpart to
   the recovery endpoints in `server.py`.
+* `security.audit` (PH1.10) — centralized security audit logging & event
+  observability: the closed event taxonomy (authentication / identity / session /
+  security / administration), the structured, versioned record schema, recursive
+  secret redaction (a token can never reach a sink), and a pluggable `AuditSink`
+  interface (durable Mongo + structured/SIEM-ready logging, composed) behind a
+  fail-safe `AuditLogger`. The one place a security-relevant event is shaped,
+  redacted, and emitted — the prior scattered `log_auth_event` now delegates
+  here. Every emit is best-effort: audit logging is observability, never a gate.
 * `security.secrets` (PH1.9) — centralized secret & configuration management:
   the authoritative `SECRET_REGISTRY` of every environment variable (category,
   sensitivity, which environments require it), boot-time `validate_config()`
   that fails closed on missing/weak critical secrets, and value-free reporting
   that never logs a secret. The one place the app's configuration surface is
   defined; drives `backend/.env.example` and `.claude/SECRETS.md`.
+* `security.roles` (PH1.12) — centralized role taxonomy & assignment
+  authorization (finding F-1): the `ASSIGNABLE_ROLES` allowlist and
+  `validate_role_assignment`, which enforces least privilege on elevation
+  (only a `super_admin` may grant the admin-tier roles). The one place a role
+  written to `users.role` is validated.
+* `security.identifiers` (PH1.12) — centralized ObjectId parsing (finding F-2):
+  `parse_object_id`, the one place an untrusted identifier becomes a
+  `bson.ObjectId`. Turns malformed ids into a clean 400 instead of an
+  accidental 500. Use at every trust boundary (path/query/body); trusted ids
+  (a verified JWT `sub`, an `_id` read back from Mongo) stay raw.
 
 Subsequent hardening sprints add their own modules here per PRODUCTION_ROADMAP.md.
 """

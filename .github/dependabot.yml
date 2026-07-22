@@ -1,0 +1,110 @@
+# ==============================================================================
+# StockAssist AI — Dependabot configuration (PH1.11 / R-14)
+#
+# Automated dependency-update PRs across every ecosystem the project consumes.
+# Complements the `security-audit` workflow (pip-audit / npm audit / gitleaks):
+# that job *detects* vulnerable/stale dependencies; Dependabot *opens the PR*
+# that fixes them, which CI then gates.
+#
+# Triage policy (authoritative copy in .claude/SECRETS.md §8 and .claude/TESTING.md):
+#   - security updates            → reviewed within the SLA for their severity
+#                                    (critical: block/patch immediately;
+#                                     high: 7 days; medium: 30 days; low: 90 days)
+#   - grouped non-security updates → reviewed on the weekly cadence below
+#
+# All updates land as PRs against `main` and must pass the full CI suite before
+# merge. Pins stay exact (see backend/requirements*.txt) so every bump is
+# explicit and reviewable.
+# ==============================================================================
+version: 2
+updates:
+  # ── Backend: Python (pip) ──────────────────────────────────────────────────
+  # Watches both the runtime set and the dev/CI set so tooling stays current too.
+  - package-ecosystem: "pip"
+    directory: "/backend"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 10
+    labels:
+      - "dependencies"
+      - "backend"
+    commit-message:
+      prefix: "deps"
+      prefix-development: "deps-dev"
+    groups:
+      # Batch low-risk non-security bumps into one PR to cut review overhead;
+      # security updates always come as their own PRs (Dependabot default).
+      backend-minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
+
+  # ── Frontend: JavaScript (npm) ─────────────────────────────────────────────
+  - package-ecosystem: "npm"
+    directory: "/frontend"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 10
+    labels:
+      - "dependencies"
+      - "frontend"
+    commit-message:
+      prefix: "deps"
+      prefix-development: "deps-dev"
+    groups:
+      frontend-minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
+
+  # ── CI: GitHub Actions ─────────────────────────────────────────────────────
+  # Keeps pinned action versions (actions/checkout, setup-python, gitleaks, …)
+  # patched — a supply-chain surface that is easy to forget.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "ci"
+    commit-message:
+      prefix: "ci"
+
+  # ── Containers: Docker (base images) ───────────────────────────────────────
+  # ACTIVATES with PH2.1 / PH2.2, when backend/Dockerfile and frontend/Dockerfile
+  # land. Uncomment each block once the corresponding Dockerfile exists — until
+  # then Dependabot would error on a missing manifest.
+  #
+  # - package-ecosystem: "docker"
+  #   directory: "/backend"
+  #   schedule:
+  #     interval: "weekly"
+  #     day: "monday"
+  #     time: "06:00"
+  #     timezone: "Etc/UTC"
+  #   labels:
+  #     - "dependencies"
+  #     - "docker"
+  #
+  # - package-ecosystem: "docker"
+  #   directory: "/frontend"
+  #   schedule:
+  #     interval: "weekly"
+  #     day: "monday"
+  #     time: "06:00"
+  #     timezone: "Etc/UTC"
+  #   labels:
+  #     - "dependencies"
+  #     - "docker"

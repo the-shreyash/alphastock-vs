@@ -2015,9 +2015,71 @@ deltas from the roadmap plan: module is `backend/security/secrets.py` (not
 the rotation runbook is a dedicated `SECRETS.md` (not folded into DEPLOYMENT.md).
 See CHANGELOG.md and SECURITY_ARCHITECTURE.md §23/§24.
 
-Next Recommended Sprint: **PH1.9 — Real-Time & WebSocket Security** (roadmap
-slot: Socket.IO connection/room authorization, R-15), awaiting review/approval.
-PH3.1 (Backend Test Suite Repair) may run in parallel.
+PH1.10 — Audit Logging & Security Monitoring is COMPLETE (2026-07-22). Security-event
+observability is now centralized in `backend/security/audit.py`: a **closed event
+taxonomy** across five categories (authentication / identity / session / security /
+administration) mapping every event to a `category` + default `severity`
+(info / notice / warning / critical; an unknown event fails safe to
+security/warning); a **versioned structured schema** (`schema_version=1`: event,
+category, severity, outcome, email, user_id, session_id, reason, ip, user_agent,
+request_id, target, redacted details, timestamp); **recursive secret redaction**
+that blanks any sensitive-keyed value (password/token/secret/authorization/code/
+state/csrf/hash/api_key/cookie/signature) before storage — a secret can never
+reach a sink; a **pluggable `AuditSink`** interface with a default composite of
+durable `MongoAuditSink` (`security_audit_logs`) + SIEM-ready `LoggingAuditSink`;
+and a **fail-safe `AuditLogger`** — emitting can never break a security flow. The
+prior scattered `log_auth_event` is now a thin backward-compatible facade over it
+(historical record fields are a strict subset, so every existing caller/query/
+index/test is unaffected). Instrumented the auth surface (login ± / registration /
+session created·revoked / logout·logout-all / refresh rotation / token-replay vs.
+invalid-refresh / tampered-vs-expired invalid-JWT), the CSRF middleware
+(`csrf_validation_failure`), and the rate limiter (`rate_limit_triggered` at the
+single `_trip` choke point). 20 hermetic tests (`backend/tests/test_audit.py`);
+full backend suite green (578 passed, 1 pre-existing unrelated failure). This took
+the PH1.10 slot per the sprint brief; Admin Hardening & Session Management moves to
+PH1.10b. See CHANGELOG.md and SECURITY_ARCHITECTURE.md §31b.
+
+PH1.11 — Dependency & Vulnerability Scanning is COMPLETE (2026-07-22). The core
+supply-chain deliverables (pip-audit/pip check/npm audit/gitleaks CI, full
+exact-pinning, 7 CVE patches, `scripts/audit_dependencies.py`) landed in PH1.9;
+the PH1.12 sprint finished the remainder: `.github/dependabot.yml` (weekly PRs
+for pip `/backend`, npm `/frontend`, github-actions; docker staged for PH2.1/2.2),
+the `requirements.txt` → `requirements-dev.txt` split (finding M14 — dev tools
+`pytest/black/flake8/isort/mypy` + their exclusively-dev transitive deps, each
+verified dev-only via `pip show … Required-by`, moved out of the runtime set so
+the prod image ships no tooling), the triage-SLA policy (critical blocks release ·
+high 7d · medium 30d · low 90d) in SECRETS.md §7 and TESTING.md, and a CI change
+to audit BOTH requirements files and run `pip check` on the runtime-only install
+(which doubles as proof of the split). See CHANGELOG.md and SECURITY_ARCHITECTURE.md §25.
+
+PH1.12 — Security Certification is COMPLETE (2026-07-22) — the Phase 1 exit gate.
+Implemented the three PH1.11 verification residuals: **F-1** (privilege
+escalation) — new `backend/security/roles.py` centralizes the role allowlist and
+`validate_role_assignment`, wired into `admin_update_user` so a plain `admin` can
+no longer grant admin-tier roles (only `super_admin` can) and unknown roles are
+rejected; **F-2** (unhandled ObjectId parsing → 500s) — new
+`backend/security/identifiers.py` `parse_object_id` is the single boundary that
+turns an untrusted id into a clean 400, applied to every user-facing path/body id
+(admin user/ticket/flag/announcement editors, trade/notification/paper endpoints);
+**F-3** (supply-chain automation) — see PH1.11 above. 48 new hermetic tests
+(`test_roles.py`, `test_identifiers.py`); full hermetic suite 626 passed / 1
+pre-existing unrelated failure. Executed the security verification checklist
+(no debug mode, no backdoors, no hardcoded secrets; cookies/CORS/headers/CSRF/
+rate-limit/audit/config-validation all confirmed) and re-scored: **Authentication
+& Authorization 2.0 → 9.0**, **API & Transport Security 3.0 → 8.5** (both clear
+the ≥ 8.0 gate). Deliverables: `docs/security/PH1_CERTIFICATION.md` (full report),
+PH1.12 update prepended to `PRODUCTION_READINESS_REPORT.md`, sign-off in
+PRODUCTION_HARDENING.md §17. **Decision: Phase 1 security CERTIFIED COMPLETE;
+overall production deployment remains NO-GO pending Phase 2 (infra/Docker/CI-CD)
+and Phase 3 (QA/frontend tests).**
+
+**PHASE 1 (PRODUCTION SECURITY HARDENING) IS COMPLETE.** Next Recommended Phase:
+**PH2 — Production Infrastructure & DevOps**, starting with **PH2.1 (Backend
+Production Dockerfile)**. Deferred-within-PH1 items to schedule in the PH1 tail or
+alongside PH2: PH1.9 Real-Time/WebSocket Security (Socket.IO auth, R-15) and
+PH1.10b Admin Hardening & Session Management. PH3.1 (Backend Test Suite Repair —
+the pre-existing `test_trading_engine::test_run_cycle_trails_and_books_targets`
+failure + legacy live-server test migration) may run in parallel.
 
 Authoritative documents: PRODUCTION_HARDENING.md and PRODUCTION_ROADMAP.md.
 Task tracking below under "Production Hardening Program".
@@ -2026,7 +2088,7 @@ Task tracking below under "Production Hardening Program".
 
 # Production Hardening Program (PH1–PH3)
 
-Status: IN_PROGRESS (PH1.1 + PH1.2 complete 2026-07-17; PH1.3 + PH1.4 complete 2026-07-18; PH1.5 complete 2026-07-19; PH1.4b + PH1.6 complete 2026-07-20; PH1.7 complete 2026-07-21; PH1.5b/Identity Recovery + PH1.9 Secrets & Supply Chain complete 2026-07-22; SI1.1 Repository Audit complete 2026-07-17)
+Status: PH1 COMPLETE (2026-07-22) — PH1.1 + PH1.2 complete 2026-07-17; PH1.3 + PH1.4 complete 2026-07-18; PH1.5 complete 2026-07-19; PH1.4b + PH1.6 complete 2026-07-20; PH1.7 complete 2026-07-21; PH1.5b/Identity Recovery + PH1.9 Secrets & Supply Chain + PH1.10 Audit Logging + PH1.11 Dependency Scanning + PH1.12 Security Certification complete 2026-07-22; SI1.1 Repository Audit complete 2026-07-17. **Phase 1 security certified; transition to PH2 (Infrastructure & DevOps).** Deferred within PH1: PH1.9 Real-Time/WebSocket Security, PH1.10b Admin Hardening.
 
 Priority: Critical — blocks all other work
 
@@ -2046,9 +2108,10 @@ rollback, estimates) live in PRODUCTION_ROADMAP.md. Status tracker:
 - [x] PH1.7 CSRF Protection & Rate Limiting — COMPLETE (2026-07-21) — High
 - [x] PH1.8 Secrets & Environment Hardening (delivered as the "PH1.9 — Secrets & Supply Chain Security" sprint, combined with the supply-chain portion of PH1.11) — COMPLETE (2026-07-22) — High
 - [ ] PH1.9 Real-Time & WebSocket Security — NOT_STARTED — High
-- [ ] PH1.10 Admin Hardening & Session Management — NOT_STARTED — Medium
-- [~] PH1.11 Dependency & Vulnerability Scanning — PARTIAL (2026-07-22) — Medium — *CI auditing (pip-audit/npm audit/gitleaks), full pinning, and 7 CVE patches delivered in PH1.9; remaining: Dependabot config, requirements-dev split (M14), triage-SLA doc*
-- [ ] PH1.12 Security Certification — NOT_STARTED — Critical (gate)
+- [x] PH1.10 Audit Logging & Security Monitoring (centralized `backend/security/audit.py` — taxonomy, redaction, pluggable sinks, fail-safe; took the PH1.10 slot per the sprint brief) — COMPLETE (2026-07-22) — High
+- [ ] PH1.10b Admin Hardening & Session Management — NOT_STARTED — Medium
+- [x] PH1.11 Dependency & Vulnerability Scanning — COMPLETE (2026-07-22) — Medium — *finished in PH1.12/F-3: `.github/dependabot.yml` (pip/npm/github-actions; docker staged), `requirements-dev.txt` split (M14), triage-SLA in SECRETS.md §7 + TESTING.md; CI audits both requirements files. Core (pip-audit/npm audit/gitleaks, pinning, 7 CVE patches) landed in PH1.9.*
+- [x] PH1.12 Security Certification — COMPLETE (2026-07-22) — Critical (gate) — *PH1 security certified; F-1/F-2/F-3 fixed; re-score authn 9.0 / API 8.5. Overall release NO-GO pending PH2+PH3. See docs/security/PH1_CERTIFICATION.md*
 
 ## PH2 — Production Infrastructure & DevOps
 
