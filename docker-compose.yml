@@ -57,15 +57,61 @@ name: stockassist
 # Compose supports YAML anchors, and `x-` prefixed top-level keys are explicitly
 # reserved for extensions and ignored by the schema. Defining the cross-cutting
 # policies once means they cannot drift apart between services.
+# ── Container log capture (stdout/stderr → the Docker daemon) ─────────────────
+# This is the FIRST of the two log paths in this stack, and the one that is
+# always on. Every container writes structured JSON to stdout; the daemon's
+# logging driver decides what happens to it next. The second path — the
+# application writing rotated files itself — is opt-in via LOG_TO_FILES and is
+# documented on the backend service below. See docs/operations/LOGGING.md.
+#
+# CHANGING THE DRIVER: this one anchor is the only place to edit, and it is
+# deliberately the whole integration point for centralized logging. Point it at
+# a platform and no application code changes, because the application only ever
+# writes to stdout:
+#
+#   Loki        driver: loki        (needs the loki-docker-driver plugin)
+#               options: {loki-url: "http://loki:3100/loki/api/v1/push"}
+#   ELK / Fluentd
+#               driver: fluentd
+#               options: {fluentd-address: "localhost:24224", tag: "stockassist.{{.Name}}"}
+#   CloudWatch  driver: awslogs
+#               options: {awslogs-region: "...", awslogs-group: "/stockassist"}
+#   Datadog / Splunk — both ingest via their own agent reading json-file, so
+#               they need NO driver change at all; keep json-file and run the
+#               agent as a sidecar with /var/lib/docker/containers mounted :ro.
+#
+# ONE CAVEAT WORTH KNOWING BEFORE SWITCHING: with any driver other than
+# json-file or journald, `docker logs` stops working — the daemon no longer
+# keeps a local copy. That is fine when the platform is healthy and extremely
+# painful during the incident where the platform is what broke. It is the reason
+# the backend can also write local files, and the reason json-file remains the
+# default here.
 x-logging: &default-logging
   driver: json-file
   options:
     # WHY: the json-file driver is unbounded by default. A service that logs
     # steadily will fill the host disk — and a full disk takes down every
     # container on the box, not just the noisy one. 10 MB × 3 files caps each
-    # service at 30 MB. Ship logs off-host (PH2.9) rather than raising this.
+    # service at 30 MB.
+    #
+    # This cap is the reason `docker logs` is a TRIAGE tool here and not an
+    # archive: at a few hundred requests a second, 30 MB is minutes of history,
+    # not days. Durable retention comes from shipping off-host (change the
+    # driver above) or from the backend's own file sinks (LOG_TO_FILES). Raising
+    # these numbers to get retention is the mistake this comment exists to
+    # prevent — it trades a bounded, well-understood footprint for an unbounded
+    # one and still gives no retention guarantee.
     max-size: "10m"
     max-file: "3"
+    # Non-blocking delivery. The default `mode: blocking` means that if the
+    # logging driver stalls, `write()` to stdout blocks — and for an asyncio
+    # server that stalls the EVENT LOOP: a slow log backend becomes an
+    # application-wide outage on requests that never logged anything. With
+    # `non-blocking` the daemon buffers and, if the buffer fills, drops log
+    # lines instead of the service. Losing telemetry to keep a trading backend
+    # serving is the right trade in every case where it has to be made.
+    mode: "non-blocking"
+    max-buffer-size: "4m"
 
 x-service-defaults: &service-defaults
   # `unless-stopped` rather than `always`: the container comes back after a
@@ -143,6 +189,20 @@ services:
       # replicas, not workers.
       WEB_CONCURRENCY: ${WEB_CONCURRENCY:-1}
 
+      # ── Logging (PH2.6) ─────────────────────────────────────────────────────
+      # LOG_DIR is set HERE and nowhere else because it must agree with the
+      # volume mount below — the two are one decision, and splitting them across
+      # two files is how you get logs written to a path nothing is persisting.
+      #
+      # LOG_TO_FILES is deliberately NOT set here. It is an application choice,
+      # it lives in production.env like every other application setting, and
+      # `environment` OVERRIDES `env_file` — so pinning a default here would
+      # silently ignore an operator who turned file logging on in the file the
+      # documentation told them to edit. Everything else (rotation size,
+      # retention, stream selection) is likewise owned by production.env; see
+      # backend/.env.example for the full list.
+      LOG_DIR: /var/log/stockassist
+
     ports:
       # Host side is configurable, container side is not — the container port is
       # a property of the image (EXPOSE 8000), the host port is a property of
@@ -203,6 +263,27 @@ services:
     #   read_only: true
     #   tmpfs:
     #     - /tmp:size=64m,mode=1777
+
+    volumes:
+      # Durable storage for the backend's own rotated log files (PH2.6).
+      #
+      # MOUNTED UNCONDITIONALLY, but written to only when LOG_TO_FILES is on.
+      # An empty volume costs nothing, and the alternative — asking operators to
+      # add a mount at the same time they enable file logging — guarantees the
+      # case where logs are written to the container's writable layer, look
+      # completely fine in `docker exec`, and vanish on the next deploy. That is
+      # a genuinely bad way to discover a retention policy was never in effect.
+      #
+      # A NAMED VOLUME, not a bind mount: it survives `docker compose down`,
+      # `up` and image upgrades, and it does not inherit host filesystem
+      # ownership semantics — the image pre-creates /var/log/stockassist owned
+      # by uid 10001 (backend/Dockerfile), and Docker copies that ownership onto
+      # a fresh named volume. A bind mount to a host directory would NOT get
+      # that ownership and the non-root process could not write to it.
+      #
+      # To read the logs:  docker compose exec backend ls /var/log/stockassist
+      # To ship them:      run a log agent with this same volume mounted :ro.
+      - backend_logs:/var/log/stockassist
 
     # A named volume for future user uploads is DECLARED below but not mounted.
     # Mounting it here today would create /app/uploads owned by root:root inside
@@ -302,34 +383,55 @@ services:
     image: redis:${REDIS_IMAGE_TAG:-7.2-alpine}
     container_name: stockassist-redis
 
-    # Configuration by flags rather than a mounted redis.conf: the settings that
-    # matter here are few, and every one of them is visible in this file next to
-    # the rationale for it. A conf file would move them somewhere a reader of
-    # the compose stack does not look.
+    # CONFIGURATION MOVED TO A FILE IN PH2.7 — and that reverses a decision this
+    # file used to argue for, so here is why.
+    #
+    # PH2.2 configured Redis with six `--flag value` pairs right here, on the
+    # grounds that every setting was then visible next to the comment explaining
+    # it. That reasoning holds for six settings. Production tuning needs about
+    # thirty — persistence, eviction, lazy-free, pub/sub buffers, slowlog,
+    # latency monitoring, the administrative-command lockdown — and thirty flags
+    # in a YAML list is a wall of strings nobody proofreads. It would also have
+    # to be duplicated verbatim into docker-compose.secrets.yml, and two copies
+    # of a tuning decision are one decision plus a future inconsistency.
+    #
+    # The split that replaces it:
+    #
+    #   docker/redis/redis.conf   every tuning decision, each with its rationale,
+    #                             mounted read-only, shared by every overlay.
+    #   the three flags below     a CREDENTIAL and two PER-ENVIRONMENT sizes,
+    #                             neither of which belongs in a tracked file.
+    #
+    # redis-server applies the config file first and command-line arguments
+    # after, so these three override whatever the file says. That precedence is
+    # what makes the split work rather than merely look tidy.
     command:
       - redis-server
+      - /usr/local/etc/redis/redis.conf
       # No default. An unauthenticated Redis reachable from any container on the
       # network is a remote-code-execution primitive, not merely a data leak:
       # CONFIG SET dir + SAVE lets a caller write arbitrary files as the redis
-      # user, which is the standard path to a cron entry or an SSH key.
+      # user, which is the standard path to a cron entry or an SSH key. (The
+      # conf file also sets `enable-protected-configs no`, which blocks that
+      # specific pair — defence in depth, not a replacement for the password.)
+      #
+      # It is passed on the command line, not written into redis.conf, because
+      # redis.conf is tracked in git. The secrets overlay does better still and
+      # reads it from a mounted Docker secret at container start.
       - --requirepass
       - ${REDIS_PASSWORD:?set REDIS_PASSWORD in .env — see compose.env.example}
-      # Persistence. AOF (append-only file) rather than RDB snapshots: an AOF
-      # loses at most one second of writes (`everysec`), an RDB snapshot loses
-      # everything since the last checkpoint. `--save ""` disables RDB so the
-      # two mechanisms do not both write to the same volume.
-      - --appendonly
-      - "yes"
-      - --appendfsync
-      - everysec
-      - --save
-      - ""
       # A cache without a memory ceiling is an OOM waiting to happen: Redis will
       # consume everything it is given and then be killed by the kernel, taking
       # the AOF's clean shutdown with it. With a ceiling it evicts instead —
       # `allkeys-lru` because everything stored here is reconstructible cache or
       # transient pub/sub state, so evicting the least-recently-used key is
       # always preferable to refusing a write.
+      #
+      # ⚠ SIZE THE CONTAINER FOR 2× THIS. An AOF rewrite forks, and copy-on-write
+      # can push peak RSS toward double `maxmemory` on a write-heavy workload. A
+      # container limited to exactly REDIS_MAXMEMORY gets OOM-killed mid-rewrite,
+      # which is strictly worse than having no persistence at all — it also
+      # truncates the AOF being rewritten.
       - --maxmemory
       - ${REDIS_MAXMEMORY:-256mb}
       - --maxmemory-policy
@@ -344,18 +446,41 @@ services:
 
     volumes:
       - redis_data:/data
+      # Read-only bind mount of the tuning file, exactly as the mongo service
+      # mounts its init script: the file is source code, versioned in git, and
+      # must track the repository. `:ro` guarantees the Redis container cannot
+      # rewrite its own configuration — which, combined with
+      # `enable-protected-configs no` inside it, means neither the process nor
+      # anything that compromises it can persist a config change.
+      - ./docker/redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
 
     healthcheck:
       # `| grep -q PONG` is load-bearing: redis-cli exits 0 even when the server
       # answers "NOAUTH Authentication required", so testing the exit code alone
       # would report a locked-out Redis as healthy.
+      #
+      # Deliberately still just PING, not a write probe. A health check must not
+      # be able to add load to — or mutate — the thing it is checking, and a
+      # Redis that answers PING but cannot accept writes (maxmemory reached under
+      # `noeviction`) is a condition the application already degrades around and
+      # the redis_server_memory_used_bytes metric already reports. Failing the
+      # container's health check for it would restart a server that is doing
+      # exactly what it was configured to do.
       test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      # Longer than PH2.2's 10s. With AOF persistence a restart replays the
+      # append-only file before Redis answers commands, and on a full 256 MB
+      # dataset that is seconds, not milliseconds — during which Redis replies
+      # `-LOADING` to everything. Too short a start period turns a normal
+      # AOF-backed restart into a restart loop.
+      start_period: 30s
 
-    # Time to rewrite and fsync the AOF before exit.
+    # Time to rewrite and fsync the AOF before exit. Redis flushes on SIGTERM;
+    # cutting it short costs up to `appendfsync everysec`'s worth of writes and
+    # forces a truncated-AOF recovery on next boot (survivable — see
+    # `aof-load-truncated yes` — but pointless to inflict).
     stop_grace_period: 15s
 
     # No `ports:` — same reasoning as MongoDB, and Redis is worse: it has no
@@ -422,4 +547,12 @@ volumes:
   # mounting it requires the image to pre-create the directory owned by uid
   # 10001. Declaring it here reserves the name and records the intent.
   backend_uploads:
+    driver: local
+  # Rotated application log files (PH2.6), written only when LOG_TO_FILES is on.
+  # Its size is bounded by the rotation policy, NOT by Docker: five streams at
+  # the defaults is ~500 MB worst case uncompressed, ~100 MB in steady state.
+  # `docker compose down -v` destroys it along with the databases — which for an
+  # audit trail under a retention obligation is a real consideration, so ship
+  # those records off-host rather than trusting one volume on one machine.
+  backend_logs:
     driver: local

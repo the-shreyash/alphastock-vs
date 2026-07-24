@@ -444,6 +444,68 @@ SECRET_REGISTRY: List[SecretSpec] = [
         "Redis connection URL for cross-process realtime fan-out; single-process/dev works without it.",
         sensitive=True, example="", rotation="Rotate Redis credentials on exposure",
     ),
+    # ── Redis connection tuning (PH2.7) ──────────────────────────────────────
+    # All optional, all clamped, all safe to leave unset — the defaults are the
+    # values documented in docs/infrastructure/REDIS.md. They are registered here
+    # rather than left as undocumented os.environ reads so that they appear in
+    # .env.example and an operator can discover them without reading the source.
+    SecretSpec(
+        "REDIS_MAX_CONNECTIONS", CAT_INFRA,
+        "Connection-pool ceiling per process (default 24). Bounds how many "
+        "sockets a traffic burst can open against Redis; raising it is rarely "
+        "the fix for slowness, since a saturated pool usually means a slow "
+        "command rather than too few connections.",
+        example="24", rotation="N/A",
+    ),
+    SecretSpec(
+        "REDIS_CONNECT_TIMEOUT_SECONDS", CAT_INFRA,
+        "TCP connect timeout (default 1.5). Must stay below "
+        "HEALTH_PROBE_TIMEOUT_SECONDS or a slow-to-accept Redis makes the "
+        "readiness probe time out instead of reporting a failed Redis check.",
+        example="1.5", rotation="N/A",
+    ),
+    SecretSpec(
+        "REDIS_SOCKET_TIMEOUT_SECONDS", CAT_INFRA,
+        "Per-command timeout (default 2.0). Redis answers in microseconds, so "
+        "reaching this means the server is blocked and waiting longer only ties "
+        "up the event loop.",
+        example="2.0", rotation="N/A",
+    ),
+    SecretSpec(
+        "REDIS_HEALTH_CHECK_INTERVAL_SECONDS", CAT_INFRA,
+        "PING a pooled connection before use if idle longer than this (default "
+        "30). What makes a Redis RESTART invisible: without it the first "
+        "operations after a restart each fail once on a stale pooled socket.",
+        example="30", rotation="N/A",
+    ),
+    SecretSpec(
+        "REDIS_RETRY_ATTEMPTS", CAT_INFRA,
+        "Retries after the first attempt, for connection errors and timeouts "
+        "only (default 2). Covers one dead pooled connection without turning a "
+        "real outage into a latency multiplier.",
+        example="2", rotation="N/A",
+    ),
+    SecretSpec(
+        "REDIS_CIRCUIT_FAILURE_THRESHOLD", CAT_INFRA,
+        "Consecutive connection failures before the circuit breaker opens and "
+        "the process degrades to its in-memory cache (default 5). One failure "
+        "is noise; five in a row is a dependency.",
+        example="5", rotation="N/A",
+    ),
+    SecretSpec(
+        "REDIS_CIRCUIT_RESET_SECONDS", CAT_INFRA,
+        "How long the breaker stays open before admitting one trial operation "
+        "(default 10). Long enough not to hammer a down Redis, short enough to "
+        "notice recovery within a few seconds.",
+        example="10", rotation="N/A",
+    ),
+    SecretSpec(
+        "REDIS_STATS_INTERVAL_SECONDS", CAT_INFRA,
+        "Cadence of the background INFO sample that fills the redis_server_* "
+        "metrics (default 30; 0 disables). Sampled on a timer, never at scrape "
+        "time, so a metrics scraper cannot drive load onto Redis.",
+        example="30", rotation="N/A",
+    ),
     # ── Admin bootstrap (dev seed only; never used by the API server) ─────────
     SecretSpec(
         "ADMIN_EMAIL", CAT_ADMIN, "Dev-seed admin email (scripts/seed_dev_admin.py only).",
@@ -458,6 +520,154 @@ SECRET_REGISTRY: List[SecretSpec] = [
         "ENABLE_AUTO_LOGIN", CAT_ADMIN,
         "Dev convenience flag; MUST be false/unset in production.",
         example="false", rotation="N/A",
+    ),
+    # ── Observability (PH2.5) ────────────────────────────────────────────────
+    # Registered here for the same reason every other variable is: this registry
+    # is the authoritative description of the configuration surface and it
+    # generates backend/.env.example. A variable that changes production
+    # behaviour but is absent from the registry is undocumented by construction,
+    # and the next operator finds it only by reading source.
+    SecretSpec(
+        "APP_VERSION", CAT_APPCFG,
+        "Application version reported by /api/diagnostics and the app_info metric. "
+        "Set from the Docker build arg of the same name; defaults to 0.0.0-dev.",
+        example="0.0.0-dev", rotation="N/A (set per build)",
+    ),
+    SecretSpec(
+        "VCS_REF", CAT_APPCFG,
+        "Git commit this build came from; reported by /api/diagnostics. Set by CI at image build time.",
+        example="", rotation="N/A (set per build)",
+    ),
+    SecretSpec(
+        "BUILD_DATE", CAT_APPCFG,
+        "ISO-8601 image build timestamp; reported by /api/diagnostics. Set by CI at image build time.",
+        example="", rotation="N/A (set per build)",
+    ),
+    SecretSpec(
+        "LOG_LEVEL", CAT_APPCFG,
+        "Root log level: DEBUG | INFO | WARNING | ERROR. Defaults to INFO; an "
+        "unrecognized value falls back to INFO rather than failing the boot.",
+        example="INFO", rotation="N/A",
+    ),
+    SecretSpec(
+        "LOG_FORMAT", CAT_APPCFG,
+        "Log output format: json | text. Defaults to json in production, text elsewhere.",
+        example="text", rotation="N/A",
+    ),
+    SecretSpec(
+        "LOG_SCRUB_MESSAGES", CAT_APPCFG,
+        "Blank credential-shaped values (token=..., password=...) inside free-text "
+        "log messages. Defaults to on; turn off only to debug the scrubber itself.",
+        example="1", rotation="N/A",
+    ),
+    SecretSpec(
+        "LOG_HEALTH_REQUESTS", CAT_APPCFG,
+        "Access-log health/metrics probe traffic. Off by default — a 10s probe "
+        "cadence across replicas is tens of thousands of identical lines a day. "
+        "Metrics still count every probe.",
+        example="0", rotation="N/A",
+    ),
+    # ── PH2.6 file sinks ──────────────────────────────────────────────────────
+    # All optional and all off by default: stdout remains the twelve-factor
+    # default and the recommended path. These exist for deployments with no
+    # collector yet, or with a compliance rule that requires durable local
+    # retention. Every one of them degrades to its default with a stderr warning
+    # rather than failing the boot — a logging misconfiguration must never be
+    # able to stop a deployment.
+    SecretSpec(
+        "LOG_TO_FILES", CAT_APPCFG,
+        "Write structured logs to rotated files IN ADDITION to stdout. Off by "
+        "default. Enable for a host with no log collector, or where a retention "
+        "rule requires logs on durable storage. Never replaces stdout, so "
+        "`docker logs` and any attached collector are unaffected.",
+        example="0", rotation="N/A",
+    ),
+    SecretSpec(
+        "LOG_DIR", CAT_APPCFG,
+        "Directory for log files when LOG_TO_FILES is on. Defaults to "
+        "/var/log/stockassist (the FHS location, pre-created in the image and "
+        "owned by the runtime user). An unwritable directory degrades to "
+        "stdout-only with a warning rather than failing the boot.",
+        example="/var/log/stockassist", rotation="N/A",
+    ),
+    SecretSpec(
+        "LOG_FILE_STREAMS", CAT_APPCFG,
+        "Comma-separated subset of streams to write to file: application, "
+        "access, security, audit, error. Defaults to all five. Use a subset "
+        "when a collector already takes everything but the audit trail must "
+        "also be retained locally (LOG_FILE_STREAMS=audit,security).",
+        example="", rotation="N/A",
+    ),
+    SecretSpec(
+        "LOG_FILE_MAX_BYTES", CAT_APPCFG,
+        "Size at which a log file is rotated (default 52428800 = 50 MB). "
+        "Clamped to [64 KiB, 2 GiB]; an out-of-range value is clamped with a "
+        "warning, never rejected.",
+        example="52428800", rotation="N/A",
+    ),
+    SecretSpec(
+        "LOG_FILE_BACKUP_COUNT", CAT_APPCFG,
+        "Rotated segments kept per stream (default 10). With the default size "
+        "that bounds one stream at ~550 MB uncompressed, ~100 MB gzipped. Zero "
+        "means bound the live file and keep no history.",
+        example="10", rotation="N/A",
+    ),
+    SecretSpec(
+        "LOG_RETENTION_DAYS", CAT_APPCFG,
+        "Maximum age of a rotated segment (default 14). Applied BEFORE the "
+        "backup count, so an age-based retention commitment is honoured even "
+        "when the count would have kept the segment. Zero disables age-based "
+        "pruning and leaves the count as the only bound.",
+        example="14", rotation="N/A",
+    ),
+    SecretSpec(
+        "LOG_FILE_COMPRESS", CAT_APPCFG,
+        "Gzip rotated segments (default on). JSON logs compress at roughly "
+        "10:1. Compression runs on the log writer thread, never on a request.",
+        example="1", rotation="N/A",
+    ),
+    SecretSpec(
+        "LOG_QUEUE_SIZE", CAT_APPCFG,
+        "Records buffered between the application and the log writer thread "
+        "(default 10000, clamped to [100, 1000000]). The queue is what keeps "
+        "disk I/O off the event loop. When it is full records are DROPPED, not "
+        "blocked on, and counted by the log_records_dropped_total metric.",
+        example="10000", rotation="N/A",
+    ),
+    SecretSpec(
+        "METRICS_TOKEN", CAT_INFRA,
+        "Shared secret required to read /api/metrics and /api/diagnostics IN "
+        "PRODUCTION. Unset in production, both endpoints fail closed with 403. "
+        "Presented as 'Authorization: Bearer <token>' or 'X-Metrics-Token'.",
+        sensitive=True, min_length=MIN_SIGNING_SECRET_LENGTH,
+        example="generate-with: python -c \"import secrets;print(secrets.token_urlsafe(32))\"",
+        rotation="Rotate on exposure or when scrape credentials change",
+    ),
+    SecretSpec(
+        "METRICS_ALLOW_UNAUTHENTICATED", CAT_INFRA,
+        "Serve /api/metrics and /api/diagnostics without a token in production. "
+        "ONLY for a deployment where those paths are unreachable from outside "
+        "(private scrape network / mesh-only listener).",
+        example="", rotation="N/A",
+    ),
+    SecretSpec(
+        "METRICS_MAX_SERIES", CAT_INFRA,
+        "Per-metric ceiling on distinct label combinations (default 500). A "
+        "backstop against a mislabelling bug exhausting memory; overflow is "
+        "counted by the metrics_series_dropped_total gauge.",
+        example="500", rotation="N/A",
+    ),
+    SecretSpec(
+        "HEALTH_PROBE_TIMEOUT_SECONDS", CAT_INFRA,
+        "Per-dependency readiness probe timeout (default 2.0). Must stay well "
+        "below the load balancer's probe timeout.",
+        example="2.0", rotation="N/A",
+    ),
+    SecretSpec(
+        "HEALTH_CACHE_TTL_SECONDS", CAT_INFRA,
+        "How long a readiness result is reused (default 2.0). Prevents several "
+        "independent pollers from generating continuous ping load on MongoDB.",
+        example="2.0", rotation="N/A",
     ),
 ]
 

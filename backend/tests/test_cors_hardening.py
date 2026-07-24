@@ -181,8 +181,20 @@ class TestCorsKwargs:
         assert "*" not in headers
         assert headers == ALLOWED_HEADERS
 
-    def test_no_response_headers_exposed(self, clean_env):
-        assert cors_kwargs()["expose_headers"] == EXPOSE_HEADERS == []
+    def test_only_the_correlation_id_is_exposed(self, clean_env):
+        """The exposure list stays minimal — one header, for one reason.
+
+        Cookie-based auth needs nothing exposed, so this list was empty until
+        PH2.5. `X-Request-ID` was added because the CORS spec hides every
+        response header from JavaScript unless it is named here: without the
+        entry the browser receives the correlation ID but the SPA cannot read it,
+        so a user hitting an error would have no ID to quote to support. The
+        value is opaque and server-generated, so exposing it leaks nothing.
+
+        Any *further* addition needs the same justification — hence the exact
+        equality rather than a membership check.
+        """
+        assert cors_kwargs()["expose_headers"] == EXPOSE_HEADERS == ["X-Request-ID"]
 
     def test_credentials_never_paired_with_wildcard_origin(self, clean_env):
         # The core invariant: credentials + wildcard is forbidden by the Fetch

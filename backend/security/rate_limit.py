@@ -402,6 +402,20 @@ _MIDDLEWARE_EXEMPT_PATHS = {
     "/api/auth/register",
     "/api/auth/refresh",
     "/api",              # health check — hit by load balancers/probes
+    # Operational endpoints (PH2.5). Exempt for the same reason as /api, and the
+    # reason is worth being explicit about: a probe cadence of one request every
+    # 10 seconds, multiplied by a kubelet + a load balancer + an uptime monitor,
+    # would consume the anonymous per-IP budget and start returning 429. The
+    # orchestrator reads that 429 as "unhealthy" and restarts a container that
+    # was fine — the rate limiter would be manufacturing the outage it exists to
+    # prevent. Metrics/diagnostics are gated by their own token in production
+    # (observability/routes.py), so exempting them costs nothing.
+    "/api/health",
+    "/api/health/live",
+    "/api/health/ready",
+    "/api/health/startup",
+    "/api/metrics",
+    "/api/diagnostics",
 }
 
 

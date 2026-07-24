@@ -26,10 +26,37 @@ load_dotenv(ROOT_DIR / '.env', override=True)
 from security import secrets as _secret_config
 
 _config_report = _secret_config.validate_config()
+
+# Structured logging (PH2.5) — installed HERE, immediately after configuration is
+# hydrated and before the application modules below are imported.
+#
+# The ordering is the whole point. Roughly forty modules in this codebase log at
+# import time; the previous `logging.basicConfig(...)` call lived at the BOTTOM of
+# this file, so every one of those lines was emitted through Python's default
+# handler in a different format — and the boot sequence, which is exactly what you
+# read when a container refuses to start, was the least legible part of the log.
+#
+# It runs after `validate_config()` because that call is what materializes
+# file-backed secrets and configuration into `os.environ` (PH2.3); LOG_LEVEL and
+# LOG_FORMAT are read from there. The config report is therefore emitted just
+# below, through the now-structured logger, rather than before it.
+#
+# observability.logging owns the root logger from this line onwards: format,
+# level, destination (stdout only — shipping is the platform's job, which is the
+# seam PH2.6 attaches to), secret scrubbing, and third-party noise suppression.
+from observability import logging as _obs_logging
+
+_logging_config = _obs_logging.configure_logging()
+
 import logging as _bootstrap_logging
 for _w in _config_report.warnings:
     _bootstrap_logging.getLogger("security.secrets").warning(_w)
 _bootstrap_logging.getLogger("security.secrets").info(_config_report.summary_line())
+_bootstrap_logging.getLogger("observability").info(
+    "Structured logging configured (%s, level=%s).",
+    _logging_config["format"], _logging_config["level"],
+    extra={"event": "logging_configured", **_logging_config},
+)
 
 from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Depends, Header, WebSocket, WebSocketDisconnect, BackgroundTasks
 from pydantic import BaseModel
@@ -96,6 +123,21 @@ from security.passwords import hash_password, verify_password
 # roles). See SECURITY_ARCHITECTURE.md and backend/security/{identifiers,roles}.py.
 from security.identifiers import parse_object_id
 from security.roles import validate_role_assignment
+
+# Centralized observability (PH2.5). `observability.logging` already owns the
+# root logger (configured at the top of this file, before these imports); the
+# rest of the package is wired below:
+#   * health           — the probe registry + process lifecycle state machine,
+#                        behind /api/health/{live,ready,startup}.
+#   * metrics          — the in-process registry rendered at /api/metrics.
+#   * middleware       — request ID, timing, counting, one access log line.
+#   * observability_routes — the operational HTTP surface.
+# See observability/__init__.py and docs/operations/MONITORING.md.
+from observability import health as obs_health
+from observability import metrics as obs_metrics
+from observability import routes as observability_routes
+from observability import runtime as obs_runtime
+from observability.middleware import apply_observability
 
 from models import (
     UserCreate, UserLogin, UserResponse, UserSettingsUpdate,
@@ -5346,7 +5388,21 @@ app.include_router(watchlist_router)
 app.include_router(gemini_router)
 app.include_router(admin_router)
 
-# Health check
+# Operational endpoints (PH2.5): /api/health/{live,ready,startup}, /api/health,
+# /api/metrics, /api/diagnostics. See observability/routes.py — and note that
+# the long-standing /api/monitor/health above is unrelated (it returns an
+# authenticated, AI-powered *portfolio* health analysis, not process health).
+app.include_router(observability_routes.router)
+
+# Liveness check (legacy path, PH2.1 container contract).
+#
+# Predates the /api/health family and is deliberately kept: backend/Dockerfile's
+# HEALTHCHECK, docker/healthcheck.sh and the PH2.4 CI smoke tests all target it,
+# and its contract ("status": "running") is asserted in the pipeline. It is
+# functionally a liveness probe — unauthenticated, rate-limit exempt, touching no
+# dependency — which is why it was a sound choice for the container health check
+# and why nothing needs to migrate. New orchestrator configuration should prefer
+# /api/health/live, which reports lifecycle state and uptime alongside the status.
 @app.get("/api")
 async def api_root():
     return {"message": "AlphaPartner API", "status": "running", "version": "1.0"}
@@ -5389,8 +5445,58 @@ apply_cors(app)
 # that module for the full policy and rationale.
 apply_security_headers(app)
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+# Observability (PH2.5): registered LAST, so it is the OUTERMOST middleware and
+# runs FIRST on every request. Three reasons, in order of importance:
+#   1. The request ID must exist before anything else can log — the rate
+#      limiter, the CSRF middleware and the audit logger all emit records, and
+#      those describe *rejected* requests, which are the ones most worth
+#      correlating.
+#   2. Rejections must be counted. A 429 from the rate limiter or a CORS refusal
+#      never reaches a route handler; instrumentation placed inside them would
+#      report a healthy service while the front door returned errors to everyone.
+#   3. X-Request-ID must be stamped on every response, including ones generated
+#      by an inner middleware, so any error a user sees carries an ID they can
+#      quote to support.
+#
+# Full request-time execution order:
+#   Observability → Security Headers → CORS → Rate Limiter → CSRF → route → handler
+apply_observability(app)
+
+# The root logger was configured at the TOP of this file (see the
+# observability.logging import there). This is only the module-level logger
+# handle used by the startup/shutdown code below.
 logger = logging.getLogger(__name__)
+
+# Dependency health checks (PH2.5). Registered at import time, not inside the
+# startup event, so /api/health/ready reports a meaningful answer even if startup
+# itself fails part-way — the readiness probe is the only thing that can explain
+# *why* a container never became ready, so it must not depend on that boot
+# completing.
+#
+# `lambda: db` is the same late-binding accessor pattern the rate limiter and the
+# audit logger use: the probe always resolves the live handle, and the test
+# suite's FakeDB monkeypatch of `server.db` is honored with no special wiring.
+#
+# Redis is registered as NON-critical, deliberately. `services/cache.py` falls
+# back to an in-process dict when REDIS_URL is unset, so a single-process
+# deployment without Redis is a supported configuration, not a fault — the probe
+# reports "skip" there. When Redis *is* configured but unreachable the check
+# fails and is reported, yet it still does not pull the instance out of the load
+# balancer, because this application degrades to that same in-process fallback
+# and can continue serving. Promote it to critical=True once Redis becomes
+# load-bearing (multi-process pub/sub fan-out).
+obs_health.register_check("mongodb", obs_health.make_mongo_probe(lambda: db), critical=True)
+obs_health.register_check("redis", obs_health.make_redis_probe(), critical=False)
+
+# Publish build metadata as the conventional `app_info` gauge, so a metrics query
+# can join runtime facts onto any other series ("p99 latency, by version").
+obs_metrics.set_app_info(
+    version=obs_runtime.service_version(),
+    environment=obs_runtime.environment(),
+    python_version=obs_runtime.python_version(),
+    revision=obs_runtime.vcs_ref(),
+)
+
 
 # Startup
 @app.on_event("startup")
@@ -5488,9 +5594,29 @@ async def startup():
     except Exception as e:
         logger.error(f"Scheduler setup error: {e}")
 
+    # Redis background stats sampler (PH2.7). Populates the redis_server_* gauges
+    # (memory, clients, evictions, AOF status) from INFO on a fixed cadence.
+    #
+    # Started BEFORE the event bridge on purpose: the bridge's Pub/Sub subscriber
+    # is the noisiest consumer of Redis, and having the memory/eviction gauges
+    # already reporting when it connects means a bad first sample is attributable.
+    # No-op when REDIS_URL is unset or REDIS_STATS_INTERVAL_SECONDS=0.
+    try:
+        from infrastructure import redis_client as obs_redis
+        if await obs_redis.start_stats_sampler():
+            logger.info("Redis stats sampler started")
+    except Exception as e:
+        logger.error(f"Redis stats sampler start error: {e}")
+
     # Wire the market event bus to WebSocket clients (Sprint R2). Bridges every
     # bus event onto a socket channel and, when Redis is configured, fans events
     # across processes. No-op cross-process fan-out in single-process/dev.
+    #
+    # PH2.7: the Redis subscriber behind this now reconnects on its own with
+    # backoff, so a Redis restart no longer silently kills cross-process realtime
+    # delivery for the life of the process. It also returns immediately rather
+    # than waiting for the subscription — startup must never block on a
+    # dependency that is allowed to be down.
     try:
         from services.realtime.event_bridge import start_event_bridge
         await start_event_bridge(ws_manager)
@@ -5516,13 +5642,66 @@ async def startup():
     except Exception as e:
         logger.error(f"Heartbeat engine start error: {e}")
 
-    logger.info("AlphaPartner API started successfully")
+    # Boot is complete (PH2.5). This is the line that flips /api/health/startup
+    # from 503 to 200 and lets /api/health/ready return "ready" — and it is the
+    # LAST statement of startup for that reason: everything above (index
+    # creation, broker session restore, market gateway, scheduler, event bridge,
+    # background loops) must finish before this instance claims it can serve.
+    obs_health.lifecycle.mark_started()
+
+    logger.info(
+        "AlphaPartner API started successfully",
+        extra={
+            "event": "startup_complete",
+            "startup_seconds": round(obs_runtime.uptime_seconds(), 3),
+            "version": obs_runtime.service_version(),
+            "revision": obs_runtime.vcs_ref(),
+            "environment": obs_runtime.environment(),
+            "health_checks": obs_health.registered_checks(),
+        },
+    )
     logger.info(f"Data sources: Alpha Vantage={'ON' if av_configured() else 'OFF'}, Zerodha={'ON' if kite_configured() else 'OFF'}")
 
 @app.on_event("shutdown")
 async def shutdown():
+    # Fail readiness FIRST, before tearing anything down (PH2.5).
+    #
+    # This one line is what makes a deploy quiet. On SIGTERM the load balancer
+    # does not know anything has changed until its next readiness poll; if the
+    # process starts closing its Mongo client and broker streams immediately, it
+    # keeps receiving requests it can no longer serve, and every release sheds a
+    # small burst of 500s. Flipping to STOPPING first means the balancer sees
+    # 503 on its next poll and stops routing here, while in-flight requests drain
+    # into a process that still works.
+    obs_health.lifecycle.mark_stopping()
+    logger.info(
+        "Shutdown initiated — readiness now reports draining",
+        extra={"event": "shutdown_started", "uptime_seconds": round(obs_runtime.uptime_seconds(), 3)},
+    )
+
     from services.scheduler import scheduler
     if scheduler.running:
         scheduler.shutdown(wait=False)
     await broker_engine.shutdown()  # close live broker WebSocket streams
+
+    # Redis teardown (PH2.7), in dependency order: subscribers first, then the
+    # shared pool.
+    #
+    # The order is not cosmetic. Closing the pool while a subscriber is still
+    # running leaves it reconnecting against a client that is being dismantled,
+    # so a clean shutdown emits a burst of connection errors and looks, in the
+    # logs, exactly like a crash. Stopping subscribers first lets each one
+    # UNSUBSCRIBE and close its own connection, which also releases the server's
+    # client slot immediately rather than leaving it for TCP keepalive to reap.
+    #
+    # Wrapped, because shutdown must complete. A backend that cannot exit because
+    # its cache teardown raised gets SIGKILLed by the orchestrator, and SIGKILL is
+    # what the 30s stop_grace_period in docker-compose.yml exists to avoid.
+    try:
+        from infrastructure import redis_pubsub as _redis_pubsub, redis_client as _redis_client
+        await _redis_pubsub.stop_all()
+        await _redis_client.close()
+    except Exception as e:
+        logger.warning(f"Redis shutdown error (ignored): {e}")
+
     client.close()

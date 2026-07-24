@@ -44,7 +44,16 @@ HEALTHCHECK_PORT="${HEALTHCHECK_PORT:-${PORT:-8000}}"
 # a MongoDB round-trip — if the database has a blip, a DB-coupled liveness probe
 # marks every replica unhealthy simultaneously and the orchestrator restarts the
 # entire fleet, turning a recoverable dependency outage into a full outage.
-# Dependency health belongs in a separate readiness probe (PH2.10).
+# Dependency health belongs in a separate readiness probe.
+#
+# PH2.5 delivered that readiness probe (/api/health/ready) along with a richer
+# liveness endpoint (/api/health/live). The default here stays /api: its contract
+# is asserted by the PH2.4 CI smoke tests, it is equally dependency-free, and
+# changing a working container health check to gain a slightly larger JSON body
+# would be churn. Point HEALTHCHECK_PATH at /api/health/live if you want the
+# lifecycle state and uptime in `docker inspect`'s health log; both payloads are
+# accepted below. Do NOT point it at /api/health/ready — a readiness failure must
+# remove an instance from the load balancer, never restart it.
 HEALTHCHECK_PATH="${HEALTHCHECK_PATH:-/api}"
 HEALTHCHECK_TIMEOUT="${HEALTHCHECK_TIMEOUT:-4}"
 
@@ -106,10 +115,18 @@ except ValueError:
 if not isinstance(payload, dict):
     unhealthy(f"{URL} returned JSON of type {type(payload).__name__}, expected an object")
 
-if payload.get("status") != "running":
+# Two accepted liveness contracts, so HEALTHCHECK_PATH can be pointed at either
+# endpoint without editing this script:
+#   "running" — /api           (the original PH2.1 contract)
+#   "ok"      — /api/health/live (PH2.5)
+# Any other value, including the "not_ready"/"starting" that a misconfigured
+# probe against /api/health/ready or /startup would return, is treated as
+# unhealthy — pointing a container health check at readiness is a real mistake
+# and it should fail loudly here rather than silently restart-loop the container.
+if payload.get("status") not in ("running", "ok"):
     unhealthy(f"{URL} reported status={payload.get('status')!r}")
 
-print(f"healthy: {URL} -> {payload.get('message', 'ok')} "
+print(f"healthy: {URL} -> {payload.get('message', payload.get('status', 'ok'))} "
       f"(version {payload.get('version', 'unknown')})")
 sys.exit(0)
 PYTHON_HEALTHCHECK

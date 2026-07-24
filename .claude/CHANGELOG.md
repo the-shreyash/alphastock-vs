@@ -5,6 +5,439 @@ This file records documentation-system versions and, from v1.0 launch onward, pr
 
 ---
 
+# Sprint PH2.7 — Production Redis Infrastructure — 2026-07-23
+
+**Redis stops being a service that happens to be running and becomes one with a
+lifecycle. A single pooled client for the whole process behind a circuit breaker
+that degrades in microseconds and re-tests the dependency instead of giving up on
+it; a Pub/Sub subscriber that reconnects with backoff and jitter instead of dying
+on the first disconnect; 37 documented server directives in a file both compose
+stacks share; and enough diagnostics to tell "Redis is down" apart from "Redis is
+up and this replica stopped listening to it". Business logic is untouched — every
+`services/cache.py` signature and contract is identical. No Sentinel, no Cluster,
+no managed Redis: the seam for all three is one function.**
+
+> **Design note — the two bugs this sprint existed to fix were both invisible.**
+> Neither raised an exception. Neither failed a request. Neither failed a health
+> check. The cache layer latched `_redis_failed = True` on the *first* failure and
+> never cleared it, so one transient blip permanently demoted a process to its
+> in-memory fallback — it kept serving, it just stopped sharing state with its
+> peers, until someone restarted it for an unrelated reason. And the Pub/Sub
+> listener ended permanently on its first exception, while Redis drops subscribers
+> *routinely by design* (`client-output-buffer-limit pubsub` exists to disconnect
+> a slow consumer). The symptom was WebSocket clients on one replica quietly
+> ceasing to receive cross-process events. To the user: "the market went quiet."
+> To the operator: nothing at all. **Silent partial degradation is the failure
+> mode that survives longest in production**, because every signal anyone is
+> watching says the system is fine — which is why this sprint's headline
+> deliverable is arguably `/api/diagnostics/redis`, the endpoint that can tell the
+> two apart.
+
+## Added
+
+- **`backend/infrastructure/`** — a new package for connections to backing
+  services, on the one-module-per-concern shape PH1 established for `security/`
+  and PH2.5 for `observability/`. The rule that keeps the boundary honest:
+  `services/` may depend on `infrastructure/`; nothing in `infrastructure/` may
+  know what a portfolio, a trade or a quote is.
+  - **`redis_client.py`** — the one pooled client, with retry, a **circuit
+    breaker**, a background `INFO` sampler and a diagnostics snapshot. Pool,
+    retry and breaker solve genuinely different problems and are routinely
+    confused: the pool amortizes setup and *bounds* concurrency, retry absorbs the
+    failure that will succeed if tried again now, the breaker absorbs the one that
+    will not. Without a breaker a dead Redis makes the **application** slow —
+    every operation pays a full connect timeout and holds an event-loop slot,
+    which is the classic cascade where the retry traffic is the outage.
+  - **`redis_pubsub.py`** — a supervised subscriber: dedicated connection
+    (a `SUBSCRIBE`-mode connection cannot serve a `GET`, so taking one from the
+    shared pool removes it from circulation for the process's lifetime),
+    reconnect with exponential backoff **and jitter** (without jitter every
+    replica retries on the same schedule and arrives at the recovering server in
+    synchronised waves), a one-subscriber-per-channel registry (duplicate delivery
+    is harder to notice than *no* delivery — the UI just updates twice), and
+    graceful shutdown via `get_message(timeout=…)` rather than `listen()`, which
+    blocks forever and can only be ended by cancelling mid-await.
+- **`docker/redis/redis.conf`** — 37 directives, each with its rationale inline,
+  mounted read-only and shared by `docker-compose.yml` **and**
+  `docker-compose.secrets.yml`. Only the credential and the two per-environment
+  sizes stay on the command line, where later arguments override the file.
+- **`GET /api/diagnostics/redis`** — connection (pool occupancy, circuit state,
+  last error), **pubsub** (per-channel connected/reconnects/messages/handler
+  errors) and server (`INFO` sample with its age). Same operational-token gate as
+  `/api/metrics`; the URL is redacted everywhere, because redis-py's connection
+  errors stringify to a message containing the password.
+- **10 Redis metric families.** `redis_circuit_state` is the one to alert on: it
+  is a **leading** indicator, since the fallback keeps serving while it climbs.
+  `redis_server_*` gauges come from a background sample on a fixed cadence,
+  **never at scrape time** — the same rule PH2.5 applied to `dependency_up`, so
+  whoever can reach `/api/metrics` cannot drive dependency load by scraping faster.
+- **`docs/infrastructure/REDIS.md`** (+ a `docs/infrastructure/` index) —
+  architecture, every server decision, connection lifecycle, the Pub/Sub
+  guarantees and the one it cannot make, measured performance, monitoring and
+  alert rules, troubleshooting, and the Sentinel → managed → Cluster path.
+- **`backend/tests/test_redis_infrastructure.py`** — 50 hermetic tests. Suite
+  879 → **929**, all green.
+- **Eight configuration variables** registered in `security/secrets.py`:
+  `REDIS_MAX_CONNECTIONS`, `REDIS_CONNECT_TIMEOUT_SECONDS`,
+  `REDIS_SOCKET_TIMEOUT_SECONDS`, `REDIS_HEALTH_CHECK_INTERVAL_SECONDS`,
+  `REDIS_RETRY_ATTEMPTS`, `REDIS_CIRCUIT_FAILURE_THRESHOLD`,
+  `REDIS_CIRCUIT_RESET_SECONDS`, `REDIS_STATS_INTERVAL_SECONDS`. All clamp-and-warn.
+
+## Fixed
+
+- **The permanent-failure latch.** `services/cache.py`'s `_redis_failed` flag was
+  set on the first exception and never cleared. Replaced by a breaker that opens
+  after 5 *consecutive connection-level* failures and half-opens after a cooldown;
+  the readiness poll doubles as the half-open trial, so recovery is detected on a
+  cadence that already exists. Command errors (`WRONGTYPE`, OOM) deliberately do
+  **not** count — a healthy server answering a buggy call site must not be able to
+  disable the cache globally.
+- **The Pub/Sub listener that never came back.** See the design note above.
+- **Health-probe connection churn.** `observability/health.py` built a throwaway
+  client on every readiness poll — a TCP connect + AUTH + teardown several times a
+  minute, per replica, forever. That was a *correct* workaround for the latch; with
+  the latch gone the probe uses the shared client, which also makes it honest: it
+  now measures what the application experiences rather than what a fresh private
+  connection would have seen.
+- **Compose configuration duplication.** The Redis flags were enumerated in both
+  `docker-compose.yml` and `docker-compose.secrets.yml`. One `redis.conf` now, so
+  a tuning change cannot land in one stack and not the other.
+- **Redis teardown on shutdown.** Subscribers are stopped before the pool is
+  closed. The reverse order leaves subscribers reconnecting against a client being
+  dismantled, so a clean shutdown emits a burst of connection errors and looks, in
+  the logs, exactly like a crash.
+
+## Changed
+
+- `services/cache.py` is now pure policy — JSON encoding, TTLs, batching, the
+  bounded in-memory fallback. Every signature and contract is unchanged; `_memory`,
+  `_MEMORY_MAX_KEYS`, `_get_redis`, `_redis_client` and `_redis_failed` are
+  retained (the last two as documented shims) so nothing that imported them breaks.
+- A Redis hit is now authoritative **including a miss**: `cache_get` no longer
+  falls through to the in-process store when Redis answers "not found", which would
+  resurrect a value cached before Redis became the source of truth.
+- `cache_delete` always clears the local copy, whatever Redis did — a force-refresh
+  that leaves a stale value in one replica's fallback appears to have done nothing,
+  on that one replica.
+- Values are serialized **before** the Redis call, so an encoding bug is not
+  misdiagnosed as a Redis failure and does not count against the breaker.
+- Redis container `start_period` 10s → 30s: with AOF persistence a restart replays
+  the log and replies `-LOADING` meanwhile, and too short a window turns a normal
+  restart into a restart loop.
+
+## Measured
+
+| Path | Cost |
+|---|---|
+| `cache_get()` facade overhead | 3.5 µs/op |
+| `cache_set()` facade overhead (incl. `json.dumps`) | 7.3 µs/op |
+| `execute()` while the circuit is **open** | **1.1 µs/op** vs the 1.5 s connect timeout it replaces (~1.3M×) |
+| Pub/Sub reconnect after a short blip | attempt 1–3, ~1–4 s after the server accepts connections |
+
+## Known limitations
+
+- **Live-stack verification was not executed** — no Docker daemon on the
+  development machine. The four checks that need a real server (restart
+  persistence, connection recovery, Pub/Sub reconnect, eviction under pressure) are
+  scripted in `docs/infrastructure/REDIS.md` §8 and must be run before production.
+- **Single node, no failover.** Explicitly out of scope; the migration path is §9
+  and its blast radius is one function, `RedisManager._build_client()`.
+- **Pub/Sub remains at-most-once.** Reconnecting restores the stream, not the gap.
+  Correct for UI refresh signals; **wrong** for anything where a missed message is
+  a lost fact, which needs Redis Streams — not a bigger buffer, which is the
+  instinct worth resisting.
+- **`allkeys-lru` is only correct while everything in Redis is reconstructible.**
+  The day something non-evictable is added, it belongs in MongoDB instead.
+- **The breaker is per-process**, so each replica discovers an outage independently.
+
+---
+
+# Sprint PH2.6 — Production Logging Infrastructure — 2026-07-22
+
+**Logs now have an answer to "what stops them?" Five streams split by purpose so
+retention can differ per stream, size-triggered rotation to timestamped gzipped
+segments, retention bounded by both age and count, every file write behind a
+bounded queue so the disk can never stall the event loop, and Docker's own log
+capture bounded and made non-blocking. Application logging was not redesigned —
+PH2.5's schema, formatters and access log are untouched. File sinks are opt-in
+and purely additive: stdout remains unconditional, so `docker logs` and any
+attached collector behave exactly as before. No ELK, no Loki, no CloudWatch, no
+alerting — this sprint builds the seam those attach to, and PH2.10 attaches
+them.**
+
+> **Design note — why stdout was not enough, given twelve-factor says it is.**
+> "The platform ships it" assumes a platform. Real deployments spend time in
+> states where there is no collector: the first VM, the on-prem install, the
+> compliance rule that says "retain authentication events for 90 days on durable
+> storage", and the incident where the collector itself is what broke. In every
+> one of those, `docker logs` is what you have — and `docker logs` with the
+> default `json-file` driver is an **unbounded file on the host**. A service
+> that logs steadily fills the disk, and a full disk does not take down the
+> noisy container; it takes down every container on the box, plus the SSH daemon
+> you were going to use to fix it. So stdout stays the default and the
+> recommended path, and this sprint makes the *other* path safe rather than
+> pretending it is never taken.
+
+## Added
+
+- **`backend/observability/log_streams.py`** — stream separation and the
+  file-sink pipeline. Records are routed into **application / access / security /
+  audit / error** entirely by **logger name**, so not one call site changed.
+  Streams exist because the five kinds of record have genuinely different
+  retention needs: storing "this admin changed that user's role" under the same
+  rule as 26 million `GET /api/health` lines forces a choice between paying to
+  keep access logs for a year and deleting the audit trail after a week. Both
+  are wrong, and no amount of clever querying fixes it once the data is gone.
+- **`backend/observability/log_rotation.py`** — the rotation, compression and
+  retention policy. Size-triggered rollover to `application.log.20260722T134501.gz`,
+  gzip level 6, and pruning by **both** age and count.
+- **`docs/operations/LOGGING.md`** — architecture, the five streams, rotation and
+  retention, the four-layer redaction policy, Docker integration and the driver
+  matrix, measured cost, troubleshooting, and the path to centralized logging.
+- **`backend/tests/test_log_infrastructure.py`** — 61 hermetic tests. Suite
+  818 → **879**, all green.
+- **Eight new configuration variables**, registered in `security/secrets.py` (the
+  single source of truth that generates `.env.example` and is drift-checked in
+  CI): `LOG_TO_FILES`, `LOG_DIR`, `LOG_FILE_STREAMS`, `LOG_FILE_MAX_BYTES`,
+  `LOG_FILE_BACKUP_COUNT`, `LOG_RETENTION_DAYS`, `LOG_FILE_COMPRESS`,
+  `LOG_QUEUE_SIZE`. Every one clamps-and-warns rather than raising: a logging
+  misconfiguration must never be able to stop a deployment.
+
+## Fixed
+
+- **The request ID was silently `"-"` in every file log record**, while stdout
+  showed it correctly for the same record. `StructuredFormatter` reads the
+  request ID from a `contextvars` variable *at format time* — and a `ContextVar`
+  is bound to the task that set it. The stdout handler formats inline on the
+  request's own thread and sees the right value; file handlers format on the
+  **queue listener thread**, whose context is empty. The context is now
+  snapshotted onto the record at enqueue time, on the calling thread, and the
+  formatters prefer that snapshot. A correlation field that is present,
+  authoritative-looking and wrong is worse than one that is absent — and it
+  would have been wrong on precisely the sink someone greps during an incident,
+  because the log platform is the thing that broke.
+
+## Changed
+
+- **`backend/Dockerfile`** — pre-creates `/var/log/stockassist` owned by
+  `appuser` (uid 10001), mode 0750. This is the only way to get it right: when
+  Docker mounts a named volume onto a path that does **not** exist in the image,
+  it creates that path **root-owned**, the non-root process gets `EACCES` on
+  first write, and the failure surfaces as a stderr warning followed by silently
+  missing log files.
+- **`docker-compose.yml`** —
+  - The `x-logging` anchor gains `mode: non-blocking` + `max-buffer-size: 4m`.
+    The default `blocking` mode means a stalled logging driver blocks `write()`
+    to stdout, which in an asyncio server stalls **the event loop** — a slow log
+    backend becomes an application-wide outage on requests that never logged
+    anything.
+  - `backend_logs` named volume, mounted **unconditionally** at
+    `/var/log/stockassist` even when file logging is off (where it stays empty
+    and costs nothing). Requiring operators to add the mount at the same moment
+    they enable file logging guarantees the case where logs land on the
+    container's writable layer, look perfectly fine under `docker exec`, and
+    vanish on the next deploy.
+  - `LOG_DIR` set by Compose, because it must agree with the mount point;
+    `LOG_TO_FILES` deliberately **not** set there, since `environment` overrides
+    `env_file` and pinning it would silently ignore an operator who enabled file
+    logging in `production.env`.
+  - The supported logging drivers (Loki, Fluentd/ELK, awslogs, Datadog, Splunk)
+    documented at the anchor, with the caveat that every driver except
+    `json-file` and `journald` **disables `docker logs`**.
+
+## Design decisions worth recording
+
+- **Timestamped segments, not the stdlib's `.1 .2 .3`.** Shifting every backup
+  on each rotation is N renames, makes a file's name change meaning over time
+  (today's `.3` is not tomorrow's), and interacts badly with compression. A
+  timestamped name is written once, never changes, sorts chronologically under a
+  plain `ls`, and makes "the logs from around 13:45" a glob. This is what
+  `logrotate`'s `dateext` does.
+- **Age is pruned before count.** Count-first can retain a segment that age has
+  already expired, quietly breaking a "we do not keep request logs longer than N
+  days" commitment — the kind of rule that exists for legal reasons rather than
+  disk reasons.
+- **The pruner only deletes files whose names it can prove it created.** An
+  operator's `application.log.keepme` or an editor swap file is invisible to
+  retention.
+- **`error.log` is a view, not a partition.** An ERROR from the access logger
+  appears in *both* `access.log` and `error.log`; making it exclusive would strip
+  the access log of exactly its 5xx lines — the ones you go there to find.
+- **Stream ordering is load-bearing.** `security.audit.events` is a child of
+  `security`, so audit is matched first; otherwise the security stream swallows
+  every audit record and `audit.log` is permanently empty.
+- **Compression is synchronous, and that is safe *because* of the queue.**
+  Gzipping 50 MB takes ~460 ms; inline that is a p99.99 latency cliff with no
+  visible cause. Behind the `QueueListener` it is paid by the log pipeline.
+- **The queue is bounded and drops rather than blocks.** An unbounded queue in
+  front of a stalled disk is a memory leak with extra steps whose failure mode
+  is an OOM kill — losing the logs anyway, plus the service. Drops are counted in
+  `log_records_dropped_total`, because dropping telemetry to keep a trading
+  backend alive is the right trade and doing it silently is not.
+
+## Measured
+
+| Measurement | Result |
+|---|---|
+| Caller-thread cost, file sinks **on** | **5.90 µs/record** (169k/sec) |
+| Caller-thread cost, stdout only (PH2.5) | 12.34 µs/record (81k/sec) |
+| Sustained end-to-end, nothing dropped | ~31,000 records/sec |
+| Rotation + gzip | 9.2 ms/MB (~460 ms at the 50 MB default) |
+| Compression ratio, realistic JSON logs | 8.1 : 1 |
+| Steady-state footprint, all five streams | ~560 MB (2.7 GB worst case) |
+
+Enabling file logging made the caller **faster** (12.34 → 5.90 µs): the queue
+moves JSON formatting off the calling thread onto the listener. That is the
+entire justification for the queue, and it is nice to see it pay twice.
+
+## Known limitations
+
+1. **Per-container, not centralized** — shipping is PH2.10.
+2. **`docker compose down -v` destroys the log volume.** One volume on one host
+   is not a retention strategy for an audit trail.
+3. **Retention runs at rotation time, not on a timer** — an idle stream keeps
+   segments past `LOG_RETENTION_DAYS` until its next rotation. Bounded by the
+   count, but not a wall-clock guarantee.
+4. **Multi-worker rotation races** if `WEB_CONCURRENCY > 1` (already required to
+   be 1 until PH2.8).
+5. **`audit.log` is a portable copy, not the record of authority** — MongoDB
+   remains that.
+
+---
+
+# Sprint PH2.5 — Production Monitoring & Observability — 2026-07-22
+
+**The backend can now describe its own state. Three distinct health probes, an
+in-process metrics registry rendered in Prometheus exposition format, structured
+JSON logging on stdout, a request ID carried from the front door through every
+log line and audit record, and a diagnostics endpoint that reports which build is
+running. No Prometheus server, no Grafana, no alerting, no log shipping — those
+are PH2.6 and PH2.10. This sprint makes the application *observable*; the
+platform that observes it comes next.**
+
+> **Design note — why there are three health endpoints and not one.** "Is it
+> healthy?" is three questions asked by three systems that take three different
+> destructive actions. Liveness failure gets the container **killed**; readiness
+> failure gets it **removed from the load balancer but left running**; startup
+> failure means **keep waiting**. Conflating them is the classic cascading-failure
+> mistake: if liveness checks MongoDB, a 60-second database blip makes every
+> replica report unhealthy simultaneously, the orchestrator restarts the entire
+> fleet at once, and the cold-start reconnect storm lands on a database that was
+> already struggling — a recoverable dependency wobble becomes a total,
+> self-sustaining outage. So `/api/health/live` performs no I/O at all,
+> `/api/health/ready` is the only endpoint that touches Mongo and Redis, and
+> `/api/health/startup` exists so an aggressive liveness timer cannot kill a boot
+> that legitimately takes 20 Mongo indexes, a broker-session restore, a market
+> gateway and four background loops to complete. `backend/docker/healthcheck.sh`
+> now explicitly rejects a readiness payload, because pointing a container health
+> check at readiness is a real and damaging mistake.
+
+## Added
+
+- **`backend/observability/`** — a new package, one focused module per concern,
+  following the shape `backend/security/` established in PH1:
+  - `context.py` — request correlation. `contextvars`-backed request ID,
+    generated as `uuid4().hex` or adopted from a validated inbound
+    `X-Request-ID`. Deliberately dependency-free so `security.audit` can import
+    it without a cycle.
+  - `logging.py` — structured logging. `StructuredFormatter` (one JSON object per
+    line), `HumanFormatter` (dev), `configure_logging()`, message scrubbing,
+    third-party noise suppression, and the single-line access log.
+  - `metrics.py` — dependency-free `Counter`/`Gauge`/`Histogram` registry with
+    Prometheus text exposition, cardinality ceiling, and the four golden signals.
+  - `health.py` — probe registry, the `starting → ready → stopping` lifecycle
+    state machine, parallel timed probes with a short result cache, and built-in
+    MongoDB/Redis probes.
+  - `runtime.py` — version, git revision, build date, environment, uptime,
+    process facts. Reads no secret values.
+  - `middleware.py` — `ObservabilityMiddleware`, one pure-ASGI seam.
+  - `routes.py` — the six operational endpoints and the production access gate.
+- **Health endpoints**: `/api/health/live` (200 always, zero I/O),
+  `/api/health/ready` (Mongo critical + Redis non-critical; 503 while starting or
+  draining), `/api/health/startup`, `/api/health` (human aggregate).
+- **`/api/metrics`** — Prometheus exposition (`?format=json` for humans).
+  `http_requests_total`, `http_request_duration_seconds`,
+  `http_request_errors_total` (client/server/exception),
+  `http_requests_in_flight`, `app_uptime_seconds`, `app_info`, `dependency_up`
+  (1/0/**-1 = not configured**), `health_check_duration_seconds`, process
+  memory/FDs, and `metrics_series_dropped_total`.
+- **`/api/diagnostics`** — version, git revision, build date, environment,
+  start time, uptime, process facts, dependency *presence*.
+- **Request correlation end to end** — `X-Request-ID` on every response
+  (including errors), on every log line, and on every `security_audit_logs`
+  record.
+- **`docs/operations/MONITORING.md`** — endpoints, metrics, logging, correlation,
+  configuration, a troubleshooting guide, measured overhead, and the PH2.6/PH2.10
+  handoff including draft alert rules.
+- **`backend/tests/test_observability.py`** — 123 hermetic tests.
+
+## Changed
+
+- **`backend/server.py`** — `configure_logging()` moved to the **top** of the
+  file, replacing the `logging.basicConfig` line that sat at line 5392. It ran
+  *after* every import, so the ~40 modules that log at import time — the boot
+  sequence, the part you read when a container will not start — were the least
+  legible output in the log. Also: observability router registered, middleware
+  applied **last** (so it is outermost), health checks registered at import time,
+  `mark_started()` as the final statement of startup, `mark_stopping()` as the
+  **first** statement of shutdown.
+- **`security/audit.py`** — `redact_fields()` made public so observability reuses
+  the same sensitive-key list rather than maintaining a second one; `request_context`
+  now reads the request ID from the context first. *PH1.10 shipped a `request_id`
+  field, but nothing ever generated one — it was `None` on every record in
+  practice. It is now populated.*
+- **`security/cors.py`** — `X-Request-ID` added to `EXPOSE_HEADERS` (previously
+  empty). Without it the browser receives the header but JavaScript cannot read
+  it, so the SPA could never show a user their correlation ID.
+- **`security/rate_limit.py`** — the six operational paths added to
+  `_MIDDLEWARE_EXEMPT_PATHS`. A probe cadence across a kubelet, a load balancer
+  and an uptime monitor would otherwise exhaust the anonymous per-IP budget and
+  return 429, which the orchestrator reads as "unhealthy" — the rate limiter
+  manufacturing the outage it exists to prevent.
+- **`security/secrets.py`** — 12 observability variables registered in
+  `SECRET_REGISTRY` (`LOG_*`, `METRICS_*`, `HEALTH_*`, `APP_VERSION`, `VCS_REF`,
+  `BUILD_DATE`); `backend/.env.example` regenerated (52 variables).
+- **`backend/Dockerfile`** — `APP_VERSION`/`VCS_REF`/`BUILD_DATE` promoted from
+  build args to runtime `ENV`. They were already OCI labels, but a process cannot
+  read its own image metadata; promoting them is what lets the application report
+  its own build.
+- **`backend/docker/healthcheck.sh`** — accepts both the `/api` (`"running"`) and
+  `/api/health/live` (`"ok"`) contracts; explicitly rejects a readiness payload.
+- **`backend/tests/test_cors_hardening.py`** — the "no response headers exposed"
+  assertion updated to the exact one-header list, with the justification recorded.
+
+## Fixed
+
+- Two defects found by exercising the real boot path, both in code added this
+  sprint: the message scrubber accepted bare whitespace as a key/value separator
+  and so corrupted ordinary prose (the config validator's own warning came out as
+  `…username:password [REDACTED] database is…`); and histogram bucket bounds were
+  rendered with fixed six-decimal padding (`le="0.005000"` beside `le="1"`),
+  which would also have truncated a sub-microsecond `_sum`. Both now have
+  regression tests.
+
+## Known limitations
+
+1. Metrics are **per-process**; with `WEB_CONCURRENCY > 1` a scraper reaches one
+   worker at random. Aggregation is a PH2.10 problem.
+2. No WebSocket instrumentation — a 40-minute connection in the same histogram as
+   a 12ms REST call makes every percentile meaningless.
+3. No distributed tracing; request IDs correlate within this service only.
+4. No alerting and no log shipping — PH2.10 and PH2.6 respectively.
+5. `/api/admin/system/health` and `/api/admin/apis/health` still return partly
+   fabricated data (hard-coded latencies). Admin-dashboard endpoints, out of
+   scope here; they should be re-pointed at this module's real data later.
+
+## Verification
+
+818 hermetic tests pass (695 before this sprint, +123). Full `flake8` clean on
+every added file; the repo-wide correctness subset remains at zero findings.
+Boot verified end to end against a real MongoDB with `LOG_FORMAT=json`.
+Measured: middleware overhead < 0.1 ms/request, `/api/health/live` ~0.76 ms,
+`/api/metrics` render ~1.2 ms, module import ~0.7 s.
+
+---
+
 # Sprint PH2.4 — Production GitHub Actions CI — 2026-07-22
 
 **Every push and every pull request is now verified by a machine. Five

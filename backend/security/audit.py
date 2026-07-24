@@ -223,6 +223,19 @@ def _is_sensitive_key(key: str) -> bool:
     return any(marker in k for marker in _SENSITIVE_KEY_MARKERS)
 
 
+def redact_fields(value: Any) -> Any:
+    """Public entry point to the redactor — the one sensitive-key list in the app.
+
+    Exposed for `observability.logging` (PH2.5), which must apply exactly the
+    same rule to structured log fields that this module applies to audit
+    metadata. Two independently maintained lists of "what counts as a secret"
+    would drift, and the half that got missed would be the half that leaks: a
+    marker added here for a new credential type would silently not protect the
+    application log. One list, two consumers.
+    """
+    return _redact(value)
+
+
 def _redact(value: Any, _depth: int = 0) -> Any:
     """Recursively copy ``value`` with any sensitive-keyed field blanked.
 
@@ -292,16 +305,48 @@ class AuditRecord:
         }
 
 
+def _context_request_id() -> Optional[str]:
+    """The active correlation ID from `observability.context`, or None.
+
+    Imported inside the function, not at module scope. `security.audit` is
+    imported at boot by `server.py` before the observability package is wired,
+    and a security primitive should not acquire a hard import-time dependency on
+    a telemetry package — if observability is ever absent or broken, audit
+    logging must still work. The import is cached by `sys.modules` after the
+    first call, so this costs a dict lookup.
+    """
+    try:
+        from observability.context import current_request_id_or_none
+
+        return current_request_id_or_none()
+    except Exception:  # pragma: no cover - defensive
+        return None
+
+
 def request_context(request) -> tuple[Optional[str], Optional[str], Optional[str]]:
     """Best-effort (ip, user_agent, request_id) from a Starlette/FastAPI request.
 
     IP honors the first hop of ``X-Forwarded-For`` when present (behind a trusted
     proxy) and falls back to the socket peer — matching ``rate_limit.client_ip``
     so the audit log and the rate limiter attribute the same request to the same
-    identity. ``request_id`` is read from an ``X-Request-ID`` header when the edge
-    sets one (the correlation key an investigation joins on). Never raises."""
+    identity.
+
+    ``request_id`` is the correlation key an investigation joins on. It comes
+    from the active request context (PH2.5) — the ID
+    ``ObservabilityMiddleware`` assigned at the front door, which is the same
+    value stamped on every application log line for this request and returned to
+    the client in ``X-Request-ID``. Before PH2.5 this read the inbound header
+    directly, so the field was ``None`` on every record unless an edge proxy
+    happened to set one; going through the context means an audit record and the
+    surrounding application logs always share a key. The raw header remains the
+    fallback for a code path running outside the middleware (a scheduler task
+    replaying a request object, a unit test constructing one by hand).
+
+    Never raises."""
     if request is None:
-        return None, None, None
+        # Still worth asking the context: a background task spawned by a request
+        # inherits its correlation ID even though it holds no request object.
+        return None, None, _context_request_id()
     try:
         ip: Optional[str] = None
         xff = request.headers.get("x-forwarded-for")
@@ -311,7 +356,7 @@ def request_context(request) -> tuple[Optional[str], Optional[str], Optional[str
         if not ip:
             ip = request.client.host if request.client else None
         ua = request.headers.get("user-agent")
-        rid = request.headers.get("x-request-id")
+        rid = _context_request_id() or request.headers.get("x-request-id")
         return ip, ua, rid
     except Exception:  # pragma: no cover - defensive; context is best-effort
         return None, None, None

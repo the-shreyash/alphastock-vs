@@ -120,7 +120,7 @@ remain the launch blockers.
 | Packaging & deployability | 1.0 | 1.0 | **Still no Dockerfiles** — PH2.1–2.3 (blocks launch) |
 | CI/CD | 0.0 | **2.0** | `security-audit` workflow only; no build/test/deploy pipeline — PH2.5–2.7 (blocks launch) |
 | Testing | 5.0 | 5.5 | Backend suite deepened (626 hermetic pass); still non-hermetic legacy tests + zero frontend tests — PH3.1/3.3 |
-| Observability | 3.5 | **7.0** | Centralized audit logging (PH1.10); metrics/error-tracking still pending — PH2.10 |
+| Observability | 3.5 | **9.0** | Audit logging (PH1.10); PH2.5 added structured JSON logging, three health probes, metrics + request correlation; PH2.6 added log stream separation, rotation, retention, compression and bounded Docker log capture. Error tracking, alerting & log shipping still pending — PH2.10 |
 | Data integrity | 5.5 | 5.5 | Mock data in admin analytics still present — PH3.2 |
 | Documentation accuracy | 5.0 | 6.5 | Security docs authoritative & synced; deployment-stack mismatch remains — PH3.10 |
 

@@ -1,0 +1,799 @@
+"""In-process application metrics (PH2.5).
+
+WHY THIS MODULE EXISTS
+----------------------
+Logs answer "what happened to this one request?". Metrics answer "what is
+happening to all of them?" — a question logs cannot answer at production volume
+without an aggregation pipeline. Four numbers cover most of an on-call shift:
+how many requests, how slow, how many failed, how many are in flight right now.
+Google's "four golden signals" (traffic, latency, errors, saturation) are that
+list; this module records all four.
+
+WHY NO prometheus_client DEPENDENCY
+-----------------------------------
+The sprint scope explicitly excludes running Prometheus, and adding a dependency
+to a production image for a few counters is a poor trade: another package to
+pin, patch and audit, plus a multiprocess-mode footgun that bites the first time
+`WEB_CONCURRENCY` goes above 1. What *is* worth adopting is the **text exposition
+format**, which is a stable, trivially generated, human-readable de-facto
+standard. Emitting it costs one string builder and means PH2.10 can point a
+scraper at `/api/metrics` with zero re-instrumentation — and any other collector
+(OpenTelemetry, Datadog, Vector) can read it too.
+
+THE CARDINALITY RULE — the mistake that takes monitoring systems down
+---------------------------------------------------------------------
+A metric series is identified by its name *and its full label set*. Every
+distinct combination is a separate time series with its own memory here and its
+own storage in whatever scrapes it. Labelling a request counter with the raw URL
+path is therefore an outage waiting to happen: `/api/trades/{trade_id}` becomes
+one series per trade ID, a vulnerability scanner walking random URLs adds one
+series per 404, and memory grows without bound in the application *and* in the
+monitoring backend — which is how a metrics change takes out the system it was
+supposed to observe.
+
+So: labels are **route templates** (`/api/trades/{trade_id}`), never raw paths;
+unmatched requests collapse to a single `<unmatched>` bucket; and there is a
+hard per-metric series ceiling (:data:`MAX_SERIES_PER_METRIC`) after which new
+label combinations fold into `<overflow>` and a dedicated counter records that
+it happened. The ceiling is a backstop against a bug in the label plumbing —
+if `metrics_series_dropped_total` is ever non-zero, that is the alert.
+
+CONCURRENCY AND COST
+--------------------
+Values live in plain dicts behind one `threading.Lock`. The lock is held for a
+dict lookup and an addition — nanoseconds — and it is a lock rather than bare
+dict mutation because a multi-worker deployment may run the ASGI app alongside
+threadpool-executed sync endpoints. Rendering, bucket summation and process
+introspection all happen at *scrape* time, so the request path pays only the
+increment.
+"""
+from __future__ import annotations
+
+import bisect
+import logging
+import os
+import threading
+import time
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+
+logger = logging.getLogger(__name__)
+
+# --------------------------------------------------------------------------- #
+# Policy constants                                                              #
+# --------------------------------------------------------------------------- #
+# Per-metric ceiling on distinct label combinations. 500 is generous for this
+# API — roughly (routes x methods x status codes) with headroom — while still
+# being a number that cannot hurt a scraper. Tunable for an unusual deployment,
+# floored at 1 so a typo'd "0" cannot silently disable all metrics.
+MAX_SERIES_PER_METRIC = max(1, int(os.environ.get("METRICS_MAX_SERIES", "500")))
+
+# The label value every over-ceiling combination folds into.
+OVERFLOW_LABEL = "<overflow>"
+
+# Latency histogram buckets, in seconds, upper-bound inclusive ("le" semantics).
+# Chosen for a JSON API in front of Mongo and third-party market-data providers:
+# dense from 5ms to 500ms where nearly all traffic lives and where an SLO is
+# actually set, then sparse out to 10s to catch provider stalls. Buckets are
+# fixed at import: changing them mid-process would corrupt the cumulative
+# counts, and changing them between deploys resets the histogram (a known,
+# accepted cost of the format — worth stating so nobody "just adds one bucket"
+# during an incident and then distrusts the graph).
+DEFAULT_LATENCY_BUCKETS: Tuple[float, ...] = (
+    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+)
+
+# Prometheus content type for the text exposition format, version 0.0.4.
+CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8"
+
+_LabelValues = Tuple[str, ...]
+
+
+# --------------------------------------------------------------------------- #
+# Exposition-format escaping                                                    #
+# --------------------------------------------------------------------------- #
+def _escape_help(text: str) -> str:
+    """Escape HELP text: backslash and newline only, per the format spec."""
+    return text.replace("\\", r"\\").replace("\n", r"\n")
+
+
+def _escape_label_value(value: str) -> str:
+    """Escape a label value: backslash, double quote and newline.
+
+    Unescaped, any of the three produces a malformed exposition document that a
+    scraper rejects *wholesale* — one bad label value would discard every metric
+    in the response, not just its own.
+    """
+    return (
+        value.replace("\\", r"\\")
+        .replace('"', r"\"")
+        .replace("\n", r"\n")
+    )
+
+
+def _render_labels(names: Sequence[str], values: _LabelValues) -> str:
+    if not names:
+        return ""
+    pairs = ",".join(
+        f'{name}="{_escape_label_value(str(value))}"'
+        for name, value in zip(names, values)
+    )
+    return "{" + pairs + "}"
+
+
+def _format_value(value: float) -> str:
+    """Render a sample value.
+
+    Integral floats are emitted without a decimal point so counters read as
+    counters (`1234`, not `1234.0`). Everything else uses Python's shortest
+    round-trip float repr — `0.005`, not `0.005000`. Fixed-precision formatting
+    was the first implementation and it was wrong twice over: it padded every
+    histogram bucket bound with meaningless zeros (`le="0.005000"` next to
+    `le="1"` in the same metric), and at six decimals it would silently truncate
+    a `_sum` that had accumulated into the microseconds.
+    """
+    if value == int(value) and abs(value) < 1e15:
+        return str(int(value))
+    return repr(float(value))
+
+
+# --------------------------------------------------------------------------- #
+# Metric families                                                               #
+# --------------------------------------------------------------------------- #
+class _Metric:
+    """Shared base: name, help text, label schema, and the series ceiling.
+
+    Subclasses own their value storage. `_lock` guards every mutation; it is
+    per-metric rather than global so an unrelated counter can never contend with
+    the request-latency histogram on the hot path.
+    """
+
+    type_name = "untyped"
+
+    def __init__(self, name: str, help_text: str, label_names: Sequence[str] = ()):
+        self.name = name
+        self.help_text = help_text
+        self.label_names: Tuple[str, ...] = tuple(label_names)
+        self._lock = threading.Lock()
+        self._dropped = 0
+
+    def _key(self, label_values: Sequence[str], existing: Dict[_LabelValues, object]) -> _LabelValues:
+        """Normalize label values into a storage key, applying the ceiling.
+
+        Called with `_lock` held. A label set that is already present is always
+        accepted (the ceiling bounds *distinct* series, and refusing to update an
+        existing one would make graphs lie). A new set beyond the ceiling folds
+        into the overflow series so the signal degrades instead of disappearing.
+        """
+        if len(label_values) != len(self.label_names):
+            # A caller/label-schema mismatch is a programming error. Fail loudly
+            # in the logs but never raise: a metrics bug must not 500 a route.
+            logger.error(
+                "metric %s expects labels %s, got %d value(s) — recording as overflow",
+                self.name, self.label_names, len(label_values),
+            )
+            return tuple(OVERFLOW_LABEL for _ in self.label_names)
+
+        key = tuple(str(v) for v in label_values)
+        if key in existing or len(existing) < MAX_SERIES_PER_METRIC:
+            return key
+        self._dropped += 1
+        return tuple(OVERFLOW_LABEL for _ in self.label_names)
+
+    @property
+    def dropped(self) -> int:
+        return self._dropped
+
+    def collect(self) -> List[Tuple[str, _LabelValues, float]]:  # pragma: no cover - interface
+        """(sample_name, label_values, value) triples for exposition."""
+        raise NotImplementedError
+
+
+class Counter(_Metric):
+    """A value that only ever increases (and resets to zero on restart).
+
+    Counters are the right shape for "how many": a scraper computes rates from
+    successive samples, so a restart is a visible reset rather than corrupted
+    data. Never use one for a value that can go down — that is a gauge.
+    """
+
+    type_name = "counter"
+
+    def __init__(self, name: str, help_text: str, label_names: Sequence[str] = ()):
+        super().__init__(name, help_text, label_names)
+        self._values: Dict[_LabelValues, float] = {}
+
+    def inc(self, amount: float = 1.0, labels: Sequence[str] = ()) -> None:
+        if amount < 0:
+            logger.error("counter %s got a negative increment (%s); ignored", self.name, amount)
+            return
+        with self._lock:
+            key = self._key(labels, self._values)
+            self._values[key] = self._values.get(key, 0.0) + amount
+
+    def value(self, labels: Sequence[str] = ()) -> float:
+        with self._lock:
+            return self._values.get(tuple(str(v) for v in labels), 0.0)
+
+    def collect(self) -> List[Tuple[str, _LabelValues, float]]:
+        with self._lock:
+            return [(self.name, key, val) for key, val in self._values.items()]
+
+
+class Gauge(_Metric):
+    """A value that goes up and down — in-flight requests, uptime, memory."""
+
+    type_name = "gauge"
+
+    def __init__(self, name: str, help_text: str, label_names: Sequence[str] = ()):
+        super().__init__(name, help_text, label_names)
+        self._values: Dict[_LabelValues, float] = {}
+
+    def set(self, value: float, labels: Sequence[str] = ()) -> None:
+        with self._lock:
+            key = self._key(labels, self._values)
+            self._values[key] = float(value)
+
+    def inc(self, amount: float = 1.0, labels: Sequence[str] = ()) -> None:
+        with self._lock:
+            key = self._key(labels, self._values)
+            self._values[key] = self._values.get(key, 0.0) + amount
+
+    def dec(self, amount: float = 1.0, labels: Sequence[str] = ()) -> None:
+        self.inc(-amount, labels)
+
+    def value(self, labels: Sequence[str] = ()) -> float:
+        with self._lock:
+            return self._values.get(tuple(str(v) for v in labels), 0.0)
+
+    def collect(self) -> List[Tuple[str, _LabelValues, float]]:
+        with self._lock:
+            return [(self.name, key, val) for key, val in self._values.items()]
+
+
+class Histogram(_Metric):
+    """Bucketed observations — latency, above all.
+
+    WHY A HISTOGRAM AND NOT AN AVERAGE: a mean latency is the single most
+    misleading number in operations. If 99 requests take 10ms and one takes 10
+    seconds, the mean is 110ms and every dashboard looks fine while a user sits
+    on a broken page. Buckets preserve the shape of the distribution, so p95/p99
+    can be computed by the scraper and the tail — where the outages live — stays
+    visible.
+
+    Storage is cumulative-by-bucket, matching the exposition format: each bucket
+    holds the count of observations **less than or equal to** its upper bound,
+    plus `_sum` and `_count`.
+    """
+
+    type_name = "histogram"
+
+    def __init__(
+        self,
+        name: str,
+        help_text: str,
+        label_names: Sequence[str] = (),
+        buckets: Sequence[float] = DEFAULT_LATENCY_BUCKETS,
+    ):
+        super().__init__(name, help_text, label_names)
+        self.buckets: Tuple[float, ...] = tuple(sorted(buckets))
+        self._counts: Dict[_LabelValues, List[int]] = {}
+        self._sums: Dict[_LabelValues, float] = {}
+        self._totals: Dict[_LabelValues, int] = {}
+
+    def observe(self, value: float, labels: Sequence[str] = ()) -> None:
+        with self._lock:
+            key = self._key(labels, self._counts)
+            counts = self._counts.get(key)
+            if counts is None:
+                counts = [0] * len(self.buckets)
+                self._counts[key] = counts
+                self._sums[key] = 0.0
+                self._totals[key] = 0
+            # bisect_left finds the first bucket whose upper bound is >= value,
+            # i.e. the "le" bucket this observation belongs to. Incrementing from
+            # there to the end keeps the counts cumulative, which is what the
+            # format requires and what lets a scraper subtract adjacent buckets.
+            index = bisect.bisect_left(self.buckets, value)
+            for i in range(index, len(counts)):
+                counts[i] += 1
+            self._sums[key] += value
+            self._totals[key] += 1
+
+    def snapshot(self, labels: Sequence[str] = ()) -> dict:
+        """Counts/sum/total for one label set — used by tests and the JSON view."""
+        key = tuple(str(v) for v in labels)
+        with self._lock:
+            return {
+                "buckets": dict(zip(self.buckets, self._counts.get(key, [0] * len(self.buckets)))),
+                "sum": self._sums.get(key, 0.0),
+                "count": self._totals.get(key, 0),
+            }
+
+    def collect(self) -> List[Tuple[str, _LabelValues, float]]:
+        """Flatten to `_bucket` / `_sum` / `_count` samples.
+
+        The `le` bucket bound is appended as an extra label value; the renderer
+        knows to widen the label-name list for `_bucket` samples only.
+        """
+        out: List[Tuple[str, _LabelValues, float]] = []
+        with self._lock:
+            for key, counts in self._counts.items():
+                for bound, count in zip(self.buckets, counts):
+                    out.append((f"{self.name}_bucket", key + (_format_value(bound),), float(count)))
+                # +Inf is mandatory and equals the total observation count.
+                out.append((f"{self.name}_bucket", key + ("+Inf",), float(self._totals[key])))
+                out.append((f"{self.name}_sum", key, self._sums[key]))
+                out.append((f"{self.name}_count", key, float(self._totals[key])))
+        return out
+
+
+# --------------------------------------------------------------------------- #
+# Registry                                                                      #
+# --------------------------------------------------------------------------- #
+class Registry:
+    """The collection of metrics this process exposes.
+
+    A class rather than module globals so the test suite can build an isolated
+    registry per test — shared mutable counters across tests produce the kind of
+    order-dependent failures that erode trust in a suite. The application uses
+    the module-level default instance.
+    """
+
+    def __init__(self) -> None:
+        self._metrics: Dict[str, _Metric] = {}
+        self._lock = threading.Lock()
+        # Callbacks evaluated at render time, for values that are cheaper (or
+        # only correct) when sampled on demand: uptime, process RSS, health
+        # status. This is what keeps the request path free of that work.
+        self._collectors: List[Callable[[], None]] = []
+
+    # -- registration ------------------------------------------------------- #
+    def _register(self, metric: _Metric) -> _Metric:
+        with self._lock:
+            existing = self._metrics.get(metric.name)
+            if existing is not None:
+                # Idempotent: re-importing a module (or a test re-running wiring)
+                # must return the same instance rather than silently replacing a
+                # live metric and zeroing its history.
+                return existing
+            self._metrics[metric.name] = metric
+            return metric
+
+    def counter(self, name: str, help_text: str, label_names: Sequence[str] = ()) -> Counter:
+        return self._register(Counter(name, help_text, label_names))  # type: ignore[return-value]
+
+    def gauge(self, name: str, help_text: str, label_names: Sequence[str] = ()) -> Gauge:
+        return self._register(Gauge(name, help_text, label_names))  # type: ignore[return-value]
+
+    def histogram(
+        self,
+        name: str,
+        help_text: str,
+        label_names: Sequence[str] = (),
+        buckets: Sequence[float] = DEFAULT_LATENCY_BUCKETS,
+    ) -> Histogram:
+        return self._register(Histogram(name, help_text, label_names, buckets))  # type: ignore[return-value]
+
+    def add_collector(self, fn) -> None:
+        """Register a zero-arg callable run before each render.
+
+        It must be fast and it must not raise; a raising collector is caught and
+        logged so one broken gauge cannot blank the whole metrics response
+        (which would be a monitoring outage on top of whatever it was reporting).
+        """
+        self._collectors.append(fn)
+
+    def metrics(self) -> Iterable[_Metric]:
+        with self._lock:
+            return list(self._metrics.values())
+
+    # -- rendering ---------------------------------------------------------- #
+    def _run_collectors(self) -> None:
+        for fn in list(self._collectors):
+            try:
+                fn()
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("metrics collector %r failed: %s", getattr(fn, "__name__", fn), exc)
+
+    def render_prometheus(self) -> str:
+        """The full exposition document, ready to serve."""
+        self._run_collectors()
+        lines: List[str] = []
+        for metric in sorted(self.metrics(), key=lambda m: m.name):
+            samples = metric.collect()
+            # A metric with no observations yet is emitted as HELP/TYPE only.
+            # Skipping it entirely would make a dashboard panel read "no data"
+            # rather than "zero", which are very different during an incident.
+            lines.append(f"# HELP {metric.name} {_escape_help(metric.help_text)}")
+            lines.append(f"# TYPE {metric.name} {metric.type_name}")
+            for sample_name, label_values, value in samples:
+                names = metric.label_names
+                if sample_name.endswith("_bucket"):
+                    names = names + ("le",)
+                lines.append(
+                    f"{sample_name}{_render_labels(names, label_values)} {_format_value(value)}"
+                )
+        # The exposition format requires a trailing newline; some scrapers reject
+        # a document without one.
+        return "\n".join(lines) + "\n"
+
+    def snapshot(self) -> dict:
+        """A JSON-shaped view of the same data.
+
+        Exists for humans and for the test suite: `curl /api/metrics?format=json`
+        during an incident is far easier to read than the text format, and a test
+        asserting on a parsed dict is clearer than one grepping strings.
+        """
+        self._run_collectors()
+        out: dict = {}
+        for metric in sorted(self.metrics(), key=lambda m: m.name):
+            series = []
+            for sample_name, label_values, value in metric.collect():
+                names = metric.label_names
+                if sample_name.endswith("_bucket"):
+                    names = names + ("le",)
+                series.append(
+                    {
+                        "sample": sample_name,
+                        "labels": dict(zip(names, label_values)),
+                        "value": value,
+                    }
+                )
+            out[metric.name] = {
+                "type": metric.type_name,
+                "help": metric.help_text,
+                "series": series,
+            }
+        return out
+
+    def dropped_series(self) -> int:
+        return sum(m.dropped for m in self.metrics())
+
+
+# --------------------------------------------------------------------------- #
+# The application's metrics                                                     #
+# --------------------------------------------------------------------------- #
+# One module-level registry, mirroring how `security.audit` exposes one default
+# logger: instrumentation call sites should not have to locate a registry.
+registry = Registry()
+
+# -- The four golden signals ------------------------------------------------- #
+# Traffic. `route` is a template and `status` a numeric code, so cardinality is
+# (routes x methods x codes) — bounded and stable.
+http_requests_total = registry.counter(
+    "http_requests_total",
+    "Total HTTP requests handled, by method, route template and status code.",
+    ("method", "route", "status"),
+)
+
+# Latency. Note it is NOT labelled by status: a histogram is the most expensive
+# metric per series (one series per bucket), and mixing status into it would
+# multiply that by ~15 for a question ("how slow are the 500s?") that is better
+# answered from logs.
+http_request_duration_seconds = registry.histogram(
+    "http_request_duration_seconds",
+    "HTTP request latency in seconds, by method and route template.",
+    ("method", "route"),
+)
+
+# Errors. Derivable from http_requests_total, but kept separate and explicit:
+# `kind` distinguishes a client's fault (4xx) from ours (5xx) from an unhandled
+# exception that never produced a response at all — three very different pages
+# in the middle of the night.
+http_request_errors_total = registry.counter(
+    "http_request_errors_total",
+    "HTTP requests that failed, by method, route template and error kind "
+    "(client=4xx, server=5xx, exception=unhandled).",
+    ("method", "route", "kind"),
+)
+
+# Saturation. The number a restart-loop or a stuck dependency shows first: it
+# climbs monotonically while latency looks normal, because the slow requests
+# have not finished yet and so have not been recorded anywhere else.
+http_requests_in_flight = registry.gauge(
+    "http_requests_in_flight",
+    "HTTP requests currently being processed.",
+)
+
+# -- Application lifecycle --------------------------------------------------- #
+app_start_time_seconds = registry.gauge(
+    "app_start_time_seconds",
+    "Unix timestamp at which this process started (constant; uptime = now - this).",
+)
+app_uptime_seconds = registry.gauge(
+    "app_uptime_seconds",
+    "Seconds since this process started.",
+)
+app_info = registry.gauge(
+    "app_info",
+    "Build and environment metadata; the value is always 1 (the info-metric idiom).",
+    ("version", "environment", "python_version", "revision"),
+)
+
+# -- Dependency health ------------------------------------------------------- #
+# Populated from the last readiness evaluation rather than by probing at scrape
+# time: a scraper must never be able to drive load onto MongoDB.
+dependency_up = registry.gauge(
+    "dependency_up",
+    "Last observed health of a dependency: 1 healthy, 0 unhealthy "
+    "(-1 not configured / skipped).",
+    ("dependency",),
+)
+health_check_duration_seconds = registry.histogram(
+    "health_check_duration_seconds",
+    "Duration of the most recent dependency health probes, in seconds.",
+    ("dependency",),
+    buckets=(0.005, 0.025, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0),
+)
+
+# -- Self-instrumentation ---------------------------------------------------- #
+# If this is ever non-zero, the label plumbing has a bug and the metrics above
+# are quietly incomplete. It is the one metric whose purpose is to be alerted on
+# at any value greater than zero.
+metrics_series_dropped_total = registry.gauge(
+    "metrics_series_dropped_total",
+    "Label combinations folded into the overflow series because a metric hit "
+    "METRICS_MAX_SERIES. Non-zero means instrumentation is mislabelled.",
+)
+
+
+# PH2.6. Non-zero means the log-file writer could not keep up and the files on
+# disk have gaps — either the volume is too slow or the level is too verbose for
+# it. Deliberately a metric rather than a log line: the one thing you cannot
+# rely on to report a broken log pipeline is the log pipeline.
+log_records_dropped_total = registry.gauge(
+    "log_records_dropped_total",
+    "Log records discarded because the file-sink queue was full (PH2.6). "
+    "Non-zero means log files on this instance are incomplete.",
+)
+
+
+def _collect_runtime_gauges() -> None:
+    """Render-time collector for uptime and the overflow counters."""
+    app_uptime_seconds.set(max(0.0, time.time() - _PROCESS_START_WALL))
+    metrics_series_dropped_total.set(registry.dropped_series())
+    try:
+        # Imported lazily and at scrape time. `log_streams` imports nothing from
+        # this module, so a module-level import would be safe today — but it
+        # would make the metrics registry a boot-order dependency of the logging
+        # pipeline, and the logging pipeline is configured first, on purpose.
+        from observability import log_streams
+
+        log_records_dropped_total.set(float(log_streams.dropped_records()))
+    except Exception:  # pragma: no cover - defensive
+        pass
+
+
+_PROCESS_START_WALL = time.time()
+app_start_time_seconds.set(_PROCESS_START_WALL)
+registry.add_collector(_collect_runtime_gauges)
+
+
+def _collect_process_gauges() -> None:
+    """Render-time collector for process resource usage.
+
+    `psutil` is already a dependency (the admin system-health endpoint uses it).
+    Sampling happens here, at scrape time, precisely because `cpu_percent` and
+    `memory_info` are syscalls that have no business running on a request path.
+    Best-effort: in a restricted container `/proc` may be unreadable, and losing
+    two gauges is not a reason to fail the metrics response.
+    """
+    try:
+        import psutil
+
+        process = psutil.Process()
+        process_resident_memory_bytes.set(float(process.memory_info().rss))
+        process_open_fds.set(float(process.num_fds()))
+    except Exception:
+        # Deliberately silent: this runs on every scrape, so logging a warning
+        # here would produce one line per scrape interval forever on any platform
+        # where psutil is restricted. The absent metric is itself the signal.
+        pass
+
+
+process_resident_memory_bytes = registry.gauge(
+    "process_resident_memory_bytes",
+    "Resident set size of this process, in bytes.",
+)
+process_open_fds = registry.gauge(
+    "process_open_fds",
+    "Number of open file descriptors held by this process.",
+)
+registry.add_collector(_collect_process_gauges)
+
+
+# --------------------------------------------------------------------------- #
+# Redis (PH2.7)                                                                 #
+#                                                                               #
+# Two families, kept separate on purpose:                                        #
+#                                                                               #
+#   redis_*         what THIS PROCESS's client is experiencing — pool occupancy, #
+#                   circuit state, command outcomes and latency. Collected from  #
+#                   in-process counters at render time, so a scrape costs        #
+#                   nothing and can never add load to Redis.                     #
+#   redis_server_*  what the SERVER reports — memory, clients, evictions.        #
+#                   Sampled by a background task on a fixed cadence              #
+#                   (REDIS_STATS_INTERVAL_SECONDS), never at scrape time, for    #
+#                   the same reason `dependency_up` is published from the        #
+#                   readiness result rather than probed on scrape: whoever can   #
+#                   reach /api/metrics must not be able to generate dependency   #
+#                   load by scraping faster.                                     #
+#                                                                               #
+# The gauges live here rather than in `infrastructure/` so that the metric names #
+# this process exposes are all declared in one file — the thing you grep when a  #
+# dashboard panel says "no data". `infrastructure.redis_client` registers the    #
+# collector that fills them.                                                     #
+# --------------------------------------------------------------------------- #
+redis_up = registry.gauge(
+    "redis_up",
+    "1 when this process holds a live Redis connection, 0 otherwise. Zero with "
+    "REDIS_URL set means the backend is running on its in-process fallback.",
+)
+
+# The single most useful Redis series to alert on. It is a leading indicator:
+# the circuit opens *before* users notice, because the fallback keeps serving.
+redis_circuit_state = registry.gauge(
+    "redis_circuit_state",
+    "Circuit breaker state: 0 closed (healthy), 1 half-open (probing recovery), "
+    "2 open (degraded to in-process fallback).",
+)
+
+redis_pool_connections = registry.gauge(
+    "redis_pool_connections",
+    "Connection-pool occupancy by state (in_use / available / max). in_use "
+    "approaching max means commands are queueing for a connection.",
+    ("state",),
+)
+
+# `outcome` is bounded to four values (ok / error / connection_error /
+# unavailable) and `operation` to the handful of verbs services/cache.py uses,
+# so cardinality stays flat regardless of traffic. A key would go here in a
+# careless implementation and make the series count unbounded.
+redis_commands_total = registry.counter(
+    "redis_commands_total",
+    "Redis operations attempted, by operation and outcome. outcome=unavailable "
+    "means the command was never sent (Redis unconfigured or circuit open).",
+    ("operation", "outcome"),
+)
+
+redis_command_duration_seconds = registry.histogram(
+    "redis_command_duration_seconds",
+    "Redis command round-trip latency in seconds, by operation.",
+    ("operation",),
+    # Redis answers in tens of microseconds on a local network, so the default
+    # HTTP buckets (which start at 5ms) would put every healthy command in the
+    # first bucket and make the histogram useless. These start at 100µs, where
+    # the interesting variation actually is.
+    buckets=(0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 2.5),
+)
+
+redis_connection_errors_total = registry.counter(
+    "redis_connection_errors_total",
+    "Connection-level Redis failures (refused, reset, timed out, loading). "
+    "Distinguished from command errors, which say nothing about the link.",
+)
+
+# -- Pub/Sub ----------------------------------------------------------------- #
+# A steadily climbing reconnect count with no corresponding Redis restart is the
+# signature of subscribers being dropped for slow consumption — see
+# `client-output-buffer-limit pubsub` in docker/redis/redis.conf.
+redis_pubsub_reconnects_total = registry.counter(
+    "redis_pubsub_reconnects_total",
+    "Times a Pub/Sub subscriber re-established its subscription after losing it.",
+    ("channel",),
+)
+
+redis_pubsub_messages_total = registry.counter(
+    "redis_pubsub_messages_total",
+    "Pub/Sub messages by channel and disposition (received / published / "
+    "dropped / handler_error).",
+    ("channel", "disposition"),
+)
+
+# -- Server-reported (background sampler) ------------------------------------ #
+redis_server_memory_used_bytes = registry.gauge(
+    "redis_server_memory_used_bytes",
+    "Redis server memory in use, as reported by INFO. Compare against "
+    "redis_server_memory_max_bytes — the ratio is the eviction pressure.",
+)
+redis_server_memory_max_bytes = registry.gauge(
+    "redis_server_memory_max_bytes",
+    "Configured maxmemory in bytes (0 means unlimited, which for a cache is a "
+    "pending OOM kill).",
+)
+redis_server_connected_clients = registry.gauge(
+    "redis_server_connected_clients",
+    "Clients currently connected to the Redis server, across all replicas.",
+)
+redis_server_evicted_keys_total = registry.gauge(
+    "redis_server_evicted_keys_total",
+    "Keys evicted by the maxmemory policy since server start. Steady growth is "
+    "normal for an LRU cache at capacity; a sudden jump means the working set "
+    "outgrew maxmemory.",
+)
+redis_server_expired_keys_total = registry.gauge(
+    "redis_server_expired_keys_total",
+    "Keys removed at TTL expiry since server start.",
+)
+redis_server_rejected_connections_total = registry.gauge(
+    "redis_server_rejected_connections_total",
+    "Connections refused because maxclients was reached. Any non-zero value is "
+    "a connection leak or an unplanned scale-up.",
+)
+
+
+# --------------------------------------------------------------------------- #
+# Instrumentation helpers — the API the middleware actually calls               #
+# --------------------------------------------------------------------------- #
+def record_request(method: str, route: str, status: int, duration_seconds: float) -> None:
+    """Record one completed HTTP request across all four signals.
+
+    One function so a call site cannot update three of the four metrics and
+    forget the fourth, leaving dashboards subtly inconsistent. Never raises:
+    wrapped whole, because it is called from a `finally` block on the request
+    path and an exception here would replace a real response with a 500.
+    """
+    try:
+        status_str = str(status)
+        http_requests_total.inc(labels=(method, route, status_str))
+        http_request_duration_seconds.observe(duration_seconds, labels=(method, route))
+        if 400 <= status < 500:
+            http_request_errors_total.inc(labels=(method, route, "client"))
+        elif status >= 500:
+            http_request_errors_total.inc(labels=(method, route, "server"))
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("failed to record request metrics: %s", exc)
+
+
+def record_exception(method: str, route: str) -> None:
+    """Record a request whose handler raised without producing a response."""
+    try:
+        http_request_errors_total.inc(labels=(method, route, "exception"))
+    except Exception:  # pragma: no cover - defensive
+        pass
+
+
+def record_dependency_health(name: str, healthy: Optional[bool], duration_seconds: float) -> None:
+    """Publish the outcome of one dependency probe.
+
+    ``healthy=None`` means "not configured" and maps to -1 rather than 0: a
+    Redis that was never configured is not the same condition as a Redis that is
+    down, and an alert rule must be able to tell them apart.
+    """
+    try:
+        value = -1.0 if healthy is None else (1.0 if healthy else 0.0)
+        dependency_up.set(value, labels=(name,))
+        health_check_duration_seconds.observe(duration_seconds, labels=(name,))
+    except Exception:  # pragma: no cover - defensive
+        pass
+
+
+def set_app_info(version: str, environment: str, python_version: str, revision: str) -> None:
+    """Publish build metadata as the conventional `_info` gauge (value 1).
+
+    The idiom exists because labels cannot be attached to a scrape as a whole:
+    a constant-1 gauge carrying them lets a query join runtime metadata onto any
+    other series (e.g. "p99 latency, by deployed version").
+    """
+    try:
+        app_info.set(1.0, labels=(version, environment, python_version, revision))
+    except Exception:  # pragma: no cover - defensive
+        pass
+
+
+def reset_for_tests() -> None:
+    """Zero every metric. Test-support only — never call from application code.
+
+    Exists so metric assertions are order-independent; without it, one test's
+    requests inflate the next test's counters and the suite fails only when run
+    in a different order.
+    """
+    for metric in registry.metrics():
+        with metric._lock:  # noqa: SLF001 - deliberate test-support access
+            metric._dropped = 0
+            if isinstance(metric, (Counter, Gauge)):
+                metric._values.clear()
+            elif isinstance(metric, Histogram):
+                metric._counts.clear()
+                metric._sums.clear()
+                metric._totals.clear()

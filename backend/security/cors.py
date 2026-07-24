@@ -91,8 +91,15 @@ ALLOWED_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
 ALLOWED_HEADERS = ["Authorization", "Content-Type", "Accept", "Origin", "X-Requested-With"]
 
 # Response headers the browser is permitted to read. Cookie-based auth needs
-# none, so nothing extra is exposed.
-EXPOSE_HEADERS: List[str] = []
+# none; the one exception is the request-correlation ID.
+#
+# X-Request-ID (PH2.5): without this entry the browser receives the header but
+# JavaScript cannot read it — the CORS spec hides every response header from
+# script unless it is explicitly exposed. That would defeat the point of the ID:
+# the frontend could not surface it in an error toast, and a user reporting a
+# failure would have nothing to quote. Exposing it leaks nothing — it is an
+# opaque value this server generated for this request.
+EXPOSE_HEADERS: List[str] = ["X-Request-ID"]
 
 # How long (seconds) a browser may cache a preflight response.
 PREFLIGHT_MAX_AGE = 600

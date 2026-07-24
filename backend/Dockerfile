@@ -184,6 +184,24 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PORT=8000 \
     WEB_CONCURRENCY=1 \
     TZ=UTC
+
+# ── Build provenance, readable at RUNTIME (PH2.5) ─────────────────────────────
+# The same three build arguments are already stamped as OCI labels above. Labels
+# are visible to `docker inspect` and to a registry — but NOT to the running
+# process, which cannot read its own image metadata.
+#
+# Promoting them to environment variables is what lets the application report its
+# own build: /api/diagnostics returns version/revision/build_date, the `app_info`
+# metric carries them as labels, and every structured log line includes the
+# version. That closes the "which commit is actually running in production?"
+# question from inside the process, instead of by correlating a deploy log with a
+# CI run with a git tag — three systems, any of which can be wrong.
+#
+# Kept as a separate ENV instruction, after the block above, so that a rebuild
+# with a new VCS_REF invalidates only this tiny layer.
+ENV APP_VERSION=${APP_VERSION} \
+    VCS_REF=${VCS_REF} \
+    BUILD_DATE=${BUILD_DATE}
 # Rationale for each:
 #   PYTHONDONTWRITEBYTECODE — the source tree is owned by root and read-only to
 #       the app user, so bytecode writes would fail anyway; bytecode is instead
@@ -257,6 +275,31 @@ COPY --chown=root:root . .
 # (Windows/NTFS, some CI artifact caches) — a genuinely common and
 # very confusing failure.
 RUN chmod 0755 docker/entrypoint.sh docker/healthcheck.sh
+
+# Log directory (PH2.6). Created here, at build time, as root — and this is the
+# ONLY way to get it right.
+#
+# When Docker mounts a named volume onto a path that does not exist in the
+# image, it creates that path owned by root:root. The application runs as uid
+# 10001 and would get EACCES on its first write — surfacing not as a startup
+# error but as a stderr warning followed by silently missing log files, which is
+# the worst shape a logging failure can take. Creating the directory in the
+# image with the right ownership makes Docker COPY that ownership onto a fresh
+# named volume instead, so `- backend_logs:/var/log/stockassist` just works.
+#
+# /var/log/<service> rather than /app/logs: mutable runtime state does not
+# belong in a source tree that is deliberately root-owned and unwritable (see
+# the COPY above), and it is where an operator, a log agent's default config and
+# every runbook already look.
+#
+# 0750 — the process needs rwx, the group can read (a sidecar log shipper
+# running in the same group), nobody else on the box gets to read logs that
+# contain user identifiers and request metadata.
+#
+# The directory exists even when LOG_TO_FILES is off, and costs nothing empty.
+# The alternative — creating it lazily at runtime — would need write permission
+# on /var/log, which the runtime user deliberately does not have.
+RUN install -d -o appuser -g appuser -m 0750 /var/log/stockassist
 
 # Precompile bytecode at build time, as root, into the read-only source tree.
 # Startup then skips compiling ~250k lines of application code on first import,
