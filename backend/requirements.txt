@@ -1,118 +1,136 @@
+# ==============================================================================
+# StockAssist AI — Backend PRODUCTION runtime dependencies
+#
+# WHY THIS FILE LOOKS DIFFERENT NOW (PH2.8)
+# -----------------------------------------
+# Until PH2.8 this file was a raw `pip freeze` — 118 fully-pinned packages, no
+# structure, no record of which ones the application actually imports. That is
+# how a dependency set rots: a package added for a feature that was later cut
+# stays forever, because nobody can tell a live dependency from a fossil without
+# reading every import in the codebase. PH2.1 measured the cost — ~220 MB of the
+# runtime image was packages NO application module imports (litellm, boto3,
+# botocore, stripe, s5cmd, the old google-generativeai SDK + grpcio/protobuf,
+# pandas, numpy, openai, huggingface, tiktoken, …). PH2.8 removed them.
+#
+# HOW THIS SET WAS DERIVED (and how to re-derive it)
+# --------------------------------------------------
+#   1. Enumerate every third-party module the application imports — including
+#      lazy imports inside functions and try/except blocks.
+#   2. Map those to their distributions; that is the DIRECT set below.
+#   3. Compute the dependency CLOSURE of the direct set from installed metadata
+#      (importlib.metadata.requires, evaluating environment markers, excluding
+#      `extra ==` optional deps). Everything in the closure and nothing else is
+#      the TRANSITIVE set below.
+#   4. Prove it: the closure is closed under its own core requirements (pip
+#      installs exactly this set, nothing missing), and with every REMOVED
+#      module blocked at import, the entire runtime module graph still imports.
+#   See docs/infrastructure/CONFIGURATION.md §"Dependency Management" for the
+#   full method, the removal ledger, and how to add a dependency correctly.
+#
+# RULES FOR EDITING
+# -----------------
+#   * A new DIRECT dependency goes in the direct section WITH a comment naming
+#     the module that imports it. No orphan pins.
+#   * Never `pip freeze > requirements.txt` again — it re-buries the structure
+#     and re-imports the fossils. Add the one package you need and let its
+#     transitives land in the transitive section, pinned.
+#   * Dev/CI tooling (pytest, black, flake8, isort, mypy, watchfiles) belongs in
+#     requirements-dev.txt and MUST NEVER appear here — the runtime image is
+#     built from this file alone (backend/Dockerfile), and every package here is
+#     production attack surface.
+#   * Pins are exact (==) for reproducible builds. Bumps flow through the
+#     dependency-update policy in .claude/SECRETS.md.
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# DIRECT runtime dependencies — imported by application code
+# ------------------------------------------------------------------------------
+# Web framework & ASGI server
+fastapi==0.110.1              # server.py, security/*, observability/* — the API
+starlette==0.37.2             # imported directly for middleware / Request / Response
+uvicorn==0.25.0               # ASGI server; launched by docker/entrypoint.sh (no [standard]:
+                              #   reload/uvloop/httptools are dev-only, see requirements-dev.txt)
+# NOTE: python-multipart is intentionally ABSENT. Starlette imports it only for
+# multipart/form-data parsing and degrades gracefully when it is missing
+# (parse_options_header -> None); this app has no Form/UploadFile endpoints.
+# Re-add here if a form/file-upload route is ever introduced.
+
+# Data validation
+pydantic==2.13.4             # models.py request/response models
+pydantic_core==2.46.4        # pydantic's compiled core (kept explicit: hard version lock)
+
+# Datastore & cache
+motor==3.3.1                 # async MongoDB driver (server.py); provides bson.ObjectId
+redis==5.0.8                 # cross-process realtime fan-out & cache (infrastructure/*)
+
+# AI providers (product core)
+anthropic==0.116.0           # services/claude_provider.py — Claude engine
+google-genai==2.6.0          # services/gemini_provider.py, gemini_direct.py — Gemini engine
+google-auth==2.53.0          # server.py — Google OAuth id_token verification
+
+# HTTP / networking
+httpx==0.28.1                # async HTTP client (AI providers, market data)
+requests==2.34.2             # google.auth.transport.requests + twilio SDK
+websockets==16.0             # services/brokers/stream.py — broker market-data feeds
+
+# Scheduling
+APScheduler==3.11.2          # services/scheduler.py — market-hours jobs
+
+# Security primitives
+cryptography==48.0.1         # Fernet broker-token encryption; JWT/CSRF crypto backend
+bcrypt==4.1.3                # password hashing (security)
+PyJWT==2.13.0                # access/refresh JWT signing & verification
+
+# Market data & content
+feedparser==6.0.12           # services/news_service.py — RSS/Atom financial news
+pytz==2025.2                 # services/market_engine/validator.py — NSE session tz math
+                              #   (PH2.8: previously imported but PINNED NOWHERE — the Market
+                              #    Engine validator failed to initialize. This line is the fix.)
+
+# Notifications
+twilio==9.10.9               # services/whatsapp_service.py — WhatsApp alerts
+
+# Runtime & configuration
+python-dotenv==1.2.2         # server.py — .env loading before secret validation
+psutil==7.2.2                # server.py + observability/metrics.py — CPU/RAM/disk metrics
+
+# ------------------------------------------------------------------------------
+# TRANSITIVE dependencies — pinned for reproducible builds, not imported directly
+# (dependency closure of the direct set above; do not edit by hand)
+# ------------------------------------------------------------------------------
 aiohappyeyeballs==2.7.1
 aiohttp==3.14.1
 aiohttp-retry==2.9.1
 aiosignal==1.4.0
-annotated-doc==0.0.4
 annotated-types==0.7.0
 anyio==4.13.0
-APScheduler==3.11.2
-psutil==7.2.2
-ast_serialize==0.5.0
 attrs==26.1.0
-bcrypt==4.1.3
-boto3==1.43.13
-botocore==1.43.13
 certifi==2026.5.20
 cffi==2.0.0
 charset-normalizer==3.4.7
 click==8.4.1
-cryptography==48.0.1
 distro==1.9.0
 dnspython==2.8.0
-ecdsa==0.19.2
-email-validator==2.3.0
-anthropic==0.116.0
-fastapi==0.110.1
-fastuuid==0.14.0
-feedparser==6.0.12
-filelock==3.29.0
+docstring_parser==0.18.0
 frozenlist==1.8.0
-fsspec==2026.4.0
-google-ai-generativelanguage==0.6.15
-google-api-core==2.30.3
-google-api-python-client==2.196.0
-google-auth==2.53.0
-google-auth-httplib2==0.4.0
-google-genai==2.6.0
-google-generativeai==0.8.6
-googleapis-common-protos==1.75.0
-grpcio==1.80.0
-grpcio-status==1.71.2
 h11==0.16.0
-hf-xet==1.5.0
 httpcore==1.0.9
-httplib2==0.32.0
-httpx==0.28.1
-huggingface_hub==1.16.1
 idna==3.16
 importlib_metadata==9.0.0
-Jinja2==3.1.6
 jiter==0.15.0
-jmespath==1.1.0
-jq==1.11.0
-jsonschema==4.26.0
-jsonschema-specifications==2025.9.1
-librt==0.11.0
-litellm==1.80.0
-markdown-it-py==4.2.0
-MarkupSafe==3.0.3
-mdurl==0.1.2
-motor==3.3.1
 multidict==6.7.1
-numpy==2.4.6
-oauthlib==3.3.1
-openai==1.99.9
-packaging==26.2
-pandas==3.0.3
-passlib==1.7.4
-pillow==12.3.0
 propcache==0.5.2
-proto-plus==1.28.0
-protobuf==5.29.6
 pyasn1==0.6.4
 pyasn1_modules==0.4.2
 pycparser==3.0
-pydantic==2.13.4
-pydantic_core==2.46.4
-Pygments==2.20.0
-PyJWT==2.13.0
 pymongo==4.6.3
-pyparsing==3.3.2
-python-dateutil==2.9.0.post0
-python-dotenv==1.2.2
-python-jose==3.5.0
-python-multipart==0.0.31
-PyYAML==6.0.3
-redis==5.0.8
-referencing==0.37.0
-regex==2026.5.9
-requests==2.34.2
-requests-oauthlib==2.0.0
-rich==15.0.0
-rpds-py==0.30.0
-rsa==4.9.1
-s3transfer==0.17.0
-s5cmd==0.2.0
 sgmllib3k==1.0.0
-shellingham==1.5.4
-six==1.17.0
 sniffio==1.3.1
-starlette==0.37.2
-stripe==14.4.1
 tenacity==9.1.4
-tiktoken==0.13.0
-tokenizers==0.23.1
-tqdm==4.67.3
-twilio==9.10.9
-typer==0.25.1
 typing-inspection==0.4.2
 typing_extensions==4.15.0
 tzdata==2026.2
 tzlocal==5.3.1
-uritemplate==4.2.0
 urllib3==2.7.0
-uvicorn==0.25.0
-watchfiles==1.2.0
-websockets==16.0
 yarl==1.24.2
 zipp==4.1.0

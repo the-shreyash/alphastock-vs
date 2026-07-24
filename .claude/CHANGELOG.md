@@ -5,6 +5,110 @@ This file records documentation-system versions and, from v1.0 launch onward, pr
 
 ---
 
+# Sprint PH2.8 — Production Configuration & Environment Optimization — 2026-07-24
+
+**Configuration stops being scattered and the runtime stops carrying dead weight.
+The configuration architecture was already centralized in
+`backend/security/secrets.py` — one registry-driven loader and validator that
+fails closed — so this sprint consolidated the model rather than rebuilding it:
+documented the source precedence and the environment profiles, and added a
+first-class `testing` profile so CI can label its environment honestly instead of
+masquerading as a laptop. The real debt was the dependency set: `requirements.txt`
+was a 118-package `pip freeze` in which ~220 MB of the runtime image was packages
+NO application module imports. Rebuilt from actual imports to 58 packages — a
+measured 377 MB (−66%) off the dependency footprint — and pinned `pytz`, whose
+absence had been silently breaking the Market Engine validator since PH2.1. No
+application code changed; 934 non-integration tests green before and after.**
+
+> **Design note — a `pip freeze` cannot tell a live dependency from a fossil.**
+> That is the whole reason 220 MB of `litellm`, `boto3`, `stripe`, the old
+> `google-generativeai` gRPC stack, `pandas` and `numpy` rode into every
+> production image: each was added for a feature that was later cut or an SDK that
+> was later replaced, and a freeze re-captures all of it forever because it records
+> *what is installed*, not *what is used*. The fix is not a bigger prune list — it
+> is deriving the set from the code: enumerate the imports, compute the dependency
+> closure, and **prove** the result two ways (the closure is closed under its own
+> requirements, so nothing is missing; and with every removed module blocked at
+> import, the whole runtime graph still loads, so nothing is over-removed). The
+> proof is what makes it safe to delete 60 packages without a running container.
+
+## Added
+
+- **`docs/infrastructure/CONFIGURATION.md`** — the configuration reference: the
+  single-source-of-truth rule, the source-precedence order, the four environment
+  profiles and their severity, the fail-closed validation contract, the dependency
+  method + removal ledger, the image-optimization results, migration guidance, and
+  the path to cloud (K8s/Vault) portability. Linked from `docs/infrastructure/README.md`.
+- **A first-class `testing` environment profile** (`security/secrets.py`):
+  `TESTING` joins `KNOWN_ENVIRONMENTS`, and a new `LENIENT_ENVIRONMENTS`
+  (`{development, testing}`) names the development-severity set. `APP_ENV=testing`
+  is now a recognized, honestly-labelled, non-production environment instead of an
+  "unknown APP_ENV" error. Non-production by construction — every production gate
+  keys on `env == production`, which `testing` can never satisfy. Three tests added
+  (`test_secrets.py`); the core-trio parametrization now covers all four profiles.
+- **`requirements.txt` structure** — split into a documented DIRECT section (each
+  pin commented with the module that imports it) and a pinned TRANSITIVE section
+  (the closure), with a header banning `pip freeze` and explaining how to add a
+  dependency correctly.
+
+## Fixed
+
+- **`pytz` was imported but pinned nowhere** — `services/market_engine/validator.py`
+  imports it for NSE session math, so the Market Engine validator failed to
+  initialize on any clean install (the PH2.1 defect note, now closed). Pinned
+  `pytz==2025.2`. Also surfaced (not fixed — business logic, out of scope): in
+  `is_market_hours()` the `import pytz` sits *outside* its `try/except ImportError`,
+  so the fallback was dead code; pinning `pytz` makes it moot.
+- **`docstring_parser` was an unpinned core dependency of `anthropic`** — the freeze
+  happened to install it but never recorded it as a first-class pin. Now explicit
+  (`docstring_parser==0.18.0`), so the dependency closure is complete.
+
+## Changed
+
+- **`requirements.txt`: 118 → 58 packages.** Removed 62 packages no application
+  module imports, in these groups (full ledger in CONFIGURATION.md §7.3): the
+  abandoned `litellm`/`openai`/`tiktoken`/`huggingface` AI-abstraction stack; the
+  **old** `google-generativeai` SDK and its `grpcio`/`protobuf`/`google-api-*` gRPC
+  tail (the app uses the new HTTP `google.genai` SDK); `boto3`/`botocore`/`s3transfer`/`s5cmd`
+  (no AWS); `stripe` (no billing code); `pandas`/`numpy` (zero application imports —
+  the Dockerfile's "pandas/numpy-heavy" note was stale); `python-jose`/`passlib`
+  (the app uses `PyJWT` + `bcrypt`); `python-multipart` (no form/upload route;
+  Starlette degrades gracefully); and their transitive tails.
+- **`watchfiles` moved to `requirements-dev.txt`** — it powers `uvicorn --reload`,
+  which the container entrypoint never uses (dev-only). The runtime image no longer
+  carries it.
+- **`backend/.env.example`** regenerated from the registry (the `APP_ENV`
+  description now lists all four profiles).
+
+## Measured
+
+- **Dependency footprint: 569 MB → ~192 MB `site-packages`; 377 MB (−66%) removed**
+  (measured as the summed on-disk size of every removed distribution in the resolved
+  venv). Largest wins: `google-api-python-client` 94 MB, `pandas` 71 MB, `litellm`
+  47 MB, `numpy` 34 MB, `botocore` 21 MB, `stripe` 18 MB.
+- **Projected runtime image: 1.03 GB → ~650 MB** (baseline minus the venv delta;
+  the exact end-to-end figure is produced by the CI Docker build, which is
+  structurally unchanged — only `requirements.txt` shrank).
+- **Verification:** the pruned set is closed under its core requirements (nothing
+  missing); with all 62 removed modules blocked at import, the entire runtime module
+  graph still imports (nothing over-removed); 934 non-integration tests pass.
+
+## Known limitations
+
+- **The end-to-end image size is projected, not built here** — the Docker daemon
+  was unavailable in the sprint environment, so the 377 MB reduction is measured
+  directly from the resolved venv (the layer the image copies) rather than from a
+  `docker images` readout. The build itself is unchanged; CI produces the exact
+  number.
+- **`yfinance` remains optional and unpinned** — `services/backtest_engine.py`
+  imports it lazily and falls back to synthetic data when absent. Pinning it would
+  reintroduce `pandas`+`numpy` (~105 MB) and route market data outside the Market
+  Gateway (forbidden by `MARKET_DATA_ARCHITECTURE.md`). Wiring backtesting through
+  the gateway is a product decision, out of scope here; until then backtests use
+  synthetic data.
+
+---
+
 # Sprint PH2.7 — Production Redis Infrastructure — 2026-07-23
 
 **Redis stops being a service that happens to be running and becomes one with a

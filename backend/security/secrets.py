@@ -36,14 +36,17 @@ SECURITY_ARCHITECTURE.md §23–§24, PH1.9 + PH2.3):
   collected and reported together so an operator fixes the whole environment in
   one pass, not one variable per crash-loop.
 
-* **Environment-aware severity.** The same registry drives all three
+* **Environment-aware severity.** The same registry drives all four
   environments. In ``production`` the rules are strict: required secrets must be
   present, signing secrets must meet a minimum length, and known placeholder /
-  weak-default values are rejected outright. In ``development`` (and to a lesser
-  extent ``staging``) the *same* findings degrade to warnings so a laptop with a
-  half-filled ``.env`` still boots — except for the small core trio the server
-  genuinely cannot run without (``MONGO_URL``, ``DB_NAME``, ``JWT_SECRET``),
-  which are hard requirements everywhere.
+  weak-default values are rejected outright. In ``development`` and ``testing``
+  (and, to a lesser extent, ``staging``) the *same* findings degrade to warnings
+  so a laptop or a CI runner with a half-filled environment still boots — except
+  for the small core trio the server genuinely cannot run without (``MONGO_URL``,
+  ``DB_NAME``, ``JWT_SECRET``), which are hard requirements everywhere.
+  ``testing`` mirrors ``development``'s leniency but is a distinct, honestly-
+  labelled environment for automated suites and CI (see
+  :data:`LENIENT_ENVIRONMENTS`).
 
 * **No secret ever touches a log.** The validator reports variable *names* and
   *presence*, never values. :func:`redact` exists for the rare case a value must
@@ -86,13 +89,26 @@ from security.cookies import is_production  # noqa: F401  (re-exported)
 # Environment model                                                             #
 # --------------------------------------------------------------------------- #
 DEVELOPMENT = "development"
+TESTING = "testing"
 STAGING = "staging"
 PRODUCTION = "production"
-KNOWN_ENVIRONMENTS: Set[str] = {DEVELOPMENT, STAGING, PRODUCTION}
+KNOWN_ENVIRONMENTS: Set[str] = {DEVELOPMENT, TESTING, STAGING, PRODUCTION}
+
+# Environments that share development's *lenient* validation posture: a missing
+# optional secret is a warning, not a boot failure, so a laptop or a CI runner
+# with a half-filled environment still boots. ``testing`` exists as a distinct,
+# first-class value (PH2.8) rather than an alias for ``development`` so that an
+# automated suite or CI job can label its environment honestly — the logs, the
+# /api/diagnostics `environment` field, and any future env-scoped behaviour then
+# say "testing", instead of masquerading as a developer's laptop or, worse,
+# tripping the "unknown APP_ENV" error. It is non-production everywhere by
+# construction: every production gate keys on ``env == PRODUCTION`` (see
+# security.cookies.is_production), which ``testing`` can never satisfy.
+LENIENT_ENVIRONMENTS: Set[str] = {DEVELOPMENT, TESTING}
 
 
 def app_env(environ: Optional[Mapping[str, str]] = None) -> str:
-    """Normalized deployment environment: one of ``development`` /
+    """Normalized deployment environment: one of ``development`` / ``testing`` /
     ``staging`` / ``production``.
 
     Reads ``APP_ENV`` (default ``development``). An unrecognized value is
@@ -289,7 +305,7 @@ SECRET_REGISTRY: List[SecretSpec] = [
     ),
     # ── App config ───────────────────────────────────────────────────────────
     SecretSpec(
-        "APP_ENV", CAT_APPCFG, "Deployment environment: development | staging | production.",
+        "APP_ENV", CAT_APPCFG, "Deployment environment: development | testing | staging | production.",
         example=DEVELOPMENT, rotation="N/A",
     ),
     SecretSpec(

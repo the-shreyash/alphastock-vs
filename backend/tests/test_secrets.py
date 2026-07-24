@@ -64,8 +64,32 @@ def test_app_env_defaults_to_development():
 def test_app_env_normalizes_and_rejects_unknown():
     assert sc.app_env({"APP_ENV": "  Production "}) == sc.PRODUCTION
     assert sc.app_env({"APP_ENV": "staging"}) == sc.STAGING
+    assert sc.app_env({"APP_ENV": "  Testing "}) == sc.TESTING
     # Unknown resolves to development (but the validator flags it — see below).
     assert sc.app_env({"APP_ENV": "prod"}) == sc.DEVELOPMENT
+
+
+def test_testing_is_a_recognized_environment():
+    # PH2.8: `testing` is first-class, not an alias — and never confused with prod.
+    assert sc.TESTING in sc.KNOWN_ENVIRONMENTS
+    assert sc.TESTING in sc.LENIENT_ENVIRONMENTS
+    assert sc.PRODUCTION not in sc.LENIENT_ENVIRONMENTS
+    report = sc.validate_config({"APP_ENV": "testing", "MONGO_URL": "m",
+                                 "DB_NAME": "db", "JWT_SECRET": STRONG_JWT},
+                                raise_on_error=False)
+    assert report.environment == sc.TESTING
+    # A recognized env must NOT raise the "unknown APP_ENV" error.
+    assert not any("is not one of" in e for e in report.errors)
+
+
+def test_testing_is_lenient_like_development():
+    # Placeholder optionals are warnings (as in development), not fatal errors.
+    env = {"APP_ENV": "testing", "MONGO_URL": "mongodb://localhost:27017",
+           "DB_NAME": "db", "JWT_SECRET": STRONG_JWT,
+           "KITE_API_KEY": "testkey", "KITE_API_SECRET": "testsecret"}
+    report = sc.validate_config(env, raise_on_error=False)
+    assert report.ok, report.errors
+    assert any("KITE_API_KEY" in w for w in report.warnings)
 
 
 def test_unknown_app_env_is_reported_error():
@@ -104,7 +128,7 @@ def test_development_short_jwt_is_still_fatal_core_trio():
 # --------------------------------------------------------------------------- #
 # Core trio required in every environment                                        #
 # --------------------------------------------------------------------------- #
-@pytest.mark.parametrize("env_name", ["development", "staging", "production"])
+@pytest.mark.parametrize("env_name", ["development", "testing", "staging", "production"])
 @pytest.mark.parametrize("missing", ["MONGO_URL", "DB_NAME", "JWT_SECRET"])
 def test_core_trio_required_everywhere(env_name, missing):
     env = base_prod_env(APP_ENV=env_name)

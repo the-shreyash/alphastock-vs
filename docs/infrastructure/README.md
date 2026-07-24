@@ -15,6 +15,7 @@ The line between this folder and its neighbours:
 
 | Document | Covers | Sprint |
 |---|---|---|
+| [CONFIGURATION.md](CONFIGURATION.md) | The single configuration entry point — sources & precedence, the four environment profiles, fail-closed validation, dependency management, and image-footprint optimization | PH2.8 |
 | [REDIS.md](REDIS.md) | Shared cache and cross-process realtime fan-out — server tuning, connection pooling, circuit breaking, Pub/Sub reliability, monitoring, and the Sentinel/Cluster migration path | PH2.7 |
 
 MongoDB has no document here yet; its topology is currently covered by

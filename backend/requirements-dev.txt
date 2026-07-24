@@ -37,3 +37,11 @@ isort==8.0.1
 # Type checker
 mypy==2.1.0
 mypy_extensions==1.1.0  # black / mypy dep
+
+# Dev-only runtime tooling
+# watchfiles powers `uvicorn --reload` for local development. It is NOT a
+# production dependency — the container entrypoint never uses --reload (see
+# backend/docker/entrypoint.sh) — so PH2.8 moved it out of requirements.txt to
+# shrink the runtime image. Without it, uvicorn's reloader falls back to stat
+# polling; installing it here restores the fast file-watch reload locally.
+watchfiles==1.2.0
