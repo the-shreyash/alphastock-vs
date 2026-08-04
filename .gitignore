@@ -100,6 +100,19 @@ android-sdk/
 credentials.json
 *.key
 .credentials
+
+# Backup artifacts (PH2.9). The default BACKUP_ROOT is <repo>/backups, which is
+# a developer-laptop convenience — a production BACKUP_ROOT belongs on a
+# different filesystem entirely (docs/operations/BACKUP_AND_RESTORE.md §4).
+# These files are a full copy of the database and of the deployment's secret
+# material; committing one would put every user record and every signing key
+# into git history permanently. Ignored by directory AND by artifact pattern, so
+# a backup written anywhere in the tree still cannot be committed by accident.
+backups/
+*.archive.gz
+*.archive.gz.enc
+*.manifest.json
+*.rejected
 frontend/node_modules/.cache/default-development/5.pack
 frontend/node_modules/.cache/default-development/8.pack
 frontend/node_modules/.cache/default-development/9.pack

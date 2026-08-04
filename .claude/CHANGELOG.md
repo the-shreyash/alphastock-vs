@@ -5,6 +5,165 @@ This file records documentation-system versions and, from v1.0 launch onward, pr
 
 ---
 
+# Sprint PH2.9 — Production Backup & Restore — 2026-08-04
+
+**The system gets its first way to lose data and get it back. Everything the
+product cannot recreate — users, portfolios, trades, the journal, sessions, the
+security audit trail — existed in exactly one place: a single Docker named
+volume on a single host, which survives `docker compose down` and nothing else.
+This sprint adds `scripts/backup/` (six files, one shared library): encrypted,
+checksummed, self-describing MongoDB backups on a grandfather-father-son
+rotation; three graduated verification levels ending in a real restore into a
+scratch database; a restore path that verifies before it writes and again after;
+an encrypted archive of the secret material without which a restored database is
+useless; and an upload-storage path that exists before uploads ship. Redis is
+deliberately NOT backed up, and §6 of the documentation argues why. A full drill
+was executed against a live MongoDB 8.0 — 205 000 documents, 26.3 MB, backup
+2.06 s, restore 3.51 s, 13.2 : 1 compression, indexes and document contents
+verified identical.**
+
+> **Design note — the only thing that distinguishes a backup from a file is a
+> restore.** The overwhelming majority of backup failures are not "the job did
+> not run". They are "the job ran every night for fourteen months and produced
+> files that cannot be restored" — a wrong credential that dumped an empty
+> database, a passphrase rotated without re-keying, a full disk that truncated
+> every artifact, a missing `docker exec -T` that CRLF-mangled a binary stream.
+> Every one of those produces a file of plausible size with a recent mtime, and
+> a monitoring check that asks "was a file written?" reports green through all of
+> them. So verification here is not a bolt-on: `checksum` (0.12 s) proves the
+> bytes have not changed, `structural` (0.31 s) decrypts and runs the entire
+> payload through gzip's CRC then confirms the mongodump archive magic — and
+> **runs automatically after every backup** — and `drill` (~5 s) restores into
+> `<db>__drill_<timestamp>` and compares per-collection document counts against
+> a baseline captured at dump time. That baseline is the load-bearing field in
+> the manifest, because `mongorestore` exits 0 on a restore that moved nothing.
+
+## Added
+
+- **`scripts/backup/lib.sh`** — the shared library the other five source. One
+  definition of encryption, checksums, manifests, retention, the Mongo transport
+  and the destructive-action guard, so the encrypt path and the decrypt path
+  cannot drift apart. Bash 3.2 compatible on purpose (macOS ships 3.2; a script
+  that only works on the production shell is one whose behaviour is first
+  observed during an incident).
+- **`scripts/backup/backup_mongo.sh`** — `mongodump --archive --gzip` streamed
+  through AES-256 straight to disk, so no plaintext copy of the database ever
+  exists on a filesystem. Writes to `.partial`, checksums, renames, **checksums
+  again** (`mv` across a filesystem is a copy, and a copy is where a full disk
+  truncates silently), writes a manifest, then prunes — **last, and only on
+  success**, because pruning first and failing to produce the replacement is how
+  a retention policy becomes a data-loss policy.
+- **`scripts/backup/verify_backup.sh`** — the three levels above, `--latest` and
+  `--all` selectors. The drill restores via `--nsFrom`/`--nsTo` into a scratch
+  database, making it non-destructive *by construction* — which is what makes it
+  safe to run monthly, and a drill you actually run beats a perfect drill you do
+  not.
+- **`scripts/backup/restore_mongo.sh`** — verify-before-write (the one
+  unrecoverable ordering mistake is dropping a live collection and *then*
+  discovering the archive is corrupt), merge-by-default rather than replace,
+  typed confirmation rather than `y/N` (at 03:00, "y" is muscle memory), and a
+  post-restore count comparison against the manifest.
+- **`scripts/backup/backup_config.sh`** — encrypted archive of `secrets/` and the
+  `.env` family. **Encryption is mandatory here with no development exemption**:
+  the archive is 100 % credential material, so there is no environment in which
+  plaintext is the right default and therefore no flag for it. Excludes anything
+  git already tracks and records the git commit instead, so a recovery checks out
+  the revision the secrets were captured against.
+- **`scripts/backup/backup_uploads.sh`** — Docker-volume or host-path tarball
+  plus restore. Written now, while `backend_uploads` is still declared-but-unmounted,
+  because the first day of a new data store is exactly when nobody remembers to
+  add it to the backup rotation.
+- **`docs/operations/BACKUP_AND_RESTORE.md`** — architecture, storage rules,
+  retention reasoning, encryption decision, the verification cost curve, the
+  measured results, the ordered restore checklist, secret recovery and the
+  recursive-dependency trap, the cron schedule, RPO/RTO, eight disaster
+  scenarios, eight known limitations, and a configuration reference.
+- **`backend/tests/test_backup_restore.py`** — 39 hermetic tests driving the real
+  scripts against stubbed mongo tools. They assert the properties whose failure
+  is silent and delayed: empty artifacts are never published, the manifest hash
+  describes the *published* file, encrypted artifacts round-trip through the exact
+  decrypt path the restore uses, production refuses plaintext, corruption and a
+  wrong passphrase are both detected, retention never crosses tiers and never
+  touches a file it did not create, a failed dump leaves every previous backup
+  intact, and the `.env` reader parses rather than `source`s.
+
+## Decisions
+
+- **Redis is not backed up.** Everything in it is either reconstructible market-data
+  cache or in-flight Pub/Sub; sessions, rate limits and the audit log are in
+  MongoDB precisely so Redis can stay disposable. PH2.7's AOF is a **warm-start
+  optimisation, not a backup** — it exists so a restart does not send every replica
+  to re-fetch the quote universe from rate-limited providers at once. Recovery
+  procedure: start Redis empty. Documented with a monthly tripwire (a key with no
+  TTL is a candidate for something meant to last).
+- **One encryption path, not two.** OpenSSL AES-256-CBC/PBKDF2-600000, no GPG
+  fallback. The encrypt path runs nightly, the decrypt path runs during an
+  outage; a two-tool scheme means the restore is where you discover the recovery
+  host has only one of them. Honest limitation recorded: CBC is not
+  authenticated.
+- **Count-based retention, deliberately diverging from PH2.6's age-first log
+  retention.** Logs carry a wall-clock legal commitment; backups carry a coverage
+  commitment, and coverage is a count. Age-first would silently reduce seven
+  restore points to five in a week when the job failed twice, while every rule
+  still passed.
+- **Backup settings stay out of `backend/security/secrets.py`.** That registry is
+  the application's configuration surface, validated fail-closed at boot and
+  mirrored into `.env.example`. `BACKUP_ROOT` is a host-operations setting the app
+  never reads; registering it would imply a validation that does not exist and
+  blur a boundary that is currently clean.
+
+## Fixed
+
+- **A failing `git status` aborted the entire configuration backup.** Under
+  `set -euo pipefail`, `GIT_DIRTY="$(git status --porcelain | head -n 1)"` exits
+  128 when the source is not a git checkout, killing the script before it wrote
+  anything — with no output at all, because the failure happened during an
+  assignment. Provenance is a nice-to-have; it must never be the reason the
+  credentials did not get backed up. Found by the test suite.
+- **An empty dump was publishable whenever encryption was on.** `openssl enc`
+  turns zero bytes of input into a ~32-byte file, so the "refuse an empty
+  artifact" check — which is the guard against a mid-dump authentication failure
+  — was satisfied by an artifact containing nothing. Post-write structural
+  verification is now load-bearing rather than advisory, and a backup that fails
+  it is renamed `*.rejected`: outside every glob, so `--latest` cannot select it
+  and retention does not count it, but still on disk, because the file is the
+  evidence for why the backup failed. Found by the test suite.
+- **The working directory was deleted the instant it was created.** `bk_workdir`
+  was lazily creating a `mktemp -d` and registering its cleanup trap — but it was
+  called from inside `$( … )`, and bash fires EXIT traps when a subshell exits.
+  The caller received a path to nothing. Creation now happens once in the main
+  shell (`bk_init_workdir`, called from `bk_load_config`).
+- **A credential file could be left inside the mongo container.** The container-side
+  tools config was staged lazily by `bk_mongo_tool`, which runs as a pipeline
+  element — i.e. in a subshell, where the assignment recording the file's path is
+  invisible to the parent's cleanup. `bk_prepare_mongo` now stages it eagerly from
+  the main shell.
+
+## Verification
+
+- 39/39 new tests pass; `flake8` clean on both the blocking and the full pass.
+- Live drill against MongoDB 8.0.13 with the real `alpha_stock_db` (21
+  collections): **21/21 collections matched**, scratch database dropped, no
+  residue. Wrong passphrase, corrupted artifact, corrupted-artifact-with-rewritten-manifest,
+  and unattended restore into a populated database all correctly **rejected**.
+- Scale drill (205 000 documents / 26.3 MB): backup **2.06 s** → **1.99 MB**
+  artifact (13.2 : 1); restore **3.51 s**; secondary index and sampled document
+  contents identical to source.
+
+## Known limitations
+
+L1 no point-in-time recovery (standalone mongod is per-collection consistent
+only; the fix is a single-node replica set + `--oplog`) · L2 off-host copy is
+documented, not implemented · L3 AES-CBC is unauthenticated · L4 backup failure
+is not alerted (PH2.10) · L5 the drill is cron, not CI (CI has no MongoDB) ·
+L6 `BACKUP_MODE=docker` is unverified — no Docker daemon in the sprint
+environment; every measurement was taken in `direct` mode against a real MongoDB,
+and the transports differ only in how the tools are invoked · L7 uploads have no
+data and so no executed Docker-volume drill · L8 `docker compose down -v` still
+destroys the local volumes. Full detail in `docs/operations/BACKUP_AND_RESTORE.md` §14.
+
+---
+
 # Sprint PH2.8 — Production Configuration & Environment Optimization — 2026-07-24
 
 **Configuration stops being scattered and the runtime stops carrying dead weight.

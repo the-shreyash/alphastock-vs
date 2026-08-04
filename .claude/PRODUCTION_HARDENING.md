@@ -97,7 +97,7 @@ Verified in code on branch `sprint-r3-frontend-realtime`:
 | R-08 | Regression ships unnoticed (no frontend tests, non-hermetic backend suite, no pipeline gate) | High | High | **HIGH** | PH3.1–3.5 |
 | R-09 | Fabricated admin revenue data drives a real business decision | Medium | High | **HIGH** | PH3.2 |
 | R-10 | Outage with no monitoring/alerting → prolonged silent downtime | Medium | High | **MEDIUM** | PH2.9–2.10 |
-| R-11 | Data loss with no tested backup/restore path | Low | Catastrophic | **MEDIUM** | PH2.11 |
+| R-11 | Data loss with no tested backup/restore path | Low | Catastrophic | **LOW** (was MEDIUM) | PH2.11 — *backup, restore, verification and an **executed, timed** drill delivered 2026-08-04; residual risk is that backups are still single-host (off-host copy documented, not wired) and failure is not yet alerted* |
 | R-12 | `server.py` monolith slows every future fix and raises defect rate | Certain | Medium | **MEDIUM** | PH3.6 |
 | R-13 | New engineer follows DEPLOYMENT.md and builds for the wrong stack | Medium | Medium | **MEDIUM** | PH3.10 |
 | R-14 | Vulnerable dependency ships (no scanning) | Medium | Medium | **MEDIUM** | PH1.11 |
@@ -232,11 +232,11 @@ Targets (ROADMAP.md / DEPLOYMENT.md): dashboard < 2 s, API < 500 ms, market upda
 
 # 11. Recovery Strategy
 
-- **RPO:** ≤ 24 h at launch (daily Mongo backups), target ≤ 1 h post-launch (point-in-time recovery / Atlas).
-- **RTO:** ≤ 4 h at launch.
-- **Backups:** daily/weekly/monthly Mongo per SECURITY.md; encrypted; restore drill executed and documented in PH2.11 — an untested backup does not count.
+- **RPO:** ≤ 24 h at launch (daily Mongo backups), target ≤ 1 h post-launch (point-in-time recovery / Atlas). **✅ Implemented 2026-08-04** — nightly full backup; the ≤ 1 h target still requires converting mongod to a single-node replica set for `--oplog`.
+- **RTO:** ≤ 4 h at launch. **✅ Measurement-backed 2026-08-04** — the mechanical restore is *seconds* at current data volume (205 000 docs / 26.3 MB restored in 3.51 s, indexes and document contents verified identical). The four-hour budget is dominated by human time: detection, decision, host provisioning, off-host fetch, configuration recovery and post-restore validation. Re-measure at production data volume — see `docs/operations/BACKUP_AND_RESTORE.md` §8.1.
+- **Backups:** daily/weekly/monthly Mongo per SECURITY.md; encrypted; restore drill executed and documented in PH2.11 — an untested backup does not count. **✅ Delivered 2026-08-04** by `scripts/backup/` — AES-256, grandfather-father-son 7/4/6, three verification levels with the structural level running automatically after every backup, and a drill that restores into a scratch database and compares per-collection counts against a baseline captured at dump time. Secret material has its own mandatory-encryption archive. Redis is deliberately **not** backed up (reconstructible cache; PH2.7's AOF is a warm-start optimisation). Full detail and the eight known limitations: `docs/operations/BACKUP_AND_RESTORE.md`.
 - **Rollback:** every deploy keeps the previous image tag warm; DB migrations must be backward-compatible one version (expand/contract pattern).
-- **Incident response:** Detect → Alert → Investigate → Contain → Recover → Review → Document (SECURITY.md); postmortem template added in PH2.11.
+- **Incident response:** Detect → Alert → Investigate → Contain → Recover → Review → Document (SECURITY.md); postmortem template added in PH2.11 — *still outstanding; the PH2.9 sprint delivered backup/restore, not the postmortem template or the full-environment DR runbook.* Eight disaster scenarios with expected recovery times are in `docs/operations/BACKUP_AND_RESTORE.md` §13.
 
 ---
 

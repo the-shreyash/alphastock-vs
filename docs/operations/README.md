@@ -13,6 +13,10 @@ To document how the system is deployed, scaled, hardened, and maintained in prod
 - [Logging Infrastructure](LOGGING.md) — log streams, rotation, retention,
   compression, redaction policy, Docker logging drivers, and the path to
   centralized log aggregation
+- [Backup & Restore](BACKUP_AND_RESTORE.md) — what is backed up and what is
+  deliberately not, encryption, grandfather-father-son retention, the three
+  verification levels and the restore drill, the restore procedure, secret
+  recovery, disaster scenarios, and the measured RPO/RTO
 
 ## Who should read it
 - DevOps Engineers
