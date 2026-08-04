@@ -17,6 +17,12 @@ To document how the system is deployed, scaled, hardened, and maintained in prod
   deliberately not, encryption, grandfather-father-son retention, the three
   verification levels and the restore drill, the restore procedure, secret
   recovery, disaster scenarios, and the measured RPO/RTO
+- [Disaster Recovery & Business Continuity](DISASTER_RECOVERY.md) — the ten
+  recovery runbooks, recovery objectives and where the RTO actually goes,
+  severity and escalation, deployment rollback, layered post-recovery
+  verification, the drill schedule, and the honest limitations
+- [Postmortem template](../runbooks/POSTMORTEM_TEMPLATE.md) — the blameless
+  writeup that closes a SEV-1 or SEV-2
 
 ## Who should read it
 - DevOps Engineers

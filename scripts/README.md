@@ -37,6 +37,27 @@ Every one of them takes `--help`.
 before running any of them in production** — particularly §4 (where backups must
 live) and §10 (where the encryption passphrase must *not* live).
 
+### `dr/` — disaster recovery (PH2.10)
+
+| Script | Purpose |
+|---|---|
+| `dr_verify.sh` | Layered diagnosis **and** post-recovery verification: host → containers → data → application. Safe to run against a broken system. |
+| `deploy_rollback.sh` | Deployment ledger (`record` / `list` / `current`) and verified rollback with an automatic revert. |
+
+Both source `backup/lib.sh` rather than reimplementing configuration loading,
+logging and the MongoDB transport — a verifier that reached the database
+differently from the way the restore reaches it could report healthy against a
+database the restore never touched.
+
+```bash
+./scripts/dr/dr_verify.sh --level full          # is it actually back?
+./scripts/dr/deploy_rollback.sh rollback --previous
+```
+
+**Read [`docs/operations/DISASTER_RECOVERY.md`](../docs/operations/DISASTER_RECOVERY.md)**
+— §7 is the runbooks, §9 is what each verification layer proves, §13 is the
+checklist of things that must be true *before* an incident.
+
 ## Conventions for anything added here
 
 * `set -euo pipefail`, and a header block explaining **why the file exists**

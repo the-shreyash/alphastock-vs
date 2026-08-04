@@ -10,7 +10,8 @@ Welcome to the documentation for this repository. Our documentation is organized
 - **[engineering/](engineering/README.md)**: Repository standards, branching strategies, commit conventions, coding standards, and governance policies.
 - **[deployment/](deployment/README.md)**: Container architecture, build artifacts, runtime configuration, and health contracts.
 - **[infrastructure/](infrastructure/README.md)**: Backing services the application runs on — how each is configured, connected to, and recovered.
-- **[operations/](operations/README.md)**: Deployment guides, production hardening plans, incident response, and runbooks.
+- **[operations/](operations/README.md)**: Deployment guides, production hardening plans, monitoring, logging, backup & restore, and disaster recovery.
+- **[runbooks/](runbooks/README.md)**: Incident artifacts — the postmortem template and completed postmortems. The recovery *procedures* live in `operations/DISASTER_RECOVERY.md`.
 - **[getting-started/](getting-started/README.md)**: Setup guides for new engineers and contributors.
 
 ---

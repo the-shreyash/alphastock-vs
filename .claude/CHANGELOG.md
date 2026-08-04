@@ -5,6 +5,78 @@ This file records documentation-system versions and, from v1.0 launch onward, pr
 
 ---
 
+# Sprint PH2.10 — Disaster Recovery & Business Continuity — 2026-08-05
+
+**PH2.9 made the data recoverable. This sprint makes the *platform* recoverable,
+and makes the recovery provable. Added `docs/operations/DISASTER_RECOVERY.md`
+(ten runbooks R1–R10, recovery objectives decomposed phase by phase, seven named
+assumptions, severity and escalation, a drill schedule, a pre-disaster
+checklist, nine limitations), `docs/runbooks/POSTMORTEM_TEMPLATE.md`, and two
+executable scripts: `scripts/dr/dr_verify.sh` — four-layer diagnosis *and*
+post-recovery verification — and `scripts/dr/deploy_rollback.sh` — a deployment
+ledger and a rollback that refuses to start unless it can finish. Measured
+against the live database: restore of 21 collections 4.48 s with 21/21 matched,
+full verification 1.10 s, configuration recovery 0.17 s for 14 files. 41
+hermetic tests; the two three-line stubs `docs/operations/runbooks.md` and
+`incident-response.md` finally have content.**
+
+> **Design note — the RTO is a human number, not a machine number.** The
+> instinct on a recovery sprint is to make the restore faster. So the four-hour
+> RTO was decomposed phase by phase (§4.2) before anything was optimised, and
+> the mechanical work — fetch, decrypt, restore, verify — came to **under five
+> minutes**, while *detection* came to **0–30 minutes** and provisioning to
+> 30–60. Making `mongorestore` twice as fast would improve the RTO by roughly a
+> second. Alerting would improve it by half an hour. That is why this sprint
+> shipped no performance work at all, and why the sprint report recommends
+> roadmap PH2.10's alerting next rather than anything in this document.
+
+> **Design note — a diagnostic is not a test suite, and must not stop early.**
+> `dr_verify.sh` runs every check even after one fails, and reports SKIP for
+> checks whose *prerequisite* failed rather than a second, misleading failure.
+> During a recovery the operator needs the SHAPE of the failure — "containers
+> up, Mongo fine, Redis unreachable" is a different incident from "nothing is
+> running" — and obtaining that shape one round-trip at a time, re-running after
+> each fix, is how a fifteen-minute recovery becomes an hour. The same tool is
+> deliberately used for diagnosis in step 1 and verification in the last step,
+> so the command that told you what broke is the command that tells you it is
+> fixed.
+
+> **Design note — an empty database passes every check that is easy to write.**
+> Containers running, health endpoint 200, compose file valid: a stack that was
+> restored without its data satisfies all of them, and the failure surfaces
+> hours later as user reports. So "the database has collections" is a hard
+> failure in layer 3, and `--expect-manifest` compares per-collection counts
+> against the baseline captured at dump time — because **`mongorestore` exits 0
+> on a restore that moved nothing**. The comparison was proven non-vacuous by
+> inserting one document into one collection and watching it fail
+> (`MISMATCH admin_audit_logs expected=7 actual=8`), then removing it and
+> watching it pass.
+
+> **Design note — "roll back the deployment" is one sentence and four facts.**
+> Which version is running; which was running before; **is that image still on
+> this host**; did the rollback take effect. With no registry and no CD
+> (PH2.7b), nothing in this deployment answered any of them: the tag lives in a
+> hand-edited `.env` and `docker compose up -d` with an unchanged tag is a
+> silent no-op. `deploy_rollback.sh` answers all four — ledger, precondition,
+> atomic apply, `--expect-version` — and the precondition is the load-bearing
+> one: it refuses to stop the running version until the replacement image is
+> confirmed present, so a pruned image is discovered *now*, with the current
+> version still serving traffic, instead of after the backend has been recreated
+> against an image that is not there. When the rollback target is also
+> unhealthy, it reverts automatically: a rollback to a second broken version is
+> the worst of the three outcomes, because it spends the operator's remaining
+> confidence in the mechanism.
+
+> **Honest limitation, stated where it hurts rather than in a footnote.** The
+> off-host backup copy is still documented and not implemented (PH2.9 L2), which
+> means **R7 — complete server loss — is not executable today**. Every other
+> limitation in this sprint is a degradation; that one is a total-loss scenario,
+> and it is one `rclone` line plus a quarterly fetch drill away from being
+> closed. It is now the first item in §14's ordered improvement list, ahead of
+> alerting, a registry, and point-in-time recovery.
+
+---
+
 # Sprint PH2.9 — Production Backup & Restore — 2026-08-04
 
 **The system gets its first way to lose data and get it back. Everything the
