@@ -47,7 +47,7 @@
 # ------------------------------------------------------------------------------
 # Web framework & ASGI server
 fastapi==0.110.1              # server.py, security/*, observability/* — the API
-starlette==0.37.2             # imported directly for middleware / Request / Response
+starlette==1.4.1             # imported directly for middleware / Request / Response
 uvicorn==0.25.0               # ASGI server; launched by docker/entrypoint.sh (no [standard]:
                               #   reload/uvloop/httptools are dev-only, see requirements-dev.txt)
 # NOTE: python-multipart is intentionally ABSENT. Starlette imports it only for
