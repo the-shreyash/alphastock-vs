@@ -5,13 +5,7 @@ import { useAuth } from "../context/AuthContext";
 import { Eye, EyeOff, ArrowRight } from "lucide-react";
 import APLogo from "../components/APLogo";
 import { startGoogleLogin } from "../services/googleAuth";
-
-function formatApiError(detail) {
-  if (detail == null) return "Something went wrong. Please try again.";
-  if (typeof detail === "string") return detail;
-  if (Array.isArray(detail)) return detail.map((e) => e?.msg || JSON.stringify(e)).join(" ");
-  return String(detail);
-}
+import { resolveApiErrorMessage } from "../utils/apiError";
 
 export default function Login() {
   const [email, setEmail] = useState("");
@@ -30,7 +24,7 @@ export default function Login() {
       await login(email, password);
       navigate("/dashboard");
     } catch (err) {
-      setError(formatApiError(err.response?.data?.detail) || err.message);
+      setError(resolveApiErrorMessage(err));
     } finally {
       setLoading(false);
     }
@@ -41,7 +35,7 @@ export default function Login() {
     try {
       await startGoogleLogin();
     } catch (err) {
-      setError(formatApiError(err.response?.data?.detail) || err.message);
+      setError(resolveApiErrorMessage(err));
     }
   };
 
@@ -82,27 +76,27 @@ export default function Login() {
           <h2 className="page-title mb-8">Sign In</h2>
 
           {error && (
-            <div data-testid="login-error" className="mb-4 p-3 rounded-xl text-sm" style={{ background: "rgba(244,63,94,0.08)", color: "var(--loss)", border: "1px solid rgba(244,63,94,0.2)" }}>
+            <div data-testid="login-error" role="alert" className="mb-4 p-3 rounded-xl text-sm" style={{ background: "rgba(244,63,94,0.08)", color: "var(--loss)", border: "1px solid rgba(244,63,94,0.2)" }}>
               {error}
             </div>
           )}
 
           <form onSubmit={handleSubmit} className="space-y-4">
             <div>
-              <label className="stat-label block mb-1.5">Email</label>
-              <input data-testid="login-email-input" type="email" value={email} onChange={(e) => setEmail(e.target.value)} required
+              <label className="stat-label block mb-1.5" htmlFor="login-email">Email</label>
+              <input id="login-email" data-testid="login-email-input" type="email" value={email} onChange={(e) => setEmail(e.target.value)} required
                 className="w-full rounded-xl px-4 py-3 text-sm focus:outline-none transition-all"
                 style={{ background: "var(--bg-surface)", border: "1px solid var(--border)", color: "var(--text-primary)" }}
                 placeholder="trader@example.com" />
             </div>
             <div>
-              <label className="stat-label block mb-1.5">Password</label>
+              <label className="stat-label block mb-1.5" htmlFor="login-password">Password</label>
               <div className="relative">
-                <input data-testid="login-password-input" type={showPw ? "text" : "password"} value={password} onChange={(e) => setPassword(e.target.value)} required
+                <input id="login-password" data-testid="login-password-input" type={showPw ? "text" : "password"} value={password} onChange={(e) => setPassword(e.target.value)} required
                   className="w-full rounded-xl px-4 py-3 text-sm focus:outline-none transition-all pr-10"
                   style={{ background: "var(--bg-surface)", border: "1px solid var(--border)", color: "var(--text-primary)" }}
                   placeholder="Enter password" />
-                <button type="button" onClick={() => setShowPw(!showPw)} className="absolute right-3 top-1/2 -translate-y-1/2" style={{ color: "var(--text-muted)" }}>
+                <button type="button" onClick={() => setShowPw(!showPw)} aria-label={showPw ? "Hide password" : "Show password"} className="absolute right-3 top-1/2 -translate-y-1/2" style={{ color: "var(--text-muted)" }}>
                   {showPw ? <EyeOff size={16} /> : <Eye size={16} />}
                 </button>
               </div>

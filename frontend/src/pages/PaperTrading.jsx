@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from "react";
 import { motion } from "framer-motion";
 import api from "../services/api";
 import { formatCurrency, formatNumber, formatPercent } from "../utils/formatters";
+import { resolveApiErrorMessage } from "../utils/apiError";
 import {
   FlaskConical, TrendingUp, TrendingDown, Plus, X, RefreshCw,
   RotateCcw, ChevronDown, AlertTriangle, CheckCircle2, Clock,
@@ -94,8 +95,9 @@ function NewTradeModal({ onClose, onSubmit, loading }) {
           {/* Symbol row */}
           <div className="flex gap-2">
             <div className="flex-1">
-              <label className="stat-label mb-1 block">NSE Symbol</label>
+              <label className="stat-label mb-1 block" htmlFor="paper-trade-symbol">NSE Symbol</label>
               <input
+                id="paper-trade-symbol"
                 value={form.symbol} onChange={e => set("symbol", e.target.value.toUpperCase())}
                 onBlur={fetchPrice}
                 placeholder="RELIANCE"
@@ -130,8 +132,9 @@ function NewTradeModal({ onClose, onSubmit, loading }) {
               { key: "target1", label: "Target (₹)", type: "number", step: "0.01" },
             ].map(f => (
               <div key={f.key}>
-                <label className="stat-label mb-1 block">{f.label}</label>
+                <label className="stat-label mb-1 block" htmlFor={`paper-trade-${f.key}`}>{f.label}</label>
                 <input
+                  id={`paper-trade-${f.key}`}
                   type={f.type} step={f.step} min={f.min}
                   value={form[f.key]} onChange={e => set(f.key, e.target.value)}
                   required
@@ -144,9 +147,10 @@ function NewTradeModal({ onClose, onSubmit, loading }) {
 
           {/* Setup type */}
           <div>
-            <label className="stat-label mb-1 block">Setup Type</label>
+            <label className="stat-label mb-1 block" htmlFor="paper-trade-setup-type">Setup Type</label>
             <div className="relative">
               <select
+                id="paper-trade-setup-type"
                 value={form.setup_type} onChange={e => set("setup_type", e.target.value)}
                 className="w-full px-3 py-2 rounded-xl text-sm appearance-none"
                 style={{ background: "var(--bg)", border: "1px solid var(--border)", color: "var(--text-primary)" }}
@@ -175,6 +179,7 @@ export default function PaperTrading() {
   const [pnl, setPnl] = useState(null);
   const [trades, setTrades] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState(null);
   const [modalOpen, setModalOpen] = useState(false);
   const [placing, setPlacing] = useState(false);
   const [toast, setToast] = useState(null);
@@ -185,6 +190,7 @@ export default function PaperTrading() {
 
   const load = useCallback(async () => {
     setLoading(true);
+    setLoadError(null);
     try {
       const [b, p, t] = await Promise.all([
         api.get("/paper/balance"),
@@ -193,9 +199,14 @@ export default function PaperTrading() {
       ]);
       setBalance(b.data);
       setPnl(p.data);
-      setTrades(t.data);
+      setTrades(Array.isArray(t.data) ? t.data : []);
     } catch (e) {
-      console.error(e);
+      // PH3.2: this used to console.error and fall through to the normal view,
+      // which rendered an empty account — a zero balance and "no open trades" —
+      // whenever the API was merely unreachable. In a trading UI that reads as
+      // "your positions are gone", so the failure is now stated explicitly and
+      // the user is given a way to retry.
+      setLoadError(resolveApiErrorMessage(e, "Could not load your paper trading account."));
     } finally {
       setLoading(false);
     }
@@ -242,8 +253,22 @@ export default function PaperTrading() {
   const closedTrades = trades.filter(t => t.status === "CLOSED");
 
   if (loading) return (
-    <div className="space-y-4">
+    <div className="space-y-4" data-testid="paper-trading-loading">
       {[1, 2, 3].map(i => <div key={i} className="h-24 rounded-2xl animate-pulse" style={{ background: "var(--bg-surface)" }} />)}
+    </div>
+  );
+
+  if (loadError) return (
+    <div className="glass-card p-8 flex flex-col items-center text-center gap-3" data-testid="paper-trading-error" role="alert">
+      <AlertTriangle size={28} style={{ color: "var(--loss)" }} />
+      <div>
+        <h2 className="card-title mb-1">Paper trading is unavailable</h2>
+        <p className="body-text" style={{ color: "var(--text-muted)" }}>{loadError}</p>
+      </div>
+      <button onClick={load} className="btn-primary btn-lg" data-testid="paper-trading-retry">
+        <RefreshCw size={15} />
+        Try again
+      </button>
     </div>
   );
 

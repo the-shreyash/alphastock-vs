@@ -5,13 +5,7 @@ import { useAuth } from "../context/AuthContext";
 import { ArrowRight, Eye, EyeOff } from "lucide-react";
 import APLogo from "../components/APLogo";
 import { startGoogleLogin } from "../services/googleAuth";
-
-function formatApiError(detail) {
-  if (detail == null) return "Something went wrong.";
-  if (typeof detail === "string") return detail;
-  if (Array.isArray(detail)) return detail.map((e) => e?.msg || JSON.stringify(e)).join(" ");
-  return String(detail);
-}
+import { resolveApiErrorMessage } from "../utils/apiError";
 
 export default function Register() {
   const [name, setName] = useState("");
@@ -26,18 +20,18 @@ export default function Register() {
   const handleSubmit = async (e) => {
     e.preventDefault(); setError("");
     // Mirrors the server-side policy minimum (PH1.5); the API enforces the
-    // full rule set and its 422 messages render via formatApiError below.
+    // full rule set and its 422 messages render via resolveApiErrorMessage below.
     if (password.length < 12) { setError("Password must be at least 12 characters"); return; }
     setLoading(true);
     try { await register(name, email, password); navigate("/dashboard"); }
-    catch (err) { setError(formatApiError(err.response?.data?.detail) || err.message); }
+    catch (err) { setError(resolveApiErrorMessage(err)); }
     finally { setLoading(false); }
   };
 
   const handleGoogleLogin = async () => {
     setError("");
     try { await startGoogleLogin(); }
-    catch (err) { setError(formatApiError(err.response?.data?.detail) || err.message); }
+    catch (err) { setError(resolveApiErrorMessage(err)); }
   };
 
   return (
@@ -57,23 +51,23 @@ export default function Register() {
           initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.5, delay: 0.1 }}>
           <p className="eyebrow mb-1">Get Started</p>
           <h2 className="page-title mb-8">Create Account</h2>
-          {error && <div data-testid="register-error" className="mb-4 p-3 rounded-xl text-sm" style={{ background: "rgba(244,63,94,0.08)", color: "var(--loss)" }}>{error}</div>}
+          {error && <div data-testid="register-error" role="alert" className="mb-4 p-3 rounded-xl text-sm" style={{ background: "rgba(244,63,94,0.08)", color: "var(--loss)" }}>{error}</div>}
           <form onSubmit={handleSubmit} className="space-y-4">
             {[{ id: "register-name-input", label: "Name", type: "text", val: name, set: setName, ph: "Your name" },
             { id: "register-email-input", label: "Email", type: "email", val: email, set: setEmail, ph: "trader@example.com" }
             ].map((f) => (
               <div key={f.id}>
-                <label className="stat-label block mb-1.5">{f.label}</label>
-                <input data-testid={f.id} type={f.type} value={f.val} onChange={(e) => f.set(e.target.value)} required placeholder={f.ph}
+                <label className="stat-label block mb-1.5" htmlFor={f.id}>{f.label}</label>
+                <input id={f.id} data-testid={f.id} type={f.type} value={f.val} onChange={(e) => f.set(e.target.value)} required placeholder={f.ph}
                   className="w-full rounded-xl px-4 py-3 text-sm focus:outline-none" style={{ background: "var(--bg-surface)", border: "1px solid var(--border)", color: "var(--text-primary)" }} />
               </div>
             ))}
             <div>
-              <label className="stat-label block mb-1.5">Password</label>
+              <label className="stat-label block mb-1.5" htmlFor="register-password">Password</label>
               <div className="relative">
-                <input data-testid="register-password-input" type={showPw ? "text" : "password"} value={password} onChange={(e) => setPassword(e.target.value)} required placeholder="Min 6 characters"
+                <input id="register-password" data-testid="register-password-input" type={showPw ? "text" : "password"} value={password} onChange={(e) => setPassword(e.target.value)} required placeholder="Min 6 characters"
                   className="w-full rounded-xl px-4 py-3 text-sm focus:outline-none pr-10" style={{ background: "var(--bg-surface)", border: "1px solid var(--border)", color: "var(--text-primary)" }} />
-                <button type="button" onClick={() => setShowPw(!showPw)} className="absolute right-3 top-1/2 -translate-y-1/2" style={{ color: "var(--text-muted)" }}>
+                <button type="button" onClick={() => setShowPw(!showPw)} aria-label={showPw ? "Hide password" : "Show password"} className="absolute right-3 top-1/2 -translate-y-1/2" style={{ color: "var(--text-muted)" }}>
                   {showPw ? <EyeOff size={16} /> : <Eye size={16} />}
                 </button>
               </div>

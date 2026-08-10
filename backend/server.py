@@ -58,10 +58,11 @@ _bootstrap_logging.getLogger("observability").info(
     extra={"event": "logging_configured", **_logging_config},
 )
 
-from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Depends, Header, WebSocket, WebSocketDisconnect, BackgroundTasks
+from fastapi import FastAPI, APIRouter, HTTPException, Query, Request, Response, Depends, Header, WebSocket, WebSocketDisconnect, BackgroundTasks
 from pydantic import BaseModel
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
+from bson.errors import InvalidId
 import os
 import logging
 import secrets
@@ -279,6 +280,35 @@ async def validation_error_handler(request, exc: RequestValidationError):
         for e in exc.errors()
     ]
     return _JSONResponse(status_code=422, content={"detail": sanitized})
+
+
+# A malformed JSON body is a client error, not a server error (PH3.3 / D-6).
+#
+# Eighteen routes read their body with `await request.json()` instead of binding
+# a Pydantic model — the admin editors, the trade modifier, the broker session
+# exchanges. Those routes never reach FastAPI's own body parsing, so they never
+# get its 422; `json.loads` raises `JSONDecodeError` inside the handler, nothing
+# catches it, and a truncated request body from a flaky mobile connection is
+# reported as "the server is broken". It also means a trivially-generated 500 is
+# available to any authenticated caller, which flat-lines an error-rate SLO.
+#
+# Handled centrally rather than with a try/except in each of the eighteen: a
+# per-route fix is eighteen chances to forget, and the nineteenth route added
+# next sprint would not be covered. `JSONDecodeError` subclasses `ValueError`,
+# so the handler is registered against the precise type to avoid swallowing
+# unrelated ValueErrors (which are genuine 500s and must stay visible).
+import json as _json
+
+
+@app.exception_handler(_json.JSONDecodeError)
+async def malformed_json_handler(request, exc: _json.JSONDecodeError):
+    # The parse error's position/snippet is deliberately not echoed: it would
+    # reflect fragments of the submitted body back to the caller, the same
+    # reflection the 422 handler above exists to prevent.
+    return _JSONResponse(
+        status_code=400,
+        content={"detail": "Malformed JSON body.", "code": "INVALID_JSON"},
+    )
 
 
 # JWT & Session Config (PH1.6)
@@ -2490,8 +2520,21 @@ async def mark_all_read(user: dict = Depends(get_current_user)):
 
 @notifications_router.put("/{notif_id}/read")
 async def mark_read(notif_id: str, user: dict = Depends(get_current_user)):
+    """Mark one notification read. Ownership is enforced by the filter, so a
+    notification belonging to another user is never mutated.
+
+    PH3.3 (D-2): the miss now answers 404 instead of "Marked as read". The
+    write was always safe — `user_id` is part of the filter — but reporting
+    success for a row that was not touched is a contract lie: it makes an
+    ownership rejection indistinguishable from a real update, so no client and
+    no log could ever reveal a probe walking notification ids. Every sibling
+    endpoint (trades, watchlist) already answers 404 on the same miss.
+    """
     notif_oid = parse_object_id(notif_id, "notification")
-    await db.notifications.update_one({"_id": notif_oid, "user_id": user["_id"]}, {"$set": {"read": True}})
+    result = await db.notifications.update_one(
+        {"_id": notif_oid, "user_id": user["_id"]}, {"$set": {"read": True}})
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Notification not found")
     return {"message": "Marked as read"}
 
 
@@ -2789,7 +2832,19 @@ async def sip_recommend(data: SIPRequest, user: dict = Depends(get_current_user)
     return {"recommendation": result, "input": data.model_dump()}
 
 @sip_router.get("/calculator")
-async def sip_calculator(amount: float = 5000, years: int = 10, rate: float = 12):
+async def sip_calculator(
+    # PH3.3 (D-5). These were unbounded floats. `amount=1e308` overflowed the
+    # compound-growth expression to `inf`, and JSON has no representation for
+    # it — the response serializer then raised "Out of range float values are
+    # not JSON compliant" and the request 500ed *after* the handler had
+    # succeeded, which is the most confusing shape this failure can take.
+    # Bounding the inputs is the honest fix: these are the ranges a monthly SIP
+    # projection is actually meaningful over, and a value outside them is a
+    # client error, not an arithmetic adventure.
+    amount: float = Query(5000, gt=0, le=1e9, description="Monthly investment."),
+    years: int = Query(10, ge=1, le=100, description="Investment horizon."),
+    rate: float = Query(12, ge=0, le=100, description="Expected annual return %."),
+):
     months = years * 12
     r = rate / 12 / 100
     if r > 0:
@@ -4813,13 +4868,36 @@ async def admin_dashboard(user: dict = Depends(require_admin)):
     }
 
 
+# ---------- Pagination ----------
+#
+# PH3.3 (D-1). `page` and `limit` were plain unvalidated ints, so a client could
+# send `page=0` and reach `skip = (page - 1) * limit == -20`. MongoDB rejects a
+# negative skip with an OperationFailure rather than clamping it, and the
+# uncaught driver error surfaced as a 500 — an implementation error leaking out
+# for what is plainly a bad request. `limit=0` reached the page-count expression
+# `(total + limit - 1) // limit` and raised ZeroDivisionError by the same route.
+#
+# Declared as FastAPI `Query` constraints rather than defensive clamping inside
+# each handler, for three reasons: an out-of-range value becomes a 422 that
+# names the offending parameter (clamping would silently serve page 1 to a
+# client that asked for page 0, and hide its bug); the bound appears in the
+# OpenAPI schema, so it documents itself; and there is nothing for a fourth
+# paginated endpoint to forget to copy — it reuses these two aliases.
+#
+# The `le=100` upper bound is not cosmetic: without it `limit=1000000` is an
+# unbounded collection scan that any authenticated admin session can trigger.
+PageParam = Query(1, ge=1, description="1-based page number.")
+LimitParam = Query(20, ge=1, le=100, description="Rows per page (max 100).")
+LogLimitParam = Query(50, ge=1, le=200, description="Rows per page (max 200).")
+
+
 # ---------- User Management ----------
 
 @admin_router.get("/users")
 async def admin_list_users(
     request: Request,
-    page: int = 1,
-    limit: int = 20,
+    page: int = PageParam,
+    limit: int = LimitParam,
     search: str = "",
     role: str = "",
     status: str = "",
@@ -4914,6 +4992,16 @@ async def admin_grant_plan(user_id: str, request: Request, user: dict = Depends(
     valid_plans = {"free", "pro", "elite", "lifetime", "developer", "investor", "beta_tester"}
     if plan not in valid_plans:
         raise HTTPException(status_code=400, detail=f"Invalid plan. Choose from: {', '.join(valid_plans)}")
+    # PH3.3 (D-3): `duration_days` went straight from an untyped JSON body into
+    # `timedelta(days=...)`, which raises TypeError for a string/null/list and
+    # OverflowError for an astronomically large int — both uncaught, both a 500
+    # for what is a malformed request. The route reads its body as raw JSON
+    # rather than a Pydantic model, so the coercion has to be explicit here.
+    # 3650 days (10 years) is the ceiling: anything longer is `lifetime`.
+    if not isinstance(duration_days, int) or isinstance(duration_days, bool):
+        raise HTTPException(status_code=400, detail="duration_days must be an integer")
+    if not 1 <= duration_days <= 3650:
+        raise HTTPException(status_code=400, detail="duration_days must be between 1 and 3650")
     expires_at = (datetime.now(timezone.utc) + timedelta(days=duration_days)).isoformat() if plan != "lifetime" else None
     await db.users.update_one({"_id": oid}, {"$set": {
         "role": plan,
@@ -4928,7 +5016,8 @@ async def admin_grant_plan(user_id: str, request: Request, user: dict = Depends(
 # ---------- Payments ----------
 
 @admin_router.get("/payments")
-async def admin_list_payments(page: int = 1, limit: int = 20, user: dict = Depends(require_admin)):
+async def admin_list_payments(page: int = PageParam, limit: int = LimitParam,
+                              user: dict = Depends(require_admin)):
     # Check if payments collection exists
     collections = await db.list_collection_names()
     if "payments" not in collections:
@@ -5031,7 +5120,16 @@ async def admin_ai_usage(user: dict = Depends(require_admin)):
     top_users = []
     async for doc in db.chat_messages.aggregate(pipeline):
         uid = doc["_id"]
-        u = await db.users.find_one({"_id": ObjectId(uid)}, {"name": 1, "email": 1, "role": 1}) if uid else None
+        # PH3.3 (D-9): `ObjectId(uid)` raised InvalidId on any chat_messages row
+        # whose `user_id` is not a well-formed id — a legacy row, an import, or a
+        # future code path writing a session key here — and took the whole admin
+        # AI-usage page to a 500. One malformed row must not blank an operational
+        # dashboard; the aggregate still counts it, it simply resolves to Unknown.
+        try:
+            u = await db.users.find_one(
+                {"_id": ObjectId(uid)}, {"name": 1, "email": 1, "role": 1}) if uid else None
+        except (InvalidId, TypeError):
+            u = None
         top_users.append({
             "user_id": uid,
             "name": u.get("name", "Unknown") if u else "Unknown",
@@ -5123,7 +5221,7 @@ async def admin_analytics_features(user: dict = Depends(require_admin)):
 
 @admin_router.get("/logs")
 async def admin_list_logs(
-    page: int = 1, limit: int = 50, action: str = "", admin_id: str = "",
+    page: int = PageParam, limit: int = LogLimitParam, action: str = "", admin_id: str = "",
     user: dict = Depends(require_admin),
 ):
     query = {}
@@ -5153,7 +5251,7 @@ async def admin_list_logs(
 
 @admin_router.get("/support/tickets")
 async def admin_list_tickets(
-    page: int = 1, limit: int = 20, status: str = "",
+    page: int = PageParam, limit: int = LimitParam, status: str = "",
     user: dict = Depends(require_admin),
 ):
     query = {}

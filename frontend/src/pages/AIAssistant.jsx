@@ -131,6 +131,7 @@ export default function AIAssistant() {
               <input
                 data-testid="chat-input"
                 type="text"
+                aria-label="Ask the AI assistant about markets"
                 placeholder="Ask anything about markets..."
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
@@ -139,7 +140,7 @@ export default function AIAssistant() {
                 style={{ paddingLeft: 16 }}
                 disabled={sending}
               />
-              <button data-testid="chat-send-btn" onClick={() => handleSend()} disabled={sending || !input.trim()} className="btn-primary px-4 py-2.5">
+              <button data-testid="chat-send-btn" aria-label="Send message" onClick={() => handleSend()} disabled={sending || !input.trim()} className="btn-primary px-4 py-2.5">
                 <Send size={15} />
               </button>
             </div>

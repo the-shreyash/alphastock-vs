@@ -99,7 +99,7 @@ export default function NotificationPanel({ onClose }) {
                 <CheckCheck size={12} /> Mark all read
               </button>
             )}
-            <button data-testid="close-notifications-btn" onClick={onClose}
+            <button data-testid="close-notifications-btn" aria-label="Close notifications" onClick={onClose}
               className="p-1.5 rounded-lg transition-all hover:opacity-70" style={{ color: "var(--text-muted)" }}>
               <X size={14} />
             </button>

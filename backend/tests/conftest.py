@@ -37,6 +37,7 @@ _testenv.apply()
 
 import server  # noqa: E402
 from server import app, create_access_token  # noqa: E402
+from services.broker_engine import broker_engine  # noqa: E402
 from tests._fakedb import FakeDB  # noqa: E402
 
 
@@ -196,32 +197,130 @@ def client():
 
 @pytest.fixture
 def fake_db(monkeypatch):
-    """Swap the module-level `server.db` for an in-memory FakeDB."""
+    """Swap the module-level `server.db` for an in-memory FakeDB.
+
+    PH3.3: `server.db` is not the only handle. `services.broker_engine` captures
+    its own reference at startup (`broker_engine.db`), and patching only
+    `server.db` left every `/api/brokers/*` and `/api/zerodha/*` route talking
+    to the **real** Motor client. That did not fail loudly — it failed as
+    `RuntimeError: Event loop is closed`, thrown from deep inside Motor on the
+    second DB-backed request of the session, which reads like an async bug in
+    the application and is really an unpatched dependency. Every broker route
+    was unreachable from a hermetic test until this was found.
+
+    Any future component that caches its own handle belongs in this list, and
+    the symptom to recognise is that same RuntimeError.
+    """
     fdb = FakeDB()
     monkeypatch.setattr(server, "db", fdb)
+    monkeypatch.setattr(broker_engine, "db", fdb)
     return fdb
+
+
+def _seed_user(fake_db, email, role, name):
+    """Insert a synthetic user document and return it.
+
+    Shared by every principal fixture below so the four roles differ in exactly
+    one field (`role`) and nothing else — an authorization test that passes for
+    the wrong reason (different capital, different name) is not possible.
+    """
+    doc = {
+        "_id": ObjectId(),
+        "name": name,
+        "email": email,
+        "capital": 100000.0,
+        "risk_level": "moderate",
+        "role": role,
+    }
+    fake_db.users.docs.append(doc)
+    return doc
+
+
+def _headers_for(user_doc):
+    """A real JWT (minted via the app's own `create_access_token`) for a user.
+
+    Minting through the application's own function rather than hand-rolling a
+    token is deliberate: a test that forges its own JWT stops testing the
+    issuer, and would keep passing after the issuer started emitting something
+    the verifier rejects.
+    """
+    token = create_access_token(str(user_doc["_id"]), user_doc["email"])
+    return {"Authorization": f"Bearer {token}"}
 
 
 @pytest.fixture
 def test_user(fake_db):
     """A user document pre-seeded into the fake DB, for auth + ownership checks."""
-    user_doc = {
-        "_id": ObjectId(),
-        "name": "Test User",
-        "email": "test_user@example.com",
-        "capital": 100000.0,
-        "risk_level": "moderate",
-        "role": "user",
-    }
-    fake_db.users.docs.append(user_doc)
-    return user_doc
+    return _seed_user(fake_db, "test_user@example.com", "user", "Test User")
 
 
 @pytest.fixture
 def auth_headers(test_user):
     """A real JWT (minted via the app's own create_access_token) for test_user."""
-    token = create_access_token(str(test_user["_id"]), test_user["email"])
-    return {"Authorization": f"Bearer {token}"}
+    return _headers_for(test_user)
+
+
+# --------------------------------------------------------------------------- #
+# Additional principals (PH3.3)                                                 #
+# --------------------------------------------------------------------------- #
+# Authorization has four distinct answers in this system — anonymous, owner,
+# admin, super_admin — and "another ordinary user" is the principal that proves
+# *horizontal* isolation. Each is a first-class fixture so a test names the
+# principal it is exercising rather than assembling one inline, where the role
+# string is easy to get subtly wrong (e.g. "superadmin") and the test then
+# passes by falling into the 403 branch it meant to escape.
+
+@pytest.fixture
+def other_user(fake_db):
+    """A second ordinary user — the victim in horizontal-escalation tests."""
+    return _seed_user(fake_db, "other_user@example.com", "user", "Other User")
+
+
+@pytest.fixture
+def other_headers(other_user):
+    return _headers_for(other_user)
+
+
+@pytest.fixture
+def admin_user(fake_db):
+    return _seed_user(fake_db, "test_admin@example.com", "admin", "Test Admin")
+
+
+@pytest.fixture
+def admin_headers(admin_user):
+    return _headers_for(admin_user)
+
+
+@pytest.fixture
+def super_admin_user(fake_db):
+    return _seed_user(fake_db, "test_super@example.com", "super_admin", "Test Super Admin")
+
+
+@pytest.fixture
+def super_admin_headers(super_admin_user):
+    return _headers_for(super_admin_user)
+
+
+@pytest.fixture
+def authenticated_client(fake_db, auth_headers):
+    """`TestClient` that sends `test_user`'s bearer token on every request.
+
+    Saves threading `headers=` through every call in ownership-heavy suites.
+    Where a test's *point* is the presence or absence of credentials, use the
+    plain `client` fixture and pass headers explicitly — an implicit credential
+    is exactly the thing those tests must not have.
+    """
+    return TestClient(app, headers=auth_headers)
+
+
+@pytest.fixture
+def admin_client(fake_db, admin_headers):
+    return TestClient(app, headers=admin_headers)
+
+
+@pytest.fixture
+def super_admin_client(fake_db, super_admin_headers):
+    return TestClient(app, headers=super_admin_headers)
 
 
 @pytest.fixture

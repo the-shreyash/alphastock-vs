@@ -5,7 +5,7 @@ Version: 1.1
 
 Status: Active Development
 
-Last updated: 2026-08-09 (PH3.1)
+Last updated: 2026-08-10 (PH3.3)
 
 ---
 
@@ -22,10 +22,11 @@ command to run, what each marker means, how isolation is enforced — live in
 TEST_ARCHITECTURE.md is describing reality and this document is describing the
 target.
 
-**Current state in one line (PH3.1, 2026-08-09):** the backend has 1,130 tests;
-`pytest` runs 1,035 of them hermetically and green in ~2m20s with no server,
+**Current state in one line (PH3.3, 2026-08-10):** the backend has 2,245 tests;
+`pytest` runs 2,150 of them hermetically and green in ~2m46s with no server,
 database, credentials or network; 95 live-server tests are classified and skip
-cleanly without a deployment; there is **no frontend test suite yet** (PH3.3).
+cleanly without a deployment; the frontend has 313 tests across 17 suites
+(PH3.2), green in ~8s.
 
 ---
 
@@ -102,11 +103,15 @@ End-to-end tests should cover critical user journeys.
 ```
 Developer
    │
-   ├── pytest                          ← the default. 1,035 tests, ~2m20s
+   ├── pytest                          ← the default. 2,150 tests, ~2m46s
    │     │                               no server, no database, no network
    │     ├── Unit                      (services, engines, pure logic)
    │     ├── Security                  (452 tests — PH1 controls)
-   │     └── Hermetic Integration      (FastAPI TestClient + FakeDB)
+   │     └── Hermetic API / Integration (FastAPI TestClient + FakeDB)
+   │           ├── authz + validation sweeps derived from the live route
+   │           │   table (PH3.3) — 126 protected routes, 29 admin routes
+   │           ├── provider-failure matrices (market, AI, broker)
+   │           └── trading lifecycle asserted at the database level
    │
    ├── pytest -m integration           ← 95 tests, needs a running deployment
    │     ├── Mongo   (real, through the app)
@@ -116,7 +121,7 @@ Developer
          │
          └── Running deployment
                ├── real market data, real AI, real brokers
-               └── E2E journeys: none yet (PH3.3 / PH3.9)
+               └── E2E journeys: none yet (PH3.9)
 ```
 
 CI executes the deterministic suite on every push and pull request. The
@@ -184,42 +189,95 @@ Recommended 90%
 
 # Frontend Testing
 
-**Status: not implemented.** No frontend test suite exists in this repository
-as of 2026-08-09. `npm test` runs nothing. PH3.3 owns creating the foundation
-and PH3.4 the service/hook coverage. The rest of this section is the target,
-not a description.
+**Status: implemented (PH3.2, 2026-08-10).** 313 tests across 17 suites, green
+in ~8s. Full detail: `docs/testing/PH3.2_FRONTEND_TEST_CERTIFICATION.md`.
 
-Framework
+## Framework
 
-Vitest
+**Jest 27 + React Testing Library 16**, run through `craco test` — the runner
+already shipping inside `react-scripts`. No second framework was introduced.
 
-React Testing Library
+Vitest was the documented target above and was *not* adopted: it would have
+meant a parallel build pipeline (esbuild) alongside the webpack/CRA one that
+actually ships the app, so tests would run against a different transform than
+production. Revisit only if the build itself migrates to Vite.
 
-Test
+| Tool | Role |
+|------|------|
+| `jest` (via `react-scripts`) | runner, jsdom environment, coverage |
+| `@testing-library/react` | render + query by accessible role/text |
+| `@testing-library/user-event` | realistic user interaction |
+| `@testing-library/jest-dom` | DOM/accessibility matchers |
+| `axios-mock-adapter` | request interception at the transport boundary |
 
-Pages
+## Commands
 
-Components
+Run from `frontend/`:
 
-Forms
+| Purpose | Command |
+|---------|---------|
+| Run once | `yarn test` |
+| Watch (inner loop) | `yarn test:watch` |
+| Coverage | `yarn test:coverage` |
+| CI mode | `yarn test:ci` |
+| One file | `yarn test --testPathPattern=Login` |
 
-Buttons
+## Architecture
 
-Charts
+Two layers, both in-process; no browser and no running backend.
 
-Cards
+```
+frontend/src/
+├── setupTests.js              ← jsdom polyfills + network isolation
+├── test-utils/
+│   ├── index.js               ← renderWithProviders, renderAppAt, auth helpers
+│   ├── apiMock.js             ← installApiMock, HTTP codes, pending()
+│   └── fixtures.js            ← deterministic test data
+├── **/__tests__/*.test.js(x)  ← unit + component tests, beside their subject
+└── __tests__/                 ← cross-screen integration (routing, auth flow)
+```
 
-Navigation
+**Layer 1 — unit/component.** Formatters, the API client's interceptors, the
+realtime store's reducers, and each critical screen rendered in isolation.
 
-Theme
+**Layer 2 — integration.** `routing.test.jsx` and `authFlow.integration.test.jsx`
+drive the application's *real* route table (`AppRouter`, exported from App.js for
+this purpose), so a guard removed from the route declaration fails the suite.
 
-Responsive Layout
+**Layer 3 — E2E.** Deliberately not started in PH3.2; see Known Gaps in the
+certification document.
 
-Loading States
+## Mocking strategy
 
-Error States
+Every network call goes through the single axios instance in
+`src/services/api.js`. `axios-mock-adapter` replaces that instance's *adapter* —
+the last step before a request leaves the process. Everything above it runs for
+real: the bearer-token request interceptor, the 401 silent-refresh interceptor,
+every service module and every component.
 
-Empty States
+MSW was evaluated and rejected: CRA 5 / Jest 27 predate `package.json#exports`
+resolution, and MSW v2 is exports-only ESM needing Web-streams polyfills under
+jsdom. Adapter interception is the smaller tool for the same job here.
+
+`onNoMatch: "throwException"` is the default, so an unstubbed request fails
+loudly by name rather than hanging.
+
+> **Trap.** `axios-mock-adapter` matches handlers **in registration order**.
+> Register specific routes *before* `stubRemainingWith()`, or the catch-all
+> answers them and the test passes for the wrong reason.
+
+No test can reach a real service: `setupTests.js` points the axios base URL at a
+fake host, replaces `fetch` with a rejecting stub, and substitutes an inert
+`WebSocket` so `RealtimeProvider` never opens a socket. Live-data behaviour is
+exercised by writing directly into the Zustand realtime store.
+
+## What is covered
+
+Authentication (login, registration, logout, session restore, expiry, Google
+OAuth callback), routing and route guards including admin access control, the
+dashboard shell, paper trading order entry, the AI workspace, the watchlist,
+notifications, the admin dashboard, and the realtime store. Each critical screen
+is asserted in all four states: loading, success, empty and error.
 
 ---
 
@@ -247,6 +305,68 @@ Markers: `integration`, `live`, `e2e`, `security`, `slow`, `requires_db`,
 `requires_redis`, `allow_network` — registered in `backend/pyproject.toml`,
 applied mechanically by `backend/tests/conftest.py`. `--strict-markers` turns a
 typo into a collection error.
+
+## API test architecture (PH3.3)
+
+Nine hermetic API suites, 1,134 tests, all in-process via `TestClient` + `FakeDB`:
+
+| Suite | Tests | Covers |
+|---|---:|---|
+| `test_api_authz.py` | 307 | Authentication + authorization over the **live route table** |
+| `test_api_validation.py` | 552 | Malformed input over the **live route table** |
+| `test_api_market_data.py` | 68 | Market-provider failure matrix + containment |
+| `test_api_ai.py` | 48 | AI-provider failure matrix + containment |
+| `test_api_admin.py` | 39 | Admin control plane, audit records, empty-DB rendering |
+| `test_api_errors.py` | 38 | Error envelope, rate-limit attachment, DB failure |
+| `test_api_trading.py` | 35 | Order lifecycle asserted at the database level |
+| `test_api_migrated.py` | 28 | Converted from the live-server suites |
+| `test_api_contract.py` | 19 | PH3.1 conversions |
+
+**The route table is read, not written down.** `tests/_routes.py` inspects
+`server.app.routes` at collection time and classifies each route by its resolved
+**dependency graph** — "protected" iff `get_current_user` is in its dependency
+tree, "admin" iff `require_admin` is. Three suites parametrize over that
+classification, so a new endpoint gets authorization tests automatically and one
+that ships without its dependency turns them red. Guard tests fail if the
+derived lists ever empty, so the sweeps cannot silently vanish and report green.
+
+One parametrized case per route, not one loop: a failure names the route, and
+each case gets a fresh `fake_db` and therefore its own rate-limit counter (a
+single test issuing 126 anonymous requests would trip the 60/min anonymous
+limiter partway through).
+
+**Assert each guarantee at the layer that provides it.** The routes contain no
+error handling for provider failures, and correctly so — containment lives at the
+transport boundary (`fetch_yahoo_quote` catches everything and returns `None`;
+provider adapters convert SDK exceptions into `AIResponse.error`). Tests that
+inject a *raise* at the top of the stack assert a state production cannot enter.
+The failure matrices therefore use only reachable results, and the containment
+itself is asserted directly at the `try/except` that provides it. Full rationale:
+`docs/testing/PH3.3_BACKEND_TEST_CERTIFICATION.md` §10.1.
+
+### Fixtures (PH3.3 additions)
+
+`other_user`/`other_headers` (horizontal-escalation victim), `admin_user`/
+`admin_headers`, `super_admin_user`/`super_admin_headers`,
+`authenticated_client`, `admin_client`, `super_admin_client`. All four
+principals come from one `_seed_user` helper so they differ in exactly one field
+(`role`); tokens are minted by the app's own `create_access_token`.
+
+> **Trap.** `fake_db` must patch **every** database handle.
+> `services.broker_engine` keeps its own (`broker_engine.db`); before PH3.3 it
+> was unpatched, so all 33 broker routes talked to the real Motor client during
+> "hermetic" tests and failed as `RuntimeError: Event loop is closed` — which
+> reads like an application async bug and is really an unpatched dependency.
+
+> **Trap.** `monkeypatch.setattr(instance, "method", ...)` for a method defined
+> on the *class* leaves a permanent instance attribute after teardown, shadowing
+> the class attribute. Any later class-level patch of that object is then
+> silently ignored. Patch the same object every other test in the area patches.
+
+> **Trap.** `tests/_fakedb.py` raises `UnsupportedQuery` for any Mongo operator
+> it does not model. It previously *ignored* them, which meant a filter meant to
+> narrow a result set silently matched the whole collection. If you hit this,
+> extend the double — do not assert around it.
 
 Hermeticity is enforced, not assumed: `tests/_testenv.py` installs a fixed
 synthetic environment (and disables `.env` loading) before `server` is
@@ -913,12 +1033,48 @@ These are long-term targets, not current state.
 | `services/market_engine/` | 46.5% | 90% |
 | `services/` (other) | 42.4% | 90% |
 | **Backend total** | **59.2%** | 90% |
-| Frontend | **0%** (no suite) | 90% |
 
-No `fail_under` threshold is enforced. PH3.11 sets one from trend data rather
-than inventing a number alongside the first measurement.
+## Measured baseline (PH3.2, 2026-08-10) — frontend
 
-Full detail and methodology: `docs/testing/TEST_ARCHITECTURE.md` §8.
+`yarn test:coverage`, application code only, excluding the vendored
+`components/ui/` shadcn primitives.
+
+| Metric | Overall | Critical paths |
+|--------|--------:|---------------:|
+| Statements | **33.6%** | **77.0%** |
+| Branches | 19.5% | — |
+| Functions | 28.6% | — |
+| Lines | 34.4% | — |
+
+Overall is low by design: it counts ~30 untested feature pages (Portfolio,
+TradeMonitor, StockDetail, Markets, News, Settings, ten admin pages) that PH3.2
+did not scope. The number that matters is the second column.
+
+| Critical path | Stmts |
+|---------------|------:|
+| `services/api.js` (interceptors) | **100%** |
+| `services/googleAuth.js` | **100%** |
+| `utils/formatters.js` | **100%** |
+| `pages/Login.jsx` | **100%** |
+| `pages/AIAssistant.jsx` | **100%** |
+| `context/AuthContext.jsx` | 97.6% |
+| `pages/PaperTrading.jsx` | 96.1% |
+| `pages/AuthCallback.jsx` | 95.8% |
+| `services/tradeService.js` | 94.3% |
+| `components/notifications/NotificationPanel.jsx` | 94.1% |
+| `utils/apiError.js` | 92.0% |
+| `pages/Watchlist.jsx` | 89.1% |
+| `pages/admin/AdminDashboard.jsx` | 84.0% |
+| `components/admin/AdminRoute.jsx` | 75.0% |
+| `hooks/useAIWorkspace.js` | 75.6% |
+| `pages/Dashboard.jsx` | 66.4% |
+| `store/realtimeStore.js` | 60.6% |
+
+No `fail_under` threshold is enforced on either suite. PH3.11 sets one from
+trend data rather than inventing a number alongside the first measurement.
+
+Full detail and methodology: `docs/testing/TEST_ARCHITECTURE.md` §8 (backend)
+and `docs/testing/PH3.2_FRONTEND_TEST_CERTIFICATION.md` (frontend).
 
 ## Targets
 

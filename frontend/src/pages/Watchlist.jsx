@@ -67,6 +67,7 @@ function AddStockSearch({ onAdd, existing }) {
       <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2" style={{ color: "var(--text-muted)" }} />
       <input
         data-testid="watchlist-search-input"
+        aria-label="Search for a stock to add to your watchlist"
         type="text"
         value={query}
         onChange={e => setQuery(e.target.value)}
@@ -169,6 +170,7 @@ const WatchlistRow = memo(forwardRef(function WatchlistRow({ item, onRemove }, r
 
       <button
         data-testid={`watchlist-remove-${item.symbol}`}
+        aria-label={`Remove ${item.symbol} from watchlist`}
         onClick={() => onRemove(item.symbol)}
         className="btn-ghost shrink-0"
         style={{ padding: "8px", color: "var(--text-muted)" }}

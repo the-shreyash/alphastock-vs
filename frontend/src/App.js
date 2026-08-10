@@ -85,7 +85,14 @@ function PublicRoute({ children }) {
   return children;
 }
 
-function AppRouter() {
+/*
+ * Exported for tests (PH3.2): the route table and its guards are the security
+ * boundary of the SPA, so the routing tests must exercise *this* declaration
+ * rather than a copy. `App` still owns the BrowserRouter, which lets a test
+ * mount AppRouter inside a MemoryRouter and drive navigation without touching
+ * window.history.
+ */
+export function AppRouter() {
   return (
     <Suspense fallback={<PageFallback />}>
     <Routes>

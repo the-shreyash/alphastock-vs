@@ -5,6 +5,193 @@ This file records documentation-system versions and, from v1.0 launch onward, pr
 
 ---
 
+# Sprint PH3.3 — Backend Tests & API Coverage — 2026-08-10
+
+**Full report:** `docs/testing/PH3.3_BACKEND_TEST_CERTIFICATION.md`.
+
+**Numbering.** The sprint brief labelled this work PH3.3. This repository's
+roadmap numbers PH3.3 as *Frontend Test Foundation* (delivered under the brief
+label "PH3.2") and numbers this work **PH3.5 — API Contract & Error-State
+Testing**. The certification keeps the brief's label; the roadmap carries the
+cross-reference. Roadmap PH3.2 (*Mock Data Eradication*) remains untouched.
+
+**The backend went from 1,035 to 2,150 hermetic tests** (2,144 passed + 6
+xfailed), green in ~2m46s with no server, no database, no credentials and no
+network. 1,115 new tests across 8 suites.
+
+**The central change is not the count — it is that three suites derive their
+cases from the live route table** (`tests/_routes.py`), classifying each route by
+its *resolved dependency graph* rather than its URL. Every authenticated route
+is checked for anonymous rejection (126), every admin route for non-admin
+rejection (29), every identifier-shaped path parameter for malformed input. A
+route added next sprint is covered automatically; a route that ships without its
+auth dependency turns those suites red with no one having to remember to write a
+test. Guard tests fail if the derived lists ever empty, so the sweeps cannot
+silently vanish and report green.
+
+**Eight genuine defects found. Six fixed, two documented and assigned.**
+
+| ID | Sev | Defect | Status |
+|---|---|---|---|
+| D-11 | HIGH | Blank `SMTP_PORT` → `int("")` → ValueError. 500ed `GET /api/data-sources` and **broke all outbound email**, including password-reset and verification delivery, on any install scaffolded from `.env.example`. | Fixed |
+| D-4 | HIGH | `POST /api/admin/payments/{id}/refund` is a stub — returns `success: true` for any string, and writes a `payment.refunded` audit record for a refund that never happened. | **Assigned to PH3.9** |
+| D-1 | MED | `page=0` → negative Mongo `skip` → 500; `limit=0` → ZeroDivisionError. All 4 paginated admin endpoints; `limit` was also unbounded (full-collection scan). | Fixed |
+| D-3 | MED | `grant-plan` `duration_days` went from raw JSON into `timedelta(days=...)` — TypeError / OverflowError → 500. | Fixed |
+| D-6 | MED | 18 routes read `await request.json()` with no model, so a malformed or truncated body raised `JSONDecodeError` → 500. | Fixed |
+| D-10 | MED | `UserCreate.email` is a bare `str` with no format validation — an account created with an invalid address can never verify and can never reset its password. | **Assigned** (auth migration) |
+| D-9 | LOW | `GET /api/admin/ai/usage` called `ObjectId()` raw on aggregated `user_id`; one malformed row 500ed the page. | Fixed |
+| D-2 | LOW | `PUT /api/notifications/{id}/read` returned 200 for another user's notification (write was always safe; the *report* was not). | Fixed |
+
+**D-6 was fixed centrally**, with one `@app.exception_handler(json.JSONDecodeError)`
+rather than 18 try/except blocks — a per-route fix is 18 chances to forget, and
+the 19th route added next sprint would not be covered. **D-1 was fixed
+declaratively** with FastAPI `Query` bounds rather than clamping, so an
+out-of-range page becomes a 422 naming the parameter instead of silently serving
+page 1 to a client whose bug is then hidden.
+
+**Three tests were wrong and were rewritten rather than "fixing" the
+application.** Patching `real_overview`/`fetch_real_gainers` to *raise* made 20
+tests fail and looked like a serious finding. It was not: failure containment
+lives at the transport boundary (`fetch_yahoo_quote` catches everything and
+returns `None`; `fetch_all_universe_quotes` gathers with `return_exceptions=True`),
+so a provider timeout reaches a route as `None`, never as an exception. The
+tests were asserting a state production cannot enter, and "fixing" the routes
+would have added handlers for exceptions that never arrive. The suites now
+inject failure where it originates and **assert each guarantee at the layer that
+provides it** — so removing a `try/except` fails a test at the line that broke,
+not in twenty route tests reporting a symptom. Same correction applied to the AI
+provider adapters and to `fetch_news`'s list contract.
+
+**Two test-isolation defects found in the existing fixtures.**
+`services.broker_engine` holds its own Mongo handle that `fake_db` never
+patched, so all 33 broker/Zerodha routes were hitting the **real Motor client**
+during "hermetic" tests — surfacing as `RuntimeError: Event loop is closed`,
+which reads like an application async bug and is really an unpatched dependency.
+Separately, `test_ai_workspace.py`'s `monkeypatch.setattr(_engine, "simple_chat", …)`
+patches an *instance* attribute for a *class* method, so teardown leaves a
+permanent shadow and every later class-level patch is silently ignored. Latent
+for as long as that test existed; it surfaced as a new test that passed alone
+and failed in the full suite. Both fixed; order-independence verified both ways.
+
+**`tests/_fakedb.py` was strengthened** with `aggregate`, `list_collection_names`,
+`command`, cursor `skip`/`limit`, projections, `deleted_count`, and the
+`$or`/`$in`/`$nin`/`$regex`/`$lt`/`$gt` operators. The important change is
+defensive: **an unmodelled operator now raises instead of matching everything.**
+Previously a condition containing an unsupported operator fell through every
+branch and matched, so a filter meant to *narrow* a result set silently
+*widened* it to the whole collection — the "stub agrees with the bug" failure
+mode. `skip(-n)` now raises as MongoDB does, which is what made D-1 visible.
+
+**Live-server migration continued** (`test_api_migrated.py`, 28 tests): Zerodha
+config/callback/postback, Google OAuth validation, data-sources, journal,
+portfolio monitor and several validation cases converted to hermetic tests. What
+genuinely needs a deployment — real Yahoo data, a real broker session, a real
+WebSocket hop, real Twilio delivery — was deliberately left live, and no live
+file was deleted.
+
+**Coverage: 59.2% → 65.0%**; `server.py` **51.9% → 67.2%** (+15.3 points across
+2,914 statements). Security modules unchanged at 94.8%; PH1's 452 security tests
+unchanged and green; PH3.2's 313 frontend tests unchanged and green.
+
+**Not done, deliberately:** no trading logic modified, no API redesigned, no
+rate limiter changed, no security test weakened, no load or performance testing.
+
+---
+
+# Sprint PH3.2 — Frontend Testing & UI Regression Foundation — 2026-08-10
+
+**Full report:** `docs/testing/PH3.2_FRONTEND_TEST_CERTIFICATION.md`.
+
+**Numbering.** The sprint brief labelled this work PH3.2. This repository's
+roadmap and task tracker number PH3.2 as *Mock Data Eradication* — which remains
+untouched — and number this work **PH3.3**. The certification document keeps the
+brief's label; both trackers now carry the cross-reference. No renumbering was
+done unilaterally.
+
+**The frontend has a test suite now: 313 tests across 17 suites, green in ~8
+seconds.** Before this sprint `npm test` ran nothing at all.
+
+**Framework choice went against the documented target, on evidence.** TESTING.md
+had specified Vitest. Vitest would run the suite through esbuild while this
+application ships through webpack/CRA — the tests would validate a transform
+that never reaches a user. Jest 27 and React Testing Library 16 were used
+instead, driven by `craco test`, the runner already sitting inside
+`react-scripts`. No second framework was added to the project.
+
+**MSW was rejected for the same class of reason.** CRA 5 and Jest 27 predate
+`package.json#exports` resolution, and MSW v2 is exports-only ESM requiring a
+stack of Web-streams polyfills under jsdom. Requests are intercepted at the
+**axios adapter** instead — the app's real transport boundary. The consequence
+is the point: the bearer-token request interceptor and the 401 silent-refresh
+interceptor in `services/api.js` execute for real in every single test. Mocking
+`tradeService.create` would have proven nothing about either.
+
+**Nothing in the suite can reach a real service.** `setupTests.js` points the
+axios base URL at a fake host, replaces `fetch` with a rejecting stub, and
+substitutes an inert `WebSocket` so `RealtimeProvider` never opens a socket.
+Unstubbed requests fail loudly by name rather than hanging.
+
+**Route guards are tested against the real route table.** `AppRouter` is now
+exported from `App.js` so the routing suite drives the actual declaration rather
+than a test-local copy — a guard deleted from a route fails these tests instead
+of quietly passing against a stand-in. Both admin roles are admitted, and
+signed-out and non-admin users are both bounced.
+
+**Five frontend defects were found by the tests and fixed:**
+
+- **FE-001 — every client-thrown error message was silently discarded.**
+  `setError(formatApiError(err.response?.data?.detail) || err.message)` looks
+  like a fallback chain and is not one: `formatApiError(undefined)` returns
+  `"Something went wrong. Please try again."`, which is truthy, so `err.message`
+  was unreachable in both Login and Register. Google sign-in failing with the
+  deliberate, specific "Google sign-in is unavailable right now." showed the
+  generic message instead. The helper — duplicated in both files and already
+  drifted apart — is now `utils/apiError.js`, which additionally distinguishes a
+  transport failure (whose message is a diagnostic) from an application error
+  (whose message was written for a user).
+- **FE-002 — a failed sign-in was announced in colour only.** The error banner
+  carried no `role="alert"`; a screen-reader user received no signal at all.
+- **FE-003 — paper trading rendered a failed load as an empty account.** The
+  `catch` block called `console.error` and fell through to the normal view, so a
+  server outage produced a zero balance and "No open paper trades. Place your
+  first one!" In a trading UI that reads as *my positions are gone*, not *the
+  server is down*. Now an explicit error state with a retry control.
+- **FE-004 — form labels were visual only.** Login, Register and the order
+  ticket rendered `<label>` elements with no `htmlFor`/`id` association, so
+  assistive technology could not connect them to their inputs.
+- **FE-005 — icon-only controls had no accessible name.** Chat send, watchlist
+  remove and notification close announced as bare "button".
+
+**One pre-existing defect was found and deliberately not fixed.** `yarn build`
+fails at `[eslint] Failed to load config "react-app" to extend from`, because
+`eslint@^9` in devDependencies displaces the `eslint@^8` /
+`eslint-config-react-app@^7` that `react-scripts` requires. **Attribution was
+verified rather than assumed:** the working tree was stashed back to the
+pristine pre-sprint `package.json` and `yarn.lock`, dependencies reinstalled
+from the lockfile, and the identical failure reproduced. It predates this work
+and repairing the lint toolchain is not this sprint's scope. The application
+itself compiles cleanly — `DISABLE_ESLINT_PLUGIN=true yarn build` succeeds with
+every PH3.2 change in place.
+
+**Coverage baseline: 33.6% overall statements, 77.0% across critical paths.**
+`services/api.js`, `googleAuth.js`, `formatters.js`, `Login.jsx` and
+`AIAssistant.jsx` are at 100%; `AuthContext.jsx` 97.6%, `PaperTrading.jsx`
+96.1%, `tradeService.js` 94.3%. The overall figure is low **by design**: it
+counts roughly thirty feature pages this sprint did not scope. Raising it with
+shallow does-it-render tests was declined — it would have moved the percentage
+without adding a single piece of information about whether the product works.
+
+**Regression:** the PH1 security and PH3.1 backend suites were re-run — **1,035
+passed, 95 deselected, 152s**, exactly the PH3.1 baseline.
+
+**Carried, not fixed:** the CI frontend job is still the PH2.6 placeholder; no
+E2E layer (PH3.9); no coverage gate (PH3.11); and the silent-load-failure
+pattern fixed in PaperTrading **still exists** in Dashboard, Watchlist,
+AdminDashboard and NotificationPanel — pinned by tests at current behaviour so
+the deferred fix has a starting point and cannot regress further.
+
+---
+
 # Sprint PH3.1 — Test Infrastructure & Test Stabilization — 2026-08-09
 
 **PHASE 3 OPENS. Decision: CERTIFIED.** Full report:

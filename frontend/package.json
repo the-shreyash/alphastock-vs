@@ -64,7 +64,36 @@
   "scripts": {
     "start": "craco start",
     "build": "craco build",
-    "test": "craco test"
+    "test": "craco test --watchAll=false",
+    "test:watch": "craco test",
+    "test:coverage": "craco test --watchAll=false --coverage",
+    "test:ci": "craco test --watchAll=false --coverage --ci --runInBand"
+  },
+  "jest": {
+    "moduleNameMapper": {
+      "^@/(.*)$": "<rootDir>/src/$1",
+      "^react-router-dom$": "<rootDir>/node_modules/react-router-dom/dist/index.js",
+      "^react-router/dom$": "<rootDir>/node_modules/react-router/dist/development/dom-export.js",
+      "^react-router$": "<rootDir>/node_modules/react-router/dist/development/index.js"
+    },
+    "transformIgnorePatterns": [
+      "[/\\\\]node_modules[/\\\\](?!gsap)[^/\\\\]+[/\\\\].+\\.(js|mjs|jsx|ts|tsx)$",
+      "^.+\\.module\\.(css|sass|scss)$"
+    ],
+    "collectCoverageFrom": [
+      "src/**/*.{js,jsx}",
+      "!src/index.js",
+      "!src/setupTests.js",
+      "!src/test-utils/**",
+      "!src/**/__tests__/**",
+      "!src/components/ui/**"
+    ],
+    "coverageReporters": [
+      "text-summary",
+      "text",
+      "lcov",
+      "json-summary"
+    ]
   },
   "browserslist": {
     "production": [
@@ -82,7 +111,12 @@
     "@babel/plugin-proposal-private-property-in-object": "^7.21.11",
     "@craco/craco": "^5.9.0",
     "@eslint/js": "9.23.0",
+    "@testing-library/dom": "^10.4.0",
+    "@testing-library/jest-dom": "^6.6.3",
+    "@testing-library/react": "^16.3.0",
+    "@testing-library/user-event": "^14.5.2",
     "autoprefixer": "^10.4.20",
+    "axios-mock-adapter": "^2.1.0",
     "eslint": "^9.39.5",
     "eslint-plugin-import": "2.31.0",
     "eslint-plugin-jsx-a11y": "6.10.2",

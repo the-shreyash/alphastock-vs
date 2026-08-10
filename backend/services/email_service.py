@@ -13,7 +13,17 @@ def _get_sendgrid_key():
 def _get_smtp_config():
     return {
         "host": os.environ.get("SMTP_HOST", "").strip(),
-        "port": int(os.environ.get("SMTP_PORT", "587")),
+        # PH3.3 (D-11): `os.environ.get("SMTP_PORT", "587")` applies its default
+        # only when the key is ABSENT. A key that is present but *empty* —
+        # exactly what a declared-but-unset variable looks like, and what every
+        # deployment scaffolded from `.env.example` starts with — reached
+        # `int("")` and raised ValueError. That took `GET /api/data-sources` to a
+        # 500 (the endpoint the Settings page reads to show integration status)
+        # and broke every outbound email, including password-reset and
+        # email-verification delivery, on an installation that had simply not
+        # configured SMTP yet. Blank is treated as unset, which is what the
+        # default was always there to express.
+        "port": int(os.environ.get("SMTP_PORT", "").strip() or "587"),
         "user": os.environ.get("SMTP_USER", "").strip(),
         "password": os.environ.get("SMTP_PASSWORD", "").strip(),
         "from_email": os.environ.get("EMAIL_FROM", "alerts@alphapartner.ai").strip(),
