@@ -1,9 +1,31 @@
 # StockAssist AI
 ## Testing Documentation
 
-Version: 1.0
+Version: 1.1
 
 Status: Active Development
+
+Last updated: 2026-08-09 (PH3.1)
+
+---
+
+# How to read this document
+
+This document is the testing **policy**: what must be tested, to what standard,
+and what quality gates a release must pass. Much of it describes the intended
+end state rather than what exists today — that is deliberate, and each such
+section now says so.
+
+The testing **mechanics** — how the backend suite is actually organized, which
+command to run, what each marker means, how isolation is enforced — live in
+`docs/testing/TEST_ARCHITECTURE.md`. When the two disagree about what exists,
+TEST_ARCHITECTURE.md is describing reality and this document is describing the
+target.
+
+**Current state in one line (PH3.1, 2026-08-09):** the backend has 1,130 tests;
+`pytest` runs 1,035 of them hermetically and green in ~2m20s with no server,
+database, credentials or network; 95 live-server tests are classified and skip
+cleanly without a deployment; there is **no frontend test suite yet** (PH3.3).
 
 ---
 
@@ -75,6 +97,37 @@ End-to-end tests should cover critical user journeys.
 
 ---
 
+# Test Architecture (as built, PH3.1)
+
+```
+Developer
+   │
+   ├── pytest                          ← the default. 1,035 tests, ~2m20s
+   │     │                               no server, no database, no network
+   │     ├── Unit                      (services, engines, pure logic)
+   │     ├── Security                  (452 tests — PH1 controls)
+   │     └── Hermetic Integration      (FastAPI TestClient + FakeDB)
+   │
+   ├── pytest -m integration           ← 95 tests, needs a running deployment
+   │     ├── Mongo   (real, through the app)
+   │     └── Redis   (real, through the app)
+   │
+   └── Live / E2E
+         │
+         └── Running deployment
+               ├── real market data, real AI, real brokers
+               └── E2E journeys: none yet (PH3.3 / PH3.9)
+```
+
+CI executes the deterministic suite on every push and pull request. The
+integration layer needs a booted stack, which PH2.6 owns provisioning; until
+then it runs only on demand.
+
+Mechanics, fixtures and the full command set:
+`docs/testing/TEST_ARCHITECTURE.md`.
+
+---
+
 # Testing Levels
 
 Unit Testing
@@ -131,6 +184,11 @@ Recommended 90%
 
 # Frontend Testing
 
+**Status: not implemented.** No frontend test suite exists in this repository
+as of 2026-08-09. `npm test` runs nothing. PH3.3 owns creating the foundation
+and PH3.4 the service/hook coverage. The rest of this section is the target,
+not a description.
+
 Framework
 
 Vitest
@@ -169,7 +227,32 @@ Empty States
 
 Framework
 
-Vitest / Jest
+**pytest** (8.0+, currently 9.0.3). This section previously said "Vitest / Jest",
+which was never true of this backend — it is Python/FastAPI. Corrected in PH3.1.
+
+Authoritative mechanics: `docs/testing/TEST_ARCHITECTURE.md`.
+
+Commands (from `backend/`, all verified working):
+
+| Goal | Command |
+|------|---------|
+| Default hermetic suite | `pytest` |
+| Fast inner loop | `pytest -m "not slow"` |
+| Security regression | `pytest -m security` |
+| Integration / live | `pytest -m integration` |
+| Integration, CI-strict | `REQUIRE_LIVE_BACKEND=1 pytest -m integration` |
+| Coverage | `pytest --cov` |
+
+Markers: `integration`, `live`, `e2e`, `security`, `slow`, `requires_db`,
+`requires_redis`, `allow_network` — registered in `backend/pyproject.toml`,
+applied mechanically by `backend/tests/conftest.py`. `--strict-markers` turns a
+typo into a collection error.
+
+Hermeticity is enforced, not assumed: `tests/_testenv.py` installs a fixed
+synthetic environment (and disables `.env` loading) before `server` is
+imported; `tests/_netguard.py` blocks non-loopback sockets for every test not
+marked `integration`/`live`/`e2e`/`allow_network`; `tests/_fakedb.py` replaces
+MongoDB. No test uses a real credential, a real database, or a real API.
 
 Test
 
@@ -709,6 +792,29 @@ Synthetic Users
 
 Never test on production user data.
 
+## As implemented (PH3.1)
+
+The backend hermetic suite needs no test database at all: `tests/_fakedb.py`
+replaces MongoDB with a function-scoped in-memory double, so isolation and
+cleanup are structural rather than procedural. `MONGO_URL`/`DB_NAME` still point
+at an unmistakably-named test target (`stockassist_pytest`) so an accidental
+connection cannot reach development data.
+
+Every third-party credential is blanked by `tests/_testenv.py`, so no broker,
+payment, AI or messaging provider is ever configured during a hermetic run —
+and `tests/_netguard.py` blocks the socket if something tries anyway.
+
+Fixture data is obviously synthetic and labelled: `@example.com` addresses,
+`TEST`-prefixed titles and notes, round market numbers. PH3.1 removed the
+hardcoded `admin@alphapartner.com` / `admin123` pair from five test files;
+live-server credentials now come from `TEST_ADMIN_EMAIL` /
+`TEST_ADMIN_PASSWORD` with no defaults.
+
+One test in the repository has an irreversible outward-facing side effect —
+`test_phase7.py::TestWhatsAppLive::test_send_test_message_via_twilio` sends a
+real, billable WhatsApp message. It requires `ALLOW_LIVE_WHATSAPP_SEND=1` on
+top of `-m integration` and skips otherwise.
+
 ---
 
 # CI/CD Testing
@@ -757,27 +863,64 @@ and (for the three security workflows) weekly. Authoritative documentation:
 
 | Workflow | Verifies | Status |
 |----------|----------|--------|
-| `backend-ci` | Lint (correctness subset, blocking; full style advisory), static analysis (mypy on `backend/security`), compile + import + startup-validation, **695 hermetic tests** | Implemented |
+| `backend-ci` | Lint (correctness subset, blocking; full style advisory), static analysis (mypy on `backend/security`), compile + import + startup-validation, **1,035 hermetic tests** (PH3.1; was 695 at PH2.4) | Implemented |
 | `docker-build` | hadolint; production image builds; image refuses to start unconfigured; production config validates; boots against real MongoDB + Redis; graceful SIGTERM | Implemented |
 | `dependency-audit` | `pip-audit --strict` (runtime + dev), `npm audit --audit-level=high`, suppression-expiry ratchet | Implemented |
 | `security-audit` | gitleaks over full history, no tracked `.env`, `.env.example` in sync with the secret registry | Implemented |
 | `codeql` | Taint-tracking SAST for Python and JavaScript/TypeScript | Gated — requires a public repo or GitHub Advanced Security |
 
-Test selection is mechanical: `pytest -m "not integration"`. The `integration`
-marker is applied automatically to the live-server suites by
-`backend/tests/conftest.py` — never by a flag in a workflow file.
+Test selection is mechanical: `pytest -m "not integration"` — which is also the
+default in `backend/pyproject.toml` since PH3.1, so a bare `pytest` on a laptop
+selects exactly what CI selects. The `integration` marker is applied
+automatically to the live-server suites by `backend/tests/conftest.py` — never
+by a flag in a workflow file.
+
+The test job no longer sets test environment variables either. PH3.1 moved that
+to `backend/tests/_testenv.py`, which overwrites rather than defaults, so CI and
+a developer machine provably run the same configuration.
 
 Not yet implemented, with owners:
 
-- Integration tests against a booted stack — PH2.6
+- Integration tests against a booted stack — PH2.6. **Must set
+  `REQUIRE_LIVE_BACKEND=1`**, or a stack that failed to boot will skip its way
+  to a green tick.
 - Frontend build / lint / test job — PH3.3
-- Coverage measurement (needs `pytest-cov` pinned) — unowned
+- Coverage measurement in CI — PH3.11. Tooling itself is done: `pytest-cov`
+  is pinned and configured (PH3.1), `pytest --cov` works; what is missing is a
+  job, a trend, and a threshold.
 - Branch protection requiring these checks — PH2.5
 - Deploy Staging — PH2.7 (CD; no workflow in this repository deploys anything)
 
 ---
 
 # Coverage Goals
+
+These are long-term targets, not current state.
+
+## Measured baseline (PH3.1, 2026-08-09)
+
+`pytest --cov` over the default hermetic suite, application code only
+(statements; branch coverage is not measured yet):
+
+| Area | Coverage | Target |
+|------|---------:|-------:|
+| `security/` (PH1 modules) | **94.8%** | 100% |
+| `observability/` (PH2.5) | **95.8%** | 90% |
+| `infrastructure/` (PH2.7) | **82.4%** | 90% |
+| `services/trading_engine.py` | **82.0%** | 95% |
+| `services/brokers/` | 56.9% | 90% |
+| `server.py` (API surface) | 51.9% | 90% |
+| `services/market_engine/` | 46.5% | 90% |
+| `services/` (other) | 42.4% | 90% |
+| **Backend total** | **59.2%** | 90% |
+| Frontend | **0%** (no suite) | 90% |
+
+No `fail_under` threshold is enforced. PH3.11 sets one from trend data rather
+than inventing a number alongside the first measurement.
+
+Full detail and methodology: `docs/testing/TEST_ARCHITECTURE.md` §8.
+
+## Targets
 
 Frontend
 

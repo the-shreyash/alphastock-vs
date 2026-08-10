@@ -3,13 +3,10 @@
 Live-server tests. Requires a running backend and a seeded dev admin
 (`python scripts/seed_dev_admin.py`).
 """
-import os
 import pytest
 import requests
 
-BASE_URL = os.environ.get("REACT_APP_BACKEND_URL", "http://localhost:8000").rstrip("/")
-ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "admin@alphapartner.com")
-ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin123")
+from tests._live import ADMIN_EMAIL, ADMIN_PASSWORD, BASE_URL, admin_login  # noqa: F401
 
 
 @pytest.fixture(scope="module")
@@ -21,10 +18,7 @@ def client():
 
 @pytest.fixture(scope="module")
 def auth_client(client):
-    r = client.post(f"{BASE_URL}/api/auth/login",
-                    json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD}, timeout=30)
-    assert r.status_code == 200, f"admin login failed: {r.status_code} {r.text}"
-    data = r.json()
+    data = admin_login(client, timeout=30)
     assert "token" in data and data["email"]
     s = requests.Session()
     s.headers.update({
@@ -37,10 +31,12 @@ def auth_client(client):
 # ---------- Admin credential login ----------
 class TestAdminLogin:
     def test_admin_login_returns_token_and_cookie(self, client):
+        d = admin_login(client, timeout=30)
+        # `admin_login` already asserted the 200; re-read the response for the
+        # Set-Cookie assertion below.
         r = client.post(f"{BASE_URL}/api/auth/login",
                         json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD}, timeout=30)
         assert r.status_code == 200
-        d = r.json()
         assert d["email"] == ADMIN_EMAIL
         assert d["token"]
         assert d["role"] in ("admin", "user")

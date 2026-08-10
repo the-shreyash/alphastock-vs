@@ -34,14 +34,45 @@ testpaths = ["tests"]
 # is precisely the failure mode this config exists to prevent.
 # -ra prints a short reason for every non-passing outcome at the end of the run,
 # so a CI log answers "what was skipped and why?" without re-running verbosely.
+#
+# `-m "not integration"` (PH3.1) makes the BARE `pytest` command deterministic.
+# Before this line, plain `pytest` collected the live-server suites too and
+# reported 47 failures + 51 errors on any machine without a running backend —
+# so the default command was one nobody could use, and "the tests are red" had
+# stopped meaning anything. pytest applies addopts BEFORE the command line, and
+# `-m` is single-valued, so an explicit `pytest -m integration` still overrides
+# this cleanly. See docs/testing/TEST_ARCHITECTURE.md for the full command set.
 addopts = [
     "--strict-markers",
     "--strict-config",
     "-ra",
+    "-m", "not integration",
 ]
 
+# Marker taxonomy (PH3.1).
+#
+# Only `integration` is load-bearing for selection today — every GitHub Actions
+# workflow selects with `-m "not integration"`, and `tests/conftest.py` applies
+# it mechanically to the live-server suites. The rest are declarative: they
+# describe what a test needs so that a future CI job can provision it, and they
+# are registered here so `--strict-markers` accepts them instead of turning a
+# correct annotation into a collection error.
+#
+# Deliberately NOT added: a `unit` marker. It would have to be hand-applied to
+# ~1000 existing tests to mean anything, and a marker that is missing from most
+# of the tests it describes is worse than no marker — `-m unit` would silently
+# run a fraction of the suite and look green. "Hermetic" is the default and is
+# defined by the ABSENCE of the markers below, which needs no annotation and
+# cannot drift.
 markers = [
-    "integration: requires a live backend server at $REACT_APP_BACKEND_URL (and, transitively, MongoDB, Redis and network access to real market-data providers). Excluded from the default CI selection via `-m 'not integration'`. Applied automatically by tests/conftest.py to the legacy `requests`-based suites — do not hand-apply it.",
+    "integration: requires a live backend server at $REACT_APP_BACKEND_URL (and, transitively, MongoDB, Redis and network access to real market-data providers). Excluded from the default selection via `-m 'not integration'` in addopts. Applied automatically by tests/conftest.py to the legacy `requests`-based suites — do not hand-apply it.",
+    "live: drives a running deployment over HTTP/WebSocket rather than an in-process TestClient. Applied automatically alongside `integration` by tests/conftest.py. Implies the outbound-network guard is not installed.",
+    "e2e: exercises a complete user journey across the running stack. No test carries this yet — PH3.9 owns the journeys.",
+    "security: a PH1 security-control regression test (auth, cookies, CORS, JWT, sessions, password policy, rate limiting, CSRF, headers, RBAC, audit). Hermetic; included in the default run. Applied automatically by tests/conftest.py from the file list in `_SECURITY_SUITES`.",
+    "slow: takes more than ~5 seconds. Included in the default run; `-m 'not slow'` gives a fast inner-loop selection.",
+    "requires_db: needs a real MongoDB. No hermetic test carries this — the `fake_db` fixture exists so none has to. Reserved for the PH2.6 integration job.",
+    "requires_redis: needs a real Redis. No hermetic test carries this — the Redis suites drive `RedisSettings`/client construction without connecting. Reserved for the PH2.6 integration job.",
+    "allow_network: this test is deliberately exempt from the hermetic outbound-network guard. Requires a comment at the test explaining why.",
 ]
 
 # Third-party deprecation noise (FastAPI's on_event, starlette's per-request
@@ -111,3 +142,49 @@ warn_redundant_casts = true
 show_error_codes = true
 pretty = true
 exclude = "(venv|\\.venv|__pycache__)/"
+
+# ------------------------------------------------------------------------------
+# coverage (PH3.1)
+#
+# Deliberately NOT enabled in pytest's addopts. Coverage instrumentation costs
+# roughly a quarter of the suite's wall-clock, and the inner-loop command has to
+# stay fast or people stop running it. `pytest --cov` opts in; CI can do the
+# same when a coverage job exists (none does yet — see docs/testing/
+# TEST_ARCHITECTURE.md §Coverage).
+#
+# `source` is the application code only. Measuring the tests themselves inflates
+# the headline number by ~13 points (72% including tests vs 59% for application
+# code on the PH3.1 baseline) — the more flattering figure being the meaningless
+# one, since test files are ~100% covered by construction.
+#
+# No `fail_under`. PH3.1's job is to establish an honest baseline; a threshold
+# invented in the same commit as the first measurement is a number pulled from
+# the air, and the first person it blocks will simply lower it.
+# ------------------------------------------------------------------------------
+# `source = ["."]` plus an omit list, NOT a list of the packages to measure.
+# coverage resolves `source` entries as package names or directories — a plain
+# file path like "server.py" is silently ignored, which would have dropped the
+# single largest module (2,897 statements) out of the denominator and reported
+# a headline number ~8 points too high. Measuring everything and subtracting
+# what we mean to exclude fails loudly instead: a new package is included by
+# default rather than forgotten.
+[tool.coverage.run]
+source = ["."]
+omit = [
+    "*/venv/*",
+    "*/.venv/*",
+    "*/__pycache__/*",
+    "tests/*",
+    "scripts/*",
+    "docker/*",
+]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+exclude_also = [
+    # Import-time guards and typing-only branches are not behaviour.
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+]

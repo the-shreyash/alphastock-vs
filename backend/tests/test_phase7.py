@@ -1,21 +1,16 @@
 """Phase 7 backend tests: Real market data (Yahoo Finance) + WhatsApp Twilio LIVE."""
 import os
+
 import pytest
 import requests
 
-BASE_URL = os.environ.get("REACT_APP_BACKEND_URL", "").rstrip("/")
-assert BASE_URL, "REACT_APP_BACKEND_URL must be set"
-ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "admin@alphapartner.com")
-ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin123")
+from tests._live import ADMIN_EMAIL, BASE_URL, admin_login  # noqa: F401
 
 
 @pytest.fixture(scope="module")
 def session():
     s = requests.Session()
-    r = s.post(f"{BASE_URL}/api/auth/login",
-               json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD}, timeout=20)
-    assert r.status_code == 200, f"admin login failed: {r.status_code} {r.text}"
-    token = r.json().get("token")
+    token = admin_login(s, timeout=20).get("token")
     s.headers.update({"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
     return s
 
@@ -97,6 +92,16 @@ class TestWhatsAppLive:
         assert d.get("has_to") is True
 
     def test_send_test_message_via_twilio(self, session):
+        # This test SENDS A REAL WHATSAPP MESSAGE through Twilio to
+        # $USER_WHATSAPP_TO and bills the account for it. Every other test in
+        # the repository is read-only against the deployment; this one has an
+        # irreversible, outward-facing side effect, so it requires a separate,
+        # explicit opt-in rather than riding along with `-m integration`.
+        if os.environ.get("ALLOW_LIVE_WHATSAPP_SEND") != "1":
+            pytest.skip(
+                "Sends a real, billable WhatsApp message. "
+                "Set ALLOW_LIVE_WHATSAPP_SEND=1 to run it."
+            )
         r = session.post(f"{BASE_URL}/api/whatsapp/test", timeout=30)
         assert r.status_code == 200
         d = r.json()
@@ -108,10 +113,7 @@ class TestWhatsAppLive:
 # ---- Regression on prior features ----
 class TestRegression:
     def test_admin_login_still_works(self):
-        r = requests.post(f"{BASE_URL}/api/auth/login",
-                          json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD}, timeout=10)
-        assert r.status_code == 200
-        assert r.json().get("token")
+        assert admin_login(requests, timeout=10).get("token")
 
     def test_top_picks(self, session):
         r = session.get(f"{BASE_URL}/api/analysis/top-picks", timeout=60)

@@ -5,6 +5,260 @@ This file records documentation-system versions and, from v1.0 launch onward, pr
 
 ---
 
+# Sprint PH3.1 — Test Infrastructure & Test Stabilization — 2026-08-09
+
+**PHASE 3 OPENS. Decision: CERTIFIED.** Full report:
+`docs/testing/PH3.1_TEST_CERTIFICATION.md`. Developer reference:
+`docs/testing/TEST_ARCHITECTURE.md`.
+
+**The default test command works now.** `pytest` reports **1,035 passed, 0
+failed, 0 errors** in ~2m20s, on a machine with no server, no database, no
+credentials and no network. Before this sprint the same command reported **47
+failures and 51 errors**, because the live-server suites were collected by
+default and had nothing to connect to. The signal was not weak; it was absent,
+and everyone working in this repository had learned that red is normal.
+
+**The larger finding is what the "hermetic" suite was actually doing.** The
+charter assumed hermeticity and asked only for the live suites to be marked.
+Socket instrumentation built for this sprint found **three tests in the default
+suite opening live TLS connections on every single run** — `api.anthropic.com`,
+Google's Generative Language API, and Yahoo Finance — **authenticated with the
+developer's real production API keys.** The mechanism is one line:
+`server.py` calls `load_dotenv(backend/.env, override=True)` at import time, and
+`tests/conftest.py` imports `server`. Nobody could have noticed from the output:
+those call sites are wrapped in broad exception handlers — correctly, since a
+provider outage must not take the API down — so a live call and a mocked one
+produce the same green tick.
+
+It is now closed three independent ways, and measured rather than asserted:
+
+- **`backend/tests/_testenv.py`** — installs a fixed synthetic environment
+  *before* `server` is imported, sets `PYTHON_DOTENV_DISABLED=1` (python-dotenv's
+  own supported kill switch, so `load_dotenv` becomes a no-op rather than
+  something to monkeypatch), sets `APP_ENV=testing`, and blanks every
+  third-party credential. Values are **overwritten, not defaulted** — `setdefault`
+  would let a real key exported in the developer's shell walk straight past the
+  guard, which is the exact hole this closes.
+- **`backend/tests/_netguard.py`** — an autouse guard that raises on any
+  non-loopback `socket.connect`. Patched at the socket layer rather than
+  per-client because the three escapes came through three *different* HTTP
+  clients (`aiohttp`, `httpx`, `requests` via yfinance); a per-client allowlist
+  goes stale the moment someone adds a fourth. `NetworkAccessBlocked` subclasses
+  `OSError` so application code takes its normal offline path and the test fails
+  on a wrong assertion, which is diagnosable.
+- **Blank credentials**, so every `*_configured()` check reads false and routes
+  take their documented offline branch.
+
+Result: **zero outbound connections** across the full default run, and runtime
+down from 202 s to 139 s because three tests had been waiting on real API
+round-trips.
+
+**Two genuine implementation defects, both in `backend/security/secrets.py`.**
+`app_env()` and `get()` used the idiom `(environ or os.environ)`. An empty
+mapping is falsy, so `secrets.app_env({})` — a caller explicitly asking "what
+does this resolve to with nothing configured?" — was answered with **the host's
+live configuration**. In a security-configuration reader that is wrong in the
+most dangerous direction. Fixed to an explicit `is None` sentinel in both
+places. It had survived every prior review because the test that catches it
+(`test_app_env_defaults_to_development`) was itself running in a process that
+had loaded the developer's `.env`, which happens not to set `APP_ENV` — so the
+assertion passed for the wrong reason. **This is the same pattern PH2.12
+recorded** — a check and the thing it checks sharing an assumption — one level
+further up the stack.
+
+**The chartered stale test was already fixed.**
+`test_run_cycle_trails_and_books_targets` was investigated against
+`services/trading_engine.py:346` and found repaired by a prior sprint, with the
+reason documented inline and the exact-equality assertion intact — not
+weakened. Recorded as classification B rather than silently ticked off.
+
+**Test data and credential hygiene.** The pair `admin@alphapartner.com` /
+`admin123` was a literal or a default in **five** of the six live-server files
+(and is the credential `IMPLEMENTATION_REPORT.md` logged as Critical finding
+C1). Two files located the deployment by scraping `/app/frontend/.env` and then
+walking up the source tree — making the *target of the test* a property of the
+machine running it. Both are gone; `backend/tests/_live.py` owns live
+configuration, and `TEST_ADMIN_EMAIL` / `TEST_ADMIN_PASSWORD` have no defaults.
+`test_phase7.py::TestWhatsAppLive::test_send_test_message_via_twilio` — the one
+test in the repository that **sends a real, billable WhatsApp message** — now
+requires a second explicit opt-in, `ALLOW_LIVE_WHATSAPP_SEND=1`.
+
+**Live suites skip honestly instead of failing.**
+`conftest.py::_require_live_server` probes the deployment once per session and
+skips `live` tests when nothing answers: 95 skipped in 0.28 s, versus 47
+failures and 51 errors over ~3 minutes. **`REQUIRE_LIVE_BACKEND=1` turns those
+skips into failures** — and **the PH2.6 integration job must set it**, because
+a stack that failed to boot skipping its way to a green tick is a worse outcome
+than the red one this replaced. The same switch governs missing credentials.
+
+**Marker taxonomy**, registered in `backend/pyproject.toml`:
+`integration`, `live`, `e2e`, `security`, `slow`, `requires_db`,
+`requires_redis`, `allow_network`. The load-bearing ones are applied
+**mechanically** from filename tuples in `conftest.py`, never by hand — a
+decorator on 452 security tests would be missing from some of them within a
+sprint, and `pytest -m security` would then quietly under-report the regression
+surface. There is deliberately **no `unit` marker**: hand-applying it to ~1,000
+tests to make `-m unit` mean something is a job that would be done badly, and a
+marker missing from most of the tests it describes is worse than none.
+
+**Files**
+
+- **`backend/tests/_testenv.py`** (new) — deterministic test environment.
+- **`backend/tests/_netguard.py`** (new) — outbound-network guard.
+- **`backend/tests/_live.py`** (new) — live-suite configuration; one `BASE_URL`,
+  one `admin_login()`, credentials from env with no defaults.
+- **`backend/tests/test_api_contract.py`** (new) — **19 hermetic API-contract
+  tests** converted from the live suite: market overview, stock
+  universe/search/detail, the 404-vs-503 distinction, top picks, portfolio
+  summary, notification ownership filtering, SIP calculator. Deliberately
+  includes the **degraded** branches (`available: false`, empty live fetch not
+  persisted) that production hits during a provider outage and that a live test
+  cannot trigger on demand. **Every assertion was mutation-checked** — five
+  representative assertions individually inverted, all five detected — because
+  a new test file that passes on the first run deserves suspicion.
+- **`backend/tests/conftest.py`** — isolation guards, mechanical marker
+  application, live-server gating.
+- **`backend/pyproject.toml`** — marker taxonomy, `-m "not integration"` in
+  `addopts`, `[tool.coverage.*]`.
+- **`backend/requirements-dev.txt`** — `pytest-cov==7.0.0`, `coverage==7.15.4`.
+  Dev-only; `requirements.txt` is untouched and the runtime image is unchanged.
+- **`backend/security/secrets.py`** — the two `(environ or os.environ)` fixes.
+- **`backend/tests/test_backend.py` → `test_backend_live.py`** — not cosmetic:
+  the old name read as "the backend tests", which is how it came to be run by
+  default and how the default command came to be permanently red.
+- **`backend/tests/test_phase{2,4,5,6,7}.py`** — credentials, base URL, Twilio
+  opt-in.
+- **`backend/tests/test_backup_restore.py`** — `TestRetention` marked `slow`
+  (43 s of real sleeps; not a hidden race — the pruner sorts by whole-second
+  mtime, so the fixture genuinely has to space artifacts out).
+- **`backend/tests/test_phase8.py`** — deleted; zero bytes since 2026-06-09.
+- **`.github/workflows/backend-ci.yml`** — the test job no longer sets
+  `APP_ENV`/`MONGO_URL`/`DB_NAME`/`JWT_SECRET`. `_testenv.py` overwrites, so
+  those values were already being ignored; leaving them would imply CI and a
+  laptop run different configurations. They now provably run the same one.
+- **`docs/testing/`** (new) — `TEST_ARCHITECTURE.md`,
+  `PH3.1_TEST_CERTIFICATION.md`, `README.md`; indexed in `docs/README.md`.
+
+**Coverage baseline** (`pytest --cov`, statements, application code only):
+**59.2%** — `security/` 94.8%, `observability/` 95.8%, `infrastructure/` 82.4%,
+`trading_engine` 82.0%, `brokers/` 56.9%, `server.py` 51.9%,
+`market_engine/` 46.5%, `services/` other 42.4%. Recorded as 59.2% rather than
+the 72% that including `tests/` in the denominator produces — the flattering
+figure being the meaningless one, since test files are ~100% covered by
+construction. No `fail_under`: a threshold invented alongside the first
+measurement is a number pulled from the air, and the first person it blocks
+will lower it. PH3.11 sets one from trend data.
+
+A configuration trap worth recording: coverage's `source` resolves package names
+and directories and **silently ignores a plain file path**. The first attempt
+listed `"server.py"` explicitly, which dropped the largest module (2,897
+statements) out of the denominator and reported a number ~8 points too high.
+Corrected to `source = ["."]` plus an omit list, so a new package is included by
+default rather than forgotten.
+
+**Regression** — `pytest -m security`: **452 passed** (OAuth, cookies, CORS,
+JWT, sessions, password policy, rate limiting, CSRF, headers, RBAC, identifier
+validation, audit, secret loading, recovery). PH2 infrastructure suites all
+green (observability 123, Redis 50, backup/restore 39, DR 43). Blocking flake8
+gate clean; `compileall` clean; application imports on runtime deps alone (204
+routed endpoints); `mypy` on `security/` unchanged at the 2 pre-existing
+`bool(x) and ...` false positives documented in `pyproject.toml`.
+
+**Not delivered, with owners:** no CI integration job (PH2.6), no frontend tests
+(PH3.3), no branch coverage or coverage gate (PH3.11). And `FakeDB` remains an
+operator-subset double — a query using an unmodelled Mongo operator behaves
+differently under test than in production, which is precisely why a green
+hermetic suite must not become the argument for dropping the integration layer.
+
+---
+
+# Sprint PH2.12 — Infrastructure Certification & Release Readiness — 2026-08-09
+
+**PHASE 2 EXIT GATE. Decision: CONDITIONALLY CERTIFIED. Infrastructure score
+8.0 / 10** (from ~6.4 post-PH1). Full report: `docs/infrastructure/PH2_CERTIFICATION.md`.
+
+**This is the first PH2 sprint with a working Docker daemon.** Every sprint from
+PH2.7 onward carried the same limitation — *no Docker daemon in the sprint
+environment* — so the container stack, compose topology, backup transport, DR
+verifier and rollback script had all shipped on hermetic tests and careful
+reading. Certifying against a live stack (Docker 29.4.0, fresh volumes, real
+secrets) found **one Critical and two High defects that no amount of further
+reading would have found**, and confirmed the rest of the infrastructure is
+genuinely strong.
+
+**CRITICAL — the rollback did not roll back, and reported success.**
+`deploy_rollback.sh` rewrote `BACKEND_IMAGE_TAG` in `.env`, ran compose, recreated
+**nothing**, and printed `rollback verified` while the bad release kept serving.
+Root cause: `scripts/backup/lib.sh::bk_load_env_file` **exports every key it
+parses from `.env`**, so the tag being rolled *away from* was already in the
+process environment — and Compose ranks shell variables **above** the `.env` file.
+The script's atomic file rewrite was silently outranked by its own config loader.
+Verification then passed because it checked *health*, and the release being rolled
+away from was perfectly healthy — it was serving wrong behaviour, not failing a
+probe, which is the normal case for a rollback. Measured live: `.env` said `cert`,
+the container ran `v2-bad`, the app reported `2.13.0-badrelease`, and the script
+said verified. **Fixed** by passing the tag on the compose command itself and by
+asserting the *running build* (not just health) before declaring success — on
+mismatch it now fails, writes `FAILED rollback` to the ledger, and tells the
+operator not to close the incident. Post-fix drill: `Recreated`, 10 s,
+independently confirmed serving `2.12.0-cert`.
+
+**HIGH — the blocking CI lint gate has been red on every run since PH2.4.** CI
+builds its virtualenv at `backend/.venv-ci`; `.flake8` excluded `venv` and
+`.venv`, and flake8 matches on the path **basename**, so `.venv-ci` never matched.
+CI linted its own `site-packages`, where libraries legitimately trip F811. It
+passes locally because the developer venv is named `venv`. A blocking gate that is
+always red for reasons outside the repository is a gate a team learns to ignore.
+**Fixed**; verified with a controlled before/after (`EXIT=1` → `EXIT=0`, with a
+control proving the gate still catches a real F821).
+
+**HIGH — the DR running-build probe could never pass.** `dr_verify.sh` parsed
+`"app_version"`/`"vcs_ref"` from `/api/diagnostics`; the endpoint has always
+returned them nested as `build.version`/`build.revision`. The check could only
+SKIP — or, with `--expect-version`, **FAIL a healthy correctly-deployed stack while
+blaming `DR_OPS_TOKEN`**. The hermetic stub emitted the same wrong shape, so the
+suite agreed with the bug. **Fixed** in both; the stub now mirrors the real payload
+including a `process.python_version` decoy the parser must not match.
+
+**Verified live (evidence, not assertion):** image **423 MB** (PH2.1 shipped
+1.03 GB; better than PH2.8's ~650 MB projection), non-root uid 10001, `/app`
+unwritable, no pip, no secrets in layers or filesystem; stack healthy in **8 s**
+from fresh volumes, graceful shutdown **exit 0** on all three, data intact across
+a full `down`/`up`; `data` network `internal:true` with **no** published database
+ports and both datastores refusing unauthenticated access; **fail-closed config**
+rejected 5 of 6 bad configurations before startup (including a placeholder API key
+— which caught the certifier's own stand-in credential); **zero secret leakage**
+grepping four *real* live secrets across stdout and file sinks;
+liveness/readiness correctly split (Mongo down → `/live` 200, `/ready` 503; Redis
+down → app stays `ready`); metrics token-gated with 20+ families; **backup/restore
+drilled in `docker` mode — closing PH2.9's L6** — with a **destructive** test
+(3 collections dropped → full recovery, 16 matched); `dr_verify --level full`
+**12/12**; **1014 hermetic tests pass**; frontend build clean.
+
+**Not fixed, deliberately — documented as required actions:** 6 CVEs in *runtime*
+dependencies (`cryptography` 48.0.1, `aiohttp` 3.14.1) — a `cryptography` major
+bump touches broker-token Fernet encryption and does not belong in a certification
+sprint; npm high-severity advisories; **no off-host backup copy** (leaves R7,
+complete server loss, unexecutable); no CD or image registry; no frontend
+production image; **and no alerting at all** — detection is entirely manual, which
+per PH2.10's own RTO decomposition dominates recovery time and makes the measured
+sub-15-second mechanical RTO theoretical.
+
+**Files changed (4, all remediation — no feature work):** `backend/.flake8`,
+`scripts/dr/dr_verify.sh`, `scripts/dr/deploy_rollback.sh`,
+`backend/tests/test_disaster_recovery.py` (DR suite 41 → **43**; both new tests
+proven to fail without the fix by reverting it and re-running). No trading logic,
+AI logic, product functionality or architecture was touched. Machine left as
+found: stack torn down, volumes removed, certification images deleted, and the
+developer `.env` restored **byte-identical** (sha256 verified).
+
+**Engineering lesson recorded as PH3.1's charter:** both the Critical and one High
+survived review because their hermetic tests stubbed a system boundary and then
+agreed with the implementation rather than the contract. When a probe and its test
+share an assumption, only the real system can settle it.
+
+---
+
 # Sprint PH2.10 — Disaster Recovery & Business Continuity — 2026-08-05
 
 **PH2.9 made the data recoverable. This sprint makes the *platform* recoverable,

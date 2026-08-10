@@ -93,7 +93,8 @@ Verified in code on branch `sprint-r3-frontend-realtime`:
 | R-04 | ~~Auth tokens transmitted over plain HTTP (`secure=False`)~~ **CLOSED** (PH1.3: `Secure` forced in production, `HttpOnly`+`SameSite` everywhere, centralized cookie policy) | — | — | **CLOSED** | PH1.3 |
 | R-05 | ~~Credential stuffing / brute force succeeds (no rate limiting, no password policy)~~ **CLOSED** (PH1.5: production password policy + timing-equalized login; PH1.7 (2026-07-21): centralized limiter in `backend/security/rate_limit.py` — login 5/15min per `ip:account` with progressive lockout, platform-wide per-user/per-IP tiers, `Retry-After`; plus a signed session-bound CSRF token layer in `backend/security/csrf.py`) | — | — | **CLOSED** | PH1.5 ✅, PH1.7 ✅ |
 | R-06 | ~~Stolen access token valid for 24 h; refresh tokens never rotate or revoke~~ **CLOSED** (PH1.6: 15-min access token; refresh rotation with reuse-detection that revokes the family on replay; durable server-side revocation store; `password_changed_at` + token `ver` kill-switches) | — | — | **CLOSED** | PH1.6 |
-| R-07 | Deployment impossible or hand-rolled (broken Docker, no CI/CD) → unreproducible prod, config drift | Certain today | High | **HIGH** | PH2.1–2.7 |
+| R-07 | Deployment impossible or hand-rolled (broken Docker, no CI/CD) → unreproducible prod, config drift | ~~Certain today~~ **Low** | High | **MEDIUM** (was HIGH) | PH2.1–2.7 — *PH2.12 executed a fresh-environment deployment end to end against a live daemon (build → healthy in 8 s → smoke tests → shutdown → restart → recovery), so the image and compose topology are reproducible and verified. Residual risk is entirely the **CD half**: deployment is still a human running compose, with no registry and no pipeline — so a rollback depends on the previous image surviving on the host. PH2.7b* |
+| R-07b | **A rollback silently does nothing and reports success** | ~~Certain~~ **Very Low** | Catastrophic | **LOW** (new, then closed) | *Found by PH2.12 against a live stack and fixed the same sprint: `deploy_rollback.sh` recreated nothing while printing `rollback verified`, because Compose ranks shell environment above `.env` and the script's own config loader exported the tag it was rolling away from. Now passes the tag to compose explicitly and **asserts the running build** before declaring success. Two regression tests, both proven to fail without the fix. Recorded here rather than deleted because it is the sharpest example in the programme of a control that existed, was tested, and did not work* |
 | R-08 | Regression ships unnoticed (no frontend tests, non-hermetic backend suite, no pipeline gate) | High | High | **HIGH** | PH3.1–3.5 |
 | R-09 | Fabricated admin revenue data drives a real business decision | Medium | High | **HIGH** | PH3.2 |
 | R-10 | Outage with no monitoring/alerting → prolonged silent downtime | Medium | High | **MEDIUM** | PH2.9–2.10 |
@@ -111,25 +112,41 @@ Two columns: the 2026-07-17 baseline, and the post-PH1 re-score (2026-07-22).
 Categories in PH1 scope moved; Phase 2 / Phase 3 categories are unchanged and
 remain the launch blockers.
 
-| Category | Baseline | Post-PH1 | Basis (post-PH1) |
-|---|---|---|---|
-| Application functionality | 8.5 | 8.5 | Feature-complete MVP, deep backend test coverage (unchanged) |
-| Authentication & authorization | 2.0 | **9.0** | Backdoors removed; OAuth hardened; password policy; JWT rotation; recovery; F-1 role least-privilege |
-| API & transport security | 3.0 | **8.5** | CORS hardened; Secure cookies + HSTS; CSP/headers; CSRF; rate limiting; F-2 id validation |
-| Secrets & configuration | 6.0 | **8.5** | `secrets.py` fail-closed boot validation; full pinning; F-3 Dependabot + dev/runtime split |
-| Packaging & deployability | 1.0 | 1.0 | **Still no Dockerfiles** — PH2.1–2.3 (blocks launch) |
-| CI/CD | 0.0 | **2.0** | `security-audit` workflow only; no build/test/deploy pipeline — PH2.5–2.7 (blocks launch) |
-| Testing | 5.0 | 5.5 | Backend suite deepened (626 hermetic pass); still non-hermetic legacy tests + zero frontend tests — PH3.1/3.3 |
-| Observability | 3.5 | **9.0** | Audit logging (PH1.10); PH2.5 added structured JSON logging, three health probes, metrics + request correlation; PH2.6 added log stream separation, rotation, retention, compression and bounded Docker log capture. Error tracking, alerting & log shipping still pending — PH2.10 |
-| Data integrity | 5.5 | 5.5 | Mock data in admin analytics still present — PH3.2 |
-| Documentation accuracy | 5.0 | 6.5 | Security docs authoritative & synced; deployment-stack mismatch remains — PH3.10 |
+Three columns: the 2026-07-17 baseline, the post-PH1 re-score (2026-07-22), and
+the post-PH2 re-score (2026-08-09, PH2.12 certification). Post-PH2 figures are
+backed by execution against a live stack, not by review — see
+`docs/infrastructure/PH2_CERTIFICATION.md`.
 
-## **Overall Production Readiness Score: 4.2 → ~6.4 / 10** (post-PH1, 2026-07-22)
+| Category | Baseline | Post-PH1 | Post-PH2 | Basis (post-PH2) |
+|---|---|---|---|---|
+| Application functionality | 8.5 | 8.5 | 8.5 | Unchanged — PH2 touched no product code |
+| Authentication & authorization | 2.0 | **9.0** | **9.0** | No regression under containerisation (PH2.12 §17) |
+| API & transport security | 3.0 | **8.5** | **9.0** | All PH1 headers verified live; `server` header suppressed; operational endpoints token-gated; proxy headers trusted only from the immediate peer |
+| Secrets & configuration | 6.0 | **8.5** | **9.0** | Fail-closed rejected 5/6 bad configs at boot; gitleaks clean over full history; **zero leakage** of four real secrets across stdout + file sinks |
+| Packaging & deployability | 1.0 | 1.0 | **9.0** | **423 MB** non-root image (was 1.03 GB), immutable source tree, no pip, no baked secrets; compose lifecycle verified end to end incl. full `down`/`up` persistence. −1: no frontend production image |
+| CI/CD | 0.0 | **2.0** | **6.0** | Five workflows with real gates — but the blocking lint gate was **red on every run since PH2.4** (fixed in PH2.12), the dependency gate is **still failing** on 6 runtime CVEs, and there is **no CD, no registry** — PH2.7b (blocks launch) |
+| Testing | 5.0 | 5.5 | 5.5 | 1014 hermetic pass, but PH2.12 showed two suites **agreeing with bugs** via stubs that never met the real contract; still zero frontend tests — PH3.1/3.2/3.3 |
+| Observability | 3.5 | **9.0** | **9.0** | Instrumentation confirmed excellent live (health split correct under Mongo/Redis failure; 20+ metric families). **Alerting still does not exist** — every signal is present and nothing watches it |
+| Data integrity | 5.5 | 5.5 | 7.0 | **Destructive restore drilled**: 3 collections dropped → full recovery, 16 matched; backup `docker` transport verified. −3: no off-host copy, no PITR; admin-analytics mock data remains — PH3.9 |
+| Documentation accuracy | 5.0 | 6.5 | 7.5 | Operations docs proved usable by following them; deployment-stack mismatch closed. −2.5: no single deploy-from-nothing runbook; undocumented `.env` coupling in the backup scripts — PH3.10 |
+
+## **Overall Production Readiness Score: 4.2 → ~6.4 → ~8.0 / 10** (post-PH2, 2026-08-09)
 
 Definition of launchable: **≥ 9.0 composite with no category below 8.0** (see §22).
-PH1 lifted every security category over the 8.0 bar; the composite is now gated by
-Packaging (1.0), CI/CD (2.0), Testing (5.5), and Data integrity (5.5) — all
-**Phase 2 / Phase 3** work.
+
+PH1 lifted every security category over the bar. PH2 lifted Packaging from 1.0 to
+9.0 — the single largest movement in the programme — and put Data integrity on
+measured evidence for the first time. **The composite is now gated by three
+categories below 8.0: CI/CD (6.0), Testing (5.5) and Data integrity (7.0), plus
+Documentation (7.5).**
+
+Note that Observability holds at 9.0 while the certification records "no alerting
+whatsoever". That is not an inconsistency being papered over: the *observable*
+surface genuinely is 9.0-grade, and alerting is scored under CI/CD-adjacent
+operational tooling rather than instrumentation. It is called out here because it
+is the highest-value remaining infrastructure item — per PH2.10's RTO
+decomposition, detection dominates recovery time, so the measured sub-15-second
+mechanical RTO is theoretical until something notices the failure.
 
 ## Priority Matrix
 
@@ -318,7 +335,7 @@ Sign-off matrix — each row requires named sign-off and date:
 | Area | Evidence Required | Gate | Sign-off |
 |---|---|---|---|
 | Security | PH1.12 certification report; pen-checklist results | Blocks launch | ✅ **CERTIFIED — Principal Release & Security Engineer, 2026-07-22** (`docs/security/PH1_CERTIFICATION.md`; authn 9.0 / API sec 8.5; F-1/F-2/F-3 closed) |
-| Infrastructure | PH2.12 report; staging soak (7 days, no Sev-1) | Blocks launch | ⛔ Pending PH2 |
+| Infrastructure | PH2.12 report; staging soak (7 days, no Sev-1) | Blocks launch | ⚠️ **CONDITIONALLY CERTIFIED — Principal Platform Engineer, 2026-08-09** (`docs/infrastructure/PH2_CERTIFICATION.md`; infrastructure 8.0/10; 1 Critical + 2 High found and fixed in-sprint against a live stack). **The 7-day staging soak was NOT performed — no staging environment exists — so this row is not fully satisfied and carries to PH3.** Certification was executed against a live local stack instead. Six required actions before production in §24; the blocking three are runtime dependency CVEs, the unwired off-host backup copy, and the total absence of alerting |
 | Quality | PH3.12 report; regression protocol run | Blocks launch | ⛔ Pending PH3 |
 | Data | Restore drill record; ADR-021 compliance grep | Blocks launch | ⛔ Pending PH2.8/PH3.2 |
 | Documentation | PH3.10 sync report | Blocks launch | ⛔ Pending PH3.10 |

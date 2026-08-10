@@ -19,6 +19,13 @@ node_modules/
 # Testing
 /coverage
 
+# Python coverage artifacts (PH3.1). `pytest --cov` writes .coverage in the
+# working directory; the HTML/XML reports are build output, not source.
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
 # Next.js
 /.next/
 /out/

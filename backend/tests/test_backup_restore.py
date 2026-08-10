@@ -422,7 +422,20 @@ class TestVerification:
 # --------------------------------------------------------------------------- #
 # Retention                                                                     #
 # --------------------------------------------------------------------------- #
+@pytest.mark.slow
 class TestRetention:
+    """Marked `slow` (PH3.1): every test here sleeps 1.05 s per artifact.
+
+    The sleeps are not hiding a race — the retention pruner sorts by
+    whole-second filesystem mtime, so two artifacts created inside the same
+    second are genuinely indistinguishable to it and the fixture has to space
+    them out. That makes this class ~43 s of the suite's ~140 s. It stays in
+    the default run (it is real coverage of PH2.9's pruner); the marker exists
+    so `pytest -m "not slow"` gives a fast inner loop. Making it fast for real
+    means letting the pruner take an explicit clock — PH3.11's problem, not a
+    reason to skip it now.
+    """
+
     def test_keeps_only_the_configured_number_per_tier(self, env):
         env["BACKUP_RETAIN_DAILY"] = "3"
         for _ in range(5):

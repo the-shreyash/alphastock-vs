@@ -1,26 +1,16 @@
 """Phase 2 backend tests: Data sources, Zerodha (mock), Alpha Vantage fallback (live/intraday), Google OAuth session, WebSocket."""
-import os
 import json
 import asyncio
 import pytest
 import requests
 import websockets
 
-BASE_URL = os.environ.get("REACT_APP_BACKEND_URL", "http://localhost:8000").rstrip("/")
-API = f"{BASE_URL}/api"
-WS_URL = BASE_URL.replace("https://", "wss://").replace("http://", "ws://") + "/api/ws"
-
-ADMIN_EMAIL = "admin@alphapartner.com"
-ADMIN_PASSWORD = "admin123"
+from tests._live import API, BASE_URL, WS_URL, admin_login  # noqa: F401
 
 
 @pytest.fixture(scope="session")
 def admin_token():
-    r = requests.post(f"{API}/auth/login", json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD}, timeout=30)
-    if r.status_code == 429:
-        pytest.skip("Rate-limited")
-    assert r.status_code == 200, f"login failed: {r.text}"
-    return r.json()["token"]
+    return admin_login(requests)["token"]
 
 
 @pytest.fixture(scope="session")

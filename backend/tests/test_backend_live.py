@@ -1,24 +1,44 @@
-"""AlphaPartner backend API tests - auth, market, trades, portfolio, chat, SIP, settings, notifications."""
-import os
-import time
+"""Live-deployment smoke suite — auth, market, trades, portfolio, chat, SIP,
+settings, notifications, driven over HTTP against a RUNNING backend.
+
+Renamed from `test_backend.py` in PH3.1. The old name suggested "the backend
+tests", which is how it came to be run by default — and, with no server on the
+machine, how the default `pytest` invocation came to report 47 failures and 51
+errors that meant nothing. The `_live` suffix states the requirement in the one
+place nobody can miss it.
+
+WHAT STAYED HERE, AND WHY
+-------------------------
+These tests answer a question a hermetic test cannot: *is the deployed stack
+actually working end to end* — real FastAPI process, real MongoDB, real Yahoo
+Finance, real Anthropic. That makes this a deployment/smoke suite, and it earns
+its place as one.
+
+The **response-shape contracts** it used to be the only home for were converted
+to hermetic `TestClient` tests in `tests/test_api_contract.py` (PH3.1 §7
+Option A), so they now run on every push instead of never. What remains here is
+the round-trip that genuinely needs the stack: registration writing to a real
+database, a trade lifecycle persisting across requests, and the AI chat route
+producing a real completion.
+
+HOW TO RUN
+----------
+    export REACT_APP_BACKEND_URL=http://localhost:8000
+    export TEST_ADMIN_EMAIL=... TEST_ADMIN_PASSWORD=...
+    pytest -m integration tests/test_backend_live.py
+
+Credentials come from the environment and have no defaults — see `tests/_live.py`.
+"""
 import uuid
 import pytest
 import requests
 
-BASE_URL = os.environ.get("REACT_APP_BACKEND_URL", "http://localhost:8000").rstrip("/")
-API = f"{BASE_URL}/api"
-
-ADMIN_EMAIL = "admin@alphapartner.com"
-ADMIN_PASSWORD = "admin123"
+from tests._live import ADMIN_EMAIL, API, BASE_URL, admin_login  # noqa: F401
 
 
 @pytest.fixture(scope="session")
 def admin_token():
-    r = requests.post(f"{API}/auth/login", json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD}, timeout=30)
-    if r.status_code == 429:
-        pytest.skip("Rate limited; rerun in 15 min")
-    assert r.status_code == 200, f"Admin login failed: {r.status_code} {r.text}"
-    data = r.json()
+    data = admin_login(requests)
     assert "token" in data and data["email"] == ADMIN_EMAIL
     return data["token"]
 
@@ -188,26 +208,13 @@ class TestPortfolio:
             assert k in r2.json()
 
 
-# ---------- Notifications ----------
-class TestNotifications:
-    def test_notifications_list(self, admin_client):
-        r = admin_client.get(f"{API}/notifications", timeout=20)
-        assert r.status_code == 200
-        assert isinstance(r.json(), list)
-
-    def test_mark_all_read(self, admin_client):
-        r = admin_client.put(f"{API}/notifications/read-all", timeout=20)
-        assert r.status_code == 200
-
-
-# ---------- SIP ----------
-class TestSIP:
-    def test_calculator(self):
-        r = requests.get(f"{API}/sip/calculator", params={"amount": 5000, "years": 10, "rate": 12}, timeout=15)
-        assert r.status_code == 200
-        d = r.json()
-        assert d["total_invested"] == 5000 * 12 * 10
-        assert d["future_value"] > d["total_invested"]
+# Notifications and the SIP calculator used to be asserted here. Both moved to
+# tests/test_api_contract.py (hermetic): the SIP calculator is pure arithmetic
+# with no deployment dimension at all, and the notification list/read-all
+# behaviour is ownership filtering, which the hermetic version checks properly
+# (it seeds a second user's notification and asserts it is neither returned nor
+# mutated — something this suite could not do without polluting a real
+# database). Nothing was dropped; both are now checked on every push.
 
 
 # ---------- Settings ----------

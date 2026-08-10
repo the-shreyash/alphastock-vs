@@ -335,7 +335,23 @@ EOF
         # during an application rollback restarts the database for no reason and
         # empties the cache, turning a 20-second rollback into a cold start on
         # every tier at once.
-        docker compose -f "${BACKUP_COMPOSE_FILE}" up -d --no-deps "${DR_BACKEND_SERVICE}"
+        #
+        # BACKEND_IMAGE_TAG IS PASSED EXPLICITLY, and that is load-bearing.
+        # Writing it to `.env` above is NOT sufficient: bk_load_env_file (in
+        # scripts/backup/lib.sh) exports every key it parses out of `.env` when
+        # this script starts, so BACKEND_IMAGE_TAG is already in this process's
+        # environment holding the tag we are rolling AWAY from — and Docker
+        # Compose resolves shell environment variables at HIGHER precedence than
+        # the `.env` file. The rewritten file was therefore silently ignored,
+        # compose recreated nothing, and the failing release kept serving while
+        # the health check (which the bad build still passed) reported success.
+        # Setting it on the command itself makes the intended tag win over
+        # whatever this process happens to have inherited.
+        # Found and fixed during PH2.12 certification against a live daemon; the
+        # hermetic suite stubs `docker`, so compose's precedence rules — where
+        # the whole defect lived — were never exercised.
+        BACKEND_IMAGE_TAG="${tag}" \
+            docker compose -f "${BACKUP_COMPOSE_FILE}" up -d --no-deps "${DR_BACKEND_SERVICE}"
     }
 
     log "applying ${TARGET_TAG}"
@@ -366,7 +382,28 @@ EOF
     done
 
     if [[ ${VERIFIED} -eq 1 ]]; then
-        log "rollback verified: ${BACKEND_IMAGE}:${TARGET_TAG} is healthy"
+        # HEALTHY IS NOT THE SAME CLAIM AS ROLLED BACK.
+        #
+        # dr_verify --level quick answers "is something serving correctly?".
+        # This script's contract (see the header, question 4) is "did the
+        # rollback actually take effect?" — and the build being rolled away from
+        # is, in the common case, perfectly healthy: it was passing its health
+        # check while producing whatever wrong behaviour prompted the rollback.
+        # Reporting success on health alone is how a rollback that changed
+        # nothing gets closed as a resolved incident.
+        #
+        # The running CONTAINER is the authority here, exactly as it is for
+        # `current` above — not the env file, which only records intent.
+        ROLLED_TO="$(current_tag 2>/dev/null || printf '')"
+        if [[ -n "${ROLLED_TO}" && "${ROLLED_TO}" != "${TARGET_TAG}" ]]; then
+            err "ROLLBACK DID NOT TAKE EFFECT — asked for '${TARGET_TAG}', still serving '${ROLLED_TO}'"
+            err "the stack is HEALTHY but is running the version you tried to leave."
+            err "do NOT close the incident. Check for a BACKEND_IMAGE_TAG in the"
+            err "environment overriding ${DEPLOY_ENV_FILE}, then see §Runbook R5."
+            ledger_append "${ROLLED_TO}" "FAILED rollback to ${TARGET_TAG} — no-op, still serving ${ROLLED_TO}"
+            exit 1
+        fi
+        log "rollback verified: ${BACKEND_IMAGE}:${TARGET_TAG} is healthy and is the running build"
         ledger_append "${TARGET_TAG}" "rollback from ${CURRENT}${NOTE:+ — ${NOTE}}"
         log "run a full check before closing the incident:"
         log "  ./scripts/dr/dr_verify.sh --level full"

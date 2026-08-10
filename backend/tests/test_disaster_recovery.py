@@ -81,7 +81,16 @@ case "$1" in
           *State.Status*)  printf '%s\n' "${STUB_STATE:-running}" ;;
           *Health*)        printf '%s\n' "${STUB_HEALTH:-healthy}" ;;
           *RestartCount*)  printf '%s\n' "${STUB_RESTARTS:-0}" ;;
-          *Config.Image*)  printf '%s\n' "${STUB_RUNNING_IMAGE:-}" ;;
+          # The running image reflects the last successful `up -d`, not a fixed
+          # constant. A stub that reports the SAME image before and after a
+          # rollback cannot tell a real rollback apart from a silent no-op —
+          # which is precisely the defect PH2.12 found against a live daemon.
+          *Config.Image*)
+              if [ -n "${STUB_STATE_FILE:-}" ] && [ -s "${STUB_STATE_FILE:-}" ]; then
+                  cat "${STUB_STATE_FILE}"
+              else
+                  printf '%s\n' "${STUB_RUNNING_IMAGE:-}"
+              fi ;;
       esac
       exit 0 ;;
   compose)
@@ -96,7 +105,18 @@ case "$1" in
               *" ${svc} "*) exit 0 ;;
             esac
             printf 'cid-%s\n' "${svc}" ;;
-        up) exit "${STUB_UP_RC:-0}" ;;
+        up)
+            # A successful `up -d` publishes the tag it was invoked with, so a
+            # later `inspect` reports the new build. STUB_UP_IS_NOOP=1 models
+            # the failure this stub used to hide: compose exits 0, prints
+            # nothing alarming, and recreates NOTHING (an inherited
+            # BACKEND_IMAGE_TAG outranking the .env file, for instance).
+            if [ "${STUB_UP_RC:-0}" = "0" ] && [ "${STUB_UP_IS_NOOP:-0}" != "1" ] \
+               && [ -n "${STUB_STATE_FILE:-}" ]; then
+                printf '%s:%s\n' "${BACKEND_IMAGE:-stockassist-backend}" \
+                    "${BACKEND_IMAGE_TAG:-}" > "${STUB_STATE_FILE}"
+            fi
+            exit "${STUB_UP_RC:-0}" ;;
         exec)
             # exec -T <service> <cmd> ...
             shift            # exec
@@ -145,7 +165,13 @@ fi
 case "${url}" in
     */api/diagnostics)
         [ "${STUB_DIAG_CODE:-200}" = "200" ] || exit 0
-        printf '{"app_version": "%s", "vcs_ref": "%s"}\n' \
+        # MUST mirror the real /api/diagnostics payload: the build identity is
+        # nested under "build", and "process.python_version" sits alongside it as
+        # a decoy the parser must not match. This stub previously emitted a flat
+        # {"app_version","vcs_ref"} pair that the endpoint has never returned —
+        # so the suite validated dr_verify.sh against its own bug and passed
+        # while the real check could never succeed (PH2.12).
+        printf '{"service": "stockassist-backend", "build": {"version": "%s", "revision": "%s", "build_date": "unknown"}, "process": {"python_version": "3.11.15"}}\n' \
             "${STUB_APP_VERSION:-1.4.0}" "${STUB_VCS_REF:-abc1234}" ;;
 esac
 exit 0
@@ -207,6 +233,9 @@ def env(tmp_path):
             "DR_DEPLOY_LEDGER": str(tmp_path / "deployments.tsv"),
             "BACKEND_IMAGE": "stockassist-backend",
             "STUB_RUNNING_IMAGE": "stockassist-backend:1.4.0",
+            # Where the docker stub records the image published by `up -d`, so
+            # "what is running" can change over a test the way it does in life.
+            "STUB_STATE_FILE": str(tmp_path / "running_image"),
         }
     )
     (tmp_path / "docker-compose.yml").write_text("services: {}\n")
@@ -512,6 +541,38 @@ class TestRollbackApply:
             # rollback is a cold start on every tier at once.
             assert "--no-deps" in line and "backend" in line
             assert " mongo" not in line
+
+    def test_a_rollback_that_changed_nothing_is_reported_as_a_failure(self, env):
+        """A healthy stack still serving the OLD build is a FAILED rollback.
+
+        PH2.12 found this against a live Docker daemon: scripts/backup/lib.sh
+        exports every key it parses from `.env`, so BACKEND_IMAGE_TAG was
+        already in the environment holding the tag being rolled away from — and
+        compose ranks shell variables above the `.env` file. The rewritten file
+        was ignored, compose recreated nothing, and the failing release kept
+        serving while the script printed "rollback verified", because the build
+        being rolled away from passes its health check by definition. Health and
+        "the intended build is running" are two claims; only the second one is a
+        rollback.
+        """
+        p = run(ROLLBACK, ["rollback", "--to", "1.3.0", "--yes"], env,
+                STUB_IMAGE_PRESENT_RC="0", STUB_UP_IS_NOOP="1")
+        assert p.returncode == 1, out(p)
+        assert "ROLLBACK DID NOT TAKE EFFECT" in out(p)
+        assert "still serving '1.4.0'" in out(p)
+        # The operator must not be able to close the incident on this.
+        assert "rollback verified" not in out(p)
+        # …and the ledger records the failure rather than a phantom success.
+        assert "FAILED rollback to 1.3.0" in env["ledger"].read_text()
+
+    def test_the_intended_tag_is_passed_to_compose_not_only_written_to_the_env_file(self, env):
+        """The .env rewrite alone is not enough — see the test above."""
+        run(ROLLBACK, ["rollback", "--to", "1.3.0", "--yes"], env,
+            STUB_IMAGE_PRESENT_RC="0")
+        # The stub records what `up -d` actually published; if the tag reached
+        # compose only via the file, an inherited value would have won.
+        assert (env["tmp"] / "running_image").read_text().strip() == \
+            "stockassist-backend:1.3.0"
 
     def test_failed_verification_triggers_an_automatic_revert(self, env):
         """A rollback to a version that is also broken must not be left running."""

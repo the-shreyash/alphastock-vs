@@ -115,7 +115,14 @@ def app_env(environ: Optional[Mapping[str, str]] = None) -> str:
     *reported* by the validator but resolves here to ``development`` so callers
     always receive a valid member of :data:`KNOWN_ENVIRONMENTS`.
     """
-    env = (environ or os.environ).get("APP_ENV", DEVELOPMENT).strip().lower()
+    # `environ is None`, not `environ or os.environ`: an EMPTY mapping is a
+    # legitimate argument meaning "an environment in which nothing is set", and
+    # the truthiness form silently substituted the host process environment for
+    # it. For a security-configuration reader that is the wrong answer in the
+    # most dangerous direction — a caller asking "what would this resolve to
+    # with no configuration?" was answered with the host's real configuration.
+    # Found by PH3.1 when the test process stopped inheriting a bare `.env`.
+    env = (os.environ if environ is None else environ).get("APP_ENV", DEVELOPMENT).strip().lower()
     return env if env in KNOWN_ENVIRONMENTS else DEVELOPMENT
 
 
@@ -1192,7 +1199,9 @@ def get(name: str, default: Optional[str] = None,
         environ: Optional[Mapping[str, str]] = None) -> Optional[str]:
     """Read a configuration value (stripped). Returns ``default`` when unset or
     blank. Prefer this over ``os.environ`` so reads route through one place."""
-    raw = (environ or os.environ).get(name)
+    # `environ is None` rather than `environ or os.environ` — see app_env().
+    # An explicitly empty mapping must read as "unset", not as the host env.
+    raw = (os.environ if environ is None else environ).get(name)
     if raw is None:
         return default
     raw = raw.strip()

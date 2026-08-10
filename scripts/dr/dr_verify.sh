@@ -381,8 +381,22 @@ fi
 # production — export DR_OPS_TOKEN to read it.
 if [[ ${APP_OK} -eq 1 ]]; then
     DIAG="$(http_body "${BASE_URL}/api/diagnostics")"
-    RUNNING_VERSION="$(printf '%s' "${DIAG}" | sed -n 's/.*"app_version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
-    RUNNING_REF="$(printf '%s' "${DIAG}" | sed -n 's/.*"vcs_ref"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
+    # The build identity is NESTED under "build" — {"build":{"version":…,"revision":…}}
+    # (server.py /api/diagnostics, backed by observability/runtime.py). Both
+    # patterns therefore anchor on "build" and match the key INSIDE that object.
+    #
+    # PH2.12 fixed this. It previously read a flat "app_version"/"vcs_ref" pair
+    # that the endpoint has never emitted, so RUNNING_VERSION was always empty
+    # and this check could only ever SKIP — or, once --expect-version was
+    # supplied, FAIL a perfectly good deployment while blaming DR_OPS_TOKEN. The
+    # hermetic stub in test_disaster_recovery.py encoded the same wrong shape, so
+    # the suite agreed with the bug instead of catching it. When a probe and its
+    # test share an assumption, only the real endpoint can settle it.
+    #
+    # `[^}]*` keeps the match inside the build object, so the unrelated
+    # "python_version" under "process" cannot be picked up instead.
+    RUNNING_VERSION="$(printf '%s' "${DIAG}" | sed -n 's/.*"build"[[:space:]]*:[[:space:]]*{[^}]*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
+    RUNNING_REF="$(printf '%s' "${DIAG}" | sed -n 's/.*"build"[[:space:]]*:[[:space:]]*{[^}]*"revision"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
     if [[ -z "${RUNNING_VERSION}" ]]; then
         if [[ -n "${EXPECT_VERSION}" ]]; then
             fail "running build" "could not read /api/diagnostics (gated? set DR_OPS_TOKEN)"

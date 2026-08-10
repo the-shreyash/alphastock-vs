@@ -371,8 +371,11 @@ jobs:
   # applied automatically in backend/tests/conftest.py, not listed in this file,
   # so adding a new live-server suite never requires touching CI.
   #
-  # Those integration suites are NOT abandoned: PH3.1 owns converting them, and
-  # the roadmap's PH2.6 stage will boot the real compose stack and run
+  # Those integration suites are NOT abandoned. PH3.1 converted the API-contract
+  # half of the largest one into `backend/tests/test_api_contract.py`, which runs
+  # in THIS job; what remains behind the marker genuinely needs a deployment
+  # (real Mongo round-trips, real market data, real AI completions). The
+  # roadmap's PH2.6 stage will boot the compose stack and run
   # `pytest -m integration` against it. Excluding them here is the documented,
   # temporary state — not a decision to stop testing that layer.
   # ---------------------------------------------------------------------------
@@ -388,19 +391,23 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
           requirements: dev
 
-      # The suite is hermetic, but a few modules read configuration at import
-      # time. Supplying an obviously-synthetic environment keeps the run
-      # deterministic instead of dependent on what the runner happens to have.
+      # The test environment is NOT configured here any more (PH3.1).
+      # `backend/tests/_testenv.py` installs a fixed, obviously-synthetic
+      # environment before `server` is imported, and it *overwrites* rather
+      # than defaults — so anything set here would be ignored, and leaving it
+      # would imply CI and a developer laptop run different configurations.
+      # They now run the same one. Change it in `_testenv.py`, one place.
+      #
+      # `-m "not integration"` is also the default in `backend/pyproject.toml`
+      # now. It is repeated here deliberately: this step should say out loud
+      # which suite it runs rather than inherit it silently from a config file
+      # a reader of this workflow has no reason to open.
       - name: Run hermetic test suite
         working-directory: backend
         env:
-          APP_ENV: development
-          MONGO_URL: mongodb://ci:ci@127.0.0.1:27017
-          DB_NAME: stockassist_ci
-          JWT_SECRET: ci-test-suite-only-not-a-real-secret-0000000000000
           # Belt and braces: even if a live-server suite escaped the marker, it
           # would try to reach an address that refuses connections immediately
-          # rather than hanging for a 30 s timeout × 98 tests.
+          # rather than hanging for a 30 s timeout × 95 tests.
           REACT_APP_BACKEND_URL: http://127.0.0.1:1
         run: |
           set -euo pipefail

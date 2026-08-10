@@ -1,21 +1,15 @@
 """Phase 6 backend tests: Deep Zerodha integration + Stock autocomplete."""
-import os
 import pytest
 import requests
 
-BASE_URL = os.environ.get("REACT_APP_BACKEND_URL", "http://localhost:8000").rstrip("/")
-ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "admin@alphapartner.com")
-ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin123")
+from tests._live import ADMIN_EMAIL, ADMIN_PASSWORD, BASE_URL, admin_login  # noqa: F401
 
 
 @pytest.fixture(scope="module")
 def session():
     s = requests.Session()
     # Credential login to obtain JWT cookies + bearer
-    r = s.post(f"{BASE_URL}/api/auth/login",
-               json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD}, timeout=20)
-    assert r.status_code == 200, f"admin login failed: {r.status_code} {r.text}"
-    token = r.json().get("token")
+    token = admin_login(s, timeout=20).get("token")
     s.headers.update({"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
     return s
 
@@ -130,10 +124,7 @@ class TestStockSearch:
 # ---- Credential login still healthy ----
 class TestAdminLogin:
     def test_admin_login_returns_token(self):
-        r = requests.post(f"{BASE_URL}/api/auth/login",
-                          json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD}, timeout=15)
-        assert r.status_code == 200
-        d = r.json()
+        d = admin_login(requests, timeout=15)
         assert d.get("token")
         assert d.get("email") == ADMIN_EMAIL
 

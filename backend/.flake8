@@ -47,6 +47,17 @@ exclude =
     .pytest_cache,
     venv,
     .venv,
+    # The CI-managed virtualenv (.github/actions/setup-backend creates
+    # backend/.venv-ci). It is git-ignored, so it never appears in a developer
+    # checkout — which is exactly why its absence here went unnoticed: flake8
+    # matches these entries against the path BASENAME, and ".venv-ci" is not
+    # ".venv". CI therefore linted its own site-packages, and third-party
+    # libraries legitimately trip F811 (conditional re-exports, @overload,
+    # @property/@setter pairs). The BLOCKING correctness gate above has been red
+    # on every CI run since PH2.4 for reasons entirely outside this repository's
+    # code, which is the failure mode that trains a team to ignore a red gate.
+    # Fixed in PH2.12 — verified by building the exclusion into the local run.
+    .venv-ci,
     node_modules,
     # Generated / vendored trees have no author to fix them.
     .mypy_cache

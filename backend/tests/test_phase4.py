@@ -1,30 +1,15 @@
 """Phase 4 backend tests: portfolio monitor, WhatsApp, Zerodha urls/callback, data-sources."""
-import os
 # pyrefly: ignore [missing-import]
 import pytest
 import requests
 
-BASE_URL = os.environ.get("REACT_APP_BACKEND_URL", "").rstrip("/")
-if not BASE_URL:
-    from pathlib import Path
-    env_path = Path("/app/frontend/.env") if Path("/app/frontend/.env").exists() else Path(__file__).parent.parent.parent / "frontend" / ".env"
-    if env_path.exists():
-        for line in env_path.read_text().splitlines():
-            if line.startswith("REACT_APP_BACKEND_URL="):
-                BASE_URL = line.split("=", 1)[1].strip().rstrip("/")
-                break
-
-ADMIN_EMAIL = "admin@alphapartner.com"
-ADMIN_PASSWORD = "admin123"
+from tests._live import BASE_URL, admin_login  # noqa: F401
 
 
 @pytest.fixture(scope="session")
 def auth_session():
     s = requests.Session()
-    r = s.post(f"{BASE_URL}/api/auth/login",
-               json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD})
-    assert r.status_code == 200, f"login failed: {r.status_code} {r.text}"
-    data = r.json()
+    data = admin_login(s)
     s.headers.update({"Authorization": f"Bearer {data['token']}"})
     return s
 

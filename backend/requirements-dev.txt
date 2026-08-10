@@ -21,6 +21,14 @@ pytest==9.0.3
 iniconfig==2.3.0        # pytest dep
 pluggy==1.6.0           # pytest dep
 
+# Coverage measurement (PH3.1). Not wired into `addopts`: instrumenting every
+# local run costs ~25% wall-clock for a number nobody reads on the inner loop.
+# Invoked explicitly — `pytest --cov` — and configured in pyproject.toml under
+# [tool.coverage.*]. TESTING.md previously listed "coverage measurement (needs
+# pytest-cov pinned)" as unowned; PH3.1 closes that.
+pytest-cov==7.0.0
+coverage==7.15.4        # pytest-cov dep
+
 # Formatter
 black==26.5.1
 pathspec==1.1.1         # black / mypy dep

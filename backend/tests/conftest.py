@@ -1,10 +1,14 @@
-"""Shared fixtures for the hermetic (in-process) backend test files.
+"""Shared fixtures and suite-wide isolation for the backend test suite.
 
-These fixtures back the 8 new feature test files (activity feed, morning
-report, paper trading, chart patterns, setup stats, trade coaching,
-backtesting, webhooks). They do NOT touch or alter the existing
-`requests`-based integration test files (test_backend.py, test_phase*.py),
-which hit the live dev server directly and are untouched.
+Two jobs, in this order:
+
+1. **Isolation (PH3.1).** Before `server` is imported, install a deterministic
+   test environment so no test ever sees the developer's real `backend/.env`
+   (`tests/_testenv.py`). Then, per test, block outbound network for anything
+   not explicitly classified as needing it (`tests/_netguard.py`).
+
+2. **Fixtures.** An in-process `TestClient`, an in-memory Mongo double, and a
+   deterministic test user + JWT.
 
 Why in-process + a fake DB instead of `requests` against the live server:
 Motor (the async Mongo driver) binds its client to the event loop that was
@@ -12,8 +16,8 @@ running when it was constructed. FastAPI's synchronous TestClient runs each
 request on a fresh loop via `asyncio.run`, so a second DB-backed request
 raises `RuntimeError: Event loop is closed`. Swapping `server.db` for an
 in-memory `FakeDB` (tests/_fakedb.py) sidesteps that entirely, keeps tests
-hermetic (no real Mongo needed), and matches testing.md rule 5 (no real
-external services required to pass).
+hermetic (no real Mongo needed), and matches the rule that no real external
+service is required to pass.
 """
 import sys
 from pathlib import Path
@@ -24,13 +28,20 @@ from fastapi.testclient import TestClient
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from tests import _netguard, _testenv  # noqa: E402
+
+# MUST run before `import server`: server.py reads configuration — and calls
+# load_dotenv(override=True) — at module scope, so by the time the import
+# statement below returns it is too late to influence what it read.
+_testenv.apply()
+
 import server  # noqa: E402
 from server import app, create_access_token  # noqa: E402
 from tests._fakedb import FakeDB  # noqa: E402
 
 
 # --------------------------------------------------------------------------- #
-# Suite selection (PH2.4)                                                       #
+# Suite classification                                                          #
 # --------------------------------------------------------------------------- #
 # The backend has two kinds of test file living side by side:
 #
@@ -46,14 +57,17 @@ from tests._fakedb import FakeDB  # noqa: E402
 # never find it — and their suite would then run in CI, hit no server, and fail
 # for a reason that looks nothing like the cause.
 #
-# So the marker is applied HERE, from the one fact that actually distinguishes
-# them, and CI just says `-m "not integration"`. Adding a new live-server suite
-# means adding its filename to this tuple; nothing in .github/ changes.
+# So the markers are applied HERE, from the one fact that actually
+# distinguishes them, and CI just says `-m "not integration"`. Adding a new
+# live-server suite means adding its filename to this tuple; nothing in
+# .github/ changes.
 #
-# PH3.1 owns converting these suites to hermetic equivalents. Until then they
-# remain runnable on demand (`pytest -m integration` against a live stack).
+# PH3.1 kept `integration` on these files even though `live` is the more
+# accurate name, because `-m "not integration"` is the selection every existing
+# GitHub Actions workflow already uses. Both markers are applied; the
+# deselection contract is unchanged, and `-m live` now also addresses them.
 _LIVE_SERVER_SUITES = frozenset({
-    "test_backend.py",
+    "test_backend_live.py",
     "test_phase2.py",
     "test_phase4.py",
     "test_phase5.py",
@@ -61,13 +75,118 @@ _LIVE_SERVER_SUITES = frozenset({
     "test_phase7.py",
 })
 
+#: The PH1 security-control suites. Marked `security` mechanically for the same
+#: reason the live suites are marked mechanically: a hand-applied decorator on
+#: ~450 tests would be missing from some of them within a sprint, and
+#: `pytest -m security` would then quietly under-report the regression surface.
+#: These are all hermetic and all run in the default selection — the marker
+#: exists so the security gate can be run *alone*, not to exclude it.
+_SECURITY_SUITES = frozenset({
+    "test_audit.py",
+    "test_auth_hardening.py",
+    "test_cookie_security.py",
+    "test_cors_hardening.py",
+    "test_csrf.py",
+    "test_identifiers.py",
+    "test_jwt_sessions.py",
+    "test_oauth_hardening.py",
+    "test_password_policy.py",
+    "test_rate_limit.py",
+    "test_recovery.py",
+    "test_roles.py",
+    "test_secret_loading.py",
+    "test_secrets.py",
+    "test_security_headers.py",
+})
+
+#: Markers that mean "this test is allowed to touch the outside world".
+#: A test carrying any of them does not get the outbound-network guard.
+#:
+#: `allow_network` is the single-test escape hatch. It is a *marker* rather
+#: than an opt-out fixture on purpose: a marker shows up in `--collect-only`
+#: and can be selected against (`pytest -m allow_network` lists every test
+#: that claims the exemption), whereas an unused fixture is invisible.
+_NON_HERMETIC_MARKERS = frozenset({"integration", "live", "e2e", "allow_network"})
+
 
 def pytest_collection_modifyitems(items):
-    """Mark every test in a live-server suite as ``integration``."""
-    integration = pytest.mark.integration
+    """Apply the file-level markers: `integration`+`live`, and `security`."""
     for item in items:
-        if Path(str(item.fspath)).name in _LIVE_SERVER_SUITES:
-            item.add_marker(integration)
+        filename = Path(str(item.fspath)).name
+        if filename in _LIVE_SERVER_SUITES:
+            item.add_marker(pytest.mark.integration)
+            item.add_marker(pytest.mark.live)
+        if filename in _SECURITY_SUITES:
+            item.add_marker(pytest.mark.security)
+
+
+@pytest.fixture(scope="session")
+def _live_backend_reachable():
+    """Probe the configured deployment once per session. Cached."""
+    import urllib.error
+    import urllib.request
+
+    from tests._live import API
+
+    try:
+        with urllib.request.urlopen(f"{API}", timeout=5) as resp:
+            return 200 <= resp.status < 500
+    except (urllib.error.URLError, OSError):
+        return False
+
+
+@pytest.fixture(autouse=True)
+def _require_live_server(request, _live_backend_reachable):
+    """Skip `live` tests when there is no deployment to drive.
+
+    WHY SKIP RATHER THAN FAIL
+    -------------------------
+    A live-server test with no live server is not a failing test — it is an
+    unrun one, and reporting it as a failure is how a suite ends up with 43
+    permanently-red results that everyone learns to scroll past. This is
+    PH3.1 §6 classification C ("test requires external infrastructure"),
+    applied honestly.
+
+    It also makes marker selection composable. `-m` is single-valued, so
+    `pytest -m "not slow"` REPLACES the `-m "not integration"` default in
+    `pyproject.toml` and pulls the live suites back into the run. Before this
+    fixture that produced 43 connection errors; now it produces skips with a
+    readable reason.
+
+    WHY IT CANNOT HIDE A BROKEN DEPLOYMENT
+    --------------------------------------
+    Set ``REQUIRE_LIVE_BACKEND=1`` and an unreachable deployment becomes a hard
+    failure instead. The PH2.6 integration job MUST set it — otherwise a stack
+    that failed to boot would skip its way to a green tick, which is a worse
+    outcome than the red one this fixture is replacing.
+    """
+    import os
+
+    if not request.node.get_closest_marker("live"):
+        return
+    if _live_backend_reachable:
+        return
+
+    from tests._live import BASE_URL
+
+    message = f"No backend reachable at {BASE_URL} — live-server test not run."
+    if os.environ.get("REQUIRE_LIVE_BACKEND") == "1":
+        pytest.fail(f"{message} REQUIRE_LIVE_BACKEND=1 forbids skipping it.")
+    pytest.skip(message)
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_network(request, monkeypatch):
+    """Block outbound network for every test not classified non-hermetic.
+
+    Autouse and unconditional by design. An opt-in guard only guards the tests
+    someone remembered to opt in, which is never the one that regresses. The
+    escape hatch is a *marker* on the test, which is visible in the collection
+    listing and in the CI selection — unlike a fixture that quietly isn't used.
+    """
+    if _NON_HERMETIC_MARKERS.intersection(m.name for m in request.node.iter_markers()):
+        return
+    _netguard.install(monkeypatch)
 
 
 @pytest.fixture
