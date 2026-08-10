@@ -61,7 +61,7 @@ pydantic_core==2.46.4        # pydantic's compiled core (kept explicit: hard ver
 
 # Datastore & cache
 motor==3.3.1                 # async MongoDB driver (server.py); provides bson.ObjectId
-redis==5.0.8                 # cross-process realtime fan-out & cache (infrastructure/*)
+redis==8.1.0                 # cross-process realtime fan-out & cache (infrastructure/*)
 
 # AI providers (product core)
 anthropic==0.116.0           # services/claude_provider.py — Claude engine
