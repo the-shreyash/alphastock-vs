@@ -5,6 +5,120 @@ This file records documentation-system versions and, from v1.0 launch onward, pr
 
 ---
 
+# Sprint PH3.4 — Performance Engineering & Optimization — 2026-08-14
+
+**Full report:** `docs/performance/PH3.4_PERFORMANCE_CERTIFICATION.md`.
+
+**Numbering.** The sprint brief labelled this work PH3.4. The roadmap numbers
+PH3.4 as *Frontend Service & Hook Coverage* and numbers this work **PH3.7 —
+Performance Benchmarking & Load Testing**, of which this sprint delivers the
+benchmarking half (load testing is the brief's PH3.5). The certification keeps the
+brief's label; the roadmap carries the cross-reference.
+
+**The application code was not the bottleneck — and establishing that took
+measurement rather than assumption.** With every prioritised route instrumented,
+no endpoint's own logic exceeded **11 ms** in steady state. Two other layers were
+the problem, and neither was visible from reading the code.
+
+**The database was reading whole collections to answer single-user questions.**
+Four collections — `watchlist`, `holdings`, `orders`, `payments` — had **no index
+of any kind**, and they back the product's most-visited pages. Measured against a
+real MongoDB with `explain`: `GET /api/watchlist` examined **2,000 documents to
+return 5**; every `/api/portfolio*` route examined **4,800 to return 12**. The cost
+scaled with *total signups* rather than with the caller's own data — the shape that
+looks healthy in development indefinitely and then does not. The sharpest case was
+the AI chat path: the continuity lookup (`server.py:488`) filters on `session_id`
+alone, which the existing `{user_id, session_id}` compound index **cannot serve**
+because a compound index is only usable from its leading field — so **every message
+a user sent to the AI scanned the entire `chat_messages` collection**, 12,000
+documents examined to return 10. Seven further hot queries filtered on an indexed
+field and then sorted on an unindexed one, producing blocking in-memory `SORT`
+stages that MongoDB **aborts outright past 100 MB** — a user with a long trade
+history was heading for a hard failure, not just a slow page.
+
+**Every provider call opened a new TLS connection.** `fetch_yahoo_quote` runs once
+per symbol, fanned out with `asyncio.gather` (12 symbols for a watchlist, up to 50
+for open positions), and each call constructed its own `httpx.AsyncClient` — one
+handshake per symbol to the same host, then discarded. Measured through the
+application's own `real_quotes_map`: **803.8 ms → 236.2 ms (3.40×)**. Layer
+attribution showed **>90% of the latency on every quote-enriched endpoint was
+provider transport**, so optimising the Python in those handlers would have moved a
+term that was never more than 7% of the total.
+
+| Measure | Baseline | After |
+|---|---|---|
+| `chat_messages` docs examined per AI chat turn | 12,000 | **10** (1,200×) |
+| `orders` docs examined per order-book load | 2,000 | **1** (2,000×) |
+| `holdings` docs examined per portfolio load | 4,800 | **12** (400×) |
+| `watchlist` docs examined per watchlist load | 2,000 | **5** (400×) |
+| Collections with no index at all | 4 | **0** |
+| Blocking in-memory `SORT` stages | 7 | **1** |
+| 10-symbol quote batch (real Yahoo) | 803.8 ms | **236.2 ms** |
+| `GET /api/admin/logs` queries (25 rows) | 31 | **7** |
+| `GET /api/admin/dashboard` serial DB round trips | 11 | **1** (gathered) |
+| Frontend initial load (gzip) | 172.7 KiB | 172.7 KiB — no change warranted |
+
+**Four optimizations, each measured before and after:** 12 indexes across 6
+collections with `ensure_indexes()` extracted from the startup handler so the index
+set can finally be *asserted* (the in-memory double has no query planner, so an
+unindexed collection passed all 2,144 existing tests); a loop- and timeout-keyed
+pooled HTTP client (`services/http_client.py`); the `/api/admin/logs` N+1 replaced
+with one `$in`; and the admin dashboard's 11 independent counts gathered.
+
+**Equally important: the places nothing was changed.** No frontend optimization
+was warranted and none was made — route splitting was already complete, all **13**
+polling timers were already disconnected-only fallbacks (verified by measuring
+zero requests over 70 s with the socket live), and no duplicate request per mount
+exists. Redis needed nothing: Sprint R9's `MGET` batching was already the
+highest-leverage change available. No blocking operation was found in a request
+path. `recharts`' transitive `@reduxjs/toolkit` looked like an easy 280 KiB win and
+is not removable. **`framer-motion` in the entry chunk is correct**, not a defect.
+
+**Two findings were deliberately NOT acted on**, with measurements recorded and
+owners assigned: the rate limiter's `update_one`-then-`find_one` could become one
+atomic `find_one_and_update`, removing **one query from every request on all 201
+routes** *and* closing a documented non-atomic race — but it modifies PH1-certified
+security surface, and a performance sprint is the wrong place to rush a limiter
+change (→ next security-touching sprint). And `fetch_yahoo_quote` pulls ~7 KB of
+3-month history per symbol for a 14-period RSI; whether it needs all of it is an
+indicator-accuracy question, not a performance one.
+
+**Two of the sprint's own measurements were wrong before they were right**, and
+both are documented because the errors are instructive. A corpus field-name typo
+(`target_1` for `target1`) manufactured a `KeyError` that looked exactly like a
+HIGH defect on `/api/portfolio/intelligence`; the endpoint was never broken. And a
+frontend test set `{connected: true}` when the selector reads
+`connection.status === "live"`, then set it *before* the provider mounts and
+overwrites it — manufacturing a polling defect that does not exist. **Neither was
+reported as a finding.** PH3.3's rule held: ask whether the test or the application
+is wrong, and answer it before changing anything.
+
+**38 performance regression tests, none asserting a wall-clock duration** — a
+timing assertion measures the CI runner, goes red when it is busy, and stays green
+on a fast laptop that has just regressed by forty queries. Instead: query counts
+asserted **identical at 3 rows and 33** (the N+1 *signature*, which a constant
+cannot be updated to satisfy), index coverage for every hot filter+sort recorded by
+running `ensure_indexes()` against a stub rather than parsing source, payload
+bounds, gather structure, and the per-request floor. Plus a counter-test proving
+Watchlist *does* poll when disconnected — without it, "no polling while connected"
+would pass just as happily if every timer had been deleted.
+
+**No regression.** Backend 2,144 → **2,176 passed** (the +32 are new), PH1 security
+**452 passed unchanged**, frontend 313 → **319 passed**, production build green, no
+API contract or response shape changed, no trading logic, AI decision logic,
+prompt, or model selection touched. The benchmark script refuses to run against the
+configured `DB_NAME`, uses an unmistakably-named scratch database, and drops it —
+verified afterwards that `alpha_stock_db` was untouched.
+
+**Still open, unchanged:** the PH3.2 `yarn build` eslint defect (`eslint@^9`
+displaces the `eslint@^8` react-scripts needs, and `eslint-config-react-app` is not
+installed) — every build in this sprint used the documented
+`DISABLE_ESLINT_PLUGIN=true` workaround, and "production build passes" carries that
+qualification deliberately rather than burying it. PH3.3's D-4 and D-10 also remain
+with their assigned owners.
+
+---
+
 # Sprint PH3.3 — Backend Tests & API Coverage — 2026-08-10
 
 **Full report:** `docs/testing/PH3.3_BACKEND_TEST_CERTIFICATION.md`.

@@ -4821,18 +4821,48 @@ async def log_admin_action(admin_id: str, action: str, target: str = "", details
 
 @admin_router.get("/dashboard")
 async def admin_dashboard(user: dict = Depends(require_admin)):
-    total_users = await db.users.count_documents({})
-    premium_users = await db.users.count_documents({"role": {"$in": ["pro", "premium"]}})
-    elite_users = await db.users.count_documents({"role": "elite"})
-    admin_users = await db.users.count_documents({"role": {"$in": ["admin", "super_admin"]}})
     today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    today_trades = await db.trades.count_documents({"entry_time": {"$regex": f"^{today_str}"}})
-    total_trades = await db.trades.count_documents({})
-    open_trades = await db.trades.count_documents({"status": "OPEN"})
-    ai_requests_today = await db.chat_messages.count_documents({"created_at": {"$regex": f"^{today_str}"}})
-    total_notifications = await db.notifications.count_documents({})
-    open_tickets = await db.support_tickets.count_documents({"status": {"$in": ["open", "in_progress"]}})
-    total_payments = await db.payments.count_documents({}) if "payments" in await db.list_collection_names() else 0
+
+    # Eleven independent counts, issued CONCURRENTLY rather than one after another
+    # (PH3.4, O-4).
+    #
+    # Nothing here depends on anything else here — they are eleven separate
+    # `count_documents` calls whose results are assembled into one response. Run
+    # sequentially, the endpoint's latency was the SUM of eleven database round
+    # trips; run concurrently it is the slowest one. On a deployment where Mongo is
+    # a network hop away (rather than the in-memory double this is measured
+    # against) that is the difference between ~11xRTT and ~1xRTT of waiting.
+    #
+    # This is a latency change only: the same eleven queries are issued, so the
+    # load on the database is identical and there is no new cache, no new index and
+    # no changed result. The gather is bounded by the literal length of this list —
+    # it cannot fan out with the data — so it can never become a source of
+    # unbounded concurrency against the database.
+    #
+    # `list_collection_names()` stays sequential and ahead of the gather: the
+    # payments count is *conditional* on its result. Folding a dependent call into
+    # the same gather would race it.
+    has_payments = "payments" in await db.list_collection_names()
+
+    (
+        total_users, premium_users, elite_users, admin_users,
+        today_trades, total_trades, open_trades,
+        ai_requests_today, total_notifications, open_tickets,
+        broker_connections,
+    ) = await asyncio.gather(
+        db.users.count_documents({}),
+        db.users.count_documents({"role": {"$in": ["pro", "premium"]}}),
+        db.users.count_documents({"role": "elite"}),
+        db.users.count_documents({"role": {"$in": ["admin", "super_admin"]}}),
+        db.trades.count_documents({"entry_time": {"$regex": f"^{today_str}"}}),
+        db.trades.count_documents({}),
+        db.trades.count_documents({"status": "OPEN"}),
+        db.chat_messages.count_documents({"created_at": {"$regex": f"^{today_str}"}}),
+        db.notifications.count_documents({}),
+        db.support_tickets.count_documents({"status": {"$in": ["open", "in_progress"]}}),
+        db.broker_accounts.count_documents({}),
+    )
+    total_payments = await db.payments.count_documents({}) if has_payments else 0
     # Revenue (mock — real system would sum from payments collection)
     revenue_today = total_payments * 499  # placeholder
     mrr = premium_users * 499 + elite_users * 999
@@ -4844,8 +4874,6 @@ async def admin_dashboard(user: dict = Depends(require_admin)):
         db_health = "healthy"
     except Exception:
         db_health = "unhealthy"
-
-    broker_connections = await db.broker_accounts.count_documents({})
 
     return {
         "total_users": total_users,
@@ -5231,19 +5259,55 @@ async def admin_list_logs(
         query["admin_id"] = admin_id
     total = await db.admin_audit_logs.count_documents(query)
     skip = (page - 1) * limit
-    cursor = db.admin_audit_logs.find(query).sort("timestamp", -1).skip(skip).limit(limit)
-    logs = []
-    async for log in cursor:
-        log["_id"] = str(log["_id"])
-        # Resolve admin name
+    logs = await db.admin_audit_logs.find(query).sort("timestamp", -1).skip(skip).limit(limit).to_list(limit)
+
+    # Resolve every actor in ONE query, not one per row (PH3.4, O-3).
+    #
+    # This loop previously issued `db.users.find_one(...)` per log entry: 26
+    # queries to render 25 rows, measured. The row count is operator-controlled
+    # (`limit`, bounded at 200 by LogLimitParam), so the query count scaled with
+    # the page size — 201 round trips for a page of 200. On a deployment where
+    # Mongo is a network hop away that is the whole latency of the page, and it is
+    # invisible in `explain` because each individual query is perfectly indexed.
+    #
+    # Distinct ids only: an operator who performed every action on the page (the
+    # common case) is fetched once rather than `limit` times.
+    #
+    # The per-row `try/except` is preserved in behaviour, not structure: a
+    # malformed `admin_id` must not take the page to a 500, and an id that
+    # resolves to no user must still render. Audit rows deliberately outlive the
+    # accounts that wrote them, so "unresolvable" is a normal state here, not an
+    # error — see PH3.3 §12.
+    # The two failure modes stay distinguishable, because they mean different
+    # things and PH3.3 §12 pins the difference: an `admin_id` that is not a
+    # well-formed ObjectId is "System" (a record not written by a human operator,
+    # or a legacy row), while a well-formed id with no surviving user is "Unknown"
+    # (a real operator whose account has since been deleted). Collapsing both to
+    # "Unknown" would have been an invisible behaviour change carried in on the
+    # back of a performance fix.
+    unparseable = set()
+    valid_oids = []
+    for raw in {log.get("admin_id") for log in logs if log.get("admin_id")}:
         try:
-            adm = await db.users.find_one({"_id": ObjectId(log["admin_id"])}, {"name": 1, "email": 1})
-            log["admin_name"] = adm.get("name", "Unknown") if adm else "Unknown"
-            log["admin_email"] = adm.get("email", "") if adm else ""
-        except Exception:
+            valid_oids.append(ObjectId(raw))
+        except (InvalidId, TypeError):
+            unparseable.add(raw)
+
+    actors = {}
+    if valid_oids:
+        async for u in db.users.find({"_id": {"$in": valid_oids}}, {"name": 1, "email": 1}):
+            actors[str(u["_id"])] = u
+
+    for log in logs:
+        log["_id"] = str(log["_id"])
+        raw_id = log.get("admin_id")
+        if raw_id in unparseable or not raw_id:
             log["admin_name"] = "System"
             log["admin_email"] = ""
-        logs.append(log)
+            continue
+        actor = actors.get(str(raw_id))
+        log["admin_name"] = actor.get("name", "Unknown") if actor else "Unknown"
+        log["admin_email"] = actor.get("email", "") if actor else ""
     return {"logs": logs, "total": total, "page": page, "limit": limit, "pages": max(1, (total + limit - 1) // limit)}
 
 
@@ -5596,13 +5660,131 @@ obs_metrics.set_app_info(
 )
 
 
-# Startup
-@app.on_event("startup")
-async def startup():
+async def ensure_indexes():
+    """Declare every index the application depends on. Idempotent.
+
+    EXTRACTED FROM `startup()` IN PH3.4, AND WHY
+    --------------------------------------------
+    These declarations used to be the first forty lines of the startup event
+    handler, interleaved with feature-flag seeding, broker-session restore,
+    scheduler wiring and five background tasks. That had three costs, and the
+    third is the one that mattered:
+
+    1. Nothing could assert the index set. A missing index is invisible in code
+       review and silent in every test — the in-memory double has no plans — so
+       the only place it shows up is a production query that got slower as the
+       collection grew. `tests/test_perf_regression.py` now asserts this
+       function's output against the queries the routes actually issue.
+    2. Nothing could measure them. `scripts/perf_db_benchmark.py` runs the real
+       query shapes against a real MongoDB before and after this function; it
+       could not call the previous version without also starting the scheduler,
+       the heartbeat engine and the WebSocket loops.
+    3. The list could not be read. Deciding whether a new query is covered meant
+       reading past unrelated startup work to find out.
+
+    Nothing about *when* this runs changed: `startup()` still awaits it first,
+    before anything else, exactly as before.
+
+    ADDING AN INDEX HERE IS A PRODUCTION COST, NOT A FREE WIN. Every index is
+    paid for on every write to the collection and in RAM for the working set. The
+    ones below are justified individually against a query in the request path;
+    §8 of `docs/performance/PH3.4_PERFORMANCE_CERTIFICATION.md` records the
+    query, the measured plan before and after, and the write cost for each.
+    """
     await db.users.create_index("email", unique=True)
+
+    # ----------------------------------------------------------------------- #
+    # trades — the busiest user-scoped collection in the product.
+    #
+    # `user_id` alone (all this collection had before PH3.4) serves the filter
+    # and nothing else. Every listing route then sorts, and a sort a compound
+    # index cannot serve is a blocking in-memory SORT stage: Mongo materializes
+    # every matching document, sorts it, and — past 100 MB — gives up and errors.
+    # The compound indexes below let the index supply the ordering, so the
+    # `.limit(100)` stops the scan at 100 documents instead of after reading the
+    # user's entire trade history. Measured: 60x fewer documents examined on
+    # GET /api/trades at 60 trades/user (PH3.4 §8, O-1).
+    # ----------------------------------------------------------------------- #
+    await db.trades.create_index([("user_id", 1), ("entry_time", -1)])   # GET /api/trades
+    await db.trades.create_index([("user_id", 1), ("exit_time", -1)])    # GET /api/trades/history
+
+    # `{user_id, status, entry_time}` and not `{user_id, status}`. The shorter
+    # form serves the *filter* for GET /api/trades/active but not its
+    # `sort(entry_time DESC)`, which measured as a surviving in-memory SORT stage
+    # even once the filter was indexed. Appending the sort key lets the index
+    # supply the ordering too, and — because a compound index also serves any
+    # prefix of itself — it still answers every `{user_id, status}` lookup
+    # (portfolio holdings, the trade stream) that the two-field version did.
+    # Three fields instead of two, one index instead of two.
+    await db.trades.create_index([("user_id", 1), ("status", 1), ("entry_time", -1)])
+
+    # `user_id` is deliberately KEPT rather than replaced. It is redundant for
+    # reads — the compound indexes above have `user_id` as their prefix and serve
+    # every filter it served — but dropping an index is a separate, riskier
+    # operation than adding one (it cannot be rolled back without a rebuild on a
+    # large collection), and this sprint's rule is the smallest safe change.
+    # Removal is recorded as technical debt in the certification, not done here.
     await db.trades.create_index("user_id")
-    await db.notifications.create_index("user_id")
-    await db.chat_messages.create_index([("user_id", 1), ("session_id", 1)])
+
+    # ----------------------------------------------------------------------- #
+    # notifications — polled by the bell badge on every authenticated page.
+    # `{user_id, read}` serves the unread count; `{user_id, created_at}` serves
+    # the panel's newest-first listing without an in-memory sort.
+    # ----------------------------------------------------------------------- #
+    await db.notifications.create_index([("user_id", 1), ("created_at", -1)])
+    await db.notifications.create_index([("user_id", 1), ("read", 1)])
+    await db.notifications.create_index("user_id")  # kept, as above
+
+    # ----------------------------------------------------------------------- #
+    # watchlist — had NO index of any kind before PH3.4, on any field.
+    #
+    # Every read (`GET /api/watchlist`), every duplicate check on add, and every
+    # delete was a full collection scan across *every user's* rows. At 400 users
+    # x 20 symbols that is 8,000 documents read to return one user's 20, and the
+    # cost grows with total signups rather than with the caller's own data — the
+    # shape that looks fine in development forever and then does not.
+    # The unique compound index also makes the duplicate check the application
+    # already performs enforceable by the database.
+    # ----------------------------------------------------------------------- #
+    await db.watchlist.create_index([("user_id", 1), ("symbol", 1)], unique=True)
+    await db.watchlist.create_index([("user_id", 1), ("added_at", -1)])
+
+    # ----------------------------------------------------------------------- #
+    # holdings — synced broker positions. Also had no index.
+    #
+    # `services/portfolio_engine.build_holdings` reads this on EVERY
+    # /api/portfolio* route (summary, intelligence, performance, export), and
+    # `portfolio_stream`/`trade_stream` read it per broker on every realtime
+    # symbol-token resolution. It was a collection scan on the single most
+    # data-heavy page in the product.
+    # ----------------------------------------------------------------------- #
+    await db.holdings.create_index([("user_id", 1), ("broker", 1)])
+
+    # ----------------------------------------------------------------------- #
+    # orders — the unified cross-broker order book (GET /api/orders), listed
+    # newest-first. No index before PH3.4.
+    # ----------------------------------------------------------------------- #
+    await db.orders.create_index([("user_id", 1), ("placed_at", -1)])
+
+    # ----------------------------------------------------------------------- #
+    # chat_messages.
+    #
+    # `{user_id, session_id}` was the only index, and it left the hottest query
+    # in the AI product on a collection scan: `POST /api/chat` loads the last ten
+    # turns for conversation continuity (server.py:488) filtering on
+    # **`session_id` alone**. A compound index is only usable from its leading
+    # field, so a query that does not constrain `user_id` cannot touch it — every
+    # message a user sends to the AI scanned the entire chat collection.
+    # `{session_id, created_at}` serves both its filter and its newest-first sort.
+    #
+    # `{user_id, session_id, created_at}` replaces the old two-field index rather
+    # than joining it: it serves `GET /api/chat/history?session_id=` including the
+    # sort, and still answers every `{user_id, session_id}` and `{user_id}` lookup
+    # as a prefix.
+    # ----------------------------------------------------------------------- #
+    await db.chat_messages.create_index([("session_id", 1), ("created_at", -1)])
+    await db.chat_messages.create_index([("user_id", 1), ("session_id", 1), ("created_at", 1)])
+
     await db.broker_accounts.create_index([("user_id", 1), ("broker", 1)], unique=True)
 
     # Admin Portal collections (Sprint 11)
@@ -5646,6 +5828,33 @@ async def startup():
     await db.announcements.create_index("created_at")
     await db.support_tickets.create_index("status")
     await db.support_tickets.create_index("created_at")
+
+    # payments — the admin payments page lists newest-first over the whole
+    # collection (there is no per-user payments view). One index on the sort key.
+    await db.payments.create_index("created_at")
+
+
+# Startup
+@app.on_event("startup")
+async def startup():
+    # Indexes first, before anything else in boot and before the readiness gate
+    # opens — unchanged from the pre-PH3.4 ordering, now one call instead of
+    # forty inline statements. See `ensure_indexes()` for why it was extracted.
+    await ensure_indexes()
+
+    # Outbound HTTP connection pooling (PH3.4). Enabled here, on the application's
+    # own event loop, because an httpx client's connections belong to the loop
+    # that opened them — see services/http_client.py for why this is an explicit
+    # lifespan call and not a module-level client. Until this runs, every provider
+    # call constructs its own client, which is the pre-PH3.4 behaviour and remains
+    # the behaviour under the TestClient.
+    try:
+        from services import http_client as _http_pool
+        await _http_pool.open_pool()
+    except Exception as e:
+        # Pooling is an optimisation, never a boot requirement: falling back to
+        # per-call clients is slower and completely correct.
+        logger.error(f"HTTP connection pool init error: {e}")
 
     # Seed default feature flags if empty
     if await db.feature_flags.count_documents({}) == 0:
@@ -5801,5 +6010,15 @@ async def shutdown():
         await _redis_client.close()
     except Exception as e:
         logger.warning(f"Redis shutdown error (ignored): {e}")
+
+    # Outbound HTTP pool (PH3.4). Closed after the broker streams and Redis, and
+    # wrapped for the same reason they are: shutdown must complete. Closing the
+    # pool politely matters in a rolling deploy — the instance being replaced
+    # should return its provider connections rather than have them reset.
+    try:
+        from services import http_client as _http_pool
+        await _http_pool.close_pool()
+    except Exception as e:
+        logger.warning(f"HTTP pool shutdown error (ignored): {e}")
 
     client.close()

@@ -198,8 +198,15 @@ class _Cursor:
 
 
 class FakeCollection:
-    def __init__(self, docs=None):
+    def __init__(self, docs=None, name="<unnamed>"):
         self.docs = [dict(d) for d in (docs or [])]
+        #: The attribute this collection was reached through (`db.trades` -> "trades").
+        #: Motor collections know their own name; this double did not, which made it
+        #: impossible for `tests/_perf.py` to report *which* collection an endpoint
+        #: over-queried — the counts alone say "102 find_one calls" without saying
+        #: where to look. Set by `FakeDB`, defaulted here so a directly-constructed
+        #: collection (several tests do that) still has the attribute.
+        self.name = name
 
     async def find_one(self, flt=None, projection=None):
         for d in self.docs:
@@ -332,12 +339,12 @@ class FakeDB:
     def __init__(self, **collections):
         object.__setattr__(self, "_collections", {})
         for name, docs in collections.items():
-            self._collections[name] = FakeCollection(docs)
+            self._collections[name] = FakeCollection(docs, name=name)
 
     def __getattr__(self, name):
         cols = object.__getattribute__(self, "_collections")
         if name not in cols:
-            cols[name] = FakeCollection()
+            cols[name] = FakeCollection(name=name)
         return cols[name]
 
     def __getitem__(self, name):

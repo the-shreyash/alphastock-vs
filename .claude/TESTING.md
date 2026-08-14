@@ -620,6 +620,71 @@ Portfolio Load
 
 ---
 
+## Performance measurement, as built (PH3.4)
+
+Full report: `docs/performance/PH3.4_PERFORMANCE_CERTIFICATION.md`.
+
+**None of the targets above has been verified against a deployment.** They remain
+targets. What PH3.4 built is the instrumentation to measure the things that
+*determine* them, in three contexts that must not be confused:
+
+| Context | Tool | Measures | Cannot measure |
+|---|---|---|---|
+| Hermetic, in-process | `scripts/perf_api_profile.py --offline` | Application code + serialization; query count; documents read; payload bytes | Any real latency |
+| Real MongoDB | `scripts/perf_db_benchmark.py` | Query **plans** via `explain`, `docsExamined/nReturned`, in-memory sort stages — before and after `ensure_indexes()` | Concurrency, contention |
+| Real provider | same profiler without `--offline` | Actual market-data transport latency | Anything reproducible |
+
+Run them:
+
+```bash
+cd backend
+python scripts/perf_api_profile.py --offline     # application cost only
+python scripts/perf_api_profile.py               # + real provider latency
+python scripts/perf_db_benchmark.py              # query plans, before/after
+```
+
+`perf_db_benchmark.py` seeds an isolated scratch database, **refuses to run if its
+name resolves to the configured `DB_NAME`**, and drops it on exit. It never reads
+or writes application data.
+
+### Why performance regression tests assert counts, not durations
+
+`assert elapsed < 0.05` measures the CI runner. It goes red when the runner is busy
+and stays green on a fast laptop that has just regressed by forty queries — failing
+for the wrong reasons and passing for the only reason that matters. Such a test is
+marked `skip` within two sprints and takes its coverage with it.
+
+The 38 PH3.4 regression tests therefore assert only exactly-reproducible
+quantities:
+
+* **`tests/test_perf_regression.py` (32).** Query count **identical at 3 rows and
+  33** — the N+1 *signature*, which unlike a pinned constant cannot be satisfied by
+  updating the number; index coverage for every hot filter+sort; payload bounds;
+  `asyncio.gather` structure; the per-request query floor; health probes touching
+  zero collections.
+* **`frontend/src/__tests__/requestEfficiency.test.jsx` (6).** No duplicate request
+  per mount; no re-fetch on re-render (the unstable-dependency detector); **zero**
+  requests over 70 s while the socket is live — plus a counter-test proving
+  Watchlist *does* poll when disconnected, without which the previous assertion
+  would pass just as happily if every timer had been deleted.
+
+**`TestIndexCoverage` is the assertion the in-memory double cannot make.** `FakeDB`
+has no query planner, so a collection with no index behaves identically under test
+to a perfectly indexed one — four unindexed collections passed all 2,144 pre-PH3.4
+tests. That class records what `server.ensure_indexes()` declares by running it
+against a stub `db` (rather than parsing source, which would keep passing if the
+call moved somewhere that never runs) and checks each hot query shape against it.
+It also carries a floor assertion so the mechanism cannot silently empty and
+report green.
+
+`tests/_perf.py` is the shared instrument: a `count_queries()` context manager and
+a `measure()` helper that reports **cold and warm timings separately** — several
+handlers import their service module inside the function body, and conflating that
+once-per-process import with steady-state latency is how PH3.4 nearly attributed
+288 ms to an endpoint that runs in 11 ms.
+
+---
+
 # Load Testing
 
 Simulate
