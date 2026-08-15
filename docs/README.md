@@ -12,7 +12,7 @@ Welcome to the documentation for this repository. Our documentation is organized
 - **[infrastructure/](infrastructure/README.md)**: Backing services the application runs on — how each is configured, connected to, and recovered.
 - **[operations/](operations/README.md)**: Deployment guides, production hardening plans, monitoring, logging, backup & restore, and disaster recovery.
 - **[testing/](testing/README.md)**: Test architecture, suite classification, markers, commands, and coverage baselines.
-- **[performance/](performance/README.md)**: Measured performance baselines, query-plan analysis, optimizations with before/after evidence, and the profiling tools.
+- **[performance/](performance/README.md)**: Measured performance baselines, query-plan analysis, optimizations with before/after evidence, the profiling tools, and the load-test harness with the capacity envelope it established.
 - **[runbooks/](runbooks/README.md)**: Incident artifacts — the postmortem template and completed postmortems. The recovery *procedures* live in `operations/DISASTER_RECOVERY.md`.
 - **[getting-started/](getting-started/README.md)**: Setup guides for new engineers and contributors.
 

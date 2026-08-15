@@ -28,6 +28,8 @@ from services.real_market import (
     resolve_yahoo_ticker,
     fetch_yahoo_quote,
     fetch_real_stock_quote,
+    yahoo_origin,
+    yahoo_origin_overridden as _origin_overridden,
 )
 
 logger = logging.getLogger(__name__)
@@ -95,14 +97,21 @@ async def _get_crumb_session(force: bool = False):
             return _session["cookies"], _session["crumb"]
         try:
             async with httpx.AsyncClient(timeout=10, follow_redirects=True, headers=_HEADERS) as client:
+                # The cookie-planting request goes to a *different* Yahoo host
+                # than the query hosts, so it follows the origin override
+                # separately (PH3.5). With an override in place there is no
+                # `fc.yahoo.com` to reach and no reason to reach for it — going
+                # anyway would be the one outbound request a redirected origin
+                # failed to redirect.
+                cookie_url = yahoo_origin("fc") if _origin_overridden() else "https://fc.yahoo.com"
                 try:
                     # Any response (even 404) sets the required cookies
-                    await client.get("https://fc.yahoo.com")
+                    await client.get(cookie_url)
                 except httpx.HTTPError:
                     pass
                 for host in _QUERY_HOSTS:
                     try:
-                        resp = await client.get(f"https://{host}.finance.yahoo.com/v1/test/getcrumb")
+                        resp = await client.get(f"{yahoo_origin(host)}/v1/test/getcrumb")
                     except httpx.HTTPError:
                         continue
                     crumb = (resp.text or "").strip()
@@ -132,7 +141,7 @@ async def fetch_quote_summary(symbol: str, modules: list):
         params = {"modules": ",".join(modules), "formatted": "false", "crumb": crumb}
         auth_failed = False
         for host in _QUERY_HOSTS:
-            url = f"https://{host}.finance.yahoo.com/v10/finance/quoteSummary/{ticker}"
+            url = f"{yahoo_origin(host)}/v10/finance/quoteSummary/{ticker}"
             try:
                 async with httpx.AsyncClient(timeout=10, headers=_HEADERS, cookies=cookies) as client:
                     resp = await client.get(url, params=params)
@@ -564,7 +573,7 @@ async def _fetch_timeseries_table(ticker: str, statement: str, period: str):
         "merge": "false",
     }
     for host in _QUERY_HOSTS:
-        url = f"https://{host}.finance.yahoo.com/ws/fundamentals-timeseries/v1/finance/timeseries/{ticker}"
+        url = f"{yahoo_origin(host)}/ws/fundamentals-timeseries/v1/finance/timeseries/{ticker}"
         try:
             async with httpx.AsyncClient(timeout=10, headers=_HEADERS) as client:
                 resp = await client.get(url, params=params)

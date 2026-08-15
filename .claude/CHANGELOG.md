@@ -5,6 +5,153 @@ This file records documentation-system versions and, from v1.0 launch onward, pr
 
 ---
 
+# Sprint PH3.5 — Load Testing & Capacity Validation — 2026-08-14
+
+**Full report:** `docs/performance/PH3.5_LOAD_TEST_CERTIFICATION.md`.
+
+**Numbering.** The sprint brief labelled this work PH3.5. This repository's roadmap
+numbers PH3.5 as *API Contract & Error-State Testing* (already delivered under the
+brief label "PH3.3") and numbers this work as the **load-testing half of PH3.7 —
+Performance Benchmarking & Load Testing**, whose benchmarking half was the brief's
+PH3.4. Both halves of PH3.7 are now complete. The certification keeps the brief's
+label, matching the PH3.2/PH3.3/PH3.4 precedent; the roadmap carries the
+cross-reference.
+
+**The application code is not the constraint, and neither is MongoDB.** At every
+tested concurrency from 5 to 100 virtual users the system served **zero 5xx, zero
+timeouts and passed 100% of functional checks**, with a median latency that did not
+move: **10.9 ms at 5 users, 8.3 ms at 100**. MongoDB never queued a single
+operation, and PH3.4's measured per-request floor of 4–5 queries held at
+**3.9–4.6 across a 65× load range**. Six of PH3.4's seven claims were confirmed
+under concurrency. **The seventh was corrected, and it is one of this sprint's three
+P1 findings.**
+
+**L-1 — the Redis client pool is sized below the application's own fan-out width,
+and the failure it produces is a cascade rather than a slowdown.**
+`REDIS_MAX_CONNECTIONS` defaults to **24**. One watchlist request fans out a quote
+lookup per symbol, each doing its own `cache_get`; a few such requests plus the
+background market loop exceed 24 concurrent commands. **redis-py's pool does not
+queue when exhausted — it raises immediately**, and five consecutive failures open a
+**process-wide** circuit breaker that degrades *the entire cache* to the in-process
+fallback for 10 seconds. During those 10 seconds every quote misses and goes
+upstream, which is the worst possible moment to add provider load. It scales sharply
+and non-linearly: p95 at 100 rps **21 ms**, at 150 rps 187 ms, at 200 rps 515 ms, at
+250 rps **10,485 ms**. **Re-running the identical sweep with
+`REDIS_MAX_CONNECTIONS=200` removes it completely** — 11.1 ms at 250 rps, 29.1 ms at
+400 rps, **zero** Redis failures at every rate — lifting sustained read throughput
+from **~217 to ~410 rps (1.9×) with no code change**. The ceiling that remains is an
+honest one: at 400 rps the uvicorn worker is at **100.0% of one CPU core**, which is
+what a single-process Python event loop should be limited by.
+
+**L-2 — a market broadcast is silently dropped under socket churn.**
+`ConnectionManager.broadcast()` iterates `self.active` **directly** while awaiting
+`ws.send_text` inside the loop, and every `await` is a point where another task can
+run `connect()`/`disconnect()`. At 200 concurrent sockets with 14,057 open/close
+cycles it raised `RuntimeError: Set changed size during iteration` — **every client
+after the mutation point receives nothing, and the event-bus publish that follows
+the loop is skipped too**. The sibling method `broadcast_to_channel` already iterates
+a `list(...)` copy, so the fix is one line. Steady-state connections never expose
+this; only churn does.
+
+**L-3 — bcrypt runs synchronously on the event loop.** `security/passwords.py` pins
+cost 12 — correct, and not something to trade away — measured at **234 ms per
+verification**. Because the call is not offloaded, login throughput is **pinned at
+~4 logins/second regardless of how many users are waiting** (4.02/s at 5 users,
+4.06/s at 25 — 1/234 ms to three significant figures, perfectly serialised on one of
+eight cores). **The proof is not the login numbers but the neighbouring ones:**
+`/refresh` and `/logout` perform no bcrypt at all and have a 3–4 ms floor, yet their
+medians rise to **1,670 ms and 1,430 ms** at 25 concurrent users. They are queued
+behind bcrypt. This is what corrects PH3.4 §13's "no synchronous blocking operation
+in an async request path" — single-request measurement cannot see a queue.
+
+**Everything else held, and several things held better than expected.** Provider
+failure is contained completely: with the market provider injected at 30% errors,
+10% timeouts or +800 ms, and the AI provider at 6 s plus 20% rate-limiting, there
+were **zero 5xx and zero timeouts in every phase**, and AI degradation did not
+contaminate the rest of the API (`api` p95 stayed at 30.5 ms while `ai` p95 sat at
+the injected 6,152 ms). Rate limiting was exact at its boundary — 120 served, then
+429 with `Retry-After` on 100% of rejections — and a throttled identity never
+affected a bystander (**0 of 39** blocked). The 60 s quote cache collapsed **7,044
+quote-enriched requests into 583 upstream fetches (91.7%)** with **no thundering
+herd at TTL expiry**, answering in the negative the risk PH3.4 flagged as the most
+likely load finding. 150 WebSocket connections held 75 s with zero errors and a 2 ms
+ping→pong p95.
+
+**Capacity, stated with its constraint rather than as a user count.** Safe sustained
+read throughput is **~100 rps** on the shipped Redis pool and **~300 rps** with
+`REDIS_MAX_CONNECTIONS≈100`; the hard ceiling is ~410 rps, CPU-bound on one worker.
+**Login is capacity-limited far more tightly at ~4/s per worker** — the number to
+plan a launch spike or any mass re-authentication around. This is explicitly **not**
+a claim that the product supports *N* users: converting rps into users needs a
+per-user request rate that only production telemetry can supply, and the traffic
+model here is derived from the product's structure rather than observed behaviour.
+
+**One application change, and it is inert by default.**
+`services/real_market.py::yahoo_origin()` reads `MARKET_DATA_YAHOO_BASE` at call
+time; unset — the only supported production value — the URLs are byte-identical to
+before. All seven Yahoo call sites across `real_market.py` and `stock_details.py`
+route through it. A harness monkeypatch was rejected as the alternative because it
+would exercise a code path production does not have, making the measurement
+non-transferable. The AI side needed no application change at all: the SDK reads
+`ANTHROPIC_BASE_URL` itself. **12 tests pin both halves of the contract** — inert by
+default, and actually effective when set, because a working provider and a working
+mock produce the same green result. **Verification did not rely on either mechanism
+being correct:** every outbound TCP connection from the backend during a run was
+enumerated and every one was loopback.
+
+**Nothing in the findings table was fixed.** Changing application code mid-sprint
+invalidates every measurement taken before the change; findings that belong to a
+later sprint are documented and handed off with their evidence and, where short,
+their exact remediation. **L-1 → PH3.7 (config), L-2 → next real-time sprint, L-3 →
+next auth sprint**, plus L-4 multi-worker scaling (P2), L-6 (**there is no
+Redis-backed rate-limit store — only Mongo; PH3.4 §21.5 and the roadmap imply
+otherwise**), S-1 (`X-Forwarded-For` honoured with no trusted-proxy check, so the
+anonymous tier is bypassable) and S-2 (unauthenticated `user_id` on `/api/ws` —
+already tracked as PH1.9).
+
+**No security control was modified, weakened or disabled to obtain any number
+here.** Rate limiting stayed on for every run *including the saturation search*,
+where turning it off would have raised the ceiling; every 429 observed is explained
+rather than eliminated. No `X-Forwarded-For` spoofing was used to widen the
+anonymous budget even though it would have worked — it is reported as S-1 instead.
+bcrypt cost 12 was not lowered; login was given the loosest threshold instead of the
+cost factor being treated as tunable. One accidental exposure — a first boot that
+inherited `backend/.env` — was found, closed with `PYTHON_DOTENV_DISABLED=1`, and
+the stray rows it wrote to the development database were removed and verified gone.
+
+**Two of this sprint's own results were wrong before they were right, and both are
+recorded because the error is instructive.** A 4.4% "error rate" was the risk engine
+correctly refusing over-drawn paper orders — the harness was generating orders
+larger than the seeded balances. And 83 consecutive CSRF failures on `/logout-all`
+were the harness reusing a token the server had **correctly rotated**: `/refresh`
+re-mints the double-submit value, which is exactly what that scheme should do, and a
+browser re-reads the cookie every time. Neither was reported as a defect.
+
+**Load testing stays an explicit workflow and was deliberately not added to PR CI:**
+every run needs Redis, a seeded MongoDB, two mock processes and a warmed backend,
+and a latency threshold on a shared runner goes red when the runner is busy and
+green on a fast runner that just regressed — which is how a check ends up
+`continue-on-error` and stops meaning anything. A scheduled `baseline` run against a
+persistent staging deployment (trends survive noisy runners; single thresholds do
+not) plus a manual `workflow_dispatch` for heavier stages are handed to PH3.7.
+
+**One correction found while committing the harness (2026-08-15):** the
+repository-wide `*.env` rule silently swallowed `scripts/load/env/loadtest.env`, so
+`git add scripts/load` skipped it and the harness would have arrived **unrunnable**
+for anyone cloning — with the reproducibility instructions pointing at a file that
+was never committed. Fixed with one negation rule beside the existing
+`!.env.example` exceptions; every value in that file is synthetic and
+self-labelling, and it is never sourced by the application.
+
+**No regression.** Backend 2,176 → **2,188 passed** (+12, this sprint's), PH1
+security **452 passed, unchanged**, frontend **319 passed**, production build green,
+bundle 172.8 KiB gzip initial (unchanged within noise), and a production-shaped
+import confirms the provider override inert. **No API contract, response shape,
+trading logic, AI decision logic, prompt, model selection, index or security control
+was changed, and no frontend source was modified.**
+
+---
+
 # Sprint PH3.4 — Performance Engineering & Optimization — 2026-08-14
 
 **Full report:** `docs/performance/PH3.4_PERFORMANCE_CERTIFICATION.md`.

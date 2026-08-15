@@ -18,6 +18,63 @@ CACHE_TTL = 60  # 1 minute cache for live data, longer when market closed
 
 ALPHA_VANTAGE_BASE = "https://www.alphavantage.co/query"
 
+
+# --------------------------------------------------------------------------- #
+# Provider origin — overridable for non-production environments (PH3.5)         #
+# --------------------------------------------------------------------------- #
+#: When set, every Yahoo Finance request in this module and in
+#: `services.stock_details` is issued against this origin instead of
+#: ``https://<host>.finance.yahoo.com``. Unset (the default, and the only
+#: supported production value) the URLs are byte-identical to what they were
+#: before this variable existed.
+#:
+#: WHY THIS EXISTS. PH3.5 load-tests the quote fan-out, which is the hottest
+#: outbound path in the system (once per symbol, 12–50 symbols per request).
+#: Driving that at 50 concurrent users would mean thousands of requests per
+#: minute at Yahoo Finance — which the PH3.5 brief (§14) forbids outright, and
+#: which would in any case measure Yahoo's throttle rather than StockAssist's
+#: capacity. The alternative — monkeypatching the call sites from the load
+#: harness — would exercise a code path that does not exist in production, so
+#: the measurement would not transfer. Redirecting the origin keeps every line
+#: of application code (pooling, timeouts, caching, error containment, indicator
+#: maths) on exactly the path production takes, and changes only where the bytes
+#: come from.
+#:
+#: This mirrors the mechanism the Anthropic SDK already provides via
+#: ``ANTHROPIC_BASE_URL``, which PH3.5 uses for the same reason on the AI path.
+#: It is a *test-environment* affordance, not a provider-selection feature:
+#: MARKET_DATA_ARCHITECTURE.md remains authoritative for which provider serves
+#: production traffic, and this variable must never be set in production.
+_YAHOO_ORIGIN_ENV = "MARKET_DATA_YAHOO_BASE"
+
+
+def yahoo_origin(host: str = "query1") -> str:
+    """Scheme+authority for a Yahoo Finance request against ``host``.
+
+    Read from the environment on every call rather than captured at import,
+    because `security.secrets.load_secrets()` materialises configuration into
+    ``os.environ`` *after* this module is imported — the same reason
+    `infrastructure.redis_client.redis_url()` is a function.
+
+    A trailing slash on the override is tolerated and stripped so that callers
+    can concatenate a path without producing a double slash.
+    """
+    override = os.environ.get(_YAHOO_ORIGIN_ENV, "").strip()
+    if override:
+        return override.rstrip("/")
+    return f"https://{host}.finance.yahoo.com"
+
+
+def yahoo_origin_overridden() -> bool:
+    """True when a non-production provider origin is configured.
+
+    Callers need this only where a request targets a Yahoo host that is *not*
+    one of the query hosts (the `fc.yahoo.com` cookie bootstrap in
+    `services.stock_details`), and so cannot be redirected by host substitution
+    alone."""
+    return bool(os.environ.get(_YAHOO_ORIGIN_ENV, "").strip())
+
+
 # NSE stocks with Yahoo Finance tickers
 YAHOO_TICKERS = {
     "RELIANCE": "RELIANCE.NS", "TCS": "TCS.NS", "HDFCBANK": "HDFCBANK.NS",
@@ -75,7 +132,7 @@ async def fetch_yahoo_quote(symbol: str, range_str: str = "2d"):
         return cached
 
     try:
-        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{yahoo_ticker}?interval=1d&range={range_str}"
+        url = f"{yahoo_origin('query1')}/v8/finance/chart/{yahoo_ticker}?interval=1d&range={range_str}"
         # Pooled client (PH3.4). This function is called once per symbol and
         # fanned out with asyncio.gather — 12 for a watchlist, up to 50 for open
         # positions — so a fresh client here meant one TLS handshake per symbol to
@@ -157,7 +214,7 @@ async def fetch_dividend_info(symbols):
             return sym, cached
         result = {"available": False, "rate": None, "yield": None}
         try:
-            url = (f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/"
+            url = (f"{yahoo_origin('query2')}/v10/finance/quoteSummary/"
                    f"{yahoo_ticker}?modules=summaryDetail")
             async with http_client.client_for(timeout=8) as client:
                 resp = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
@@ -839,7 +896,7 @@ async def fetch_real_chart_data(symbol: str, period: str = "1D"):
     intraday = interval.endswith("m")
 
     try:
-        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{yahoo_ticker}?interval={interval}&range={range_str}"
+        url = f"{yahoo_origin('query1')}/v8/finance/chart/{yahoo_ticker}?interval={interval}&range={range_str}"
         async with http_client.client_for(timeout=10) as client:
             resp = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
             if resp.status_code != 200:
@@ -1135,7 +1192,7 @@ async def search_yahoo_stocks(query: str, limit: int = 10):
         return cached
 
     try:
-        url = "https://query1.finance.yahoo.com/v1/finance/search"
+        url = f"{yahoo_origin('query1')}/v1/finance/search"
         params = {"q": q, "quotesCount": 20, "newsCount": 0, "listsCount": 0}
         async with http_client.client_for(timeout=8) as client:
             resp = await client.get(url, params=params, headers={"User-Agent": "Mozilla/5.0"})

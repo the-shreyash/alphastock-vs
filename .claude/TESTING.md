@@ -717,6 +717,73 @@ WebSocket Stability
 
 ---
 
+## Load testing, as built (PH3.5)
+
+Full report: `docs/performance/PH3.5_LOAD_TEST_CERTIFICATION.md`.
+
+**The user counts above are still aspirations, and the honest number is lower than
+any of them.** PH3.5 measured **100 concurrent synthetic users** against a
+single-worker local stack; 500 and beyond were not attempted, because a figure
+produced by one uvicorn process on a shared laptop would not transfer to a
+deployment that does not exist yet. What *was* established is a capacity envelope
+with a named binding constraint at each level, which is the thing a scaling
+decision actually needs.
+
+**Tool: k6 v2.2.0**, one framework, chosen over Locust because the load driver
+should not itself be a Python process competing with the system under test for the
+GIL and the CPU that is the measured ceiling.
+
+```bash
+scripts/load/load-test.sh smoke        # ~40 s, 5 VUs — "can the stack serve traffic at all"
+scripts/load/load-test.sh baseline     # 20 VUs
+scripts/load/load-test.sh moderate     # 50 VUs
+scripts/load/load-test.sh high         # 75 VUs
+scripts/load/load-test.sh stress       # 100 VUs
+scripts/load/load-test.sh saturation   # arrival-rate ceiling search
+scripts/load/load-test.sh auth         # login throughput
+scripts/load/load-test.sh ratelimit    # 429 boundary, rejection shape, bystander isolation
+scripts/load/load-test.sh websocket    # hold and churn modes
+scripts/load/load-test.sh failure      # provider fault injection, 6 phases
+```
+
+The runner brings up the whole environment, runs a **preflight that refuses to
+start against the configured `DB_NAME`**, snapshots server-side metrics before and
+after each run, and writes every artefact to `scripts/load/results/<timestamp>-<shape>/`.
+
+### Two rules this harness exists to enforce
+
+**No third party receives load.** The brief forbids it and it would in any case
+measure the provider's throttle rather than StockAssist's capacity. Market data is
+redirected with `MARKET_DATA_YAHOO_BASE` (`services/real_market.py::yahoo_origin()`,
+read at call time, **inert when unset**), AI with the SDK's own
+`ANTHROPIC_BASE_URL` — no application change needed for the second. Both are backed
+by local stdlib mocks with a `/__control` endpoint for latency / error / timeout /
+429 injection. **Verification does not rely on either mechanism being correct:**
+every outbound TCP connection from the backend was enumerated during a run and all
+of them were loopback.
+
+**`tests/test_load_harness.py` (12 tests) pins both halves of that contract** — that
+the override is inert by default, *including* that an empty or whitespace-only value
+is treated as unset, and that it actually takes effect when set. The second half
+matters as much as the first: a working provider and a working mock produce the same
+green result, so a silently-broken redirect would send the next load test at Yahoo
+and nothing would report it. Same failure shape PH3.1 found in three "hermetic"
+tests that were reaching the live internet and passing either way.
+
+### What load found that single-request measurement could not
+
+| ID | Finding | Owner |
+|---|---|---|
+| **L-1** | `REDIS_MAX_CONNECTIONS=24` is below the app's own fan-out width; redis-py's pool **raises rather than queues** when exhausted, and 5 failures open a **process-wide** circuit breaker for 10 s — so a burst becomes a total cache outage, at the worst moment. p95 at 250 rps: **10,485 ms**. Setting the pool to 200: **11.1 ms, zero failures**, ~217 → ~410 rps sustained, no code change. | PH3.7 (config) |
+| **L-2** | `ConnectionManager.broadcast` iterates a mutating set; under socket churn it raised `RuntimeError: Set changed size during iteration`, **silently dropping a market broadcast to every client past the mutation point**. The sibling `broadcast_to_channel` already iterates a copy. | Next real-time sprint |
+| **L-3** | `verify_password` (bcrypt cost 12, 234 ms) runs **synchronously on the event loop**. Login is pinned at **~4/s** at any concurrency — and `/refresh` and `/logout`, which do no bcrypt, degrade in lockstep because they are queued behind it. This **corrects** PH3.4's "no blocking operation in an async request path". | Next auth sprint |
+
+All three needed concurrency to appear, and none of them was fixed in PH3.5 —
+changing application code mid-sprint invalidates every measurement taken before the
+change.
+
+---
+
 # Stress Testing
 
 Verify behavior during
@@ -732,6 +799,33 @@ Large AI Usage
 Large Scanner Requests
 
 Mass Notifications
+
+---
+
+## Stress and failure testing, as built (PH3.5)
+
+**Two different questions, two different instruments — and using the wrong one is
+the common mistake.** `scenarios.js` models realistic users with think-time between
+page visits, so throughput there is governed by the think-time: adding virtual users
+buys linear throughput and the system never approaches its limit. It answers "does
+plausible traffic hold up" (it did: flat 8.3 ms median from 5 to 100 VUs) and says
+nothing about the ceiling.
+
+`saturation.js` removes think-time and drives a **fixed arrival rate**. That is the
+correct instrument for "where does it break", because with `ramping-arrival-rate`
+k6 keeps offering the requested rate when the system slows down, so the queue
+becomes visible — whereas with `ramping-vus` a system that slows down simply
+receives less traffic and hides its own saturation.
+
+`load-test.sh failure` covers the degradation half: the market mock injected at 30%
+errors, 10% timeouts and +800 ms latency, and the AI mock at 6 s plus 20%
+rate-limiting. **Zero 5xx and zero timeouts in every phase**, and AI degradation did
+not contaminate the rest of the API — `api` p95 stayed at 30.5 ms while `ai` p95 sat
+at the injected 6,152 ms.
+
+Market-open and breaking-news bursts remain untested as *named scenarios*; the
+traffic shapes that would produce them (burst arrival, socket fan-out under churn)
+are covered by `saturation.js` and `websocket.js -e WS_CHURN=1`.
 
 ---
 
@@ -884,6 +978,26 @@ Sessions
 Rate Limits
 
 Queue
+
+## Measured under concurrency (PH3.5)
+
+Redis was **entirely unmeasured** before PH3.5 — PH3.4 marked it explicitly
+unavailable because the measurement host had no Redis running. With one running, it
+turned out to be **the system's first bottleneck** (L-1 above), and the mechanism is
+worth knowing before reading any Redis number in this repository:
+
+* **Caching works, and works well.** The 60 s quote cache collapsed **7,044
+  quote-enriched requests into 583 upstream fetches (91.7%)**, with **no thundering
+  herd at TTL expiry** at any tested level — answering PH3.4's flagged "most likely
+  load-test finding" in the negative. It remains theoretical at higher fan-out and
+  under multiple workers, where each worker holds an independent cache.
+* **The client pool is the problem, not the server.** Redis itself sat at 25 of
+  10,000 available client slots. The exhaustion is entirely in redis-py's pool
+  sizing on the application side.
+* **"Rate Limits" above describes something that does not exist.** There is **no
+  Redis-backed rate-limit store** — only `MongoRateLimitStore`. PH3.4 §21.5 and the
+  roadmap both imply otherwise. Recorded as **L-6**, owned by the next
+  security-touching sprint.
 
 ---
 

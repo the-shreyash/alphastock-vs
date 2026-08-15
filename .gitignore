@@ -104,6 +104,15 @@ android-sdk/
 # backend/security/secrets.py via scripts/generate_env_example.py).
 !.env.example
 !**/.env.example
+# …and the PH3.5 load-test environment, for the same reason: a load test is only
+# useful if it is repeatable, and it is not repeatable unless the environment it
+# ran against is written down exactly. Every value in it is synthetic and
+# obviously so — a scratch database name, a loopback Redis index, and a key that
+# is literally the word "loadtest". It is never sourced by the application; only
+# by scripts/load/load-test.sh, which preflights that it is not pointed at the
+# configured DB_NAME. Without this line `git add scripts/load` silently skips it
+# and the harness arrives unrunnable for anyone who clones the repository.
+!scripts/load/env/loadtest.env
 credentials.json
 *.key
 .credentials
