@@ -45,10 +45,28 @@ TICK_EMIT_INTERVAL = 3.0
 # Per-user last emission time (time.monotonic()).
 _last_emit: dict = {}
 
+# Bound + staleness horizon for the throttle map (PH3.6). Identical policy to
+# `services/portfolio_stream.py` — see the comment there for why an unbounded
+# per-user float map is worth bounding even though each entry is tiny. Kept as
+# two independent maps rather than one shared module because the two streams
+# throttle independently and always have.
+_MAX_TRACKED_USERS = 4096
+_STALE_AFTER_SECONDS = 300.0
+
 
 def reset_state() -> None:
     """Clear throttle state (tests)."""
     _last_emit.clear()
+
+
+def _prune(now: float) -> None:
+    """Drop stamps that can no longer suppress anything, then bound the rest."""
+    for user_id in [u for u, ts in _last_emit.items() if (now - ts) >= _STALE_AFTER_SECONDS]:
+        _last_emit.pop(user_id, None)
+    overflow = len(_last_emit) - _MAX_TRACKED_USERS + 1
+    if overflow > 0:
+        for user_id, _ in sorted(_last_emit.items(), key=lambda kv: kv[1])[:overflow]:
+            _last_emit.pop(user_id, None)
 
 
 def _tick_allowed(user_id: str, now: Optional[float] = None) -> bool:
@@ -58,7 +76,16 @@ def _tick_allowed(user_id: str, now: Optional[float] = None) -> bool:
 
 
 def _stamp(user_id: str, now: Optional[float] = None) -> None:
-    _last_emit[str(user_id)] = time.monotonic() if now is None else now
+    now = time.monotonic() if now is None else now
+    key = str(user_id)
+    if len(_last_emit) >= _MAX_TRACKED_USERS and key not in _last_emit:
+        _prune(now)
+    _last_emit[key] = now
+
+
+def throttle_stats() -> dict:
+    """Size snapshot for the resource probe."""
+    return {"tracked_users": len(_last_emit), "max_tracked_users": _MAX_TRACKED_USERS}
 
 
 def _price_of(quote) -> Optional[float]:

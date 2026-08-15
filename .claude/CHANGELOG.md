@@ -5,6 +5,155 @@ This file records documentation-system versions and, from v1.0 launch onward, pr
 
 ---
 
+# Sprint PH3.6 — Memory & Resource Stability — 2026-08-15
+
+**Full report:** `docs/performance/PH3_MEMORY_STABILITY.md`.
+
+**Numbering.** The sprint brief labelled this work PH3.6. This repository's roadmap
+numbers PH3.6 as *Backend Decomposition (server.py → Routers)*, which is **untouched
+and still NOT_STARTED**. Same brief-label-vs-tracker drift as PH3.2–PH3.5; the
+certification keeps the brief's label and the roadmap carries the cross-reference.
+
+**PH3.5 handed this sprint the advice to start from "no leak is visible at these
+durations" rather than hunting one. That advice was correct about its own data and
+wrong as a conclusion, and the reason is the single most useful sentence to carry
+forward: RSS is the wrong instrument for the leaks this application actually has.**
+Both confirmed leaks are Python dicts that gain one entry per event and never lose
+one. An entry costs a few hundred bytes; ten thousand of them weigh less than the
+noise between two idle RSS samples. PH3.5's memory curve was accurate, honest and
+structurally incapable of showing either defect. **A leak is a shape — a count that
+only ever rises — not a size.** This sprint counted entries instead of bytes and
+found in the first hour what 150,000 requests of throughput testing could not.
+
+**M-1 (P0) — the WebSocket manager retained a dict key per connection, forever, and
+the key is attacker-chosen.** `ConnectionManager.disconnect()` removed the socket
+from the user's set and left `{user_id: set()}` behind; `_reap()` — the path a
+*dropped* connection takes, so the one that runs during exactly the churn that
+produces the most keys — had the same gap. The key is
+`websocket.query_params["user_id"]`, which **nothing authenticates** (S-2, tracked
+to PH1.9), so an anonymous caller can mint a fresh key on every connection.
+Measured: **1,000 clean connect/disconnect cycles left 1,000 empty sets; 500 dirty
+disconnects left 500.** Neither returned; the only thing that ever emptied the map
+was a process restart.
+
+**M-2 (P0) — the AI chat-context cache checked its TTL on read and evicted
+nothing.** `ai_context_builder._cache` maps a user id to a `ChatContext`: the
+rendered markdown block of live market, portfolio and news text **plus** the
+structured sections it was rendered from, several KB per entry. Measured: **5,000
+users, every entry 999 seconds stale, 5,000 live entries retained**, none of them
+reachable by any code path again. Now bounded at 512 with sweep-expired-then-evict-
+oldest — deliberately the same idiom as `services/cache.py`, so the codebase has one
+eviction pattern rather than two.
+
+**M-3 (P1) — PH3.5's L-2 confirmed and fixed.** `broadcast()` iterated the live
+socket set across an `await`; reproduced as `RuntimeError: Set changed size during
+iteration`. The exception is the *lucky* outcome — it is loud. The unlucky one is
+what it implies: every socket past the mutation point silently misses the message
+and the event-bus publish after the loop never happens. `send_to_user()` had the
+same bug on the per-user set; `broadcast_to_channel` already snapshotted.
+
+**M-4 (P2) — four perpetual loops had no shutdown path at all.**
+`market_broadcast_loop`, `ai_monitoring_loop` and both heartbeat loops were started
+with bare `asyncio.create_task` and the result discarded. Two defects in one line:
+asyncio keeps only a **weak** reference to a running task (a loop collected
+mid-execution leaves no exception and no log line — the dashboard just goes quiet),
+and a task nobody holds is a task nobody can cancel. `shutdown()` was closing the
+scheduler, broker streams, Redis, the HTTP pool and finally the Mongo client **while
+all four loops kept running against them** — and both heartbeat loops read Mongo, so
+a clean stop emitted a burst of connection errors indistinguishable in the logs from
+a crash. New `backend/infrastructure/tasks.py` holds the references, refuses a
+duplicate name (closing the coroutine it was handed rather than leaking the frame),
+cancels within a bounded 5s, and releases a task that finishes on its own so the
+registry cannot become the leak it was written to prevent. Shutdown now cancels the
+producers **before** the resources they use.
+
+**M-8 — MongoDB pooled connections were never reaped when idle.** The client was
+`AsyncIOMotorClient(mongo_url)` with every bound and timeout at the driver default
+and none of them written down: PH2.8's "connection-pool sizing documented" was
+displaced to PH2.8b and never executed. The *sizes* were never the problem
+(`maxPoolSize=100` against PH3.5's measured 18–28). `maxIdleTimeMS` unset was: a
+spike that opens 60 connections leaves 60 open until restart, a pool that only
+ratchets up. Now 60s, with every other option made explicit and env-overridable at
+its existing value. **`socketTimeoutMS` was deliberately NOT set** — no read timeout
+means a query against a wedged primary holds its request forever, but choosing a
+number requires the slowest legitimate production query, and a value picked from a
+laptop starts aborting real work under load. Wired to `MONGO_SOCKET_TIMEOUT_MS` and
+carried as an open risk to be baselined in staging.
+
+**Also fixed:** M-5 two unbounded per-user emission-throttle maps; M-6
+`BrokerStreamManager` retaining a finished stream — and the **expired broker access
+token** inside it — after `_AuthExpired`; M-7 `start_event_bridge` registering the
+catch-all `"*"` bus handler unconditionally, so a second call would double delivery
+of every event forever. Frontend: F-1 `tradeLive.byId` merged each snapshot onto the
+previous map although every producer publishes the user's *complete* open set, so a
+closed trade was retained forever **and displayed as open**; F-2 unbounded
+multi-KB AI trade reviews; F-3 an `aiRuns` cap that never evicts an `active` run and
+`break`s when all are active — a socket dropping mid-run leaves a run active forever,
+so enough dropped runs defeat the cap entirely.
+
+**What was checked and found correct is part of the result.**
+`infrastructure/redis_client.py` and `redis_pubsub.py` have **no defect** and are
+recorded as the reference the rest of the backend should look like: one client
+construction site, a circuit breaker that re-tests rather than latches, Pub/Sub on a
+dedicated connection, backoff with jitter, exactly one subscriber per channel,
+individually guarded teardown. Also clean: every Mongo cursor (`to_list(N)`
+everywhere, no `to_list(None)`), metric label cardinality with its overflow series,
+the bounded log queue, and the **entire frontend timer / listener / observer / GSAP
+surface** — 13 `setInterval` sites, 6 `addEventListener` sites, one `ResizeObserver`
+and every GSAP context, all with matching cleanup, plus a `RealtimeProvider` whose
+reconnect path cannot accumulate handlers by construction.
+
+**The bounded structures are now observable.** Six new gauges
+(`websocket_tracked_users`, `websocket_connections`, `background_tasks_running`,
+`event_bus_subscribers`, `app_cache_entries{cache=...}`) expose the counts, because
+a bound nobody can see is a bound nobody will notice breaking — both P0 leaks grew
+for the life of a process without appearing on any dashboard. **The alert worth
+writing first** is `websocket_tracked_users` holding a floor above zero while
+`websocket_connections` is at zero: that is M-1's exact signature.
+
+**Two new instruments, and they answer a question the load harness cannot.**
+`backend/scripts/resource_probe.py` drives the application's own objects in-process
+through seven scenarios and exits non-zero if a lifecycle structure fails to return
+to baseline or a cache exceeds its ceiling. `scripts/load/soak.sh` samples
+`/api/metrics` every 30s for the **whole** run plus an idle settle window — PH3.5's
+harness snapshots before and after, which cannot distinguish "grew and came back"
+from "never grew", and a ratchet is only visible as a series.
+
+**The caches sitting exactly at their ceilings in the baseline is the result, not a
+warning.** Each was driven with 3–10× its bound; landing *at* the bound and not one
+entry past it is the only evidence the eviction path executes. A constant in the
+source proves nothing — that is the same class of claim as PH2.12's stub that agreed
+with a bug.
+
+**Every regression test was verified to fail on the old code.** Run against the
+pre-PH3.6 tree, **18 of 26 failed**. The 8 that passed are the 6 covering the new
+task registry (no old behaviour to fail against) and the 2 deliberate counter-tests
+that assert *preserved* behaviour — without which deleting `_stamp`'s body entirely
+would satisfy every ceiling assertion perfectly.
+
+**One of this sprint's own measurements was wrong before it was right, and is
+recorded because the error is instructive.** The first soak attempt reported samples
+on schedule for six minutes while k6 never ran: `pid="$(start_sampler ...)"` blocks
+until the backgrounded subshell closes stdout, so the load generator was never
+started and the run was measuring an idle server. Fixed by redirecting the
+subshell's stdout, and the reason is now a comment in the script. Separately, one
+full-suite run reported a `test_perf_regression` failure that was this sprint's own
+method: that test reads `server.py` through `inspect.getsource`, and the file was
+being edited while the background run was in progress. Neither was reported as a
+finding, in the same spirit as PH3.4 §3.3 and PH3.5's two self-corrections.
+
+**No regression:** backend **2,188 → 2,216 passed** (6 xfail unchanged), PH1 security
+**452 unchanged**, frontend **319 → 324 passed**, production build green. No trading
+logic, AI decision logic, prompt, model selection, API contract or design-system
+change. **PH3.6 STATUS: PASS WITH CONDITIONS** — five conditions, all environmental
+rather than defects: `MONGO_SOCKET_TIMEOUT_MS` to be baselined in staging;
+multi-worker resource behaviour unmeasured (the resource budget is **per worker**);
+multi-day operation unmeasured; Mongo TTL reaping of `sessions`/`rate_limits` under
+sustained write rate unmeasured; frontend bounds asserted structurally rather than
+heap-profiled.
+
+---
+
 # Sprint PH3.5 — Load Testing & Capacity Validation — 2026-08-14
 
 **Full report:** `docs/performance/PH3.5_LOAD_TEST_CERTIFICATION.md`.

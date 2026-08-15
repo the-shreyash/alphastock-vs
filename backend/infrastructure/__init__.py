@@ -28,7 +28,17 @@ A future migration to Sentinel or Cluster is a change to that one function.
 
     ok, value = await redis_client.execute("get", lambda r: r.get(key))
     await redis_pubsub.start_subscriber("sa:events", handler)
-"""
-from infrastructure import redis_client, redis_pubsub  # noqa: F401
 
-__all__ = ["redis_client", "redis_pubsub"]
+PH3.6 added ``tasks`` to this package on the same test: a supervised asyncio
+task registry is *how this process runs work*, and it knows nothing about
+portfolios, trades or quotes. It is the shutdown path the perpetual loops in
+``server.py`` and ``services/heartbeat_engine.py`` did not have.
+
+    from infrastructure import tasks
+
+    tasks.spawn("market-broadcast-loop", market_broadcast_loop())
+    await tasks.cancel_all()
+"""
+from infrastructure import redis_client, redis_pubsub, tasks  # noqa: F401
+
+__all__ = ["redis_client", "redis_pubsub", "tasks"]

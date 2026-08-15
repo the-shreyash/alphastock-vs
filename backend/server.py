@@ -125,6 +125,17 @@ from security.passwords import hash_password, verify_password
 from security.identifiers import parse_object_id
 from security.roles import validate_role_assignment
 
+# Supervised background tasks (PH3.6). Every perpetual loop this process starts
+# is registered here so it (a) keeps a strong reference for its whole life — the
+# event loop holds only a weak one — and (b) has a cancellation path in
+# `shutdown()`. Before this, four loops kept running against a Mongo client that
+# was already closing. See infrastructure/tasks.py.
+# Aliased `task_registry`, not `background_tasks`: FastAPI's own
+# `BackgroundTasks` parameter is called `background_tasks` in five route
+# handlers in this file, and two different things under one name in one
+# module is a trap for whoever reads it next.
+from infrastructure import tasks as task_registry
+
 # Centralized observability (PH2.5). `observability.logging` already owns the
 # root logger (configured at the top of this file, before these imports); the
 # rest of the package is wired below:
@@ -158,8 +169,77 @@ from market_data import get_stock_meta, search_stocks, STOCK_UNIVERSE
 # explicit "unavailable" payload — never simulated values.
 
 # MongoDB
+#
+# CONNECTION-POOL CONFIGURATION (PH3.6)
+# -------------------------------------
+# This was `AsyncIOMotorClient(mongo_url)` — every pool and timeout left at the
+# driver's default, none of them written down anywhere. The sizes were never the
+# problem: pymongo's default `maxPoolSize=100` is a real ceiling, and PH3.5
+# measured 18 connections at steady state and 28 at 400 rps, comfortably inside
+# it. Two of the *unset* defaults were the problem, and only one of them is
+# changed here.
+#
+#   maxIdleTimeMS — pymongo's default is None, meaning a pooled connection is
+#       NEVER closed for being idle. A load spike that opens 60 connections
+#       leaves 60 open forever; the pool is a ratchet that only goes up until
+#       the process restarts. That is a resource lifecycle defect rather than a
+#       tuning preference, and it is the one default this sprint changes.
+#
+#   socketTimeoutMS — pymongo's default is None: no read timeout at all, so a
+#       query against a wedged primary blocks its request FOREVER, holding a
+#       connection, a worker slot and everything the handler had allocated.
+#       Deliberately still unset here. Picking a number requires knowing the
+#       slowest legitimate query on production hardware, and nothing in this
+#       repository knows that — a value chosen from a laptop would start
+#       aborting real work under load. It is wired to an env var so staging can
+#       baseline it, and recorded as an open risk in
+#       docs/performance/PH3_MEMORY_STABILITY.md §18.
+#
+# Every other value below is pymongo's own default, made explicit and
+# overridable. Making them explicit is most of the point: PH2.8's "connection-
+# pool sizing documented" was displaced to PH2.8b and never done, so until now
+# the deployed pool configuration existed only as library defaults nobody had
+# read.
+def _mongo_int(name: str, default: Optional[int]) -> Optional[int]:
+    """Read an integer pool/timeout setting from the environment.
+
+    Unset, empty or unparseable keeps `default`. A value of zero or less returns
+    None, which omits the option entirely and hands the decision back to
+    pymongo — the safe reading of "the operator explicitly asked for no limit",
+    and never an accidental `maxPoolSize=0`.
+    """
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logging.warning("%s=%r is not an integer — using default %r", name, raw, default)
+        return default
+    return value if value > 0 else None
+
+
 mongo_url = os.environ['MONGO_URL']
-client = AsyncIOMotorClient(mongo_url)
+MONGO_CLIENT_OPTIONS = {
+    # Ceiling on concurrent operations per process. pymongo's default.
+    "maxPoolSize": _mongo_int("MONGO_MAX_POOL_SIZE", 100),
+    # Connections kept warm when idle. pymongo's default (0 = keep none warm).
+    "minPoolSize": _mongo_int("MONGO_MIN_POOL_SIZE", 0),
+    # THE CHANGE: reap connections idle longer than this, so the pool returns to
+    # its steady state after a spike instead of holding the high-water mark.
+    "maxIdleTimeMS": _mongo_int("MONGO_MAX_IDLE_TIME_MS", 60_000),
+    # How long an operation waits for a suitable server before failing. pymongo's
+    # default. Bounded already, and lowering it is a deployment decision.
+    "serverSelectionTimeoutMS": _mongo_int("MONGO_SERVER_SELECTION_TIMEOUT_MS", 30_000),
+    # TCP connect timeout. pymongo's default.
+    "connectTimeoutMS": _mongo_int("MONGO_CONNECT_TIMEOUT_MS", 20_000),
+    # Read timeout. None = pymongo's default (no timeout). See above.
+    "socketTimeoutMS": _mongo_int("MONGO_SOCKET_TIMEOUT_MS", None),
+}
+client = AsyncIOMotorClient(
+    mongo_url,
+    **{k: v for k, v in MONGO_CLIENT_OPTIONS.items() if v is not None},
+)
 db = client[os.environ['DB_NAME']]
 
 # Centralized security audit logging (PH1.10). Wire the process-wide default
@@ -2958,7 +3038,18 @@ class ConnectionManager:
         self.active.discard(ws)
         self.channels.pop(ws, None)
         if user_id and user_id in self.user_connections:
-            self.user_connections[user_id].discard(ws)
+            conns = self.user_connections[user_id]
+            conns.discard(ws)
+            # Drop the key once the last socket for this user goes (PH3.6).
+            #
+            # Leaving `{user_id: set()}` behind looks harmless and is not: the
+            # key is `websocket.query_params["user_id"]`, which nothing
+            # authenticates (S-2, tracked to PH1.9), so an anonymous caller can
+            # mint a new key on every connection. 1,000 connect/disconnect
+            # cycles left 1,000 empty sets in this dict — measured — and the
+            # only thing that ever emptied it was a process restart.
+            if not conns:
+                del self.user_connections[user_id]
 
     def subscribe(self, ws: WebSocket, channels):
         """Add one or more channels to a socket's subscription set."""
@@ -2985,7 +3076,15 @@ class ConnectionManager:
     async def broadcast(self, message: dict):
         payload = self._serialize(message)
         dead = set()
-        for ws in self.active:
+        # Iterate a SNAPSHOT, not the live set (PH3.5 finding L-2, fixed PH3.6).
+        # `await ws.send_text(...)` yields to the event loop, and any socket that
+        # disconnects during that yield calls `disconnect()`, which mutates
+        # `self.active`. Iterating it directly raised `RuntimeError: Set changed
+        # size during iteration` under churn — silently dropping the broadcast to
+        # every client past the mutation point *and* skipping the event-bus
+        # publish that follows the call. `broadcast_to_channel` below already
+        # snapshotted; this method did not.
+        for ws in list(self.active):
             try:
                 await ws.send_text(payload)
             except Exception:
@@ -3010,7 +3109,10 @@ class ConnectionManager:
             return
         payload = self._serialize(message)
         dead = set()
-        for ws in conns:
+        # Snapshot for the same reason `broadcast` does: `conns` is the live set
+        # owned by `user_connections`, and a disconnect during the await below
+        # mutates it mid-iteration.
+        for ws in list(conns):
             try:
                 await ws.send_text(payload)
             except Exception:
@@ -3024,8 +3126,18 @@ class ConnectionManager:
         self.active -= dead
         for ws in dead:
             self.channels.pop(ws, None)
-        for conns in self.user_connections.values():
+        emptied = []
+        for user_id, conns in self.user_connections.items():
             conns -= dead
+            if not conns:
+                emptied.append(user_id)
+        # Same retention bug as `disconnect` (PH3.6): a socket that dies without
+        # a clean close is reaped here, and before this the user's now-empty set
+        # stayed keyed forever. This is the path a *dropped* connection takes, so
+        # it is the one that runs during exactly the network churn that produces
+        # the most keys.
+        for user_id in emptied:
+            del self.user_connections[user_id]
 
 ws_manager = ConnectionManager()
 
@@ -3044,6 +3156,47 @@ async def ws_activity_broadcast(entry: dict):
 from services.activity_logger import register_broadcast_callback
 register_broadcast_callback(ws_activity_broadcast)
 
+
+def _collect_resource_gauges() -> None:
+    """Scrape-time collector for the structures PH3.6 bounded.
+
+    Registered here rather than in `observability/metrics.py` because filling
+    these requires knowing what a socket manager and a chat-context cache are,
+    and nothing in `observability/` may know that — the same split the Redis
+    gauges use (`infrastructure.redis_client` registers, `metrics` declares).
+
+    Every value is a `len()` on a container this process already holds, so a
+    scrape costs nothing and can never perturb what it measures. Wrapped and
+    silent for the same reason `_collect_process_gauges` is: this runs on every
+    scrape, so a warning here would emit one line per scrape interval forever.
+    """
+    try:
+        from infrastructure import tasks as _bg
+        from services import ai_context_builder as _aictx
+        from services import cache as _cache
+        from services import portfolio_stream as _pstream
+        from services import trade_stream as _tstream
+        from services.market_engine.event_bus import event_bus as _bus
+
+        obs_metrics.websocket_connections.set(float(len(ws_manager.active)))
+        obs_metrics.websocket_tracked_users.set(float(len(ws_manager.user_connections)))
+        obs_metrics.websocket_channel_subscriptions.set(float(len(ws_manager.channels)))
+        obs_metrics.background_tasks_running.set(float(_bg.stats()["count"]))
+        obs_metrics.event_bus_subscribers.set(float(_bus.subscriber_count))
+
+        obs_metrics.app_cache_entries.set(
+            float(_aictx.cache_stats()["entries"]), labels=("ai_chat_context",))
+        obs_metrics.app_cache_entries.set(
+            float(len(_cache._memory)), labels=("market_memory_fallback",))
+        obs_metrics.app_cache_entries.set(
+            float(_pstream.throttle_stats()["tracked_users"]), labels=("portfolio_throttle",))
+        obs_metrics.app_cache_entries.set(
+            float(_tstream.throttle_stats()["tracked_users"]), labels=("trade_throttle",))
+    except Exception:
+        pass
+
+
+obs_metrics.registry.add_collector(_collect_resource_gauges)
 
 
 @app.websocket("/api/ws")
@@ -5931,12 +6084,24 @@ async def startup():
     except Exception as e:
         logger.error(f"Event bridge start error: {e}")
 
-    # Start WebSocket broadcast loop
-    asyncio.create_task(market_broadcast_loop())
+    # Start the two perpetual application loops (PH3.6: through the registry).
+    #
+    # These were `asyncio.create_task(...)` with the return value discarded. Two
+    # consequences, one theoretical and one certain:
+    #
+    #   * The event loop holds only a WEAK reference to a running task, so a task
+    #     nobody else references may be garbage-collected mid-execution. The
+    #     asyncio docs say to keep the reference; nothing here did.
+    #   * More concretely, a discarded task cannot be cancelled — so neither loop
+    #     had ANY shutdown path. On SIGTERM both kept running against a Mongo
+    #     client `shutdown()` was in the middle of closing, which is how a clean
+    #     stop produces a burst of connection errors that reads like a crash.
+    #
+    # `task_registry` holds the references and `shutdown()` cancels them.
+    task_registry.spawn("market-broadcast-loop", market_broadcast_loop())
     logger.info("WebSocket broadcast loop started")
 
-    # Start AI monitoring loop — watches market 24/7 and sends proactive alerts
-    asyncio.create_task(ai_monitoring_loop())
+    task_registry.spawn("ai-monitoring-loop", ai_monitoring_loop())
     logger.info("AI monitoring loop started — watching for market events")
 
     # Start AI heartbeat engine — continuously performs REAL background work
@@ -5989,6 +6154,29 @@ async def shutdown():
     from services.scheduler import scheduler
     if scheduler.running:
         scheduler.shutdown(wait=False)
+
+    # Stop the perpetual application loops BEFORE the resources they use (PH3.6).
+    #
+    # The ordering is the whole point, and it is the inverse of startup. Every
+    # loop below reads Mongo, publishes to the event bus, or writes to sockets;
+    # tearing those down first and the loops afterwards is what produced a burst
+    # of connection errors on every clean stop — indistinguishable, in the logs,
+    # from a crash. Cancelling the producers first means the teardown that
+    # follows has nothing still calling into it.
+    #
+    # Both calls are bounded (5s each) and neither raises: shutdown must
+    # complete, or the orchestrator SIGKILLs the process and the 30s
+    # stop_grace_period in docker-compose.yml buys nothing.
+    try:
+        from services.heartbeat_engine import stop_engine as stop_heartbeat_engine
+        await stop_heartbeat_engine()
+    except Exception as e:
+        logger.warning(f"Heartbeat engine shutdown error (ignored): {e}")
+    try:
+        await task_registry.cancel_all()
+    except Exception as e:
+        logger.warning(f"Background task shutdown error (ignored): {e}")
+
     await broker_engine.shutdown()  # close live broker WebSocket streams
 
     # Redis teardown (PH2.7), in dependency order: subscribers first, then the

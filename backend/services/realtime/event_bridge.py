@@ -110,14 +110,42 @@ def make_bridge(ws_manager):
     return _handler
 
 
+#: The catch-all bus subscriber, once registered. PH3.6 — the registration was
+#: unconditional, so a second call to `start_event_bridge` added a SECOND "*"
+#: handler and every bus event was delivered to every socket twice, forever.
+#: Only startup calls this today, which is exactly why it was easy to miss and
+#: why the guard belongs here rather than in the caller: `redis_pubsub` already
+#: dedupes its half of this same wiring for the same reason (a retried boot, a
+#: test that re-invokes wiring, a future hot-reload), and duplicate delivery is
+#: much harder to notice than no delivery — the UI just updates twice.
+_bridge_handler: Optional[Any] = None
+
+
+def reset_for_tests() -> None:
+    """Forget the registered bridge handler (test isolation)."""
+    global _bridge_handler
+    if _bridge_handler is not None:
+        event_bus.unsubscribe("*", _bridge_handler)
+    _bridge_handler = None
+
+
 async def start_event_bridge(ws_manager) -> Optional[Any]:
     """Wire the bridge: subscribe to the bus and start the Redis listener.
+
+    Idempotent in both halves: the bus subscription is registered at most once
+    per process (see `_bridge_handler`), and `start_pubsub_listener` returns the
+    existing subscriber for a channel rather than creating a second one.
 
     Returns the Redis listener task (or None when Redis is unavailable). Call
     once at application startup after the WebSocket manager exists.
     """
-    event_bus.subscribe("*", make_bridge(ws_manager))
-    logger.info("Event bridge: subscribed to market event bus")
+    global _bridge_handler
+    if _bridge_handler is None:
+        _bridge_handler = make_bridge(ws_manager)
+        event_bus.subscribe("*", _bridge_handler)
+        logger.info("Event bridge: subscribed to market event bus")
+    else:
+        logger.debug("Event bridge: bus subscription already registered; reusing")
 
     async def _on_remote(payload: Dict[str, Any]) -> None:
         # Skip our own events echoed back by Redis; deliver everyone else's.

@@ -57,6 +57,24 @@ CONTEXT_BUDGET_SECONDS = 4.0
 _CACHE_TTL_SECONDS = 8.0
 _cache: dict[str, tuple[float, "ChatContext"]] = {}
 
+# Bound for the micro-cache (PH3.6).
+#
+# THE TTL WAS ONLY EVER CHECKED ON READ. An entry older than
+# `_CACHE_TTL_SECONDS` was ignored, but it was never *removed* — and the key is
+# the user id, so the dict retained one entry per user who had ever sent a chat
+# message, for the life of the process. What it retained is not a timestamp: a
+# `ChatContext` carries the rendered markdown block (several KB of live market,
+# portfolio and news text) plus the structured `sections` those were rendered
+# from. 5,000 users measured as 5,000 live entries, every one of them 999
+# seconds stale and none of them reachable by any code path again.
+#
+# The bound is deliberately the same shape as `services/cache.py`'s
+# `_MEMORY_MAX_KEYS` / `_prune_memory()` — sweep expired first, evict oldest only
+# if still over — so there is one eviction idiom in this codebase rather than
+# two. The value is generous relative to the 8-second TTL: at any realistic
+# concurrency the sweep alone reclaims everything and the LRU arm never fires.
+_CACHE_MAX_ENTRIES = 512
+
 QuotesMapFunc = Callable[[list], Awaitable[dict]]
 
 
@@ -77,6 +95,38 @@ class ChatContext:
 def reset_cache() -> None:
     """Clear the per-user micro-cache (tests / forced refresh)."""
     _cache.clear()
+
+
+def _cache_store(user_id: str, ctx: "ChatContext", now: Optional[float] = None) -> None:
+    """Write to the bounded micro-cache, pruning first when at the bound."""
+    now = time.monotonic() if now is None else now
+    if len(_cache) >= _CACHE_MAX_ENTRIES and user_id not in _cache:
+        _prune_cache(now)
+    _cache[user_id] = (now, ctx)
+
+
+def _prune_cache(now: Optional[float] = None) -> int:
+    """Sweep expired entries; evict oldest-written if still at the bound.
+
+    Returns the number of entries removed. Called only on a write that would
+    push the cache past `_CACHE_MAX_ENTRIES`, so the common path — a cache with
+    room in it — costs one `len()`.
+    """
+    now = time.monotonic() if now is None else now
+    before = len(_cache)
+    for key in [k for k, (ts, _) in _cache.items() if (now - ts) >= _CACHE_TTL_SECONDS]:
+        _cache.pop(key, None)
+    overflow = len(_cache) - _CACHE_MAX_ENTRIES + 1
+    if overflow > 0:
+        for key, _ in sorted(_cache.items(), key=lambda kv: kv[1][0])[:overflow]:
+            _cache.pop(key, None)
+    return before - len(_cache)
+
+
+def cache_stats() -> dict:
+    """Size snapshot for the resource probe and the diagnostics surface."""
+    return {"entries": len(_cache), "max_entries": _CACHE_MAX_ENTRIES,
+            "ttl_seconds": _CACHE_TTL_SECONDS}
 
 
 # --------------------------------------------------------------------------- #
@@ -316,7 +366,7 @@ async def build_chat_context(
         logger.warning("AI context build failed for user %s: %s", user_id, e)
         ctx = ChatContext(text="", live_market_available=False)
 
-    _cache[user_id] = (time.monotonic(), ctx)
+    _cache_store(user_id, ctx)
     return ctx
 
 

@@ -225,6 +225,23 @@ class BrokerStreamManager:
         if stream:
             await stream.stop()
 
+    def discard(self, user_id: str, broker: str) -> bool:
+        """Forget a stream that has already ended on its own (PH3.6).
+
+        Deliberately NOT `stop_stream`. The one caller is the broker's
+        token-expiry callback, which runs *inside* the stream's own task just
+        before that task returns — and `stop()` would `cancel()` and then
+        `await` the very task doing the calling, which is a task awaiting
+        itself.
+
+        Without this the registry kept the finished `BrokerStream` forever: one
+        stale entry per (user, broker) whose token expired, each still holding
+        its `session` dict — that is, an expired broker **access token** — and
+        its callbacks, and each still listed by `status()` as a stream that
+        exists but is not running.
+        """
+        return self._streams.pop((user_id, broker), None) is not None
+
     async def stop_all(self):
         for key in list(self._streams):
             await self.stop_stream(*key)

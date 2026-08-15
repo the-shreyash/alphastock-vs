@@ -603,6 +603,74 @@ registry.add_collector(_collect_process_gauges)
 
 
 # --------------------------------------------------------------------------- #
+# In-process resource structures (PH3.6)                                        #
+#                                                                               #
+# WHY THESE ARE NOT COVERED BY process_resident_memory_bytes                     #
+#                                                                               #
+# RSS is what an operator watches, and it is the wrong instrument for the leaks  #
+# this application can actually have. A dict that gains one key per WebSocket    #
+# connection and never drops it costs a few hundred bytes; a hundred thousand    #
+# connections later it is the largest object in the process, and for the whole   #
+# first hour it moves RSS less than Python's allocator does between two idle     #
+# samples. PH3.6 found two such maps — one keyed by an unauthenticated query     #
+# parameter — and neither was visible on any dashboard while it grew.            #
+#                                                                               #
+# A leak is a SHAPE, not a size: a count that only ever rises. These gauges      #
+# expose the counts, so the shape is alertable. Every one of them corresponds to #
+# a structure with a documented bound in                                         #
+# docs/performance/PH3_MEMORY_STABILITY.md §19 — a series that climbs past its   #
+# budget and stays there is the alert, not the absolute number.                  #
+#                                                                               #
+# Collected at scrape time from in-process containers: every value below is a    #
+# `len()`, so a scrape costs nothing and cannot perturb what it measures. The    #
+# collector is registered by `server.py`, which is the module that knows what a  #
+# socket manager is — the same split as the Redis families above.                #
+# --------------------------------------------------------------------------- #
+websocket_connections = registry.gauge(
+    "websocket_connections",
+    "Live WebSocket connections held by this process.",
+)
+
+# The one that leaked. It must track `websocket_connections` — specifically, it
+# must fall back to zero when connections do. A flat-topped staircase here with
+# `websocket_connections` at zero is a retention bug, and is exactly what PH3.6
+# fixed.
+websocket_tracked_users = registry.gauge(
+    "websocket_tracked_users",
+    "Distinct user ids with at least one live socket. Must return to zero when "
+    "websocket_connections does; a floor above zero means per-user entries are "
+    "being retained after disconnect.",
+)
+
+websocket_channel_subscriptions = registry.gauge(
+    "websocket_channel_subscriptions",
+    "Sockets holding a channel subscription set.",
+)
+
+background_tasks_running = registry.gauge(
+    "background_tasks_running",
+    "Supervised background tasks currently running (infrastructure/tasks.py).",
+)
+
+event_bus_subscribers = registry.gauge(
+    "event_bus_subscribers",
+    "Handlers registered on the in-process market event bus. Constant in a "
+    "healthy process — a rising value means listeners are being registered "
+    "repeatedly, which duplicates delivery rather than losing it.",
+)
+
+# One series per bounded cache rather than one gauge each, because they share a
+# single question ("is it under its ceiling?") and `cache` is a fixed, tiny label
+# set — no user id, symbol or key ever appears here.
+app_cache_entries = registry.gauge(
+    "app_cache_entries",
+    "Entry count of each bounded in-process cache, by name. Compare against the "
+    "ceilings in docs/performance/PH3_MEMORY_STABILITY.md §19.",
+    ("cache",),
+)
+
+
+# --------------------------------------------------------------------------- #
 # Redis (PH2.7)                                                                 #
 #                                                                               #
 # Two families, kept separate on purpose:                                        #

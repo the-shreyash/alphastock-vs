@@ -226,6 +226,41 @@ Targets (ROADMAP.md / DEPLOYMENT.md): dashboard < 2 s, API < 500 ms, market upda
 - Existing R9 optimizations (event batching, selective rendering, virtualization, code splitting, Redis batching) are the foundation — hardening validates them under load rather than adding new optimization work.
 - Performance budgets enforced in CI (Lighthouse thresholds, bundle-size check) once baselines exist.
 
+## 8.1 Resource budget (PH3.7b, 2026-08-15)
+
+**Per uvicorn worker.** Multi-worker behaviour is unmeasured, and each worker
+holds an independent copy of every in-process cache, so these numbers multiply
+rather than divide. Full derivation:
+`docs/performance/PH3_MEMORY_STABILITY.md` §19.
+
+| Resource | Budget | Basis |
+|---|---|---|
+| Backend RSS (idle → sustained load) | 45–80 MB → ≤ 150 MB | measured |
+| Backend CPU | 100% of **one** core is one worker's ceiling | measured (PH3.7) |
+| Mongo pool | `maxPoolSize` 100; idle reaped after **60 s** | configured PH3.7b |
+| Redis pool | `REDIS_MAX_CONNECTIONS`; **the shipped default of 24 is too small** | PH3.7 L-1, owner PH3.7/deployment |
+| Redis Pub/Sub connections | exactly **1** per subscribed channel | enforced by registry |
+| Outbound HTTP sockets | ≤ **20** per (loop, timeout) pool | `services/http_client.py` |
+| Supervised background tasks | exactly **4** in a healthy process | `background_tasks_running` |
+| Event-bus subscribers | exactly **1** in a healthy process | `event_bus_subscribers` |
+| AI chat-context cache | ≤ **512** entries | `_CACHE_MAX_ENTRIES` |
+| Market cache fallback | ≤ **1,024** keys | `_MEMORY_MAX_KEYS` |
+| Portfolio / trade throttle maps | ≤ **4,096** each | `_MAX_TRACKED_USERS` |
+| Event-bus log | ≤ **500** events | `_max_log_size` |
+| Concurrent WebSocket connections | **TO BE BASELINED IN STAGING** | 150 held cleanly; no ceiling found |
+
+**The alert to write first** is `websocket_tracked_users` holding a floor above
+zero while `websocket_connections` sits at zero. That is the exact signature of
+the P0 leak PH3.7b fixed, and before that sprint no dashboard in the system
+could have shown it.
+
+**Every perpetual loop must be started through
+`backend/infrastructure/tasks.py`, never with a bare `asyncio.create_task`.**
+A discarded task has no strong reference (asyncio keeps only a weak one) and,
+more importantly, no cancellation path — which is how four loops came to keep
+running against a Mongo client that `shutdown()` was in the middle of closing.
+Shutdown cancels producers **before** the resources they use.
+
 ---
 
 # 9. Documentation Strategy

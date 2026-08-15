@@ -1,10 +1,77 @@
 # StockAssist AI — Production Readiness Report
 
-> **⚠️ LIVING DOCUMENT.** The current status is the **PH1.12 update** immediately
-> below (2026-07-22). The original **Sprint 12 baseline audit** (2026-07-17,
+> **⚠️ LIVING DOCUMENT.** The most recent update is **PH3.7b — Memory & Resource
+> Stability** (2026-08-15), immediately below; the **PH1.12 security update**
+> (2026-07-22) follows it and remains the standing release decision. The original
+> **Sprint 12 baseline audit** (2026-07-17,
 > verdict *NOT READY*) is preserved unchanged from the divider marked
 > *"Sprint 12 Baseline Audit"* onward, as the historical record that seeded the
 > Production Hardening program. Do not delete it.
+
+---
+
+# PH3.7b Update — Memory & Resource Stability (2026-08-15)
+
+**Companion report:** `docs/performance/PH3_MEMORY_STABILITY.md` ·
+**Sprint label:** "PH3.6 — Memory & Resource Stability"
+
+**Status: PASS WITH CONDITIONS.** The platform's long-running resource behaviour
+is now measured rather than assumed, and two P0 leaks that no previous sprint
+could have seen were found and fixed.
+
+**The finding that matters for release planning is methodological.** PH3.7's
+load testing reported flat memory across more than 150,000 requests, and that
+report was accurate. It was also structurally incapable of showing either defect
+this sprint found, because both are dictionaries that gain a few hundred bytes
+per event — less than the noise between two idle RSS samples. **A leak is a
+shape, a count that only ever rises, not a size.** Any future readiness claim
+about memory that rests on an RSS graph should be read with that in mind.
+
+**Fixed before launch:**
+
+* **A remotely-triggerable unbounded map.** The WebSocket manager kept one
+  dictionary key per connection forever, and the key comes from an
+  **unauthenticated** query parameter — so an anonymous caller could grow it at
+  will, and only a process restart ever emptied it. Measured at 1,000 retained
+  keys per 1,000 connect/disconnect cycles.
+* **An unbounded per-user AI cache** holding multi-KB rendered context objects
+  for every user who had ever sent a chat message, with a TTL that was consulted
+  on read and enforced nowhere.
+* **A market broadcast that could be silently dropped** to every client past a
+  concurrent disconnect (PH3.7's L-2, now confirmed, reproduced and closed).
+* **Four background loops with no shutdown path at all**, which kept running
+  against the database, cache and HTTP pools while the shutdown handler was
+  closing them — making every clean stop look like a crash in the logs.
+* **A MongoDB pool that only ratcheted upward**, because idle connections were
+  never reaped.
+
+**Operationally, the important change is that the bounds are now visible.** Six
+new metrics expose the counts these leaks grew in; before this sprint no
+dashboard in the system could have shown either one. The first alert to
+configure is `websocket_tracked_users` holding a floor above zero while
+`websocket_connections` is at zero.
+
+**Conditions on this status — all environmental, none an outstanding defect:**
+
+1. `MONGO_SOCKET_TIMEOUT_MS` is deliberately unset and **must be baselined in
+   staging**. Without a read timeout, a query against a wedged primary holds its
+   request and connection indefinitely. A number was not invented here because
+   one chosen without production data would abort legitimate work under load.
+2. **Multi-worker resource behaviour is unmeasured.** Every figure in the
+   resource budget is *per worker*, and each worker holds an independent copy of
+   every in-process cache, so the budget multiplies.
+3. **Multi-day continuous operation is unmeasured.** The soak is tens of
+   minutes.
+4. **Mongo TTL reaping of `sessions` and `rate_limits` under sustained write
+   rate is unmeasured.** Both collections grow with every request; the TTL
+   indexes exist and were verified present, but whether the reaper keeps up is a
+   database-side question this sprint did not answer.
+5. **Frontend bounds are asserted by tests, not heap-profiled** on a real
+   all-day session.
+
+**No regression:** backend 2,188 → **2,216** tests passing, PH1 security **452
+unchanged**, frontend 319 → **324**, production build green. No trading logic,
+AI decision logic, prompt, model selection or API contract was changed.
 
 ---
 

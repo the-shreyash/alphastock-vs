@@ -266,3 +266,92 @@ describe("reset", () => {
     expect(store().connection.status).toBe("offline");
   });
 });
+
+/**
+ * PH3.6 — bounded live state.
+ *
+ * A trading screen stays open all day. Every map below is keyed by something
+ * that keeps arriving (a trade id, a run id), so "grows a little on each event"
+ * and "leaks" are the same behaviour observed over different durations. These
+ * assert entry counts, never bytes: a heap-size assertion in jsdom measures the
+ * CI runner, not the store.
+ */
+describe("bounded live state (PH3.6)", () => {
+  it("drops closed trades from the live map instead of accumulating them", () => {
+    // Every producer of `trade.updated` publishes the user's COMPLETE set of
+    // open trades, so a trade missing from a later snapshot has closed.
+    store().applyEvent(event("trade.updated", {
+      user_id: "u1",
+      reason: "monitor",
+      trades: [
+        { trade_id: "t1", symbol: "AAA", current_price: 10 },
+        { trade_id: "t2", symbol: "BBB", current_price: 20 },
+      ],
+    }));
+    expect(Object.keys(store().tradeLive.byId)).toEqual(["t1", "t2"]);
+
+    store().applyEvent(event("trade.updated", {
+      user_id: "u1",
+      reason: "monitor",
+      trades: [{ trade_id: "t1", symbol: "AAA", current_price: 11 }],
+    }));
+
+    expect(Object.keys(store().tradeLive.byId)).toEqual(["t1"]);
+    expect(store().tradeLive.byId.t1.current_price).toBe(11);
+  });
+
+  it("keeps object identity for a row that did not change", () => {
+    // The counter-test for the one above: rebuilding the map must not cost
+    // memoized per-trade components their skipped re-render.
+    const snapshot = {
+      user_id: "u1",
+      reason: "monitor",
+      trades: [{ trade_id: "t1", symbol: "AAA", current_price: 10 }],
+    };
+    store().applyEvent(event("trade.updated", snapshot));
+    const first = store().tradeLive.byId.t1;
+
+    store().applyEvent(event("trade.updated", snapshot));
+
+    expect(store().tradeLive.byId.t1).toBe(first);
+  });
+
+  it("bounds AI trade reviews, keeping the most recent", () => {
+    for (let i = 0; i < 60; i += 1) {
+      store().applyEvent(event("trade.review.ready", {
+        trade_id: `t${i}`,
+        review: { summary: "x".repeat(500) },
+      }));
+    }
+
+    const ids = Object.keys(store().tradeReviews);
+    expect(ids.length).toBeLessThanOrEqual(25);
+    expect(ids).toContain("t59");
+    expect(ids).not.toContain("t0");
+  });
+
+  it("bounds AI runs even when none of them ever completes", () => {
+    // The soft cap refuses to evict an `active` run. A socket that drops
+    // mid-run delivers neither `ai.run.completed` nor a `resolveAIRun`, so the
+    // run stays active forever — which is exactly how the soft cap stops
+    // capping. Every run here is left active on purpose.
+    for (let i = 0; i < 200; i += 1) {
+      store().applyEvent(event("ai.run.started", { run_id: `run-${i}`, steps: ["one"] }));
+    }
+
+    expect(store().aiRunOrder.length).toBeLessThanOrEqual(50);
+    expect(Object.keys(store().aiRuns).length).toBeLessThanOrEqual(50);
+    expect(store().aiRuns["run-199"]).toBeDefined();
+  });
+
+  it("still evicts completed runs down to the soft cap first", () => {
+    // Without this, raising the hard ceiling would look like a pass while the
+    // normal path silently kept 50 finished runs instead of 6.
+    for (let i = 0; i < 20; i += 1) {
+      store().applyEvent(event("ai.run.started", { run_id: `run-${i}`, steps: ["one"] }));
+      store().applyEvent(event("ai.run.completed", { run_id: `run-${i}`, status: "done" }));
+    }
+
+    expect(store().aiRunOrder.length).toBeLessThanOrEqual(6);
+  });
+});

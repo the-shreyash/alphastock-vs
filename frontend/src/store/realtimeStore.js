@@ -23,6 +23,17 @@ const MAX_ENGINE_EVENTS = 20;
 const MAX_ALERTS = 50;
 const MAX_BROKER_ORDERS = 50;
 const MAX_AI_RUNS = 6;
+const MAX_TRADE_REVIEWS = 25;
+// Hard ceiling for `aiRunOrder` (PH3.6). MAX_AI_RUNS is a *soft* cap: its
+// eviction loop refuses to evict an active run and `break`s when every run is
+// active, which is correct while runs finish. They do not always finish — a run
+// is marked inactive by `ai.run.completed` or by `resolveAIRun`, and a socket
+// that drops mid-run delivers neither, so the run stays `active: true` forever
+// and permanently occupies a slot. Enough dropped runs in one long session and
+// the soft cap stops capping anything at all. This ceiling is what the map is
+// actually bounded by; reaching it means runs are being abandoned, so the
+// oldest is stale regardless of what its `active` flag still claims.
+const MAX_AI_RUNS_HARD = 50;
 
 const initialState = {
   // Connection state machine: offline | connecting | live | reconnecting
@@ -406,10 +417,21 @@ export const useRealtimeStore = create((set, get) => ({
           // trade_id, reusing the previous row object when unchanged so
           // memoized per-trade components skip re-render.
           set((s) => {
-            const byId = { ...s.tradeLive.byId };
+            // Built from the incoming rows ONLY, not merged onto the previous
+            // map (PH3.6). Every producer of `trade.updated` publishes the
+            // user's complete set of OPEN trades — `services/trade_stream.py`
+            // states it and all three call sites query `status: "OPEN"` — so a
+            // trade absent from this snapshot is a trade that closed. Merging
+            // kept it forever: the map grew by one entry per trade the user ever
+            // closed in the session, and the stale row it retained described a
+            // closed position as though it were still open.
+            const prevById = s.tradeLive.byId;
+            const byId = {};
             (Array.isArray(data.trades) ? data.trades : []).forEach((row) => {
               if (!row || !row.trade_id) return;
-              const prev = byId[row.trade_id];
+              const prev = prevById[row.trade_id];
+              // Object identity is preserved for unchanged rows so memoized
+              // per-trade components still skip re-render.
               byId[row.trade_id] = prev && sameRow(prev, row) ? prev : row;
             });
             return {
@@ -421,9 +443,20 @@ export const useRealtimeStore = create((set, get) => ({
             };
           });
         } else if (event === "trade.review.ready") {
-          set((s) => ({
-            tradeReviews: { ...s.tradeReviews, [data.trade_id]: data.review },
-          }));
+          set((s) => {
+            // Bounded (PH3.6). An AI trade review is a multi-KB text object and
+            // this map was keyed by trade_id with nothing ever removing an
+            // entry, so a trader who closes positions all day accumulates one
+            // per close for as long as the tab stays open. Insertion order is
+            // reliable here because the keys are ObjectId hex strings, never
+            // integer-like, so V8 keeps them in insertion order.
+            const tradeReviews = { ...s.tradeReviews, [data.trade_id]: data.review };
+            const ids = Object.keys(tradeReviews);
+            for (const id of ids.slice(0, Math.max(0, ids.length - MAX_TRADE_REVIEWS))) {
+              delete tradeReviews[id];
+            }
+            return { tradeReviews };
+          });
         } else if (TRADE_LIFECYCLE_EVENTS.has(event)) {
           // Trailing ratchet / target hit / SL hit / close — the Trade
           // Monitor patches rows in place from these (refetch only on close).
@@ -467,6 +500,15 @@ export const useRealtimeStore = create((set, get) => ({
               if (!evictable) break;
               delete aiRuns[evictable];
               aiRunOrder = aiRunOrder.filter((id) => id !== evictable);
+            }
+            // Hard ceiling: evict the oldest even if it still claims to be
+            // active. See MAX_AI_RUNS_HARD — an "active" run this old is an
+            // abandoned one, and honouring the flag forever is what turned the
+            // soft cap above into no cap at all.
+            while (aiRunOrder.length > MAX_AI_RUNS_HARD) {
+              const [oldest, ...rest] = aiRunOrder;
+              delete aiRuns[oldest];
+              aiRunOrder = rest;
             }
             return { aiRuns, aiRunOrder };
           });

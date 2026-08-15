@@ -758,11 +758,25 @@ async def _price_stream_loop():
         await asyncio.sleep(PRICE_STREAM_INTERVAL)
 
 
+#: Names the two loops are registered under (PH3.6). Module constants rather
+#: than string literals at the call sites, because `stop_engine` must cancel
+#: exactly what `start_engine` spawned and a typo would be a silent no-op.
+HEARTBEAT_TASK = "ai-heartbeat-loop"
+PRICE_STREAM_TASK = "ai-price-stream-loop"
+
+
 def start_engine(db, ws_manager):
     """Start the heartbeat + price-stream background loops.
 
     Idempotent. No-op when DISABLE_BACKGROUND_ENGINE=1 (used by the test suite,
     mirroring how the scheduler is kept out of the way during pytest).
+
+    PH3.6: the two loops are now spawned through `infrastructure.tasks` rather
+    than bare `asyncio.create_task`, which is what gives them a strong reference
+    and — the part that was actually missing — a shutdown path. Both loops read
+    Mongo (`_collect_prices` calls `distinct` on watchlist and trades), so before
+    this they kept issuing queries against a client the shutdown handler was in
+    the middle of closing.
     """
     global _db, _ws, _started
     if _started:
@@ -770,9 +784,32 @@ def start_engine(db, ws_manager):
     if os.environ.get("DISABLE_BACKGROUND_ENGINE") == "1":
         logger.info("AI heartbeat engine disabled via DISABLE_BACKGROUND_ENGINE=1")
         return
+    from infrastructure import tasks as task_registry
+
     _db = db
     _ws = ws_manager
     _started = True
-    asyncio.create_task(_heartbeat_loop())
-    asyncio.create_task(_price_stream_loop())
+    task_registry.spawn(HEARTBEAT_TASK, _heartbeat_loop())
+    task_registry.spawn(PRICE_STREAM_TASK, _price_stream_loop())
     logger.info("AI heartbeat engine started (%d tasks + live price stream)", len(TASKS))
+
+
+async def stop_engine():
+    """Cancel both loops and return the engine to a startable state.
+
+    Called from the application's shutdown handler. Resetting `_started` matters
+    beyond tidiness: it is what makes `start_engine` work again after a stop,
+    which is the property the test suite and any future lifespan-based restart
+    rely on.
+    """
+    global _db, _ws, _started
+    from infrastructure import tasks as task_registry
+
+    if not _started:
+        return
+    await task_registry.registry.cancel(HEARTBEAT_TASK)
+    await task_registry.registry.cancel(PRICE_STREAM_TASK)
+    _started = False
+    _db = None
+    _ws = None
+    logger.info("AI heartbeat engine stopped")

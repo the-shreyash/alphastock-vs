@@ -481,6 +481,12 @@ class BrokerEngine:
 
     async def _on_stream_expired(self, user_id: str, broker: str):
         self._sessions.pop((user_id, broker), None)
+        # The stream task is about to return on its own; drop the registry entry
+        # with it (PH3.6). Without this the manager retained a finished
+        # BrokerStream — and the expired access token inside its `session` — for
+        # the life of the process. `discard` rather than `stop_stream` because we
+        # are running inside that task; see BrokerStreamManager.discard.
+        stream_manager.discard(user_id, broker)
         await self._audit(user_id, "broker.session.expired", {"broker": broker})
         await self._push(user_id, {"type": "broker_status", "data": {
             "broker": broker, "connected": False, "session_expired": True}})

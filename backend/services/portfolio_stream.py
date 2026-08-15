@@ -45,10 +45,36 @@ TICK_EMIT_INTERVAL = 3.0
 # Per-user last emission time (time.monotonic()).
 _last_emit: dict = {}
 
+# Bound + staleness horizon for the throttle map (PH3.6).
+#
+# Every entry here is a float that stops being meaningful `TICK_EMIT_INTERVAL`
+# seconds after it is written — but nothing removed it, so the map retained one
+# key per user who had ever received a tick, for the life of the process. Each
+# entry is small; the objection is not its size but its shape. It is a per-user
+# structure with no expiry, which grows monotonically with cumulative signups
+# rather than with concurrent activity, and that is the shape that looks
+# perfectly healthy for months.
+#
+# A user idle for `_STALE_AFTER_SECONDS` cannot be affected by dropping their
+# stamp: the next emission is allowed either way, since the throttle only ever
+# suppresses within a 3-second window.
+_MAX_TRACKED_USERS = 4096
+_STALE_AFTER_SECONDS = 300.0
+
 
 def reset_state() -> None:
     """Clear throttle state (tests)."""
     _last_emit.clear()
+
+
+def _prune(now: float) -> None:
+    """Drop stamps that can no longer suppress anything, then bound the rest."""
+    for user_id in [u for u, ts in _last_emit.items() if (now - ts) >= _STALE_AFTER_SECONDS]:
+        _last_emit.pop(user_id, None)
+    overflow = len(_last_emit) - _MAX_TRACKED_USERS + 1
+    if overflow > 0:
+        for user_id, _ in sorted(_last_emit.items(), key=lambda kv: kv[1])[:overflow]:
+            _last_emit.pop(user_id, None)
 
 
 def _tick_allowed(user_id: str, now: Optional[float] = None) -> bool:
@@ -58,7 +84,16 @@ def _tick_allowed(user_id: str, now: Optional[float] = None) -> bool:
 
 
 def _stamp(user_id: str, now: Optional[float] = None) -> None:
-    _last_emit[str(user_id)] = time.monotonic() if now is None else now
+    now = time.monotonic() if now is None else now
+    key = str(user_id)
+    if len(_last_emit) >= _MAX_TRACKED_USERS and key not in _last_emit:
+        _prune(now)
+    _last_emit[key] = now
+
+
+def throttle_stats() -> dict:
+    """Size snapshot for the resource probe."""
+    return {"tracked_users": len(_last_emit), "max_tracked_users": _MAX_TRACKED_USERS}
 
 
 # --------------------------------------------------------------------------- #
