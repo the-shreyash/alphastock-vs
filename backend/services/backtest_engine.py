@@ -7,6 +7,14 @@ logger = logging.getLogger(__name__)
 
 STRATEGIES = ["RSI_STRATEGY", "EMA_CROSSOVER", "VWAP_REVERSION", "MACD_SIGNAL"]
 
+#: The shortest history any of these strategies can be evaluated over. Below it
+#: the indicators return their neutral seed values (`_rsi` yields a flat 50,
+#: `_ema` repeats the first price), so a "backtest" over fewer bars measures the
+#: padding rather than the strategy. Refusing is the honest answer; the previous
+#: code raised here too, but the raise was caught and answered with fabricated
+#: performance.
+_MIN_BARS = 10
+
 
 # ─── Indicator helpers ────────────────────────────────────────────────────────
 
@@ -256,66 +264,42 @@ def _compute_metrics(trades, equity_curve, initial_capital, final_capital):
     }
 
 
-# ─── Fallback synthetic data ──────────────────────────────────────────────────
+# ─── Historical-data failure ──────────────────────────────────────────────────
+#
+# PH3.9 DELETED `_synthetic_backtest`, and this is the one mock removal in the
+# sprint that is not an admin dashboard number — it is the most dangerous of the
+# seventeen, because a fabricated backtest is investment advice built on noise.
+#
+# What it did: 20 invented trades with the win count drawn from `randint(10, 16)`
+# — so the win rate was always between 50% and 80%, and **a losing strategy could
+# not be represented**. Entry and exit dates were invented 2025 strings unrelated
+# to the requested period. The Sharpe ratio, max drawdown and total return were
+# then computed by the SAME `_compute_metrics` the real path uses, so they
+# arrived looking exactly like measured statistics — and the frontend rendered
+# them in the same cards.
+#
+# It was reached on ANY yfinance failure — a missing library, a network blip, a
+# rate limit, a delisted symbol — not only when the library was absent. So the
+# common case of "the data provider is briefly unavailable" produced a flattering
+# fabricated result rather than an error.
+#
+# There is no honest fallback here. A backtest without historical prices is not a
+# degraded backtest; it is not a backtest. The endpoint fails, loudly, with a
+# reason the user can act on.
 
-def _synthetic_backtest(symbol, strategy, start_date, end_date, stop_pct, tgt_pct, capital):
-    """Return a plausible synthetic result when yfinance data is unavailable.
 
-    PH3.8 CLASSIFICATION: **MOCK, and structurally flattering.** ``wins`` is
-    drawn from ``randint(10, 16)`` out of 20 trades, so the win rate is always
-    between 50% and 80% — a losing strategy cannot be represented. Entry and
-    exit dates are invented 2025 strings unrelated to the requested period, and
-    the resulting Sharpe ratio, max drawdown and total return are computed by
-    the same ``_compute_metrics`` the real path uses, so they arrive looking
-    exactly like measured statistics.
+class HistoricalDataUnavailable(RuntimeError):
+    """Historical price data could not be obtained, so no backtest was run.
 
-    The seed was ``hash(f"{symbol}{strategy}")``. Python salts ``hash()`` of a
-    ``str`` with ``PYTHONHASHSEED``, so this was not even reproducible: the same
-    backtest of the same symbol returned 80%, 60% and 80% win rates on three
-    consecutive processes. PH3.8 seeds from a stable digest of the inputs so the
-    fabricated result is at least *deterministic* — a fabricated number that
-    changes on every deploy is a second, independent defect, and pinning it is
-    what lets a test assert this path's behaviour at all.
-
-    Removal is PH3.9 (``analytics.registry`` → ``research.backtest.synthetic``),
-    where the right outcome is an explicit failure rather than invented
-    performance.
+    Carries the reason so the route can render something a user can act on
+    ("this symbol returned no data" is a different problem from "the provider
+    timed out"), while the underlying exception detail goes to the log.
     """
-    import hashlib
-    import random
-    digest = hashlib.sha256(
-        f"{symbol}|{strategy}|{start_date}|{end_date}".encode()).hexdigest()
-    random.seed(int(digest[:16], 16))
-    n = 20
-    wins = random.randint(10, 16)
-    losses = n - wins
-    trades = []
-    equity = capital
-    eq_curve = [{"date": start_date, "capital": capital}]
-    price = 1500.0
-    for i in range(n):
-        is_win = i < wins
-        entry = round(price * (1 + random.uniform(-0.01, 0.01)), 2)
-        if is_win:
-            exit_p = round(entry * (1 + tgt_pct / 100 * random.uniform(0.6, 1.0)), 2)
-            pnl_pct = round((exit_p - entry) / entry * 100, 2)
-        else:
-            exit_p = round(entry * (1 - stop_pct / 100 * random.uniform(0.5, 1.0)), 2)
-            pnl_pct = round((exit_p - entry) / entry * 100, 2)
-        shares = int(equity * 0.9 / entry)
-        pnl = round((exit_p - entry) * shares, 2)
-        equity += pnl
-        trades.append({
-            "entry_date": f"2025-0{random.randint(1,9)}-{random.randint(10,28)}",
-            "exit_date": f"2025-0{random.randint(1,9)}-{random.randint(10,28)}",
-            "entry_price": entry, "exit_price": exit_p, "shares": shares,
-            "pnl": pnl, "pnl_pct": pnl_pct, "result": "WIN" if is_win else "LOSS",
-            "type": "BUY→SELL",
-        })
-        eq_curve.append({"date": f"2025-{i+1:02d}-01", "capital": round(equity, 2)})
-        price = exit_p
-    metrics = _compute_metrics(trades, eq_curve, capital, equity)
-    return trades, eq_curve, metrics
+
+    def __init__(self, symbol: str, reason: str):
+        self.symbol = symbol
+        self.reason = reason
+        super().__init__(f"No historical data for {symbol}: {reason}")
 
 
 # ─── Public API ───────────────────────────────────────────────────────────────
@@ -329,76 +313,81 @@ async def run_backtest(
     target_pct: float,
     initial_capital: float = 100_000.0,
 ) -> dict:
-    """Run a full backtest and return BacktestResult dict."""
+    """Run a full backtest over real historical bars, or raise.
+
+    PH3.9: raises :class:`HistoricalDataUnavailable` where this previously fell
+    back to a fabricated result. Every figure returned is now DERIVED from real
+    OHLCV — there is no path through this function that invents one.
+    """
     yahoo_symbol = symbol.upper()
     if not yahoo_symbol.endswith(".NS"):
         yahoo_symbol += ".NS"
 
-    trades, equity_curve, final_capital = [], [], initial_capital
-    data_source = "yfinance"
-
     try:
         import yfinance as yf
+    except ImportError as exc:
+        logger.error("yfinance is not installed — backtesting is unavailable")
+        raise HistoricalDataUnavailable(
+            symbol.upper(),
+            "The historical market-data library is not installed on this server.",
+        ) from exc
+
+    try:
         ticker = yf.Ticker(yahoo_symbol)
         hist = ticker.history(start=start_date, end=end_date)
-        if hist.empty:
-            raise ValueError("No data returned from yfinance")
+    except Exception as exc:
+        # The provider's own message can embed a URL or a key, so it goes to the
+        # log in full while the caller gets the CLASS of failure. Note also that
+        # this except no longer swallows anything: the old one caught every
+        # exception and answered with invented performance, so a transient
+        # network blip produced a flattering backtest instead of an error.
+        logger.warning("backtest history fetch failed for %s: %s", yahoo_symbol, exc)
+        raise HistoricalDataUnavailable(
+            symbol.upper(),
+            "The historical market-data provider could not be reached.",
+        ) from exc
 
-        dates = list(hist.index)
-        opens = list(hist["Open"])
-        closes = list(hist["Close"])
-        highs = list(hist["High"])
-        lows = list(hist["Low"])
-        volumes = list(hist["Volume"])
+    if hist.empty:
+        raise HistoricalDataUnavailable(
+            symbol.upper(),
+            f"No historical bars were returned for {yahoo_symbol} between "
+            f"{start_date} and {end_date}. The symbol may be wrong or delisted, or "
+            "the period may contain no trading days.")
 
-        if len(closes) < 10:
-            raise ValueError("Not enough data points")
+    closes = list(hist["Close"])
+    if len(closes) < _MIN_BARS:
+        raise HistoricalDataUnavailable(
+            symbol.upper(),
+            f"Only {len(closes)} trading day(s) are available in this period; at least "
+            f"{_MIN_BARS} are needed for the indicators these strategies use. Widen the "
+            "date range.")
 
-        trades, equity_curve, final_capital = _simulate(
-            dates, opens, closes, highs, lows, volumes,
-            strategy, stop_loss_pct, target_pct, initial_capital
-        )
-        metrics = _compute_metrics(trades, equity_curve, initial_capital, final_capital)
+    trades, equity_curve, final_capital = _simulate(
+        list(hist.index), list(hist["Open"]), closes,
+        list(hist["High"]), list(hist["Low"]), list(hist["Volume"]),
+        strategy, stop_loss_pct, target_pct, initial_capital,
+    )
+    metrics = _compute_metrics(trades, equity_curve, initial_capital, final_capital)
 
-    except ImportError:
-        logger.warning("yfinance not installed — using synthetic backtest data")
-        data_source = "synthetic"
-        trades, equity_curve, metrics = _synthetic_backtest(
-            symbol, strategy, start_date, end_date, stop_loss_pct, target_pct, initial_capital
-        )
-        final_capital = equity_curve[-1]["capital"] if equity_curve else initial_capital
-
-    except Exception as e:
-        logger.warning(f"yfinance backtest error ({e}) — using synthetic data")
-        data_source = "synthetic"
-        trades, equity_curve, metrics = _synthetic_backtest(
-            symbol, strategy, start_date, end_date, stop_loss_pct, target_pct, initial_capital
-        )
-        final_capital = equity_curve[-1]["capital"] if equity_curve else initial_capital
-
-    synthetic = data_source == "synthetic"
     return {
         "symbol": symbol.upper(),
         "strategy": strategy,
         "period": {"start": start_date, "end": end_date},
         "initial_capital": initial_capital,
         "final_capital": round(final_capital, 2),
-        "data_source": data_source,
-        # PH3.8: `data_source` alone was the only signal, and it is easy for a
-        # consumer to miss. `provenance` and `mock_metrics` name the affected
-        # figures explicitly so a client cannot render a fabricated Sharpe ratio
-        # without having been told.
-        "provenance": "mock" if synthetic else "derived",
-        "mock_metrics": ([
-            "win_rate", "total_return_pct", "max_drawdown_pct", "sharpe_ratio",
-            "best_trade_pct", "worst_trade_pct", "avg_trade_pct", "trades",
-            "equity_curve", "final_capital",
-        ] if synthetic else []),
-        "analytics_note": (
-            "Fabricated: historical market data was unavailable, so this result was "
-            "generated from a random series whose win rate is drawn from 50–80% by "
-            "construction. It is not a backtest of this strategy and must not be "
-            "acted on." if synthetic else ""),
+        "data_source": "yfinance",
+        "bars": len(closes),
+        "provenance": "derived",
+        # Every P&L in this product is gross (ANALYTICS.md §6.1), and a backtest
+        # is where that matters most: it is the number somebody sizes a real
+        # position from.
+        "basis": "gross",
+        "charges_note": ("Gross of brokerage, STT, exchange transaction charges, GST, "
+                         "SEBI turnover fee and stamp duty — none of which this "
+                         "simulation models. On Indian intraday equity these routinely "
+                         "exceed the edge on a small trade, so a positive gross result "
+                         "is not necessarily a positive net one."),
+        "mock_metrics": [],
         **metrics,
         "trades": trades[-50:],  # cap to last 50 for response size
         "equity_curve": equity_curve,

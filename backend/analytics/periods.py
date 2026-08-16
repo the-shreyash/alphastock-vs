@@ -286,6 +286,30 @@ def window_of_days(days: int, now: Optional[datetime] = None) -> Window:
                   _ist_midnight_utc(today + timedelta(days=1)))
 
 
+def preceding(window: Window) -> Window:
+    """The window of identical span immediately *before* ``window`` (PH3.9).
+
+    Period-over-period growth needs a comparison base, and computing one by hand
+    at the call site is how the two halves of a growth figure end up covering
+    different spans — a 30-day numerator over a 31-day denominator reads as
+    −3% of "churn" that is really a calendar artefact. Deriving the base from
+    the window guarantees the two are the same length and share a boundary:
+    ``preceding(w).end == w.start`` exactly, so the pair partitions time with no
+    gap and no overlap (the same half-open property §5.2 relies on).
+
+    Raises for the unbounded ``all`` window: "the 30 days before all of time"
+    is not a question with an answer, and returning something anyway is how a
+    growth rate ends up dividing by a window that does not exist.
+    """
+    if not window.bounded or window.start is None:
+        raise UnknownPeriod(
+            "An unbounded window has no preceding window. Growth over 'all time' "
+            "is not defined; ask for a bounded period.")
+    span = window.end - window.start
+    return Window(f"prev_{window.key}", f"Previous {window.label.lower()}",
+                  window.start - span, window.start)
+
+
 def session_date(moment=None) -> dict:
     """The NSE session an instant belongs to, IST.
 

@@ -159,6 +159,7 @@ from analytics import contract as analytics_contract
 from analytics import periods as analytics_periods
 from analytics import queries as analytics_queries
 from analytics import registry as analytics_registry
+from analytics import sources as analytics_sources
 from observability import health as obs_health
 from observability import instruments as obs_instruments
 from observability import metrics as obs_metrics
@@ -5029,18 +5030,38 @@ class BacktestRequest(BaseModel):
 
 @backtest_router.post("")
 async def run_backtest_route(data: BacktestRequest):
-    from services.backtest_engine import run_backtest
+    """Run a strategy over real historical bars.
+
+    PH3.9: this used to be incapable of failing. Any problem fetching history —
+    a missing library, a network blip, a rate limit, a delisted symbol —
+    produced a *fabricated* result: twenty invented trades whose win count was
+    drawn from `randint(10, 16)`, so the win rate was always 50–80% and a losing
+    strategy could not be represented. The Sharpe ratio, drawdown and return
+    were then computed by the same code the real path uses and rendered in the
+    same cards.
+
+    A backtest without prices is not a degraded backtest, so there is no
+    fallback. **503**, not 500: the request was valid and the strategy is fine;
+    an upstream data source is unavailable, which is a condition that may clear
+    on its own and that a client should offer to retry.
+    """
+    from services.backtest_engine import HistoricalDataUnavailable, run_backtest
     from services.activity_logger import log_activity
     log_activity(f"Running backtest: {data.strategy} on {data.symbol}", "scan", "running")
-    result = await run_backtest(
-        symbol=data.symbol,
-        start_date=data.start_date,
-        end_date=data.end_date,
-        strategy=data.strategy,
-        stop_loss_pct=data.stop_loss_pct,
-        target_pct=data.target_pct,
-        initial_capital=data.initial_capital,
-    )
+    try:
+        result = await run_backtest(
+            symbol=data.symbol,
+            start_date=data.start_date,
+            end_date=data.end_date,
+            strategy=data.strategy,
+            stop_loss_pct=data.stop_loss_pct,
+            target_pct=data.target_pct,
+            initial_capital=data.initial_capital,
+        )
+    except HistoricalDataUnavailable as exc:
+        log_activity(f"Backtest failed: no historical data for {data.symbol}",
+                     "scan", "warning")
+        raise HTTPException(status_code=503, detail=exc.reason)
     log_activity(f"Backtest complete: {result.get('win_rate', 0)}% win rate on {data.symbol}", "scan", "done")
     return result
 
@@ -5099,15 +5120,14 @@ async def admin_dashboard(user: dict = Depends(require_admin)):
     # it cannot fan out with the data — so it can never become a source of
     # unbounded concurrency against the database.
     #
-    # `list_collection_names()` stays sequential and ahead of the gather: the
-    # payments count is *conditional* on its result. Folding a dependent call into
-    # the same gather would race it.
-    has_payments = "payments" in await db.list_collection_names()
-
+    # PH3.9 removed a twelfth query — a `list_collection_names()` guard followed
+    # by `db.payments.count_documents({})`, which existed only to feed the
+    # fabricated revenue figure. With revenue resolved through
+    # `analytics.sources` there is nothing to count, so both calls are gone.
     (
         total_users, premium_users, elite_users, admin_users,
         today_trades, total_trades, open_trades,
-        ai_requests_today, total_notifications, open_tickets,
+        chat_messages_today, total_notifications, open_tickets,
         broker_connections,
     ) = await asyncio.gather(
         db.users.count_documents({}),
@@ -5122,30 +5142,58 @@ async def admin_dashboard(user: dict = Depends(require_admin)):
         db.support_tickets.count_documents({"status": {"$in": ["open", "in_progress"]}}),
         db.broker_accounts.count_documents({}),
     )
-    total_payments = await db.payments.count_documents({}) if has_payments else 0
-    # PH3.8 — FABRICATED, and left in place deliberately (mock removal is PH3.9).
+    # PH3.9 — the three fabricated money figures are gone.
     #
-    # `revenue_today` is the COUNT of every payment document ever written,
-    # multiplied by a literal ₹499. It is not a sum of amounts, it is not
-    # filtered to today, and it ignores currency, status and refunds. It reads
-    # ₹0 on this installation only because `db.payments` is empty — nothing in
-    # the codebase writes to it — so the first record to land would report ₹499
-    # of "today's revenue" whatever it was actually for.
+    # `revenue_today` was `count(all payment documents) × ₹499`: not a sum, not
+    # date-filtered, and blind to amount, currency, status and refunds. It read
+    # ₹0 only because `db.payments` is empty, so the first record to land would
+    # have reported ₹499 of "today's revenue" whatever it was for. `mrr`/`arr`
+    # inferred revenue from role counts × a hardcoded price, and roles are
+    # granted through `grant-plan` with no payment, so every comped, internal
+    # and beta account counted as paying.
     #
-    # `mrr`/`arr` infer revenue from role counts × hardcoded prices, and roles
-    # are granted by admins without payment. See GET /api/admin/payments/stats
-    # for the full classification.
-    revenue_today = total_payments * _ASSUMED_PLAN_PRICE_INR["pro"]
-    mrr = (premium_users * _ASSUMED_PLAN_PRICE_INR["pro"]
-           + elite_users * _ASSUMED_PLAN_PRICE_INR["elite"])
-    arr = mrr * 12
+    # All three now resolve through `analytics.sources`, which returns an
+    # explicit UNAVAILABLE while the platform has no payment integration. The
+    # gate is the integration, NOT the emptiness of the collection — gating on
+    # emptiness is how the first stray document flips revenue back to
+    # "available" and reports it as fact.
+    revenue_today_metric, mrr_metric, arr_metric = await asyncio.gather(
+        analytics_sources.revenue(db, today_window, name="revenue_today"),
+        analytics_sources.subscription_revenue(db, name="mrr", months=1),
+        analytics_sources.subscription_revenue(db, name="arr", months=12),
+    )
 
-    # Health checks
-    try:
-        await db.command("ping")
-        db_health = "healthy"
-    except Exception:
-        db_health = "unhealthy"
+    # PH3.9 — real readiness probes, replacing two literals that read "healthy"
+    # during a total outage. `db_health` already pinged; `api_health` and
+    # `server_health` did not check anything at all.
+    from analytics import platform_health as analytics_platform
+    dependencies = await analytics_platform.dependency_status()
+    mongo_probe = dependencies.get("mongodb", {})
+    db_health = ("healthy" if mongo_probe.get("healthy")
+                 else "unknown" if mongo_probe.get("healthy") is None else "unhealthy")
+    critical_failing = [n for n, d in dependencies.items()
+                        if d.get("critical") and d.get("healthy") is False]
+    # "The process is answering this request" is the only thing a health field
+    # served BY that process can honestly assert about itself. Named to say so
+    # rather than implying an external check happened.
+    server_health = "serving"
+
+    metrics = [
+        analytics_contract.real("total_users", total_users, source="db.users"),
+        analytics_contract.real("premium_users", premium_users, source="db.users.role"),
+        analytics_contract.real("elite_users", elite_users, source="db.users.role"),
+        analytics_contract.derived("today_trades", today_trades, period=today_window,
+                                   source="db.trades.entry_time",
+                                   note="Includes paper trades: platform activity, "
+                                        "not real order flow."),
+        analytics_contract.derived("chat_messages_today", chat_messages_today,
+                                   period=today_window, source="db.chat_messages",
+                                   note="Stored chat messages, which include both the "
+                                        "user turn and the assistant turn — roughly 2x "
+                                        "the provider calls. Real provider call counts "
+                                        "are on GET /api/admin/ai/status."),
+        revenue_today_metric, mrr_metric, arr_metric,
+    ]
 
     return {
         "total_users": total_users,
@@ -5155,27 +5203,31 @@ async def admin_dashboard(user: dict = Depends(require_admin)):
         "today_trades": today_trades,
         "total_trades": total_trades,
         "open_trades": open_trades,
-        "ai_requests_today": ai_requests_today,
+        # PH3.9: renamed from `ai_requests_today`, which it never was. The old
+        # name claimed a provider-call count; the value is stored chat messages,
+        # both turns, so it overstated provider calls by roughly 2x. The value is
+        # unchanged and correct — only the claim was wrong.
+        "chat_messages_today": chat_messages_today,
         "total_notifications": total_notifications,
         "open_tickets": open_tickets,
-        "revenue_today": revenue_today,
-        "mrr": mrr,
-        "arr": arr,
+        # Explicit nulls, never zeros. `revenue_today: 0` and "we have no
+        # revenue source" must not render identically (ANALYTICS.md §1).
+        "revenue_today": revenue_today_metric.value,
+        "mrr": mrr_metric.value,
+        "arr": arr_metric.value,
         "broker_connections": broker_connections,
         "db_health": db_health,
-        # PH3.8: `api_health` and `server_health` are literals — they report
-        # "healthy" during a total outage. `GET /api/health/detailed` (PH2.5/
-        # PH3.7) performs real dependency probes and is what an operator should
-        # read. Flagged rather than changed: this endpoint's contract is
-        # consumed by AdminDashboard's health badges and PH3.9 owns the swap.
-        "api_health": "healthy",
-        "server_health": "healthy",
+        "server_health": server_health,
+        "dependencies": dependencies,
+        "degraded_dependencies": critical_failing,
         "window": today_window.as_dict(),
-        "mock_metrics": ["revenue_today", "mrr", "arr", "api_health", "server_health"],
-        "analytics_note": (
-            "revenue_today, mrr and arr are fabricated — no payment records exist. "
-            "api_health and server_health are hardcoded literals. See "
-            "GET /api/admin/payments/stats and docs/architecture/ANALYTICS.md."),
+        "analytics": analytics_contract.envelope(metrics, period=today_window,
+                                                 surface="admin.dashboard"),
+        # Retained (empty) so a consumer written against PH3.8's contract keeps
+        # working and observes that nothing on this surface is fabricated now.
+        "mock_metrics": [],
+        "unavailable_metrics": [m.name for m in metrics
+                                if m.status == analytics_contract.UNAVAILABLE],
     }
 
 
@@ -5343,166 +5395,196 @@ async def admin_list_payments(page: int = PageParam, limit: int = LimitParam,
     return {"payments": payments, "total": total, "page": page, "limit": limit, "pages": max(1, (total + limit - 1) // limit)}
 
 
-#: Plan prices assumed by the revenue estimate, in INR per month. Named
-#: constants rather than magic numbers inline — not because that makes the
-#: estimate correct (it does not; see the route), but so the assumption is
-#: visible and greppable when PH3.9 replaces it with real subscription records.
-_ASSUMED_PLAN_PRICE_INR = {"pro": 499, "premium": 499, "elite": 999}
-
-
 @admin_router.get("/payments/stats")
 async def admin_payment_stats(user: dict = Depends(require_admin)):
     """Billing summary.
 
-    PH3.8 CLASSIFICATION — **every revenue figure here is fabricated**, and the
-    reason is structural rather than a coding slip: the `payments` collection
-    has no writer anywhere in this codebase and the platform has no payment
-    integration, so there is no revenue data to read.
+    PH3.9 — **every fabricated revenue figure on this endpoint has been
+    removed.** What replaced them is not a smaller number; it is an explicit
+    UNAVAILABLE, because the blocker is structural rather than a coding slip:
+    `db.payments` has no writer anywhere in this codebase and the platform has
+    no payment integration, so there is no revenue data to read.
 
-    * `mrr` / `arr` infer revenue from ROLE COUNTS × a hardcoded price. Roles
-      are assigned by an admin through `POST /api/admin/users/{id}/grant-plan`
-      with no payment involved, so every comped account, internal account and
-      beta tester is counted as paying.
+    What was here before, and why each was wrong rather than merely imprecise:
+
+    * `mrr` / `arr` were ROLE COUNTS × a hardcoded price. Roles are assigned by
+      an admin through `POST /api/admin/users/{id}/grant-plan` with no payment
+      involved, so every comped account, internal account and beta tester was
+      counted as paying — and the price was a literal in this route, not the
+      plan the user actually bought.
     * `revenue_today`, `revenue_week`, `pending_payments`, `refunds` and
-      `failed_payments` are literal zeros. A zero that means "we have no data"
-      is indistinguishable on a dashboard from a zero that means "no revenue
-      today" — which is the specific confusion the analytics contract exists to
-      prevent, so each is now declared.
-    * `refunds: 0` is additionally contradicted by the product: PH3.5 found that
-      `POST /api/admin/payments/{id}/refund` is a stub returning success while
-      writing a `payment.refunded` audit record for a refund that never
-      happened.
+      `failed_payments` were literal zeros. A zero meaning "we have no data" is
+      indistinguishable on a dashboard from a zero meaning "no revenue today".
+    * `revenue_month` / `revenue_year` were `mrr` / `arr` under a different
+      name, so a monthly revenue figure inherited every defect above.
 
-    `plan_distribution` and the three plan counts ARE real — they are counts of
-    users by role, which is a fact about the database.
+    The aggregation that WOULD serve these figures is written and tested in
+    `analytics.sources` — it sums captured payments per IST window and treats
+    created/pending/authorized/failed as what they are, which is not revenue.
+    It is gated on `payments_integration()`, a single predicate about the
+    platform, so wiring a provider is one reviewed edit rather than a rewrite.
+
+    `plan_distribution` and the three plan counts remain REAL — they are counts
+    of users by role, which is a fact about the database. They are counts of
+    *entitlements*, not of paying customers, and now say so.
     """
     users_by_plan = await _plan_breakdown()
     premium_count = users_by_plan.get("pro", 0) + users_by_plan.get("premium", 0)
     elite_count = users_by_plan.get("elite", 0)
     lifetime_count = users_by_plan.get("lifetime", 0)
-    mrr = (premium_count * _ASSUMED_PLAN_PRICE_INR["pro"]
-           + elite_count * _ASSUMED_PLAN_PRICE_INR["elite"])
-    arr = mrr * 12
 
-    revenue_note = ("Inferred from role counts × a hardcoded price, not from payment "
-                    "records — `db.payments` has no writer. Comped and admin-granted "
-                    "accounts are counted as paying. PH3.9.")
-    zero_note = ("A hardcoded zero, not a measured zero. No payment records exist to "
-                 "aggregate. PH3.9.")
-    metrics = [
-        analytics_contract.mock("mrr", mrr, unit=analytics_contract.INR,
-                                source="db.users.role × literal price", note=revenue_note),
-        analytics_contract.mock("arr", arr, unit=analytics_contract.INR,
-                                source="mrr × 12", note=revenue_note),
-        analytics_contract.mock("revenue_today", 0, unit=analytics_contract.INR,
-                                source="literal", note=zero_note),
-        analytics_contract.mock("revenue_week", 0, unit=analytics_contract.INR,
-                                source="literal", note=zero_note),
-        analytics_contract.mock("revenue_month", mrr, unit=analytics_contract.INR,
-                                source="mrr", note=revenue_note),
-        analytics_contract.mock("revenue_year", arr, unit=analytics_contract.INR,
-                                source="arr", note=revenue_note),
-        analytics_contract.mock("pending_payments", 0, source="literal", note=zero_note),
-        analytics_contract.mock("refunds", 0, source="literal",
-                                note=zero_note + " Contradicted by the refund endpoint, "
-                                                 "which is a stub that audits refunds it "
-                                                 "never performs (PH3.5 D-4)."),
-        analytics_contract.mock("failed_payments", 0, source="literal", note=zero_note),
-        analytics_contract.real("premium_count", premium_count, source="db.users.role"),
-        analytics_contract.real("elite_count", elite_count, source="db.users.role"),
-        analytics_contract.real("lifetime_count", lifetime_count, source="db.users.role"),
+    today = analytics_periods.resolve("today")
+    week = analytics_periods.resolve("7d")
+    month = analytics_periods.resolve("mtd")
+    year = analytics_periods.resolve("ytd")
+
+    entitlement_note = ("A count of users holding this ROLE. Roles are granted by an "
+                        "admin without payment, so this is entitlement, not paid "
+                        "subscribers.")
+    revenue_metrics = await asyncio.gather(
+        analytics_sources.subscription_revenue(db, name="mrr", months=1),
+        analytics_sources.subscription_revenue(db, name="arr", months=12),
+        analytics_sources.revenue(db, today, name="revenue_today"),
+        analytics_sources.revenue(db, week, name="revenue_week"),
+        analytics_sources.revenue(db, month, name="revenue_month"),
+        analytics_sources.revenue(db, year, name="revenue_year"),
+        analytics_sources.payment_state_count(db, analytics_sources.PENDING_STATUSES,
+                                              name="pending_payments"),
+        analytics_sources.payment_state_count(db, analytics_sources.REFUNDED_STATUSES,
+                                              name="refunds"),
+        analytics_sources.payment_state_count(db, analytics_sources.FAILED_STATUSES,
+                                              name="failed_payments"),
+    )
+    metrics = list(revenue_metrics) + [
+        analytics_contract.real("premium_count", premium_count,
+                                source="db.users.role", note=entitlement_note),
+        analytics_contract.real("elite_count", elite_count,
+                                source="db.users.role", note=entitlement_note),
+        analytics_contract.real("lifetime_count", lifetime_count,
+                                source="db.users.role", note=entitlement_note),
     ]
+    by_name = {m.name: m for m in metrics}
     return {
-        "mrr": mrr,
-        "arr": arr,
-        "revenue_today": 0,
-        "revenue_week": 0,
-        "revenue_month": mrr,
-        "revenue_year": arr,
-        "pending_payments": 0,
-        "refunds": 0,
-        "failed_payments": 0,
+        # Every one of these is `None` while no payment integration exists.
+        # Deliberately null and not 0 — see the docstring and ANALYTICS.md §1.
+        "mrr": by_name["mrr"].value,
+        "arr": by_name["arr"].value,
+        "revenue_today": by_name["revenue_today"].value,
+        "revenue_week": by_name["revenue_week"].value,
+        "revenue_month": by_name["revenue_month"].value,
+        "revenue_year": by_name["revenue_year"].value,
+        "pending_payments": by_name["pending_payments"].value,
+        "refunds": by_name["refunds"].value,
+        "failed_payments": by_name["failed_payments"].value,
         "plan_distribution": users_by_plan,
         "premium_count": premium_count,
         "elite_count": elite_count,
         "lifetime_count": lifetime_count,
+        "payments_integration": analytics_sources.payments_integration(),
         "analytics": analytics_contract.envelope(metrics, surface="admin.payments"),
-        "mock_metrics": [m.name for m in metrics if m.provenance == analytics_contract.MOCK],
+        "mock_metrics": [],
+        "unavailable_metrics": [m.name for m in metrics
+                                if m.status == analytics_contract.UNAVAILABLE],
     }
 
 
 @admin_router.post("/payments/{payment_id}/refund")
 async def admin_refund_payment(payment_id: str, user: dict = Depends(require_admin)):
-    await log_admin_action(user["_id"], "payment.refunded", payment_id)
-    return {"success": True, "message": "Refund initiated"}
+    """Refund a payment — **not implemented, and no longer pretending to be.**
+
+    PH3.5 found this (D-4): it read no payment, called no provider, and returned
+    `{"success": true}` for any string, while writing a `payment.refunded` entry
+    to the immutable audit log. Two separate harms, and the second is the worse
+    one. An operator was told a customer had been refunded when nobody had — and
+    the audit log, the artefact whose entire purpose is to be the record of what
+    happened, was recording a refund that never occurred. A log that contains
+    invented events is not a weaker audit log; it is a misleading one.
+
+    There is no payment provider to refund through (`analytics.sources.
+    payments_integration`), so the honest response is 501 and **no audit
+    record**. A missing feature that says so is strictly better than an
+    admin-visible action that lies.
+    """
+    status = analytics_sources.payments_integration()
+    raise HTTPException(
+        status_code=501,
+        detail=("Refunds are not implemented: this platform has no payment "
+                "integration, so there is no payment to reverse. " + status["reason"]))
 
 
 # ---------- AI Monitoring ----------
 
 @admin_router.get("/ai/status")
 async def admin_ai_status(user: dict = Depends(require_admin)):
-    """AI provider status.
+    """AI provider status, from the real instruments PH3.7 shipped.
 
-    PH3.8 CLASSIFICATION. `latency_ms` (1200 / 900), `failures: 0` and
-    `fallbacks: 0` are literals; `status` reflects only whether a KEY IS
-    CONFIGURED and is never probed; `estimated_cost` is a message count times a
-    flat per-message rate, when provider billing is per token. `daily_requests`
-    and `monthly_requests` are stored chat messages halved — messages include
-    both the user turn and the assistant turn, and the 50/50 split between the
-    two providers is arbitrary.
+    PH3.9 — what this endpoint used to return: `latency_ms` 1200/900,
+    `failures: 0`, `fallbacks: 0` — all literals; `status` derived from whether
+    a *key was configured* rather than from anything observed; per-provider
+    request counts computed by halving the stored chat-message count and
+    splitting it 50/50 between the two providers regardless of which one served
+    the request; and `estimated_cost` as a flat per-message rate when provider
+    billing is per token.
 
-    The sharp edge is `failures: 0`. PH3.7 shipped
-    `ai_requests_total{provider,outcome}` and `ai_request_errors_total`, which
-    count real failures — so this page can report a healthy provider while the
-    platform's own metrics record it failing. An operator watching the admin
-    console cannot see an outage that is already being measured.
+    The sharp edge was `failures: 0` sitting beside a live failure counter. An
+    operator watching this page could not see an outage the platform was already
+    measuring. All of it now reads `ai_requests_total{provider,outcome}`,
+    `ai_request_errors_total` and `ai_request_duration_seconds`.
+
+    Two honesty constraints, both enforced in `analytics.platform_health`:
+
+    * **Counters are process-scoped.** They reset on restart and, on a
+      multi-worker deployment, describe one worker. So the fields are named
+      `*_since_start` and carry `scope`. Nothing here is labelled "today" —
+      PH3.8's inventory suggested rewiring "requests today" to the counter, and
+      doing that literally would have replaced a fabricated number with a
+      mislabelled one.
+    * **Latency is a p95 bucket bound, not a mean.** A mean latency is the
+      number that hides an outage; see the `Histogram` docstring.
+
+    `estimated_cost` is gone rather than improved. Token counts are not recorded
+    anywhere, and a cost figure is the kind of number somebody forwards to
+    finance.
     """
-    claude_ok = claude_configured()
-    gemini_ok = gemini_configured()
-    # Aggregate AI usage from chat_messages
+    from analytics import platform_health as analytics_platform
+
+    configured = {"claude": claude_configured(), "gemini": gemini_configured()}
+    ai = analytics_platform.ai_providers(configured)
+
+    # Stored chat messages: durable, user-scoped, survives restarts — a genuinely
+    # different (and complementary) measurement from the in-process counters, so
+    # both are reported, each named for what it actually counts.
     today_window = analytics_periods.resolve("today")
-    total_ai, today_ai = await asyncio.gather(
+    total_messages, today_messages = await asyncio.gather(
         db.chat_messages.count_documents({}),
         db.chat_messages.count_documents(today_window.filter_for("created_at")),
     )
+    cost = analytics_contract.unavailable(
+        "estimated_cost", unit=analytics_contract.INR, source="(no token accounting)",
+        note=("Provider billing is per token and varies by model and cache hit. This "
+              "platform records no token counts, so a cost figure cannot be computed. "
+              "The previous value was a message count x a flat per-message rate, in an "
+              "ambiguous currency, split 50/50 between providers."))
+    metrics = [
+        cost,
+        analytics_contract.derived("chat_messages_today", today_messages,
+                                   period=today_window, source="db.chat_messages",
+                                   note="Stored messages: both the user turn and the "
+                                        "assistant turn, so roughly 2x provider calls."),
+        analytics_contract.derived("chat_messages_total", total_messages,
+                                   source="db.chat_messages"),
+    ]
     return {
-        "mock_metrics": ["latency_ms", "failures", "fallbacks", "estimated_cost",
-                         "daily_requests", "monthly_requests", "status"],
-        "analytics_note": (
-            "Provider latency, failure and fallback counts are literals. Real values "
-            "are in observability.metrics as ai_request_duration_seconds, "
-            "ai_requests_total{provider,outcome} and ai_request_errors_total (PH3.7); "
-            "this endpoint does not read them. Cost is a per-message flat rate, not "
-            "token-based. PH3.9."),
-        "providers": [
-            {
-                "name": "Claude (Anthropic)",
-                "model": "claude-opus-4-5-20250520",
-                "status": "online" if claude_ok else "offline",
-                "configured": claude_ok,
-                "latency_ms": 1200,
-                "daily_requests": today_ai // 2 if today_ai else 0,
-                "monthly_requests": total_ai // 2 if total_ai else 0,
-                "estimated_cost": round((total_ai // 2) * 0.015, 2) if total_ai else 0,
-                "failures": 0,
-                "fallbacks": 0,
-            },
-            {
-                "name": "Gemini (Google)",
-                "model": "gemini-2.5-pro",
-                "status": "online" if gemini_ok else "offline",
-                "configured": gemini_ok,
-                "latency_ms": 900,
-                "daily_requests": today_ai // 2 if today_ai else 0,
-                "monthly_requests": total_ai // 2 if total_ai else 0,
-                "estimated_cost": round((total_ai // 2) * 0.007, 2) if total_ai else 0,
-                "failures": 0,
-                "fallbacks": 0,
-            },
-        ],
-        "total_requests_today": today_ai,
-        "total_requests_all": total_ai,
-        "total_estimated_cost": round(total_ai * 0.011, 2) if total_ai else 0,
+        "providers": ai["providers"],
+        "fallbacks_since_start": ai["fallbacks_since_start"],
+        "fallback_note": ai["fallback_note"],
+        "scope": ai["scope"],
+        "chat_messages_today": today_messages,
+        "chat_messages_total": total_messages,
+        "estimated_cost": None,
+        "analytics": analytics_contract.envelope(metrics, surface="admin.ai"),
+        "mock_metrics": [],
+        "unavailable_metrics": ["estimated_cost"],
     }
 
 
@@ -5532,54 +5614,86 @@ async def admin_ai_usage(user: dict = Depends(require_admin)):
             "name": u.get("name", "Unknown") if u else "Unknown",
             "email": u.get("email", "") if u else "",
             "role": u.get("role", "user") if u else "user",
-            "request_count": doc["count"],
-            "estimated_cost": round(doc["count"] * 0.011, 2),
+            # Real: a count of that user's stored chat messages.
+            "message_count": doc["count"],
+            # PH3.8 kept this key; PH3.9 removes it. It was `count x 0.011` — a
+            # flat per-message rate standing in for per-token billing, in a
+            # currency the API and the UI disagreed about (rates read as USD,
+            # the table rendered a rupee sign). A per-user cost figure is
+            # exactly the kind of number that gets forwarded to finance, so an
+            # invented one is worse than none.
+            "estimated_cost": None,
         })
-    return {"top_users": top_users}
+    return {
+        "top_users": top_users,
+        "cost_note": ("Per-user cost is unavailable: no token counts are recorded, and "
+                      "provider billing is per token. `message_count` is real."),
+        "mock_metrics": [],
+        "unavailable_metrics": ["estimated_cost"],
+    }
 
 
 # ---------- API Monitoring ----------
 
 @admin_router.get("/apis/health")
 async def admin_api_health(user: dict = Depends(require_admin)):
-    """External API health.
+    """External integration health, from real probes and real counters.
 
-    PH3.8 CLASSIFICATION — **this entire response is a hardcoded list.**
-    `status` is "online" whenever a credential is configured and is never
-    probed; Yahoo Finance and News RSS are the literal string "online"
-    unconditionally. `latency_ms`, `requests_today`, `requests_month` and
-    `failure_rate` are literals, and `overall_status` is the constant
-    "healthy" — so this page reports a healthy platform during a total provider
-    outage, which is the exact opposite of what an operational dashboard is for.
+    PH3.9 — this response used to be a hardcoded list in which `status` meant
+    *a credential is configured* and never *the service answered*, `latency_ms`,
+    `requests_today`, `requests_month` and `failure_rate` were literals, and
+    `overall_status` was the constant `"healthy"`. The page reported a healthy
+    platform during a total provider outage.
 
-    Real data for every one of these fields exists: `GET /api/health/detailed`
-    runs live dependency probes (PH2.5/PH3.7) and
-    `provider_requests_total{provider,operation,outcome}` plus
-    `provider_request_duration_seconds` carry real counts and latencies.
-    Rewiring is PH3.9; PH3.8 makes the gap visible rather than shipping a
-    half-migrated health page inside an audit.
+    **The row list changed, and that is the substantive part of this fix.** The
+    old table named *vendors* — Yahoo Finance, Alpha Vantage — with individual
+    latencies. Those numbers can never be sourced honestly, because the Market
+    Gateway's Source Manager picks an upstream per request and that choice is
+    deliberately invisible above the gateway (`MARKET_DATA_ARCHITECTURE.md`);
+    `observability.instruments.PROVIDERS` is a closed vocabulary of *logical*
+    providers for precisely that reason. So this reports the logical providers
+    the platform actually instruments, and states plainly which integrations are
+    not measured rather than inventing a per-vendor breakdown the architecture
+    forbids.
+
+    **Razorpay is gone from the list entirely.** It was reported as `status:
+    "configured"` beside a 300ms latency, and there is no payment integration in
+    this codebase at all — a fabricated health row for an integration that does
+    not exist.
+
+    `configured` survives as its own column, because it is a real and useful
+    fact. What it is not is evidence the service works, and conflating the two
+    was this endpoint's original defect.
     """
-    apis = [
-        {"name": "Yahoo Finance", "type": "market_data", "status": "online", "latency_ms": 450, "requests_today": 0, "requests_month": 0, "quota_remaining": "unlimited", "failure_rate": 0.0},
-        {"name": "Claude API", "type": "ai", "status": "online" if claude_configured() else "offline", "latency_ms": 1200, "requests_today": 0, "requests_month": 0, "quota_remaining": "usage-based", "failure_rate": 0.0},
-        {"name": "Gemini API", "type": "ai", "status": "online" if gemini_configured() else "offline", "latency_ms": 900, "requests_today": 0, "requests_month": 0, "quota_remaining": "usage-based", "failure_rate": 0.0},
-        {"name": "News RSS", "type": "news", "status": "online", "latency_ms": 350, "requests_today": 0, "requests_month": 0, "quota_remaining": "unlimited", "failure_rate": 0.0},
-        {"name": "Zerodha Kite", "type": "broker", "status": "online" if kite_configured() else "offline", "latency_ms": 200, "requests_today": 0, "requests_month": 0, "quota_remaining": "usage-based", "failure_rate": 0.0},
-        {"name": "Alpha Vantage", "type": "market_data", "status": "online" if av_configured() else "offline", "latency_ms": 600, "requests_today": 0, "requests_month": 0, "quota_remaining": "500/day", "failure_rate": 0.0},
-        {"name": "Razorpay", "type": "payment", "status": "configured", "latency_ms": 300, "requests_today": 0, "requests_month": 0, "quota_remaining": "unlimited", "failure_rate": 0.0},
-        {"name": "Email (SMTP)", "type": "notification", "status": "configured", "latency_ms": 500, "requests_today": 0, "requests_month": 0, "quota_remaining": "unlimited", "failure_rate": 0.0},
-    ]
+    from analytics import platform_health as analytics_platform
+
+    # `None` means "we do not check", which is distinct from False. Each value
+    # is asked of the service that owns the credential rather than re-derived
+    # from environment variables here, so a configuration rule can never drift
+    # between the service and the page that reports on it.
+    from services import email_service, telegram_service, whatsapp_service
+    configured = {
+        # The gateway is credential-optional: its default source needs no key,
+        # and Alpha Vantage is one optional upstream among several. Reporting
+        # "market data is configured" off one vendor's key would be the same
+        # category error the old page made, so this reports the *optional*
+        # credential separately rather than as the gateway's status.
+        "market_data": None,
+        "news": None,
+        "broker_zerodha": bool(kite_configured()),
+        "email": bool(email_service.is_configured()),
+        "whatsapp": bool(whatsapp_service.is_configured()),
+        "telegram": bool(telegram_service.is_configured()),
+    }
+    report = analytics_platform.api_health(configured)
+    dependencies = await analytics_platform.dependency_status()
     return {
-        "apis": apis,
-        "overall_status": "healthy",
-        "status": analytics_contract.MOCK,
-        "mock_metrics": ["status", "latency_ms", "requests_today", "requests_month",
-                         "failure_rate", "overall_status"],
-        "analytics_note": (
-            "Hardcoded. `status` reflects credential configuration, not reachability; "
-            "latency, request counts and failure rate are literals. Use "
-            "GET /api/health/detailed and the provider_requests_total metric family "
-            "for real values. PH3.9."),
+        **report,
+        "dependencies": dependencies,
+        "status": analytics_contract.DERIVED,
+        "mock_metrics": [],
+        "unavailable_metrics": [r["name"] for r in report["apis"]
+                                if not r["instrumented"]],
     }
 
 
@@ -5605,128 +5719,165 @@ async def _plan_breakdown() -> dict:
 
 @admin_router.get("/analytics/users")
 async def admin_analytics_users(user: dict = Depends(require_admin)):
-    """User-growth analytics.
+    """User-growth and engagement analytics.
 
-    PH3.8 CLASSIFICATION. `total_users`, `today_signups`, `plan_breakdown` and
-    `conversion_rate` are real or derived. `dau`, `mau`, `retention_rate`,
-    `churn_rate` and `growth_rate` are NOT — they are today's signup count
-    relabelled, the total user count relabelled, and three literals. The values
-    are unchanged so nothing regresses, but the response now carries an
-    `analytics` block that says which is which, and `mock_metrics` lists them by
-    name for a consumer that only wants the flag. Replacement is PH3.9; the
-    specification is in `analytics.registry`.
+    PH3.9 — the five fabricated metrics on this endpoint are resolved, and they
+    are resolved three different ways, because they were not all wrong for the
+    same reason.
+
+    **Computed for real** — `dau` and `growth_rate`. DAU was today's *signup*
+    count relabelled; it is now distinct users with session activity in the IST
+    day, read from `db.sessions.last_used_at`, which has existed since PH1.6.
+    `growth_rate` was the literal `12.8`; it is now signups this period against
+    the period immediately before it, with the comparison base derived from the
+    window so the two halves cannot cover different spans.
+
+    **UNAVAILABLE, contradicting PH3.8's inventory** — `mau`. The inventory
+    prescribed "distinct user_id in `db.sessions` over a rolling 30 IST days".
+    That query would run and return a number, and the number would be wrong:
+    `db.sessions` carries a TTL index that deletes a session one refresh
+    lifetime (7 days by default) after its last use, so the rows a 30-day window
+    needs have been removed by the database. The result would be a 7-day count
+    under a 30-day label, undercounting more the longer ago a user churned.
+    Replacing a fabricated number with a systematically wrong one is not
+    progress. `analytics.sources.active_users` checks the window against the
+    retention horizon and refuses it, and the refusal is self-correcting: raise
+    `JWT_REFRESH_TTL_SECONDS` past thirty days and the same call returns a value.
+
+    **UNAVAILABLE** — `retention_rate` (78.5) and `churn_rate` (4.2). Cohort
+    retention needs activity history the TTL reaper removes; churn needs
+    subscription records that do not exist. Neither can be back-filled: an event
+    that was never recorded cannot be reconstructed.
     """
     today = analytics_periods.resolve("today")
+    month = analytics_periods.resolve("30d")
+
     total = await db.users.count_documents({})
-    today_signups = await db.users.count_documents(
-        today.filter_for("created_at"))
+    today_signups = await db.users.count_documents(today.filter_for("created_at"))
     plan_breakdown = await _plan_breakdown()
     conversion = round(
         (plan_breakdown.get("pro", 0) + plan_breakdown.get("elite", 0)) / max(total, 1) * 100, 1)
 
+    dau_metric, mau_metric, growth_metric = await asyncio.gather(
+        analytics_sources.active_users(db, today, name="dau"),
+        analytics_sources.active_users(db, month, name="mau"),
+        analytics_sources.signup_growth(db, month, name="growth_rate"),
+    )
     metrics = [
         analytics_contract.real("total_users", total, source="db.users"),
         analytics_contract.derived("today_signups", today_signups, period=today,
                                    source="db.users.created_at"),
-        analytics_contract.derived("conversion_rate", conversion, unit=analytics_contract.PERCENT,
+        analytics_contract.derived("conversion_rate", conversion,
+                                   unit=analytics_contract.PERCENT,
                                    source="db.users.role",
-                                   note="Conversion to a granted ROLE. Roles are assigned by "
-                                        "an admin without payment, so this is not paid "
+                                   note="Conversion to a granted ROLE. Roles are assigned "
+                                        "by an admin without payment, so this is not paid "
                                         "conversion."),
-        analytics_contract.mock("dau", today_signups, period=today,
-                                source="db.users.created_at",
-                                note="This is today's SIGNUP count relabelled as daily active "
-                                     "users. Real activity data exists in db.sessions "
-                                     "(last_used_at) and is not read here. PH3.9."),
-        analytics_contract.mock("mau", total, source="db.users",
-                                note="This is the TOTAL registered user count relabelled as "
-                                     "monthly actives, so DAU/MAU is meaningless. PH3.9."),
-        analytics_contract.mock("retention_rate", 78.5, unit=analytics_contract.PERCENT,
-                                source="literal",
-                                note="A constant in the source. It does not move when users "
-                                     "leave. Needs cohort analysis over db.sessions. PH3.9."),
-        analytics_contract.mock("churn_rate", 4.2, unit=analytics_contract.PERCENT,
-                                source="literal",
-                                note="A constant in the source. Needs subscription "
-                                     "cancellations, which are not recorded. PH3.9."),
-        analytics_contract.mock("growth_rate", 12.8, unit=analytics_contract.PERCENT,
-                                source="literal",
-                                note="A constant in the source. Computable today from "
-                                     "db.users.created_at period over period. PH3.9."),
+        dau_metric, mau_metric, growth_metric,
+        analytics_sources.retention_rate(name="retention_rate"),
+        analytics_sources.churn_rate(name="churn_rate"),
     ]
+    by_name = {m.name: m for m in metrics}
     return {
         "total_users": total,
         "today_signups": today_signups,
-        "dau": today_signups,
-        "mau": total,
-        "retention_rate": 78.5,
-        "churn_rate": 4.2,
-        "growth_rate": 12.8,
+        # `None`, never `0`. "Nobody was active today" and "we cannot measure
+        # activity" are different facts and must not share a rendering.
+        "dau": by_name["dau"].value,
+        "mau": by_name["mau"].value,
+        "retention_rate": by_name["retention_rate"].value,
+        "churn_rate": by_name["churn_rate"].value,
+        "growth_rate": by_name["growth_rate"].value,
         "conversion_rate": conversion,
         "plan_breakdown": plan_breakdown,
-        "analytics": analytics_contract.envelope(metrics, period=today, surface="admin.users"),
-        "mock_metrics": [m.name for m in metrics if m.provenance == analytics_contract.MOCK],
+        "analytics": analytics_contract.envelope(metrics, period=today,
+                                                 surface="admin.users"),
+        "mock_metrics": [],
+        "unavailable_metrics": [m.name for m in metrics
+                                if m.status == analytics_contract.UNAVAILABLE],
     }
 
 
 @admin_router.get("/analytics/revenue")
 async def admin_analytics_revenue(user: dict = Depends(require_admin)):
-    """Revenue trend.
+    """Revenue trend — **UNAVAILABLE, and the chart is gone.**
 
-    PH3.8: **every number returned by this endpoint is fabricated.** The series
-    is produced by a for-loop — `revenue = 2500 + i*150 + (500 if i % 7 == 0)`,
-    `subscriptions = 3 + i % 5` — with no database access of any kind, and the
-    frontend charts it identically to a real series. It is left in place because
-    ripping a chart out of a dashboard without a replacement is not an
-    improvement; what is added is that the payload now says so, in a field a
-    consumer can branch on, and every point carries `mock: true`.
+    PH3.9 deletes what was the most misleading artefact in the product: a
+    smooth, always-up-and-to-the-right 30-day revenue series produced by a
+    for-loop — `revenue = 2500 + i*150 + (500 if i % 7 == 0)`, `subscriptions =
+    3 + i % 5` — with **no database access of any kind**, rendered by Recharts
+    with no visual distinction from a real series, on an installation that has
+    never processed a payment.
 
-    The blocker is upstream of this route: `db.payments` has no writer anywhere
-    in the codebase and the platform has no payment integration, so there is no
-    revenue data to aggregate. PH3.9 either wires the payment provider or turns
-    this into an explicit UNAVAILABLE.
+    It is deleted rather than zeroed. A flat line at ₹0 across thirty days is
+    still a claim — that we measured thirty days and found no revenue — and it
+    is a false one. `daily_revenue` is an empty list with `status: unavailable`
+    and a reason, so a client renders an empty state instead of a chart.
+
+    **This series is explicitly not back-fillable.** Even once a payment
+    provider is wired, history before the integration does not exist and must
+    not be manufactured; the chart starts on the day real capture records start.
     """
-    revenue_data = []
-    for i in range(30):
-        d = datetime.now(timezone.utc) - timedelta(days=29 - i)
-        revenue_data.append({
-            "date": d.strftime("%Y-%m-%d"),
-            "revenue": 2500 + (i * 150) + (500 if i % 7 == 0 else 0),
-            "subscriptions": 3 + (i % 5),
-            "mock": True,
-        })
-    spec = analytics_registry.get("admin.revenue_series")
+    status = analytics_sources.payments_integration()
+    metric = analytics_contract.unavailable(
+        "revenue_series", unit=analytics_contract.INR,
+        period=analytics_periods.resolve("30d"), source=status["collection"],
+        note=status["reason"])
     return {
-        "daily_revenue": revenue_data,
-        "status": analytics_contract.MOCK,
-        "provenance": analytics_contract.MOCK,
-        "note": "Fabricated series generated by a formula. No payment records exist: "
-                "`db.payments` has no writer and the platform has no payment "
-                "integration. Do not report these figures.",
-        "required_source": spec.required_source if spec else "",
-        "mock_metrics": ["revenue", "subscriptions"],
+        # Empty, not fabricated, and not a zero-filled 30-point series.
+        "daily_revenue": [],
+        "status": analytics_contract.UNAVAILABLE,
+        "provenance": analytics_contract.UNAVAILABLE,
+        "note": status["reason"],
+        "backfillable": False,
+        "backfill_note": ("Historical revenue before a payment integration exists cannot "
+                          "be reconstructed. When a provider is wired, this series starts "
+                          "on the first day of real capture records."),
+        "required_source": "Captured payment records aggregated by IST day.",
+        "payments_integration": status,
+        "analytics": analytics_contract.envelope([metric], surface="admin.revenue"),
+        "mock_metrics": [],
+        "unavailable_metrics": ["revenue_series"],
     }
 
 
-#: The fixed percentages this endpoint has always returned, kept verbatim so the
-#: response does not change shape or value in an audit sprint. They correspond
-#: to nothing — see the note in the route.
-_FEATURE_USAGE_PCT = {
-    "AI Chat": 85, "Trading": 72, "Stock Scanner": 68, "Morning Report": 55,
-    "Portfolio": 50, "News": 45, "Notifications": 40, "SIP Advisor": 25,
-    "Paper Trading": 20, "Backtesting": 15,
+#: Features whose usage is backed by a real collection count, and the collection
+#: that backs each. Everything the product does that ISN'T in this map is not
+#: counted anywhere — which is why the endpoint reports adoption as unavailable
+#: rather than filling the gap. Adding a row here requires a real source.
+_COUNTED_FEATURES = {
+    "AI Chat": "chat_messages",
+    "Trading": "trades",
+    "Notifications": "notifications",
 }
 
 
 @admin_router.get("/analytics/features")
 async def admin_analytics_features(user: dict = Depends(require_admin)):
-    """Feature adoption.
+    """Feature adoption — real counts only; the percentages are gone.
 
-    PH3.8: the `percentage` column is a fixed descending list of literals with
-    no relationship to the `usage_count` beside it, and seven of the ten
-    `usage_count` values are the literal 0 because nothing counts those
-    features. Three rows — AI Chat, Trading, Notifications — carry a real
-    collection count. Each row now declares which of its two numbers is real.
+    PH3.9 — the `percentage` column was a fixed descending list (85, 72, 68, 55,
+    50, 45, 40, 25, 20, 15) with **no relationship to the `usage_count` beside
+    it**, and seven of the ten counts were themselves the literal `0` because
+    nothing counts those features. So the bar and the number next to it
+    disagreed by construction, and a reader had no way to know.
+
+    Both fabrications are removed, and they are removed differently:
+
+    * The seven uncounted rows are **deleted**, not zeroed. "The scanner has 0
+      uses" is a measurement claim, and nothing measures the scanner. A row that
+      is not there is honest; a row reading 0 is not.
+    * `adoption_pct` is UNAVAILABLE for the three real rows too. An adoption
+      percentage is *distinct users who used the feature ÷ active users*, and
+      neither term exists: these are total event counts, not distinct users, so
+      one enthusiastic user and a hundred casual ones are indistinguishable.
+      Dividing a message count by a user count would produce a percentage over
+      100% and be no more meaningful for staying under it.
+
+    A feature-usage event stream (feature, user_id, timestamp) is the required
+    source. `observability.metrics` per-route counters are the cheapest honest
+    substitute, but they are process-scoped and count requests rather than
+    users, so they answer a different question.
     """
     chat_count, trade_count, notif_count = await asyncio.gather(
         db.chat_messages.count_documents({}),
@@ -5734,28 +5885,40 @@ async def admin_analytics_features(user: dict = Depends(require_admin)):
         db.notifications.count_documents({}),
     )
     counted = {"AI Chat": chat_count, "Trading": trade_count, "Notifications": notif_count}
+    adoption_note = (
+        "Adoption requires distinct users per feature over an active-user base. This "
+        "is a total EVENT count, not a distinct-user count, so a percentage cannot be "
+        "derived from it. Required source: a feature-usage event stream "
+        "(feature, user_id, timestamp).")
     features = [
         {
             "name": name,
-            "usage_count": counted.get(name, 0),
-            "percentage": pct,
-            # The count is real only where a collection backs it.
-            "usage_count_provenance": (
-                analytics_contract.DERIVED if name in counted else analytics_contract.MOCK),
-            "percentage_provenance": analytics_contract.MOCK,
+            "usage_count": counted[name],
+            "usage_count_provenance": analytics_contract.DERIVED,
+            "source": f"db.{_COUNTED_FEATURES[name]}",
+            "adoption_pct": None,
+            "adoption_pct_provenance": analytics_contract.UNAVAILABLE,
         }
-        for name, pct in _FEATURE_USAGE_PCT.items()
+        for name in _COUNTED_FEATURES
     ]
+    metrics = [
+        analytics_contract.derived(f"usage_count.{f['name']}", f["usage_count"],
+                                   source=f["source"])
+        for f in features
+    ] + [analytics_contract.unavailable("adoption_pct", unit=analytics_contract.PERCENT,
+                                        source="(no feature-usage event stream)",
+                                        note=adoption_note)]
     return {
         "features": features,
-        "status": analytics_contract.MOCK,
-        "note": "Every `percentage` is a literal unrelated to the count beside it. Seven "
-                "of ten `usage_count` values are also literals — no feature-usage event "
-                "stream exists. `observability.metrics` counts requests per route "
-                "template and is the cheapest honest substitute. PH3.9.",
-        "mock_metrics": ["percentage"] + [
-            f["name"] for f in features
-            if f["usage_count_provenance"] == analytics_contract.MOCK],
+        "status": analytics_contract.DERIVED,
+        "adoption_note": adoption_note,
+        "uncounted_features": ("Stock Scanner, Morning Report, Portfolio, News, SIP "
+                               "Advisor, Paper Trading and Backtesting are not counted "
+                               "anywhere. They are omitted rather than reported as 0, "
+                               "which would be a measurement claim nothing supports."),
+        "analytics": analytics_contract.envelope(metrics, surface="admin.features"),
+        "mock_metrics": [],
+        "unavailable_metrics": ["adoption_pct"],
     }
 
 
@@ -6017,28 +6180,59 @@ async def admin_system_health(user: dict = Depends(require_admin)):
     # WebSocket connections
     ws_count = len(ws_manager.active_connections) if hasattr(ws_manager, "active_connections") else 0
 
-    # Platform info
+    # PH3.9 — Redis and the scheduler were both literals, and both were wrong
+    # rather than merely vague. `redis.status` read "not_configured" from before
+    # PH2.7 shipped `infrastructure.redis_client` and PH3.7 registered a real
+    # readiness probe, so a working Redis was reported as absent. `scheduler.
+    # status` was the constant "running" and stayed "running" after the
+    # scheduler died — the single worst failure mode for a status field, because
+    # it is green exactly when you need it to be red.
+    from analytics import platform_health as analytics_platform
+    dependencies = await analytics_platform.dependency_status()
+    redis_probe = dependencies.get("redis")
+    scheduler = analytics_platform.scheduler_status()
+
+    if redis_probe is None:
+        redis_state = {"status": analytics_platform.NOT_MEASURED,
+                       "note": "No Redis readiness probe is registered in this process."}
+    else:
+        # The probe's three-way answer is preserved. `skip` means Redis is not
+        # configured, which is a valid deployment (services/cache.py falls back
+        # to an in-process dict) — not a fault, and not a green light either.
+        redis_state = {
+            "status": {"pass": "healthy", "fail": "unhealthy"}.get(
+                redis_probe["status"], "not_configured"),
+            "healthy": redis_probe["healthy"],
+            "duration_ms": redis_probe["duration_ms"],
+            "source": "observability.health probe",
+        }
+
     return {
         "system": sys_info,
         "mongodb": {"status": mongo_status, **mongo_details},
-        # PH3.8: both literals, and both now wrong rather than merely vague.
-        # `redis.status` has read "not_configured" since before PH2.7 shipped
-        # `infrastructure.redis_client` and PH3.7 registered a real Redis
-        # readiness probe. `scheduler.status` is the constant "running" and stays
-        # "running" after the scheduler dies. `GET /api/health/detailed` answers
-        # both correctly. Rewiring is PH3.9 (see analytics.registry
-        # "admin.redis_status"); flagged here so an operator is not misled
-        # meanwhile.
-        "redis": {"status": "not_configured", "provenance": analytics_contract.MOCK},
-        "websockets": {"active_connections": ws_count, "status": "healthy" if ws_count >= 0 else "unknown"},
-        "scheduler": {"status": "running", "provenance": analytics_contract.MOCK},
-        "mock_metrics": ["redis.status", "scheduler.status"],
+        "redis": redis_state,
+        "websockets": {"active_connections": ws_count,
+                       "status": "healthy",
+                       "source": "ws_manager.active_connections"},
+        "scheduler": scheduler,
+        "dependencies": dependencies,
+        "mock_metrics": [],
         "platform": {
             "python_version": platform.python_version(),
             "os": platform.system(),
             "architecture": platform.machine(),
         },
-        "overall_status": "healthy" if mongo_status == "healthy" else "degraded",
+        # Now genuinely derived: any failing CRITICAL dependency degrades the
+        # platform. A non-critical failure is reported in `dependencies` without
+        # rounding the whole service up to "down" (or, as before, down to
+        # "healthy" regardless).
+        "overall_status": (
+            "degraded"
+            if mongo_status != "healthy"
+            or any(d.get("critical") and d.get("healthy") is False
+                   for d in dependencies.values())
+            or scheduler.get("running") is False
+            else "healthy"),
     }
 
 
@@ -6293,6 +6487,23 @@ async def ensure_indexes():
     # periods`), which this index can actually serve.
     # ----------------------------------------------------------------------- #
     await db.users.create_index("created_at")
+
+    # ----------------------------------------------------------------------- #
+    # sessions.last_used_at (PH3.9) — the DAU query. `GET /api/admin/analytics/
+    # users` now derives daily active users from real session activity instead
+    # of relabelling today's signup count, which means a range match on
+    # `last_used_at` followed by a distinct-user grouping.
+    #
+    # The three existing indexes cannot serve it: `session_id` and `user_id` do
+    # not constrain the field, and the `expires_at` TTL index is on a different
+    # one. Without this, every admin analytics load is a full scan of the
+    # sessions collection — which grows with logins-per-user, not with users.
+    #
+    # Compound rather than single-field: `{last_used_at, user_id}` lets the
+    # window filter and the distinct-user grouping both be served from the index
+    # without touching a document.
+    # ----------------------------------------------------------------------- #
+    await db.sessions.create_index([("last_used_at", 1), ("user_id", 1)])
 
     # ----------------------------------------------------------------------- #
     # notifications — polled by the bell badge on every authenticated page.

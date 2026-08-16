@@ -56,17 +56,34 @@ def _id_params(path):
 #: one added after any hand-written list was compiled.
 _ID_ROUTES = [(m, p) for m, p in AUTHENTICATED_ROUTES if _id_params(p)]
 
-#: Routes excluded from the strict check because they are known *stubs* rather
-#: than known-correct. Each has a dedicated failing-by-design test below, so the
-#: gap is recorded in the suite instead of quietly waived here.
-_STUB_ROUTES = frozenset({("POST", "/api/admin/payments/{payment_id}/refund")})
+#: Routes that answer **501 Not Implemented** for every identifier, valid or
+#: not, because the feature does not exist. They are excluded from both sweeps
+#: — including the 5xx invariant — and the exclusion needs its own justification
+#: because "excluded from the no-5xx rule" is exactly the kind of waiver that
+#: hides a real defect.
+#:
+#: The justification is that the invariant is about *identifier parsing*: a
+#: malformed id must not be reported as a server fault. A 501 here says nothing
+#: about the identifier. It is returned for a well-formed id too, it is the
+#: correct status for a capability the server does not have, and answering 400
+#: instead would blame the caller for a gap on our side.
+#:
+#: Until PH3.9 this set was named `_STUB_ROUTES` and held the same route for the
+#: opposite reason: the endpoint returned **200 with `success: true` for any
+#: string** while writing a `payment.refunded` audit record for a refund that
+#: never happened (PH3.3's D-4). `TestRefundEndpointIsNotImplemented` below
+#: asserts the current behaviour, including the absence of that audit record.
+_NOT_IMPLEMENTED_ROUTES = frozenset({
+    ("POST", "/api/admin/payments/{payment_id}/refund"),
+})
+
+_ID_ROUTES = [entry for entry in _ID_ROUTES if entry not in _NOT_IMPLEMENTED_ROUTES]
 
 #: The subset whose identifier really is an ObjectId, and must therefore be
 #: rejected with a 4xx rather than merely not crashing.
 _OBJECTID_ROUTES = [
     (m, p) for m, p in _ID_ROUTES
     if all(param not in _NON_OBJECTID_PARAMS for param in _id_params(p))
-    and (m, p) not in _STUB_ROUTES
 ]
 
 #: Values a client can actually put in a URL segment that are not ObjectIds.
@@ -259,49 +276,55 @@ class TestGrantPlanValidation:
         assert resp.status_code == 400
 
 
-class TestRefundEndpointIsAStub:
-    """PH3.3 defect D-4 (HIGH) — recorded, deliberately not fixed in this sprint.
+class TestRefundEndpointIsNotImplemented:
+    """PH3.3 defect D-4 (HIGH), **fixed in PH3.9.**
 
-    `POST /api/admin/payments/{payment_id}/refund` reads no payment, calls no
-    payment provider, and writes nothing but an audit line. It answers
-    `{"success": true, "message": "Refund initiated"}` to *any* string — a
-    payment id that does not exist, or one that is not even an identifier.
+    What it was: `POST /api/admin/payments/{payment_id}/refund` read no payment,
+    called no payment provider, and answered `{"success": true, "message":
+    "Refund initiated"}` to *any* string — a payment id that did not exist, or
+    one that was not even an identifier — while writing `payment.refunded` to
+    the immutable audit log.
 
-    Two consequences, both worse than a plain missing feature: the admin UI
-    tells an operator the customer has been refunded when nobody has, and the
-    immutable audit log records `payment.refunded` for a refund that never
-    happened, so the record intended to be the source of truth is the thing
-    asserting the falsehood.
+    Two harms, and the second is the worse one. An operator was told a customer
+    had been refunded when nobody had; and the audit log, whose entire purpose
+    is to be the record of what happened, was recording an event that never
+    occurred. A log containing invented entries is not a weaker audit log, it is
+    a misleading one.
 
-    Fixing it means implementing refunds against the payment provider, which is
-    PH3.9 (Mock Removal) — outside this sprint's mandate and not a change to
-    make quietly under a testing sprint. So the gap is pinned here instead:
-    `xfail` today, and the moment PH3.9 lands, this reports XPASS and demands
-    the assertion be promoted to a real one.
+    There is no payment provider to refund through (`analytics.sources.
+    payments_integration`), so the endpoint now answers 501 and writes nothing.
+    A missing feature that says so is strictly better than an admin-visible
+    action that lies.
+
+    PH3.3 pinned this as two `xfail`s expecting 404/400. Those expectations were
+    written on the assumption that PH3.9 would *implement* refunds; it removed
+    the lie instead, which is the correct outcome while no provider exists. They
+    are replaced rather than left to report a misleading XPASS.
     """
 
-    @pytest.mark.xfail(reason="D-4: refund endpoint is a stub — owned by PH3.9",
-                       strict=False)
-    def test_refunding_an_unknown_payment_should_be_404(self, admin_client, fake_db):
+    def test_it_does_not_report_success(self, admin_client, fake_db):
         resp = admin_client.post(f"/api/admin/payments/{ObjectId()}/refund")
-        assert resp.status_code == 404
+        assert resp.status_code == 501
+        assert "success" not in resp.json()
 
-    @pytest.mark.xfail(reason="D-4: refund endpoint is a stub — owned by PH3.9",
-                       strict=False)
-    def test_refunding_a_malformed_payment_id_should_be_400(self, admin_client, fake_db):
+    def test_it_answers_the_same_way_for_a_malformed_id(self, admin_client, fake_db):
+        """501 is a statement about the server's capability, not about the id,
+        so a malformed one cannot produce a different (or more encouraging)
+        answer."""
         resp = admin_client.post("/api/admin/payments/not-an-objectid/refund")
-        assert resp.status_code == 400
+        assert resp.status_code == 501
 
-    def test_the_stub_at_least_audits_the_attempt(self, admin_client, fake_db, admin_user):
-        """What is true today, asserted so the audit trail is not lost in a
-        future refactor of the stub into a real implementation."""
-        payment_id = str(ObjectId())
-        assert admin_client.post(f"/api/admin/payments/{payment_id}/refund").status_code == 200
+    def test_it_writes_no_audit_record(self, admin_client, fake_db, admin_user):
+        """The load-bearing half of the D-4 fix."""
+        admin_client.post(f"/api/admin/payments/{ObjectId()}/refund")
         logged = [entry for entry in fake_db.admin_audit_logs.docs
                   if entry["action"] == "payment.refunded"]
-        assert len(logged) == 1
-        assert logged[0]["target"] == payment_id
-        assert logged[0]["admin_id"] == str(admin_user["_id"])
+        assert logged == [], "a refund that did not happen must not be audited"
+
+    def test_the_reason_is_readable_by_an_operator(self, admin_client, fake_db):
+        detail = admin_client.post(
+            f"/api/admin/payments/{ObjectId()}/refund").json()["detail"]
+        assert "payment integration" in detail.lower()
 
 
 class TestAdminUpdateUserValidation:

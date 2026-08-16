@@ -20,6 +20,13 @@ Tenants:
   specification.
 * `analytics.quality` — source-data validation. Reports; never repairs, never
   silently excludes.
+* `analytics.sources` (PH3.9) — the authoritative production sources behind the
+  metrics whose mocks were removed, and the two gates that decide when a metric
+  is answerable at all: whether a payment integration exists, and how far back
+  ``db.sessions`` actually retains activity.
+* `analytics.platform_health` (PH3.9) — platform health read from real readiness
+  probes and real metric counters, replacing three surfaces that reported it
+  from literals.
 
 **This package computes no business metrics of its own.** It deliberately does
 not become a second place where P&L is calculated — `services.portfolio_engine`
@@ -27,16 +34,24 @@ and `services.trading_engine` remain the single source of truth for trading
 math. What lives here is the *epistemics*: windows, provenance, and honesty
 about gaps.
 """
-from analytics import contract, periods, quality, registry  # noqa: F401
+from analytics import contract, periods, quality, registry, sources  # noqa: F401
 from analytics.contract import (  # noqa: F401
     AVAILABLE, DERIVED, EMPTY, MOCK, REAL, UNAVAILABLE,
     Metric, derived, empty, envelope, mock, real, unavailable,
 )
-from analytics.periods import IST, PERIODS, UnknownPeriod, Window, resolve, session_date  # noqa: F401
+from analytics.periods import (  # noqa: F401
+    IST, PERIODS, UnknownPeriod, Window, preceding, resolve, session_date,
+)
+
+# `platform_health` is deliberately NOT imported here. It pulls in
+# `observability.metrics` and, on one path, `services.scheduler` — which builds
+# an APScheduler instance at import. A package whose import graph starts a
+# scheduler is a package that cannot be imported by a test, so the two admin
+# routes that need it import it directly.
 
 __all__ = [
-    "contract", "periods", "quality", "registry",
-    "Metric", "Window", "resolve", "session_date", "envelope",
+    "contract", "periods", "quality", "registry", "sources",
+    "Metric", "Window", "resolve", "preceding", "session_date", "envelope",
     "real", "derived", "mock", "unavailable", "empty",
     "REAL", "DERIVED", "MOCK", "UNAVAILABLE", "AVAILABLE", "EMPTY",
     "IST", "PERIODS", "UnknownPeriod",

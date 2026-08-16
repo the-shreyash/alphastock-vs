@@ -17,10 +17,13 @@ implementation details:
   than requiring archaeology.
 * Every classification in `analytics.registry` is asserted structurally, so the
   inventory cannot drift away from the code it describes.
-* The MOCK metrics are asserted to *still be flagged*. That is the load-bearing
-  guarantee of an audit sprint: PH3.8 did not remove the fabricated numbers, so
-  the only thing standing between them and a reader is the flag, and a test has
-  to hold it in place until PH3.9 removes them.
+* PH3.8 asserted that the MOCK metrics were still *flagged* — the load-bearing
+  guarantee of an audit sprint, which removed nothing. **PH3.9 removed them**,
+  so those assertions inverted: `TestAdminAnalyticsMockRemoval` now names each
+  old fabricated value and asserts it can no longer be returned. Naming the
+  specific wrong value matters — a test that only checks "the field is not
+  mock-flagged" passes again the moment somebody reintroduces the formula
+  without the flag.
 """
 import asyncio
 from datetime import datetime, timedelta, timezone
@@ -290,10 +293,9 @@ class TestRegistry:
         keys = [s.key for s in registry.REGISTRY]
         assert len(keys) == len(set(keys))
 
-    def test_every_mock_carries_a_ph39_replacement_plan(self):
-        """A MOCK entry with no named production source is not a handoff, it is
-        a complaint. This is the assertion that makes the PH3.9 inventory a
-        specification."""
+    def test_every_unanswerable_metric_names_what_would_answer_it(self):
+        """An UNAVAILABLE entry with no named production source is not a
+        handoff, it is a complaint."""
         for spec in registry.ph39_inventory():
             assert spec.required_source, f"{spec.key} does not name its real source"
             assert spec.priority in ("P1", "P2", "P3"), f"{spec.key} is unprioritised"
@@ -310,22 +312,50 @@ class TestRegistry:
             matches = [p for m, p in live if m == method and _paths_match(p, path)]
             assert matches, f"registry names {endpoint}, which the app does not serve"
 
-    def test_inventory_covers_all_four_classes(self):
-        summary = registry.summary()
-        for provenance in contract.PROVENANCE:
-            assert summary[provenance] > 0, f"nothing classified {provenance}"
+    def test_no_metric_is_classified_mock(self):
+        """PH3.9's headline assertion. The registry held 17 MOCK entries; the
+        removal sprint's whole purpose was to take that to zero, and this is
+        what stops a nineteenth fabricated metric being added quietly later."""
+        mocks = [s.key for s in registry.by_provenance(contract.MOCK)]
+        assert mocks == [], f"fabricated metrics are back in the registry: {mocks}"
+
+    def test_the_other_three_classes_are_all_populated(self):
+        for provenance in (contract.REAL, contract.DERIVED, contract.UNAVAILABLE):
+            assert registry.summary()[provenance] > 0, f"nothing classified {provenance}"
 
     def test_ph39_inventory_is_priority_ordered(self):
         priorities = [s.priority for s in registry.ph39_inventory()]
         assert priorities == sorted(priorities)
 
-    def test_revenue_metrics_are_not_classified_real(self):
+    def test_every_ph38_mock_records_what_ph39_did_to_it(self):
+        """The registry is the record of the removal, not just of the current
+        state. Each of these was MOCK before PH3.9; each must say what happened.
+        Without this, "which mocks were removed and what replaced them" is only
+        answerable from a changelog, which drifts."""
+        removed = {
+            "admin.revenue_today", "admin.mrr", "admin.arr", "admin.revenue_series",
+            "admin.revenue_window_totals", "admin.payment_states", "admin.dau",
+            "admin.mau", "admin.retention_rate", "admin.churn_rate",
+            "admin.growth_rate", "admin.feature_usage_pct",
+            "admin.ai_provider_latency", "admin.ai_estimated_cost",
+            "admin.api_health", "admin.redis_status", "research.backtest.synthetic",
+        }
+        assert len(removed) == 17, "PH3.8 classified exactly 17 metrics MOCK"
+        for key in sorted(removed):
+            spec = registry.get(key)
+            assert spec is not None, f"{key} vanished from the registry entirely"
+            assert spec.provenance != contract.MOCK, key
+            assert spec.ph39_resolution, f"{key} does not record what PH3.9 did to it"
+
+    def test_revenue_metrics_are_never_real_or_derived(self):
         """A guard against the single most tempting future mistake: making the
-        revenue numbers look real by reclassifying them instead of by wiring a
-        payment provider."""
+        revenue numbers look real by reclassifying them, instead of by wiring a
+        payment provider. UNAVAILABLE is the only honest class for these until
+        `analytics.sources.payments_integration()` says otherwise."""
         for key in ("admin.mrr", "admin.arr", "admin.revenue_today",
-                    "admin.revenue_series"):
-            assert registry.get(key).provenance == contract.MOCK, key
+                    "admin.revenue_series", "admin.revenue_window_totals",
+                    "admin.payment_states", "admin.arpu"):
+            assert registry.get(key).provenance == contract.UNAVAILABLE, key
 
 
 def _paths_match(route_path: str, registry_path: str) -> bool:
@@ -830,60 +860,312 @@ class TestTradePnlEndpoint:
         assert body["total_trades"] == 0
 
 
-class TestAdminAnalyticsContract:
-    """Step 7. PH3.8 does not remove the admin mocks — so these tests hold the
-    flags in place until PH3.9 does."""
+#: Every admin analytics surface. `mock_metrics` must be empty on all of them —
+#: parametrised rather than repeated so a surface added later is covered by
+#: construction, the same technique PH3.5 used for the authorization sweep.
+ADMIN_ANALYTICS_ROUTES = [
+    "/api/admin/dashboard",
+    "/api/admin/analytics/users",
+    "/api/admin/analytics/revenue",
+    "/api/admin/analytics/features",
+    "/api/admin/payments/stats",
+    "/api/admin/ai/status",
+    "/api/admin/ai/usage",
+    "/api/admin/apis/health",
+    "/api/admin/system/health",
+]
 
-    def test_user_analytics_flags_its_fabricated_metrics(self, client, fake_db,
-                                                         admin_headers):
-        body = client.get("/api/admin/analytics/users", headers=admin_headers).json()
-        assert set(body["mock_metrics"]) == {
-            "dau", "mau", "retention_rate", "churn_rate", "growth_rate"}
-        metrics = body["analytics"]["metrics"]
-        assert metrics["retention_rate"]["provenance"] == "mock"
-        assert metrics["total_users"]["provenance"] == "real"
-        assert body["analytics"]["trustworthy"] is False
-        for name in body["mock_metrics"]:
-            assert metrics[name]["note"], f"{name} is flagged with no reason"
 
-    def test_revenue_series_declares_itself_fabricated(self, client, fake_db,
-                                                       admin_headers):
-        body = client.get("/api/admin/analytics/revenue", headers=admin_headers).json()
-        assert body["status"] == "mock"
-        assert all(point["mock"] is True for point in body["daily_revenue"])
-        assert body["required_source"]
+class TestAdminAnalyticsMockRemoval:
+    """PH3.9. The inverse of PH3.8's `TestAdminAnalyticsContract`.
 
-    def test_payment_stats_flag_every_revenue_figure(self, client, fake_db,
-                                                     admin_headers):
+    PH3.8 asserted the fabricated numbers were *flagged*; these assert they are
+    *gone*, and each one names the specific old value. That matters: a test that
+    only checks "not mock-flagged" goes green the moment somebody reinstates the
+    formula and forgets the flag — which is precisely how these numbers got into
+    production the first time.
+    """
+
+    @pytest.mark.parametrize("route", ADMIN_ANALYTICS_ROUTES)
+    def test_no_admin_surface_returns_a_fabricated_metric(self, client, fake_db,
+                                                          admin_headers, route):
+        body = client.get(route, headers=admin_headers).json()
+        assert body.get("mock_metrics") == [], f"{route} still declares mocks"
+
+    @pytest.mark.parametrize("route", ADMIN_ANALYTICS_ROUTES)
+    def test_no_admin_surface_declares_mock_provenance_anywhere(
+            self, client, fake_db, admin_headers, route):
+        """A sweep of the whole payload, not just the summary field. A response
+        can drop `mock_metrics` and still carry `provenance: "mock"` on a nested
+        metric — and the analytics contract makes that state unconstructible, so
+        finding one means somebody bypassed the contract."""
+        def walk(node):
+            if isinstance(node, dict):
+                for key, value in node.items():
+                    if key in ("provenance", "status"):
+                        assert value != "mock", f"{route} carries {key}=mock"
+                    walk(value)
+            elif isinstance(node, list):
+                for item in node:
+                    walk(item)
+        walk(client.get(route, headers=admin_headers).json())
+
+    # -- revenue ------------------------------------------------------------ #
+    def test_revenue_is_unavailable_not_zero(self, client, fake_db, admin_headers):
+        """The distinction the whole sprint turns on. ₹0 says 'we measured and
+        found no revenue'; null plus a reason says 'we have no revenue source'."""
         body = client.get("/api/admin/payments/stats", headers=admin_headers).json()
         for name in ("mrr", "arr", "revenue_today", "revenue_week",
+                     "revenue_month", "revenue_year",
                      "pending_payments", "refunds", "failed_payments"):
-            assert name in body["mock_metrics"], name
-        # The role counts beside them ARE real and must not be over-flagged.
+            assert body[name] is None, f"{name} came back as {body[name]!r}, not null"
+            metric = body["analytics"]["metrics"][name]
+            assert metric["status"] == "unavailable", name
+            assert metric["value"] is None, name
+            assert metric["note"], f"{name} is unavailable with no reason"
+
+    def test_revenue_today_is_not_a_payment_count_times_499(self, client, fake_db,
+                                                            admin_headers):
+        """The exact old formula: `count(all payments) x 499`, not a sum, not
+        date-filtered. Seeded with three payment documents of unmistakable
+        amounts, so the old implementation would answer 1497 and any naive
+        "just sum the collection" replacement would answer 30."""
+        fake_db.payments.docs.extend([
+            {"amount": 10, "status": "created"},
+            {"amount": 10, "status": "failed"},
+            {"amount": 10, "status": "captured"},
+        ])
+        body = client.get("/api/admin/dashboard", headers=admin_headers).json()
+        assert body["revenue_today"] is None, (
+            "revenue must not be computed from payment documents while the platform "
+            "has no payment integration — the pre-PH3.9 code reported 3 x 499 = 1497")
+        assert body["mrr"] is None and body["arr"] is None
+
+    def test_mrr_is_not_role_counts_times_a_hardcoded_price(self, client, fake_db,
+                                                            admin_headers):
+        """Pre-PH3.9: pro/premium x 499 + elite x 999. Two pro users and one
+        elite would have reported MRR 1997 / ARR 23964 — every one of them
+        granted by an admin with no payment involved."""
+        fake_db.users.docs.extend([
+            {"_id": ObjectId(), "email": "a@x.com", "role": "pro"},
+            {"_id": ObjectId(), "email": "b@x.com", "role": "pro"},
+            {"_id": ObjectId(), "email": "c@x.com", "role": "elite"},
+        ])
+        body = client.get("/api/admin/payments/stats", headers=admin_headers).json()
+        assert body["mrr"] is None and body["arr"] is None
+        # The role counts themselves are real and must NOT be suppressed with them.
+        assert body["premium_count"] == 2
+        assert body["elite_count"] == 1
         assert body["analytics"]["metrics"]["premium_count"]["provenance"] == "real"
 
-    def test_feature_usage_separates_real_counts_from_invented_percentages(
-            self, client, fake_db, admin_headers):
-        body = client.get("/api/admin/analytics/features", headers=admin_headers).json()
-        by_name = {f["name"]: f for f in body["features"]}
-        assert by_name["AI Chat"]["usage_count_provenance"] == "derived"
-        assert by_name["Backtesting"]["usage_count_provenance"] == "mock"
-        assert all(f["percentage_provenance"] == "mock" for f in body["features"])
+    def test_revenue_series_is_empty_not_a_generated_curve(self, client, fake_db,
+                                                           admin_headers):
+        """Pre-PH3.9: 30 points of `2500 + i*150 + (500 if i % 7 == 0)`, with no
+        database access at all. Empty — not thirty points at zero, which would
+        still be the claim 'we measured thirty days and found nothing'."""
+        body = client.get("/api/admin/analytics/revenue", headers=admin_headers).json()
+        assert body["daily_revenue"] == []
+        assert body["status"] == "unavailable"
+        assert body["backfillable"] is False
+        assert body["required_source"]
 
-    def test_dashboard_names_its_fabricated_fields(self, client, fake_db, admin_headers):
+    def test_refund_endpoint_no_longer_audits_a_refund_it_did_not_perform(
+            self, client, fake_db, admin_headers):
+        """PH3.5's D-4, fixed here. It returned `{"success": true}` for any
+        string while writing `payment.refunded` to the immutable audit log —
+        telling an operator a customer was refunded, and recording it, when
+        nobody was. The audit-log assertion is the important half."""
+        before = len(fake_db.admin_audit_logs.docs)
+        response = client.post("/api/admin/payments/nonexistent-id/refund",
+                               headers=admin_headers)
+        assert response.status_code == 501, "the refund stub must not report success"
+        assert response.json()["detail"]
+        assert len(fake_db.admin_audit_logs.docs) == before, (
+            "a refund that did not happen must not appear in the audit log")
+
+    # -- user analytics ----------------------------------------------------- #
+    def test_dau_counts_session_activity_not_signups(self, client, fake_db,
+                                                     test_user, auth_headers,
+                                                     admin_headers):
+        """Pre-PH3.9 DAU was today's SIGNUP count. Seeded here with the two
+        populations deliberately disjoint: three users signed up today and none
+        of them has a session, while two *other* users were active today. The
+        old code answers 3; the correct answer is 2."""
+        now = datetime.now(timezone.utc)
+        fake_db.users.docs.extend([
+            {"_id": ObjectId(), "email": f"new{i}@x.com", "role": "user",
+             "created_at": now.isoformat()} for i in range(3)
+        ])
+        fake_db.sessions.docs.extend([
+            {"session_id": "s1", "user_id": "active-1", "last_used_at": now.isoformat()},
+            {"session_id": "s2", "user_id": "active-2", "last_used_at": now.isoformat()},
+            # Same user twice: DAU is DISTINCT users, not session count.
+            {"session_id": "s3", "user_id": "active-1", "last_used_at": now.isoformat()},
+            # Yesterday — outside today's window.
+            {"session_id": "s4", "user_id": "active-9",
+             "last_used_at": (now - timedelta(days=2)).isoformat()},
+        ])
+        body = client.get("/api/admin/analytics/users", headers=admin_headers).json()
+        assert body["dau"] == 2, (
+            "DAU must count distinct users active today, not today's signups "
+            f"(signups today = {body['today_signups']})")
+
+    def test_mau_is_unavailable_because_sessions_are_reaped(self, client, fake_db,
+                                                            admin_headers):
+        """The PH3.8 inventory prescribed a 30-day query over db.sessions. It
+        cannot be answered: the TTL index deletes a session one refresh lifetime
+        (7 days by default) after last use, so a 30-day window would report a
+        7-day count under a 30-day label."""
+        body = client.get("/api/admin/analytics/users", headers=admin_headers).json()
+        assert body["mau"] is None
+        metric = body["analytics"]["metrics"]["mau"]
+        assert metric["status"] == "unavailable"
+        assert "retain" in metric["note"] or "TTL" in metric["note"]
+
+    def test_retention_and_churn_are_unavailable_not_literals(self, client, fake_db,
+                                                              admin_headers):
+        """Pre-PH3.9 these were the literals 78.5 and 4.2 — constants that did
+        not move when users left."""
+        body = client.get("/api/admin/analytics/users", headers=admin_headers).json()
+        assert body["retention_rate"] is None, "78.5 was a constant in the source"
+        assert body["churn_rate"] is None, "4.2 was a constant in the source"
+
+    def test_growth_rate_is_computed_from_signups_not_the_literal_12_8(
+            self, client, fake_db, admin_headers):
+        """Four signups in the current 30-day window against two in the one
+        before it is +100%. The old code answered 12.8 regardless."""
+        now = datetime.now(timezone.utc)
+        fake_db.users.docs.extend(
+            [{"_id": ObjectId(), "email": f"cur{i}@x.com",
+              "created_at": (now - timedelta(days=1)).isoformat()} for i in range(4)]
+            + [{"_id": ObjectId(), "email": f"prev{i}@x.com",
+                "created_at": (now - timedelta(days=40)).isoformat()} for i in range(2)]
+        )
+        body = client.get("/api/admin/analytics/users", headers=admin_headers).json()
+        assert body["growth_rate"] == 100.0, body["growth_rate"]
+        comparison = body["analytics"]["metrics"]["growth_rate"]["comparison"]
+        assert comparison["current"] == 4 and comparison["previous"] == 2
+
+    def test_growth_rate_from_a_zero_base_is_unavailable_not_infinite(
+            self, client, fake_db, admin_headers):
+        """The first signup of a platform's life is not +100% growth and not
+        +infinity. With an empty comparison period there is no base, so there is
+        no percentage."""
+        fake_db.users.docs.append({
+            "_id": ObjectId(), "email": "first@x.com",
+            "created_at": datetime.now(timezone.utc).isoformat()})
+        body = client.get("/api/admin/analytics/users", headers=admin_headers).json()
+        assert body["growth_rate"] is None
+        assert body["analytics"]["metrics"]["growth_rate"]["status"] == "unavailable"
+
+    # -- feature usage ------------------------------------------------------ #
+    def test_feature_usage_drops_the_invented_percentages_and_empty_rows(
+            self, client, fake_db, admin_headers):
+        """Pre-PH3.9: ten rows, a fixed descending percentage list (85, 72, 68,
+        55, ...) unrelated to the count beside it, and seven counts that were
+        the literal 0 because nothing measures those features."""
+        body = client.get("/api/admin/analytics/features", headers=admin_headers).json()
+        names = [f["name"] for f in body["features"]]
+        assert names == ["AI Chat", "Trading", "Notifications"], names
+        assert all(f["adoption_pct"] is None for f in body["features"])
+        assert all("percentage" not in f for f in body["features"])
+        for uncounted in ("Stock Scanner", "Morning Report", "Backtesting"):
+            assert uncounted not in names, (
+                f"{uncounted} is not measured anywhere; a row reading 0 is a "
+                "measurement claim nothing supports")
+
+    def test_feature_usage_counts_are_still_real(self, client, fake_db,
+                                                 test_user, admin_headers):
+        fake_db.chat_messages.docs.extend([{"user_id": "u", "content": "hi"}] * 5)
+        body = client.get("/api/admin/analytics/features", headers=admin_headers).json()
+        chat = next(f for f in body["features"] if f["name"] == "AI Chat")
+        assert chat["usage_count"] == 5
+        assert chat["usage_count_provenance"] == "derived"
+
+    # -- AI and platform health --------------------------------------------- #
+    def test_ai_status_reports_no_literal_latency_or_zero_failures(
+            self, client, fake_db, admin_headers):
+        """Pre-PH3.9: latency_ms 1200 (Claude) / 900 (Gemini), failures 0,
+        fallbacks 0 — literals sitting beside live counters, so an operator
+        could not see an outage the platform was already measuring."""
+        body = client.get("/api/admin/ai/status", headers=admin_headers).json()
+        latencies = [p["p95_latency_ms"] for p in body["providers"]]
+        assert 1200 not in latencies and 900 not in latencies
+        for provider in body["providers"]:
+            assert "latency_ms" not in provider, "the literal field is gone"
+            # No traffic yet must read as None, never as an instantaneous 0.
+            assert provider["p95_latency_ms"] is None
+            assert provider["status"] == "no_traffic"
+        assert body["estimated_cost"] is None, "a per-token cost is not recorded"
+        # The process-scope caveat must travel with every counter-derived number.
+        assert body["scope"]["basis"] == "process_lifetime"
+
+    def test_ai_usage_drops_the_invented_per_user_cost(self, client, fake_db,
+                                                       admin_headers):
+        fake_db.chat_messages.docs.extend([{"user_id": "u1", "content": "hi"}] * 3)
+        body = client.get("/api/admin/ai/usage", headers=admin_headers).json()
+        assert body["top_users"][0]["message_count"] == 3
+        assert body["top_users"][0]["estimated_cost"] is None, (
+            "was count x 0.011 — a flat per-message rate in an ambiguous currency")
+
+    def test_api_health_probes_rather_than_reading_credentials(
+            self, client, fake_db, admin_headers):
+        """Pre-PH3.9 `overall_status` was the constant "healthy" — this page
+        reported a healthy platform during a total provider outage."""
+        body = client.get("/api/admin/apis/health", headers=admin_headers).json()
+        assert body["overall_status"] != "healthy", (
+            "'healthy' was the hardcoded constant; the derived vocabulary is "
+            "operational / degraded / no_traffic")
+        assert body["status"] == "derived"
+        for api in body["apis"]:
+            assert "latency_ms" not in api
+            assert "requests_today" not in api
+            if not api["instrumented"]:
+                assert api["status"] == "not_measured", (
+                    f"{api['name']} is not instrumented and must not claim a status")
+
+    def test_api_health_no_longer_invents_a_razorpay_integration(
+            self, client, fake_db, admin_headers):
+        """It reported `status: "configured"` beside a 300ms latency for a
+        payment integration that does not exist anywhere in the codebase."""
+        body = client.get("/api/admin/apis/health", headers=admin_headers).json()
+        names = [a["name"] for a in body["apis"]]
+        assert not any("Razorpay" in n for n in names), names
+        # Nor the per-vendor market-data rows, which the gateway architecture
+        # deliberately makes unanswerable (MARKET_DATA_ARCHITECTURE.md).
+        assert not any(n in ("Yahoo Finance", "Alpha Vantage") for n in names), names
+
+    def test_system_health_probes_redis_and_the_scheduler(self, client, fake_db,
+                                                          admin_headers):
+        """Pre-PH3.9: redis was the literal "not_configured" (stale from before
+        PH2.7 shipped a Redis client) and the scheduler was the constant
+        "running" — which stayed "running" after the scheduler died."""
+        body = client.get("/api/admin/system/health", headers=admin_headers).json()
+        assert body["mock_metrics"] == []
+        assert "source" in body["redis"] or "note" in body["redis"]
+        scheduler = body["scheduler"]
+        assert scheduler["source"] == "apscheduler.running"
+        # In a hermetic test the scheduler is genuinely not running, and the
+        # endpoint must say so rather than reporting the old constant.
+        assert scheduler["status"] == "stopped"
+        assert scheduler["running"] is False
+
+    def test_dashboard_health_badges_are_probed_not_literal(self, client, fake_db,
+                                                            admin_headers):
         body = client.get("/api/admin/dashboard", headers=admin_headers).json()
-        assert {"revenue_today", "mrr", "arr"} <= set(body["mock_metrics"])
+        assert "api_health" not in body, "the literal 'healthy' field is gone"
+        assert body["server_health"] == "serving"
+        assert "dependencies" in body
         assert body["window"]["timezone"] == "Asia/Kolkata"
 
-    def test_api_health_declares_that_it_is_not_probing(self, client, fake_db,
-                                                        admin_headers):
-        body = client.get("/api/admin/apis/health", headers=admin_headers).json()
-        assert body["status"] == "mock"
-        assert "overall_status" in body["mock_metrics"]
-
-    def test_ai_status_declares_its_literals(self, client, fake_db, admin_headers):
-        body = client.get("/api/admin/ai/status", headers=admin_headers).json()
-        assert {"latency_ms", "failures", "estimated_cost"} <= set(body["mock_metrics"])
+    def test_dashboard_renames_ai_requests_to_what_it_actually_counts(
+            self, client, fake_db, admin_headers):
+        """`ai_requests_today` counted stored chat messages — both the user turn
+        and the assistant turn — so it overstated provider calls by roughly 2x.
+        The value was right; the name was a claim it could not support."""
+        body = client.get("/api/admin/dashboard", headers=admin_headers).json()
+        assert "ai_requests_today" not in body
+        assert body["chat_messages_today"] == 0
 
 
 class TestAdminAnalyticsAuthorization:

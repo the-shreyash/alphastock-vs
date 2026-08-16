@@ -297,7 +297,11 @@ class TestAnalytics:
             {"_id": ObjectId(), "user_id": str(ObjectId()),
              "role": "user", "content": "TEST", "created_at": "2026-08-01T00:00:00"})
         top = admin_client.get("/api/admin/ai/usage").json()["top_users"]
-        assert top[0]["request_count"] == 3
+        # PH3.9 renamed `request_count` -> `message_count`. The value is
+        # unchanged and always was a count of stored chat messages; the old name
+        # claimed a provider-request count, which it overstated by roughly 2x
+        # because a message is written for the user turn AND the assistant turn.
+        assert top[0]["message_count"] == 3
         assert top[0]["email"] == other_user["email"]
 
 
