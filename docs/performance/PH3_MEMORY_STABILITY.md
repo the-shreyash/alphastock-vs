@@ -688,7 +688,87 @@ is recorded rather than blurred.
 
 ### 15.2 Provider degradation and recovery
 
-<!-- PROVIDER_FAILURE_RESULTS -->
+`scripts/load/load-test.sh failure` — six phases, ~90 s each, sampled
+continuously by `soak.sh sample 900 provider-failure`.
+
+| Phase | Injected | 5xx | Timeouts | 429 | Checks | `api` p95 | `ai` p95 |
+|---|---|---:|---:|---:|---:|---:|---:|
+| 0 | clean baseline | 0.000% | 0.000% | 0.000% | **100%** | 34.72 ms | 1,326 ms |
+| 1 | market +800 ms | 0.000% | 0.000% | 0.000% | **100%** | 54.95 ms | 1,636 ms |
+| 2 | market 30% 503 | 0.000% | 0.000% | 0.000% | **100%** | 32.48 ms | 1,000 ms |
+| 3 | market 10% timeout (30 s) | 0.000% | 0.000% | 0.000% | **100%** | 44.23 ms | 2,110 ms |
+| 4 | **AI 6 s + 20% 429** | 0.000% | 0.000% | 0.000% | **100%** | **29.17 ms** | **15,363 ms** |
+| 5 | recovery | 0.000% | 0.000% | 0.000% | **100%** | 36.71 ms | 1,006 ms |
+
+**Zero 5xx, zero timeouts and 100% of functional checks in every phase**,
+including one where the AI provider was effectively unusable.
+
+**Phase 4 is the one to read twice.** `ai` p95 reached **15,363 ms** while `api`
+p95 on the same run was **29.17 ms — the lowest of all six phases.** A
+catastrophically degraded AI provider did not cost the rest of the product a
+millisecond, which is what proper isolation looks like and is not something to
+take on trust.
+
+**Resource behaviour across the whole nine-minute fault window** — the part this
+sprint actually owns, since retry and timeout paths are where connections and
+tasks leak:
+
+| Series | first | peak | last | delta |
+|---|---:|---:|---:|---:|
+| `background_tasks_running` | 4 | 4 | 4 | **+0** |
+| `event_bus_subscribers` | 1 | 1 | 1 | **+0** |
+| `websocket_*` (all three) | 0 | 0 | 0 | **+0** |
+| `app_cache_entries{ai_chat_context}` | 0 | **4** | 4 | +4 |
+| `app_cache_entries{market_memory_fallback}` | 59 | 59 | 59 | **+0** |
+| `app_cache_entries{portfolio_throttle}` | 63 | 63 | 63 | **+0** |
+| `app_cache_entries{trade_throttle}` | 56 | 59 | 59 | +3 |
+| `process_open_fds` | 55 | 103 | 76 | +21 |
+| `process_resident_memory_bytes` | 57.2 MB | 111.2 MB | **51.2 MB** | **−6.0 MB** |
+
+**Sustained provider failure, 30-second timeouts and 20% rate limiting produced
+no task growth, no listener duplication and no connection storm.** RSS ended
+6 MB *below* where it started. The two caches that moved (`ai_chat_context` 0→4,
+`trade_throttle` +3) moved because the AI phase exercised paths the HTTP soak
+does not — four entries against a 512 ceiling.
+
+### 15.3 Clean shutdown (M-4)
+
+The defect M-4 fixed is only observable at SIGTERM, so it was tested there
+directly: start the backend against the load environment at `LOG_LEVEL=INFO`,
+confirm the four loops register, send SIGTERM, read the sequence.
+
+Startup registers all four by name:
+
+```
+Background task started: market-broadcast-loop
+Background task started: ai-monitoring-loop
+Background task started: ai-heartbeat-loop
+Background task started: ai-price-stream-loop
+```
+
+And SIGTERM produces exactly the designed order:
+
+```
+16:51:21.861  INFO  server                       Shutdown initiated — readiness now reports draining
+16:51:21.862  INFO  services.heartbeat_engine    AI heartbeat engine stopped
+16:51:21.863  INFO  infrastructure.tasks         Cancelled 2 background task(s)
+16:51:22.336  INFO  infrastructure.redis_pubsub  Redis pub/sub subscriber stopped on 'sa:events'
+16:51:22.343  INFO  infrastructure.redis_client  Redis client closed
+16:51:22.345  INFO  services.http_client         Closed 1 pooled HTTP client(s).
+              INFO  uvicorn                      Application shutdown complete.
+```
+
+**Readiness fails first, then the four producers are cancelled, and only then are
+the resources they use torn down** — the inversion of startup, which is the whole
+point of the change. Total elapsed **484 ms**, far inside both the registry's 5 s
+grace and the compose file's 30 s `stop_grace_period`.
+
+**Not one WARNING or ERROR line was emitted.** That absence is the result. Before
+this fix the loops survived into steps 4–6 and then did I/O against a closed
+Mongo client, each raising into its own `except Exception` handler — so a clean
+stop emitted a burst of connection errors that reads, in a log aggregator,
+exactly like a crash. A separate SIGTERM at `LOG_LEVEL=WARNING` produced **zero
+output at all**, which is the same result stated the other way round.
 
 ---
 
@@ -824,9 +904,9 @@ signature, and before this sprint no dashboard in the system could have shown it
 | Event listeners are cleaned up | ✅ backend §8/M-7, frontend §10 |
 | Caches are bounded or TTL-controlled | ✅ §9, ceilings exercised not asserted |
 | Reconnect behaviour is bounded | ✅ §7, §14.2 |
-| Resource cleanup occurs on shutdown | ✅ loops now cancelled **before** their dependencies |
+| Resource cleanup occurs on shutdown | ✅ verified at SIGTERM (§15.3): producers cancelled before their dependencies, 484 ms, **zero warnings or errors** |
 | Repeated connection test is stable | ✅ §12 (5,000 cycles), §14.2 |
-| Failure/recovery test is stable | ✅ §15 |
+| Failure/recovery test is stable | ✅ §15 — Redis outage + recovery, six provider-degradation phases, and SIGTERM, all with zero task or listener growth |
 | Relevant tests pass | ✅ §13 — backend 2,216, frontend 324, build green |
 | Documentation updated | ✅ §21 |
 
@@ -842,12 +922,36 @@ Conditions, all of them environmental rather than defects:
 4. **Mongo TTL reaping of `sessions`/`rate_limits` under sustained write rate is
    unmeasured** (§18.4).
 5. **Frontend bounds are asserted structurally, not heap-profiled** (§18.6).
+6. **The Redis pool never reaps idle connections (M-12)** — 139 sockets held with
+   `in_use: 0`. Bounded, released on failure, and not a defect this sprint should
+   fix in code; but it means `REDIS_MAX_CONNECTIONS` must be budgeted as a
+   **permanent per-worker socket cost**, and PH3.7 owns that decision alongside
+   L-1 (§18.2b).
 
 **PH3.7 is safe to begin.** Nothing here blocks it, and three of PH3.6's
 findings hand it better inputs than it would otherwise have had: the §19 budget
 gives its deployment work concrete per-worker numbers, the new gauges give its
 monitoring work something real to alert on, and PH3.5's L-1 Redis pool sizing —
 still open and still PH3.7's — now has a documented soak profile behind it.
+
+---
+
+## 20.1 Run artefacts
+
+Every measurement in §14 and §15 is reproducible from a committed tool, and its
+raw output is on disk under `scripts/load/results/`:
+
+| Directory | Run |
+|---|---|
+| `20260815T071727Z-soak-http` | 30-minute HTTP soak, 150 rps (§14.1) |
+| `20260815T074953Z-soak-post-soak-idle` | 4-minute idle recovery after the soak |
+| `20260815T075516Z-soak-ws` | WebSocket churn soak, 30,755 cycles (§14.2) |
+| `20260815T080729Z-soak-redis-outage` | Redis outage and recovery (§15.1) |
+| `20260815T081016Z-soak-provider-failure` | resource sampling across all six fault phases |
+| `20260815T081018Z-failure-0-baseline` … `-failure-5-recovery` | the six provider-degradation phases (§15.2) |
+
+Each contains `samples.csv` (one row per 30 s), `k6.log`, `k6-summary.json` and,
+for the soak runs, `verdict.txt`.
 
 ---
 

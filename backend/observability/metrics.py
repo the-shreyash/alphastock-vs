@@ -791,6 +791,361 @@ redis_server_rejected_connections_total = registry.gauge(
 
 
 # --------------------------------------------------------------------------- #
+# Subsystem failures (PH3.7)                                                    #
+#                                                                               #
+# THE KEYSTONE SERIES. Operator question #2 — "which subsystem is failing?" —    #
+# is answerable from this one metric and nothing else. Everything below it in    #
+# this file is detail you reach for *after* this has told you where to look.     #
+#                                                                               #
+# Both labels are closed vocabularies: `subsystem` is SUBSYSTEMS in              #
+# observability.instruments, `error_class` is ERROR_CLASSES in                   #
+# observability.errors. Neither can grow at runtime, which is what makes a       #
+# metric that every failure path in the application writes to safe to have.      #
+# --------------------------------------------------------------------------- #
+subsystem_errors_total = registry.counter(
+    "subsystem_errors_total",
+    "Failures by subsystem and error class. The first metric to look at during "
+    "an incident: it says which part of the system is broken and how.",
+    ("subsystem", "error_class"),
+)
+
+
+# --------------------------------------------------------------------------- #
+# Authentication (PH3.7)                                                        #
+#                                                                               #
+# Fed from `security.audit`, which is the one place every auth-relevant event    #
+# already passes through — so this needs no new call sites and cannot drift out  #
+# of step with the audit trail. The audit log answers "who did what"; this       #
+# answers "how often, right now", which is the only one of the two you can put   #
+# a threshold on.                                                                #
+#                                                                               #
+# `event` is the audit event constant (a fixed list of ~30 in                    #
+# security/audit.py) and `outcome` is success/failure/info. No user id, email,   #
+# IP or token ever becomes a label here — see the redaction rules in §Security   #
+# of docs/architecture/OBSERVABILITY.md. Attribution is the audit log's job;     #
+# it has access control, and a metrics endpoint does not.                        #
+# --------------------------------------------------------------------------- #
+auth_events_total = registry.counter(
+    "auth_events_total",
+    "Security-relevant authentication and session events, by event name and "
+    "outcome. Sourced from the audit trail; carries no user identity.",
+    ("event", "outcome"),
+)
+
+
+# --------------------------------------------------------------------------- #
+# MongoDB (PH3.7)                                                               #
+#                                                                               #
+# Collected through pymongo's own command-monitoring hooks                       #
+# (observability/mongo_monitor.py), not by wrapping call sites. There are        #
+# several hundred `await db.<collection>.<op>()` calls in this backend; any      #
+# scheme that requires touching them instruments whatever was written before it  #
+# and nothing written after, and the first query someone adds during an incident #
+# is invisible. The driver's listener sees every command by construction.        #
+#                                                                               #
+# Labelled by command name only (`find`, `update`, `aggregate`, …) — a fixed     #
+# vocabulary of ~20 defined by the wire protocol. NOT by collection: 21          #
+# collections today is bounded, but `db[name]` with a computed name is one       #
+# refactor away from unbounded, and the collection is in the log line anyway.    #
+# --------------------------------------------------------------------------- #
+mongodb_commands_total = registry.counter(
+    "mongodb_commands_total",
+    "MongoDB commands completed, by command name and outcome (ok / error).",
+    ("command", "outcome"),
+)
+
+mongodb_command_duration_seconds = registry.histogram(
+    "mongodb_command_duration_seconds",
+    "MongoDB command round-trip latency in seconds, by command name.",
+    ("command",),
+    # Mongo on a local network answers in single-digit milliseconds, so the
+    # default HTTP buckets (first bound 5ms) would pile every healthy query into
+    # bucket one. These start at 250µs. The 10s tail exists to catch a query
+    # waiting on server selection during a failover.
+    buckets=(0.00025, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 1.0, 5.0, 10.0),
+)
+
+mongodb_command_errors_total = registry.counter(
+    "mongodb_command_errors_total",
+    "MongoDB commands that failed, by command name and driver failure code. "
+    "A rising count with mongodb_commands_total flat means the driver cannot "
+    "reach a server at all.",
+    ("command", "reason"),
+)
+
+# Pool saturation is the failure that looks like slowness: every command waits
+# for a connection, latency climbs across the board, and nothing reports an
+# error. `checked_out` approaching `max` is the tell.
+mongodb_pool_connections = registry.gauge(
+    "mongodb_pool_connections",
+    "MongoDB connection-pool occupancy by state (checked_out / max).",
+    ("state",),
+)
+
+
+# --------------------------------------------------------------------------- #
+# WebSocket (PH3.7)                                                             #
+#                                                                               #
+# WHY COUNTERS PER FAN-OUT AND NOT PER SOCKET                                    #
+#                                                                                #
+# A broadcast to 500 sockets four times a second is 2,000 sends. Counting each   #
+# one means 2,000 lock acquisitions per second on the realtime hot path to       #
+# learn a number that `websocket_broadcasts_total * connections` already         #
+# approximates. So a fan-out increments the broadcast counter ONCE, and adds     #
+# failures in a single increment sized by the number of dead sockets. Two lock   #
+# operations per broadcast regardless of audience size.                          #
+#                                                                                #
+# The gauges above (websocket_connections, websocket_tracked_users, …) remain    #
+# the authority on *how many* connections exist; these counters cover the flow   #
+# — arrivals, departures and delivery failures — which a gauge cannot show.      #
+# --------------------------------------------------------------------------- #
+websocket_connections_total = registry.counter(
+    "websocket_connections_total",
+    "WebSocket connection attempts by outcome (accepted / rejected).",
+    ("outcome",),
+)
+
+websocket_disconnects_total = registry.counter(
+    "websocket_disconnects_total",
+    "WebSocket disconnections by reason (client = clean close, error = the "
+    "socket raised, reaped = detected dead during a fan-out). A spike in "
+    "reaped/error against a flat client count is a network or backpressure "
+    "problem, not users navigating away.",
+    ("reason",),
+)
+
+websocket_broadcasts_total = registry.counter(
+    "websocket_broadcasts_total",
+    "Fan-out operations performed, by kind (broadcast / channel / user). "
+    "Counted once per fan-out, not once per recipient.",
+    ("kind",),
+)
+
+websocket_send_failures_total = registry.counter(
+    "websocket_send_failures_total",
+    "Individual socket sends that raised during a fan-out, by kind. Incremented "
+    "in one step per fan-out by the number of failures.",
+    ("kind",),
+)
+
+
+# --------------------------------------------------------------------------- #
+# Background tasks (PH3.7)                                                      #
+#                                                                               #
+# `background_tasks_running` (PH3.6, above) says how many are alive. It cannot   #
+# distinguish "running healthily for six hours" from "crashed and respawned      #
+# forty times", because both read as the same steady gauge value. These do.      #
+#                                                                                #
+# `task` is the supervised task's registered name — a fixed list declared at     #
+# boot in server.py, and `infrastructure.tasks` refuses duplicates, so the label #
+# space equals the number of loops the application has.                          #
+# --------------------------------------------------------------------------- #
+background_task_starts_total = registry.counter(
+    "background_task_starts_total",
+    "Supervised background tasks started, by name. In a healthy process this "
+    "equals one per task for the life of the process; any increase after boot "
+    "means something restarted.",
+    ("task",),
+)
+
+background_task_terminations_total = registry.counter(
+    "background_task_terminations_total",
+    "Supervised background tasks that stopped, by name and outcome "
+    "(completed / failed / cancelled). `failed` on a perpetual loop is always "
+    "a defect — the loop's own try/except should have contained it.",
+    ("task", "outcome"),
+)
+
+background_task_duration_seconds = registry.histogram(
+    "background_task_duration_seconds",
+    "Lifetime of a supervised background task, in seconds, by name.",
+    ("task",),
+    # Nothing like the HTTP buckets: these tasks are perpetual loops that should
+    # live as long as the process. The dense end is deliberately at the SHORT
+    # side — a loop that exits after 2s is the crash-loop signature, and that is
+    # the only part of this distribution anyone will ever look at.
+    buckets=(1.0, 5.0, 30.0, 120.0, 600.0, 3600.0, 21600.0, 86400.0),
+)
+
+
+# --------------------------------------------------------------------------- #
+# Scheduler (PH3.7)                                                             #
+#                                                                               #
+# APScheduler owns the cron work (morning analysis, market scanner, trade        #
+# monitor, exit reminder, EOD report, portfolio snapshot); `background_task_*`   #
+# above covers the perpetual loops and does NOT see any of it. Both are          #
+# "background", and conflating them would hide the failure mode that only cron   #
+# has: **a job that does not run at all**. A perpetual loop announces its own    #
+# death by stopping; a scheduled job that never fires produces no event, no      #
+# error and no gap anyone notices until a user asks where their morning report   #
+# went.                                                                          #
+#                                                                                #
+# `missed` is therefore the outcome worth watching most. APScheduler emits it    #
+# when a run is skipped because its misfire grace period elapsed — the           #
+# signature of an event loop that was blocked, or of a previous run of the same  #
+# job still executing. `trade_monitor` runs every 60s during market hours, so    #
+# missed runs there mean live positions went unchecked.                          #
+#                                                                                #
+# `job` is the registered job id — six string literals in                        #
+# services/scheduler.py, so the label space is the number of cron jobs.          #
+# --------------------------------------------------------------------------- #
+scheduler_job_runs_total = registry.counter(
+    "scheduler_job_runs_total",
+    "Scheduled job executions by job id and outcome (executed / error / "
+    "missed). `missed` means the run was skipped entirely — the failure a "
+    "success-rate alert on the other two cannot see.",
+    ("job", "outcome"),
+)
+
+scheduler_job_duration_seconds = registry.histogram(
+    "scheduler_job_duration_seconds",
+    "Scheduled job execution time in seconds, by job id.",
+    ("job",),
+    # These jobs fan out across the whole user base and call providers and the
+    # AI, so seconds-to-minutes is normal and the useful signal is the tail. A
+    # job approaching its own interval (trade_monitor at 60s) is about to start
+    # missing runs, which is why the buckets straddle 60.
+    buckets=(0.1, 0.5, 1.0, 5.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0),
+)
+
+
+# --------------------------------------------------------------------------- #
+# External providers (PH3.7)                                                    #
+#                                                                               #
+# Market data, brokers, news and notification delivery. `provider` is a logical  #
+# name from a fixed table (observability.instruments.PROVIDERS), never a         #
+# hostname or URL, and `operation` is the gateway verb (`get_quote`,             #
+# `get_indices`, …) rather than a path — so a symbol, an order id or a query     #
+# string can never reach a label.                                                #
+#                                                                                #
+# `outcome` is deliberately three-valued: ok / error / empty. "Empty" is the     #
+# failure mode a market-data feed actually has — it answers 200 with no rows,    #
+# every dashboard stays green, and the product silently shows yesterday's        #
+# prices. An error-rate alert cannot see that; this can.                          #
+# --------------------------------------------------------------------------- #
+provider_requests_total = registry.counter(
+    "provider_requests_total",
+    "Outbound requests to an external provider, by provider, operation and "
+    "outcome (ok / empty / error). `empty` means the call succeeded and "
+    "returned nothing usable — the failure mode a status-code check misses.",
+    ("provider", "operation", "outcome"),
+)
+
+provider_request_duration_seconds = registry.histogram(
+    "provider_request_duration_seconds",
+    "External provider call latency in seconds, by provider and operation.",
+    ("provider", "operation"),
+    # Third parties are slow and variable; the interesting region is 100ms–10s,
+    # and the 30s bucket catches calls sitting on a connect timeout.
+    buckets=(0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 20.0, 30.0),
+)
+
+provider_errors_total = registry.counter(
+    "provider_errors_total",
+    "External provider failures, by provider and error class.",
+    ("provider", "error_class"),
+)
+
+
+# --------------------------------------------------------------------------- #
+# AI providers (PH3.7)                                                          #
+#                                                                               #
+# Split from the provider family above because the questions differ: an AI call  #
+# costs money, takes seconds rather than milliseconds, and degrades to a         #
+# simulated response instead of an error — so `ai_requests_total{provider=       #
+# "simulated"}` climbing is the real alert, and it is not an error at all.       #
+#                                                                                #
+# NO MODEL LABEL, DELIBERATELY. A model id is read from configuration, so it is  #
+# an operator-supplied string and therefore unbounded in principle; it is also   #
+# the field most likely to churn (every model release). It is recorded on the    #
+# structured log line instead, where cardinality costs nothing.                  #
+#                                                                                #
+# NOTHING FROM THE PROMPT OR THE RESPONSE IS RECORDED HERE — not the text, not   #
+# a hash of it, not a token count broken down by user. Prompts carry portfolio   #
+# positions and personal financial context.                                      #
+# --------------------------------------------------------------------------- #
+ai_requests_total = registry.counter(
+    "ai_requests_total",
+    "AI model requests by provider and outcome (ok / error / unconfigured). "
+    "Growth in provider=\"simulated\" means real AI is unavailable and users "
+    "are receiving canned responses while every other metric looks healthy.",
+    ("provider", "outcome"),
+)
+
+ai_request_duration_seconds = registry.histogram(
+    "ai_request_duration_seconds",
+    "AI model request latency in seconds, by provider.",
+    ("provider",),
+    # Seconds to tens of seconds. Starting at 0.25s because nothing real is
+    # faster, and running to 120s because that is where a stalled stream sits.
+    buckets=(0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 60.0, 120.0),
+)
+
+ai_request_errors_total = registry.counter(
+    "ai_request_errors_total",
+    "AI model request failures, by provider and error class.",
+    ("provider", "error_class"),
+)
+
+
+# --------------------------------------------------------------------------- #
+# In-process event bus (PH3.7)                                                  #
+#                                                                               #
+# `event_bus_subscribers` (PH3.6) bounds the handler registry. These cover       #
+# delivery: an event published whose handler raised is a silently dropped        #
+# domain action — a portfolio that never resynced, a notification never sent —   #
+# and before this it produced one log line and no signal.                        #
+#                                                                                #
+# `event_type` is the dotted literal from the publish call site (17 of them,     #
+# all string constants in source). A symbol or user id would be a cardinality    #
+# bug and is why the label is the type, never the payload.                       #
+# --------------------------------------------------------------------------- #
+event_bus_events_total = registry.counter(
+    "event_bus_events_total",
+    "Events published on the in-process market event bus, by type.",
+    ("event_type",),
+)
+
+event_bus_handler_failures_total = registry.counter(
+    "event_bus_handler_failures_total",
+    "Event-bus handler invocations that raised, by event type. Each one is a "
+    "domain action that silently did not happen.",
+    ("event_type",),
+)
+
+
+# --------------------------------------------------------------------------- #
+# Frontend runtime failures (PH3.7)                                             #
+#                                                                               #
+# A React crash, an unhandled promise rejection or a failed chunk load produces  #
+# NOTHING on the server: the request that served the bundle returned 200, no     #
+# exception was raised, no log line was written, and the user is looking at a    #
+# blank page. This family is the only server-side evidence that any of it        #
+# happened, fed by `POST /api/observability/client-errors`.                      #
+#                                                                               #
+# `kind` is a closed vocabulary validated at the endpoint (render / unhandled_   #
+# rejection / uncaught / chunk_load / api / websocket). The error MESSAGE is     #
+# never a label — it is attacker-controlled text arriving on an unauthenticated  #
+# endpoint, which makes it the most dangerous possible label value in this       #
+# entire file.                                                                   #
+# --------------------------------------------------------------------------- #
+frontend_errors_total = registry.counter(
+    "frontend_errors_total",
+    "Client-side runtime failures reported by the browser, by kind. "
+    "chunk_load rising sharply after a deploy means users are holding stale "
+    "index.html against purged bundles.",
+    ("kind",),
+)
+
+frontend_reports_rejected_total = registry.counter(
+    "frontend_reports_rejected_total",
+    "Client error reports refused for failing validation, by reason. Non-zero "
+    "means either a client bug or someone probing the ingest endpoint.",
+    ("reason",),
+)
+
+
+# --------------------------------------------------------------------------- #
 # Instrumentation helpers — the API the middleware actually calls               #
 # --------------------------------------------------------------------------- #
 def record_request(method: str, route: str, status: int, duration_seconds: float) -> None:

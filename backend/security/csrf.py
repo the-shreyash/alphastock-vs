@@ -120,6 +120,18 @@ _DEFAULT_EXEMPT_PATHS: Set[str] = {
     "/api/auth/verify-email",
     "/api/auth/forgot-password",
     "/api/auth/reset-password",
+    # Client error ingest (PH3.7). Exempt for two independent reasons, either of
+    # which would be sufficient. **It changes no state**: the handler increments
+    # a counter and writes a log line, touching no database and no session, so a
+    # forged report can only inflate a metric the platform rate limiter already
+    # bounds per IP. And **it must work when nothing else does** — the failures
+    # most worth hearing about are the ones where the app could not start, where
+    # a chunk failed to load, or where the auth provider itself threw, none of
+    # which have a usable CSRF cookie. It is also delivered by
+    # `navigator.sendBeacon` during page unload, which cannot set a custom
+    # header at all, so enforcing CSRF here would silently discard exactly the
+    # reports that matter most.
+    "/api/observability/client-errors",
 }
 
 

@@ -1,9 +1,9 @@
 # Monitoring & Observability
 
-**Status:** PH2.5 complete (2026-07-22)
+**Status:** PH2.5 complete (2026-07-22) · extended by PH2.6, PH2.7, PH3.6 and PH3.7 (2026-08-15) — v1.2
 **Audience:** SRE, DevOps, on-call engineers
 **Code:** `backend/observability/`
-**Related:** [DOCKER.md](../deployment/DOCKER.md) · [DOCKER_COMPOSE.md](../deployment/DOCKER_COMPOSE.md) · [SECRETS.md](../deployment/SECRETS.md) · [GITHUB_ACTIONS.md](../deployment/GITHUB_ACTIONS.md) · [runbooks.md](runbooks.md)
+**Related:** [OBSERVABILITY.md](../architecture/OBSERVABILITY.md) — the architecture, the rules, and the alert catalogue; read it before adding an instrument · [LOGGING.md](LOGGING.md) · [DOCKER.md](../deployment/DOCKER.md) · [DOCKER_COMPOSE.md](../deployment/DOCKER_COMPOSE.md) · [SECRETS.md](../deployment/SECRETS.md) · [GITHUB_ACTIONS.md](../deployment/GITHUB_ACTIONS.md) · [runbooks.md](runbooks.md)
 
 ---
 
@@ -25,8 +25,15 @@ This sprint added five things:
 | Request correlation | Which lines belong to *this* request? |
 | Runtime diagnostics | What build is this, and since when? |
 
-Explicitly **not** in scope, and still open: Prometheus/Grafana servers,
-alerting, error tracking (Sentry), distributed tracing, log shipping. See §10.
+PH3.7 added a sixth: **subsystem instrumentation** — which part of the system is
+failing, and how (MongoDB, Redis, WebSockets, background tasks, cron, external
+providers, AI, the event bus, and the browser). See
+[OBSERVABILITY.md](../architecture/OBSERVABILITY.md) for the architecture and
+the rules that bind anything added to it.
+
+Explicitly **not** in scope, and still open: Prometheus/Grafana servers, an
+alert *delivery* channel, error tracking (Sentry), distributed tracing, log
+shipping. See §11.
 
 ---
 
@@ -72,7 +79,11 @@ Client Request
 | `observability/health.py` | Probe registry, lifecycle state machine, built-in Mongo/Redis probes |
 | `observability/runtime.py` | Version, build provenance, uptime, process facts |
 | `observability/middleware.py` | The single ASGI seam that ties it together |
-| `observability/routes.py` | The six HTTP endpoints + the production access gate |
+| `observability/errors.py` | The closed 13-class failure vocabulary every label and log field uses (PH3.7) |
+| `observability/instruments.py` | The API call sites use: closed `subsystem`/`provider` vocabularies, trackers, `record_*` helpers (PH3.7) |
+| `observability/mongo_monitor.py` | Driver-level MongoDB command + pool metrics via pymongo listeners (PH3.7) |
+| `observability/log_streams.py`, `log_rotation.py` | Stream separation, rotation, retention (PH2.6) |
+| `observability/routes.py` | The HTTP endpoints + the production access gate + client-error ingest |
 
 ---
 
@@ -87,7 +98,7 @@ on failure.
 | Probe | Path | Asked by | On failure | Touches dependencies? |
 |---|---|---|---|---|
 | Liveness | `/api/health/live` | kubelet, Docker `HEALTHCHECK` | **container is killed and restarted** | **Never** |
-| Readiness | `/api/health/ready` | load balancer, service mesh | removed from the traffic pool, left running | Yes — Mongo, Redis |
+| Readiness | `/api/health/ready` | load balancer, service mesh | removed from the traffic pool, left running | Yes — Mongo, Redis, configuration |
 | Startup | `/api/health/startup` | orchestrator, during boot only | keeps waiting; suppresses liveness | No |
 
 **Never point a liveness probe at a dependency check.** If liveness depends on
@@ -123,9 +134,19 @@ deadlocked process never reaches here and the probe times out.
  "checks":[
    {"name":"mongodb","status":"pass","critical":true,"duration_ms":1.84},
    {"name":"redis","status":"skip","critical":false,"duration_ms":0.02,
-    "detail":"not configured"}],
+    "detail":"not configured"},
+   {"name":"configuration","status":"pass","critical":true,"duration_ms":0.01}],
  "timestamp":"..."}
 ```
+
+The **`configuration` check (PH3.7)** is critical: an instance whose required
+configuration does not validate must not receive traffic. It reads the verdict
+`validate_config()` already produced at boot rather than re-validating — an
+attribute access, so it adds nothing measurable to a poll that every replica
+performs every few seconds. On failure its detail is a **count** of failing
+names, never the names: an unauthenticated caller learning which secret a
+deployment is missing is a reconnaissance gift, and the names are already in the
+boot log.
 
 **503 is a correct answer, not an error** — it is how an instance asks to be
 taken out of rotation while it recovers or drains.
@@ -140,6 +161,7 @@ Registered checks (`backend/server.py`):
 |---|---|---|---|
 | `mongodb` | **yes** | `db.command("ping")` | — |
 | `redis` | no | `PING` | `REDIS_URL` unset |
+| `configuration` | **yes** | boot-time `validate_config()` verdict (PH3.7) | no report wired |
 
 Redis is non-critical deliberately: `services/cache.py` falls back to an
 in-process dict, so the app keeps serving without it. Promote it to critical
@@ -258,6 +280,50 @@ The `redis_*` gauges are read from in-process counters at render time. The
 the same rule as `dependency_up`: whoever can reach `/api/metrics` must not be able
 to drive load onto a dependency by scraping faster.
 
+#### Subsystem, MongoDB, WebSocket, tasks, providers, AI, frontend (PH3.7)
+
+Full rationale for each family — why the labels are what they are, and what a
+non-zero value actually means — is in
+[OBSERVABILITY.md §4](../architecture/OBSERVABILITY.md#4-metrics).
+
+| Metric | Type | Labels | Signal |
+|---|---|---|---|
+| `subsystem_errors_total` | counter | subsystem, error_class | **Start here.** Which part is failing, and how |
+| `auth_events_total` | counter | event, outcome | Login/registration/session outcomes; no identity |
+| `mongodb_commands_total` | counter | command, outcome | Every driver command, via pymongo hooks |
+| `mongodb_command_duration_seconds` | histogram | command | Buckets start at 250 µs |
+| `mongodb_command_errors_total` | counter | command, reason | `reason` is the error *code* name, never a message |
+| `mongodb_pool_connections` | gauge | state | `checked_out` near `max` = saturation with **no errors** |
+| `websocket_connections_total` | counter | outcome | accepted / rejected |
+| `websocket_disconnects_total` | counter | reason | client / error / reaped — abnormal vs normal |
+| `websocket_broadcasts_total` | counter | kind | broadcast / channel / user. **Once per fan-out** |
+| `websocket_send_failures_total` | counter | kind | Dead sockets found during a fan-out |
+| `background_task_starts_total` | counter | task | Any rise after boot = something restarted |
+| `background_task_terminations_total` | counter | task, outcome | completed / failed / cancelled |
+| `background_task_duration_seconds` | histogram | task | Short buckets: a crash loop is the thing to see |
+| `scheduler_job_runs_total` | counter | job, outcome | executed / error / **missed** — `missed` = the job never ran |
+| `scheduler_job_duration_seconds` | histogram | job | A job nearing its own interval is about to start missing runs |
+| `event_bus_events_total` | counter | event_type | Domain event throughput |
+| `event_bus_handler_failures_total` | counter | event_type | Each one is a lost domain action |
+| `provider_requests_total` | counter | provider, operation, outcome | ok / **empty** / error |
+| `provider_request_duration_seconds` | histogram | provider, operation | Third-party latency |
+| `provider_errors_total` | counter | provider, error_class | |
+| `ai_requests_total` | counter | provider, outcome | **`provider="simulated"` rising = canned answers** |
+| `ai_request_duration_seconds` | histogram | provider | No model label — see §4.3 of OBSERVABILITY.md |
+| `ai_request_errors_total` | counter | provider, error_class | |
+| `frontend_errors_total` | counter | kind | Browser crashes: render / chunk_load / uncaught / … |
+| `frontend_reports_rejected_total` | counter | reason | A client bug, or someone probing the ingest endpoint |
+
+Three of these deserve singling out, because each covers a failure that leaves
+every other panel green:
+
+* **`provider_requests_total{outcome="empty"}`** — the provider answered 200
+  with no rows. No error, no status code, stale prices on screen.
+* **`ai_requests_total{provider="simulated"}`** — the user got a canned
+  response because every real model failed. The request *succeeded*.
+* **`frontend_errors_total`** — the browser is showing a blank page. The
+  request that served the bundle returned 200 minutes ago.
+
 ### The cardinality rule
 
 A series is identified by name **and full label set**; each combination costs
@@ -274,6 +340,14 @@ So:
 
 **`metrics_series_dropped_total > 0` means instrumentation is mislabelled.** It
 is the one metric to alert on at any non-zero value.
+
+PH3.7 added a fourth defence for the subsystem families: **closed vocabularies**.
+`subsystem`, `provider`, `error_class` and every outcome/reason/kind label are
+validated against frozen sets in `observability/instruments.py` and
+`observability/errors.py`. A value outside one produces an
+`instrumentation_defect` log line and a single `<unknown>` bucket — never a new
+series. This is what makes it safe for a label to be passed as a string by a
+call site.
 
 ### Latency buckets
 
@@ -566,23 +640,42 @@ load against MongoDB.
 
 ## 11. Known limitations
 
+> **Updated by PH3.7 (2026-08-15).** Items 3 and 5 below were rewritten: the
+> realtime tier and every other subsystem are now instrumented, and an alert
+> catalogue exists. What is still missing is narrower and is stated as such.
+
 1. **Metrics are per-process.** With `WEB_CONCURRENCY > 1`, each worker has its
    own registry and a scraper reaches one at random. Aggregation across workers
-   is a PH2.10 problem (per-worker scrape targets, or a shared store).
+   is still open (per-worker scrape targets, or a shared store).
 2. **Metrics reset on restart.** Inherent to in-process counters; a scraper
    handles it as a counter reset. `app_start_time_seconds` makes resets visible.
-3. **No WebSocket instrumentation.** Long-lived connections would poison the
-   latency histogram. Realtime observability needs its own design.
+3. **WebSocket *latency* is still not measured.** ~~No WebSocket
+   instrumentation.~~ PH3.7 added connection, disconnection (by reason),
+   fan-out and send-failure counters, alongside PH3.6's gauges. What remains
+   absent is per-message latency: a long-lived connection would poison the HTTP
+   histogram, and realtime latency needs its own design.
 4. **No tracing.** Request IDs correlate within this service only; a
    cross-service trace context (W3C `traceparent`) is a later concern.
-5. **No alerting.** Nothing watches these numbers yet — PH2.10.
+5. **Alerts are specified but nothing delivers them.** ~~No alerting.~~ PH3.7
+   defines a full alert catalogue with thresholds, severities, expected
+   responses and false-positive analysis in
+   [OBSERVABILITY.md §9](../architecture/OBSERVABILITY.md#9-alert-catalogue).
+   There is still **no Prometheus server, no Alertmanager, no notification
+   channel and no uptime check** — detection remains manual, which dominates
+   recovery time. Thresholds are also unvalidated, because no staging baseline
+   exists.
 6. **Logs are not shipped.** PH2.6 added rotation, retention and optional
    durable local files ([LOGGING.md](LOGGING.md)), but nothing forwards them
-   off-host yet — that is PH2.10.
+   off-host yet.
 7. **`/api/admin/system/health` still returns partly fabricated data**
    (`/api/admin/apis/health` reports hard-coded latencies). It is an admin
-   dashboard endpoint, out of scope here, and should be re-pointed at this
-   module's real data in a later sprint.
+   dashboard endpoint, out of scope here, and should be re-pointed at the real
+   provider metrics PH3.7 added (`provider_requests_total`,
+   `provider_request_duration_seconds`) in a later sprint.
+8. **No error-tracking service** (Sentry/GlitchTip) for either tier. Backend
+   exceptions are logged with tracebacks and frontend errors reach
+   `frontend_errors_total` plus a structured log line (PH3.7), but neither is
+   grouped or deduplicated across releases.
 
 ---
 
@@ -595,28 +688,26 @@ load against MongoDB.
   shipper at the `backend_logs` volume). The JSON schema in §5 is the contract;
   `request_id`, `route` and `status_code` are the index fields. No application
   change required.
-* **PH2.10 — Monitoring, Metrics & Alerting.** Point Prometheus at
+* **PH3.7 — Subsystem instrumentation & alert catalogue. ✅ Done (2026-08-15).**
+  Error classification, MongoDB/WebSocket/background-task/provider/AI metrics,
+  configuration readiness, frontend observability, and a full alert catalogue
+  with thresholds, severities and false-positive analysis. See
+  [OBSERVABILITY.md](../architecture/OBSERVABILITY.md) — **its §9 supersedes the
+  sketch that used to live here.**
+* **Still open — Centralized logging.** Attach a collector to stdout (or point a
+  shipper at the `backend_logs` volume). The JSON schema in §5 is the contract;
+  `request_id`, `route` and `status_code` are the index fields. No application
+  change required.
+* **Still open — the alerting stack itself.** Point Prometheus at
   `/api/metrics` (bearer auth via `METRICS_TOKEN`), build Grafana panels from the
-  four golden signals, and define the minimum alert set: readiness failing,
-  error-rate spike, `metrics_series_dropped_total > 0`, auth-failure spike,
-  backup failure. Add error tracking (Sentry/GlitchTip).
-
-Suggested first alert rules:
-
-```
-# Instance unhealthy
-dependency_up{dependency="mongodb"} == 0                        for 1m
-# Error budget burn
-rate(http_request_errors_total{kind="server"}[5m]) > 0.05       for 5m
-# Latency SLO (p99 > 1s)
-histogram_quantile(0.99, rate(http_request_duration_seconds_bucket[5m])) > 1
-# Saturation
-http_requests_in_flight > 50                                    for 5m
-# Crash loop
-app_uptime_seconds < 300                                        for 10m
-# Instrumentation bug
-metrics_series_dropped_total > 0
-```
+  four golden signals, load the rules from
+  [OBSERVABILITY.md §9](../architecture/OBSERVABILITY.md#9-alert-catalogue),
+  wire Alertmanager to a monitored channel, and add an external uptime check on
+  the public URL. **Then re-tune every threshold against two weeks of real
+  traffic** — they are engineering estimates, not measurements, because there is
+  no staging baseline.
+* **Still open — error tracking** (Sentry/GlitchTip) for grouping and
+  deduplicating exceptions across releases, both tiers.
 
 ---
 
@@ -626,3 +717,4 @@ metrics_series_dropped_total > 0
 |---|---|---|
 | 1.0 | 2026-07-22 | Initial document — PH2.5 Production Monitoring & Observability. |
 | 1.1 | 2026-07-23 | PH2.7 — Redis metric families, `/api/diagnostics/redis`. |
+| 1.2 | 2026-08-15 | PH3.7 — subsystem/MongoDB/WebSocket/task/provider/AI/frontend metric families (§4); closed-vocabulary cardinality defence; configuration readiness check (§3); limitations 3, 5 and 7 rewritten; the alert sketch in §12 replaced by the full catalogue in [OBSERVABILITY.md §9](../architecture/OBSERVABILITY.md#9-alert-catalogue). |

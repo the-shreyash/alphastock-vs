@@ -144,9 +144,25 @@ from infrastructure import tasks as task_registry
 #   * metrics          — the in-process registry rendered at /api/metrics.
 #   * middleware       — request ID, timing, counting, one access log line.
 #   * observability_routes — the operational HTTP surface.
-# See observability/__init__.py and docs/operations/MONITORING.md.
+#   * instruments      — the subsystem instrumentation API (PH3.7): the closed
+#                        `subsystem` / `provider` vocabularies and the helpers
+#                        that keep a metric family updated as a set.
+#   * mongo_monitor    — driver-level MongoDB command + pool metrics (PH3.7),
+#                        attached to the client below.
+# See observability/__init__.py, docs/architecture/OBSERVABILITY.md and
+# docs/operations/MONITORING.md.
+# Analytics epistemics (PH3.8): time windows, provenance classification and the
+# canonical trade-scoping filters. Imported under explicit aliases because the
+# bare names `periods`, `queries` and `contract` are far too generic for a
+# 6,000-line module.
+from analytics import contract as analytics_contract
+from analytics import periods as analytics_periods
+from analytics import queries as analytics_queries
+from analytics import registry as analytics_registry
 from observability import health as obs_health
+from observability import instruments as obs_instruments
 from observability import metrics as obs_metrics
+from observability import mongo_monitor as obs_mongo_monitor
 from observability import routes as observability_routes
 from observability import runtime as obs_runtime
 from observability.middleware import apply_observability
@@ -238,6 +254,14 @@ MONGO_CLIENT_OPTIONS = {
 }
 client = AsyncIOMotorClient(
     mongo_url,
+    # PH3.7. Driver-level command and pool instrumentation. Attached to THIS
+    # client rather than through pymongo's global `monitoring.register()` so the
+    # throwaway clients the test suite and the backup scripts build do not mix
+    # their commands into the application's series. The listeners read only the
+    # command *name* and the duration — never the command document, which for
+    # this application carries emails, password hashes and broker tokens. See
+    # observability/mongo_monitor.py.
+    event_listeners=obs_mongo_monitor.listeners(),
     **{k: v for k, v in MONGO_CLIENT_OPTIONS.items() if v is not None},
 )
 db = client[os.environ['DB_NAME']]
@@ -1944,16 +1968,18 @@ async def morning_report_full(run_id: Optional[str] = None, user: dict = Depends
 
 async def _risk_inputs(user_id) -> tuple:
     """(trades entered today, realized P&L of trades closed today) — the two
-    inputs the Risk Manager needs to enforce daily discipline limits."""
-    from services.trading_engine import _today
-    today = _today()
-    trades = await db.trades.find({"user_id": user_id}).to_list(500)
-    live = [t for t in trades if not t.get("is_paper")]
-    trades_today = len([t for t in live if (t.get("entry_time") or "").startswith(today)])
-    realized_today = round(sum(
-        t.get("pnl") or 0 for t in live
-        if t.get("pnl") is not None and (t.get("exit_time") or "").startswith(today)), 2)
-    return trades_today, realized_today
+    inputs the Risk Manager needs to enforce daily discipline limits.
+
+    PH3.8: "today" is the IST session day (a UTC day rolls at 05:30 IST, so the
+    daily trade counter reset mid-morning), partial-exit bookings now count
+    toward the realised figure that gates `max_daily_loss`, and the 500-document
+    cap is gone. Delegates to `trading_engine.build_risk_summary` so the gate
+    and the Risk Manager panel can never disagree about the same two numbers —
+    they were two independent reimplementations before.
+    """
+    from services.trading_engine import build_risk_summary
+    summary = await build_risk_summary(db, {"_id": user_id})
+    return summary["trades_today"], summary["realized_pnl_today"]
 
 
 def _derive_close_status(trade: dict, exit_price: float) -> str:
@@ -2152,30 +2178,62 @@ async def trade_history(user: dict = Depends(get_current_user)):
 
 @trades_router.get("/pnl")
 async def trade_pnl(user: dict = Depends(get_current_user)):
-    trades = await db.trades.find({"user_id": user["_id"]}).to_list(500)
-    total_pnl = 0
-    today_pnl = 0
-    wins = 0
-    losses = 0
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    for t in trades:
-        if t.get("pnl") is not None:
-            total_pnl += t["pnl"]
-            if t.get("exit_time", "").startswith(today):
-                today_pnl += t["pnl"]
-            if t["pnl"] > 0:
-                wins += 1
-            else:
-                losses += 1
-    total = wins + losses
+    """Realised P&L and win rate over the user's REAL-MONEY trades.
+
+    PH3.8 corrected four things here, all of which changed the displayed
+    numbers:
+
+    * **Paper trades are excluded.** They shared this total with real ones, so
+      virtual profit was reported as trading performance.
+    * **Breakeven is not a loss.** The old `if pnl > 0 ... else losses += 1`
+      scored a ₹0 close as a loss. `reset_paper_capital` closes positions at
+      exactly ₹0, so resetting an account manufactured losses.
+    * **"Today" is the IST session day**, not the UTC day, which rolled at
+      05:30 IST.
+    * **No 500-document cap.** The old fetch had no sort, so an active trader's
+      lifetime total was the sum of an arbitrary 500 rows. Totals are now summed
+      in the database.
+
+    All figures are GROSS: no brokerage, STT, GST or stamp duty is recorded
+    anywhere in this product. See `docs/architecture/ANALYTICS.md` §6.
+    """
+    live = analytics_queries.live_trades(user["_id"])
+    closed = analytics_queries.closed(live)
+    today = analytics_periods.resolve("today")
+
+    # Seven independent reads, issued concurrently rather than one after another
+    # (the PH3.4 O-4 pattern). None depends on any other, and every one is a
+    # count or a `$group` served by the `{user_id, ...}` indexes — no document
+    # crosses the wire to produce these scalars. Sequentially this endpoint cost
+    # 7 × RTT; concurrently it costs the slowest one.
+    (total, today_totals, wins, losses, breakeven,
+     total_trades, open_trades) = await asyncio.gather(
+        analytics_queries.sum_pnl(db, closed),
+        analytics_queries.sum_pnl(db, analytics_queries.closed_in_window(today, user["_id"])),
+        db.trades.count_documents(analytics_queries.wins(closed)),
+        db.trades.count_documents(analytics_queries.losses(closed)),
+        db.trades.count_documents(analytics_queries.breakeven(closed)),
+        db.trades.count_documents(live),
+        db.trades.count_documents(analytics_queries.open_positions(live)),
+    )
+    total_pnl, _ = total
+    today_pnl, today_count = today_totals
+    decided = wins + losses + breakeven
     return {
-        "total_pnl": round(total_pnl, 2),
-        "today_pnl": round(today_pnl, 2),
-        "total_trades": len(trades),
-        "open_trades": len([t for t in trades if t.get("status") == "OPEN"]),
-        "win_rate": round((wins / total) * 100, 1) if total > 0 else 0,
+        "total_pnl": total_pnl,
+        "today_pnl": today_pnl,
+        "today_trades_closed": today_count,
+        "total_trades": total_trades,
+        "open_trades": open_trades,
+        # Denominator is every CLOSED trade, so wins + losses + breakeven
+        # accounts for 100% of them.
+        "win_rate": round((wins / decided) * 100, 1) if decided else 0,
         "wins": wins,
         "losses": losses,
+        "breakeven": breakeven,
+        "scope": "live",
+        "basis": "gross",
+        "window": today.as_dict(),
     }
 
 async def _generate_coaching_background(trade_id: str):
@@ -2512,20 +2570,28 @@ async def get_portfolio(user: dict = Depends(get_current_user)):
 async def portfolio_summary(user: dict = Depends(get_current_user)):
     from services import portfolio_engine
     holdings = await portfolio_engine.build_holdings(db, user, real_quotes_map)
-    closed = await db.trades.find(
-        {"user_id": user["_id"], "status": {"$ne": "OPEN"}}
-    ).to_list(500)
-    realized = round(sum((t.get("pnl") or 0) for t in closed), 2)
+    # Real-money only and uncapped (PH3.8). This summed paper trades into the
+    # realised P&L of the real portfolio while `build_holdings` above excluded
+    # them from the unrealised half of the same response.
+    realized, _ = await analytics_queries.sum_pnl(
+        db, analytics_queries.closed(analytics_queries.live_trades(user["_id"])))
     pnl = portfolio_engine.compute_pnl(holdings, realized)
     return {
         "total_invested": pnl["invested"],
         "current_value": pnl["current_value"],
+        # `total_pnl` is LIFETIME UNREALISED P&L, not a daily figure. The name
+        # predates PH3.8 and is kept for the existing consumers; `unrealized_pnl`
+        # is the unambiguous alias and the one new code should read.
         "total_pnl": pnl["unrealized"],
+        "unrealized_pnl": pnl["unrealized"],
         "total_pnl_pct": pnl["unrealized_pct"],
+        "unrealized_pnl_pct": pnl["unrealized_pct"],
         "realized_pnl": pnl["realized"],
         "holdings_count": len(holdings),
         "sources": sorted({h.get("source") for h in holdings if h.get("source")}),
         "capital": user.get("capital", 100000),
+        "scope": "live",
+        "basis": "gross",
     }
 
 
@@ -2549,7 +2615,14 @@ async def portfolio_performance(range: str = "ALL", user: dict = Depends(get_cur
     available:false until at least two end-of-day snapshots exist (the curve is
     built forward from real marks — never back-filled with synthetic history)."""
     from services import portfolio_engine
-    return await portfolio_engine.get_performance(db, user["_id"], range)
+    try:
+        return await portfolio_engine.get_performance(db, user["_id"], range)
+    except ValueError as e:
+        # An unrecognised `?range=` is a client error, not a server fault. The
+        # engine raises rather than silently widening to ALL (PH3.8) — a typo
+        # that quietly returns a different span is the failure this sprint
+        # exists to remove — so the route turns that into a clean 400.
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @portfolio_router.get("/export")
@@ -3033,8 +3106,19 @@ class ConnectionManager:
         self.channels.setdefault(ws, set())
         if user_id:
             self.user_connections.setdefault(user_id, set()).add(ws)
+        # PH3.7. The gauges below say how many sockets exist right now; this
+        # counter says how many arrived. A gauge alone cannot distinguish "200
+        # stable connections" from "200 clients reconnecting every second",
+        # and those are very different incidents.
+        obs_instruments.record_ws_connection("accepted")
 
-    def disconnect(self, ws: WebSocket, user_id: str = None):
+    def disconnect(self, ws: WebSocket, user_id: str = None, reason: str = "client"):
+        # `reason` distinguishes a clean close from a socket that raised. Both
+        # empty the same structures, but only one of them is normal: a spike in
+        # reason="error" against a flat reason="client" is a network or
+        # backpressure problem, and rounding the two together into a single
+        # "disconnects" number is what makes that invisible (PH3.7).
+        obs_instruments.record_ws_disconnect(reason)
         self.active.discard(ws)
         self.channels.pop(ws, None)
         if user_id and user_id in self.user_connections:
@@ -3089,6 +3173,10 @@ class ConnectionManager:
                 await ws.send_text(payload)
             except Exception:
                 dead.add(ws)
+        # PH3.7: two increments per fan-out, whatever the audience size. See the
+        # cost note on `websocket_broadcasts_total` — counting per recipient
+        # would put thousands of lock acquisitions a second on this path.
+        obs_instruments.record_ws_fanout("broadcast", len(dead))
         self._reap(dead)
 
     async def broadcast_to_channel(self, channel: str, message: dict):
@@ -3101,6 +3189,7 @@ class ConnectionManager:
                     await ws.send_text(payload)
                 except Exception:
                     dead.add(ws)
+        obs_instruments.record_ws_fanout("channel", len(dead))
         self._reap(dead)
 
     async def send_to_user(self, user_id: str, message: dict):
@@ -3117,6 +3206,7 @@ class ConnectionManager:
                 await ws.send_text(payload)
             except Exception:
                 dead.add(ws)
+        obs_instruments.record_ws_fanout("user", len(dead))
         self._reap(dead)
 
     def _reap(self, dead: Set[WebSocket]):
@@ -3236,8 +3326,20 @@ async def websocket_endpoint(websocket: WebSocket):
 
     except WebSocketDisconnect:
         ws_manager.disconnect(websocket, user_id)
-    except Exception:
-        ws_manager.disconnect(websocket, user_id)
+    except Exception as exc:
+        # PH3.7. This branch was previously indistinguishable from a clean
+        # close — same call, no log line — so a socket dying on a malformed
+        # frame, a serialization bug or a dropped link left no trace anywhere.
+        # The exception is classified into the closed vocabulary so it appears
+        # on `subsystem_errors_total{subsystem="websocket"}` next to every
+        # other failure, and logged once with the request-scoped context.
+        error_class = obs_instruments.record_exception("websocket", exc)
+        logger.warning(
+            "WebSocket connection closed abnormally",
+            exc_info=exc,
+            extra={"event": "websocket_abnormal_close", "error_class": error_class},
+        )
+        ws_manager.disconnect(websocket, user_id, reason="error")
 
 
 # Background task: broadcast market data every 10 seconds
@@ -4974,7 +5076,12 @@ async def log_admin_action(admin_id: str, action: str, target: str = "", details
 
 @admin_router.get("/dashboard")
 async def admin_dashboard(user: dict = Depends(require_admin)):
-    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    # PH3.8: the IST session day, as a half-open range, replacing
+    # `strftime("%Y-%m-%d")` + `$regex: "^<date>"`. Two improvements at once —
+    # the boundary is the one the business and the exchange use rather than one
+    # that rolls at 05:30 IST, and a range comparison is servable by an index
+    # while a regex on an unindexed string field is a collection scan.
+    today_window = analytics_periods.resolve("today")
 
     # Eleven independent counts, issued CONCURRENTLY rather than one after another
     # (PH3.4, O-4).
@@ -5007,18 +5114,30 @@ async def admin_dashboard(user: dict = Depends(require_admin)):
         db.users.count_documents({"role": {"$in": ["pro", "premium"]}}),
         db.users.count_documents({"role": "elite"}),
         db.users.count_documents({"role": {"$in": ["admin", "super_admin"]}}),
-        db.trades.count_documents({"entry_time": {"$regex": f"^{today_str}"}}),
+        db.trades.count_documents(today_window.filter_for("entry_time")),
         db.trades.count_documents({}),
         db.trades.count_documents({"status": "OPEN"}),
-        db.chat_messages.count_documents({"created_at": {"$regex": f"^{today_str}"}}),
+        db.chat_messages.count_documents(today_window.filter_for("created_at")),
         db.notifications.count_documents({}),
         db.support_tickets.count_documents({"status": {"$in": ["open", "in_progress"]}}),
         db.broker_accounts.count_documents({}),
     )
     total_payments = await db.payments.count_documents({}) if has_payments else 0
-    # Revenue (mock — real system would sum from payments collection)
-    revenue_today = total_payments * 499  # placeholder
-    mrr = premium_users * 499 + elite_users * 999
+    # PH3.8 — FABRICATED, and left in place deliberately (mock removal is PH3.9).
+    #
+    # `revenue_today` is the COUNT of every payment document ever written,
+    # multiplied by a literal ₹499. It is not a sum of amounts, it is not
+    # filtered to today, and it ignores currency, status and refunds. It reads
+    # ₹0 on this installation only because `db.payments` is empty — nothing in
+    # the codebase writes to it — so the first record to land would report ₹499
+    # of "today's revenue" whatever it was actually for.
+    #
+    # `mrr`/`arr` infer revenue from role counts × hardcoded prices, and roles
+    # are granted by admins without payment. See GET /api/admin/payments/stats
+    # for the full classification.
+    revenue_today = total_payments * _ASSUMED_PLAN_PRICE_INR["pro"]
+    mrr = (premium_users * _ASSUMED_PLAN_PRICE_INR["pro"]
+           + elite_users * _ASSUMED_PLAN_PRICE_INR["elite"])
     arr = mrr * 12
 
     # Health checks
@@ -5044,8 +5163,19 @@ async def admin_dashboard(user: dict = Depends(require_admin)):
         "arr": arr,
         "broker_connections": broker_connections,
         "db_health": db_health,
+        # PH3.8: `api_health` and `server_health` are literals — they report
+        # "healthy" during a total outage. `GET /api/health/detailed` (PH2.5/
+        # PH3.7) performs real dependency probes and is what an operator should
+        # read. Flagged rather than changed: this endpoint's contract is
+        # consumed by AdminDashboard's health badges and PH3.9 owns the swap.
         "api_health": "healthy",
         "server_health": "healthy",
+        "window": today_window.as_dict(),
+        "mock_metrics": ["revenue_today", "mrr", "arr", "api_health", "server_health"],
+        "analytics_note": (
+            "revenue_today, mrr and arr are fabricated — no payment records exist. "
+            "api_health and server_health are hardcoded literals. See "
+            "GET /api/admin/payments/stats and docs/architecture/ANALYTICS.md."),
     }
 
 
@@ -5213,17 +5343,75 @@ async def admin_list_payments(page: int = PageParam, limit: int = LimitParam,
     return {"payments": payments, "total": total, "page": page, "limit": limit, "pages": max(1, (total + limit - 1) // limit)}
 
 
+#: Plan prices assumed by the revenue estimate, in INR per month. Named
+#: constants rather than magic numbers inline — not because that makes the
+#: estimate correct (it does not; see the route), but so the assumption is
+#: visible and greppable when PH3.9 replaces it with real subscription records.
+_ASSUMED_PLAN_PRICE_INR = {"pro": 499, "premium": 499, "elite": 999}
+
+
 @admin_router.get("/payments/stats")
 async def admin_payment_stats(user: dict = Depends(require_admin)):
-    users_by_plan = {}
-    async for u in db.users.find({}, {"role": 1}):
-        r = u.get("role", "user")
-        users_by_plan[r] = users_by_plan.get(r, 0) + 1
+    """Billing summary.
+
+    PH3.8 CLASSIFICATION — **every revenue figure here is fabricated**, and the
+    reason is structural rather than a coding slip: the `payments` collection
+    has no writer anywhere in this codebase and the platform has no payment
+    integration, so there is no revenue data to read.
+
+    * `mrr` / `arr` infer revenue from ROLE COUNTS × a hardcoded price. Roles
+      are assigned by an admin through `POST /api/admin/users/{id}/grant-plan`
+      with no payment involved, so every comped account, internal account and
+      beta tester is counted as paying.
+    * `revenue_today`, `revenue_week`, `pending_payments`, `refunds` and
+      `failed_payments` are literal zeros. A zero that means "we have no data"
+      is indistinguishable on a dashboard from a zero that means "no revenue
+      today" — which is the specific confusion the analytics contract exists to
+      prevent, so each is now declared.
+    * `refunds: 0` is additionally contradicted by the product: PH3.5 found that
+      `POST /api/admin/payments/{id}/refund` is a stub returning success while
+      writing a `payment.refunded` audit record for a refund that never
+      happened.
+
+    `plan_distribution` and the three plan counts ARE real — they are counts of
+    users by role, which is a fact about the database.
+    """
+    users_by_plan = await _plan_breakdown()
     premium_count = users_by_plan.get("pro", 0) + users_by_plan.get("premium", 0)
     elite_count = users_by_plan.get("elite", 0)
     lifetime_count = users_by_plan.get("lifetime", 0)
-    mrr = premium_count * 499 + elite_count * 999
+    mrr = (premium_count * _ASSUMED_PLAN_PRICE_INR["pro"]
+           + elite_count * _ASSUMED_PLAN_PRICE_INR["elite"])
     arr = mrr * 12
+
+    revenue_note = ("Inferred from role counts × a hardcoded price, not from payment "
+                    "records — `db.payments` has no writer. Comped and admin-granted "
+                    "accounts are counted as paying. PH3.9.")
+    zero_note = ("A hardcoded zero, not a measured zero. No payment records exist to "
+                 "aggregate. PH3.9.")
+    metrics = [
+        analytics_contract.mock("mrr", mrr, unit=analytics_contract.INR,
+                                source="db.users.role × literal price", note=revenue_note),
+        analytics_contract.mock("arr", arr, unit=analytics_contract.INR,
+                                source="mrr × 12", note=revenue_note),
+        analytics_contract.mock("revenue_today", 0, unit=analytics_contract.INR,
+                                source="literal", note=zero_note),
+        analytics_contract.mock("revenue_week", 0, unit=analytics_contract.INR,
+                                source="literal", note=zero_note),
+        analytics_contract.mock("revenue_month", mrr, unit=analytics_contract.INR,
+                                source="mrr", note=revenue_note),
+        analytics_contract.mock("revenue_year", arr, unit=analytics_contract.INR,
+                                source="arr", note=revenue_note),
+        analytics_contract.mock("pending_payments", 0, source="literal", note=zero_note),
+        analytics_contract.mock("refunds", 0, source="literal",
+                                note=zero_note + " Contradicted by the refund endpoint, "
+                                                 "which is a stub that audits refunds it "
+                                                 "never performs (PH3.5 D-4)."),
+        analytics_contract.mock("failed_payments", 0, source="literal", note=zero_note),
+        analytics_contract.real("premium_count", premium_count, source="db.users.role"),
+        analytics_contract.real("elite_count", elite_count, source="db.users.role"),
+        analytics_contract.real("lifetime_count", lifetime_count, source="db.users.role"),
+    ]
     return {
         "mrr": mrr,
         "arr": arr,
@@ -5238,6 +5426,8 @@ async def admin_payment_stats(user: dict = Depends(require_admin)):
         "premium_count": premium_count,
         "elite_count": elite_count,
         "lifetime_count": lifetime_count,
+        "analytics": analytics_contract.envelope(metrics, surface="admin.payments"),
+        "mock_metrics": [m.name for m in metrics if m.provenance == analytics_contract.MOCK],
     }
 
 
@@ -5251,13 +5441,39 @@ async def admin_refund_payment(payment_id: str, user: dict = Depends(require_adm
 
 @admin_router.get("/ai/status")
 async def admin_ai_status(user: dict = Depends(require_admin)):
+    """AI provider status.
+
+    PH3.8 CLASSIFICATION. `latency_ms` (1200 / 900), `failures: 0` and
+    `fallbacks: 0` are literals; `status` reflects only whether a KEY IS
+    CONFIGURED and is never probed; `estimated_cost` is a message count times a
+    flat per-message rate, when provider billing is per token. `daily_requests`
+    and `monthly_requests` are stored chat messages halved — messages include
+    both the user turn and the assistant turn, and the 50/50 split between the
+    two providers is arbitrary.
+
+    The sharp edge is `failures: 0`. PH3.7 shipped
+    `ai_requests_total{provider,outcome}` and `ai_request_errors_total`, which
+    count real failures — so this page can report a healthy provider while the
+    platform's own metrics record it failing. An operator watching the admin
+    console cannot see an outage that is already being measured.
+    """
     claude_ok = claude_configured()
     gemini_ok = gemini_configured()
     # Aggregate AI usage from chat_messages
-    total_ai = await db.chat_messages.count_documents({})
-    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    today_ai = await db.chat_messages.count_documents({"created_at": {"$regex": f"^{today_str}"}})
+    today_window = analytics_periods.resolve("today")
+    total_ai, today_ai = await asyncio.gather(
+        db.chat_messages.count_documents({}),
+        db.chat_messages.count_documents(today_window.filter_for("created_at")),
+    )
     return {
+        "mock_metrics": ["latency_ms", "failures", "fallbacks", "estimated_cost",
+                         "daily_requests", "monthly_requests", "status"],
+        "analytics_note": (
+            "Provider latency, failure and fallback counts are literals. Real values "
+            "are in observability.metrics as ai_request_duration_seconds, "
+            "ai_requests_total{provider,outcome} and ai_request_errors_total (PH3.7); "
+            "this endpoint does not read them. Cost is a per-message flat rate, not "
+            "token-based. PH3.9."),
         "providers": [
             {
                 "name": "Claude (Anthropic)",
@@ -5326,6 +5542,23 @@ async def admin_ai_usage(user: dict = Depends(require_admin)):
 
 @admin_router.get("/apis/health")
 async def admin_api_health(user: dict = Depends(require_admin)):
+    """External API health.
+
+    PH3.8 CLASSIFICATION — **this entire response is a hardcoded list.**
+    `status` is "online" whenever a credential is configured and is never
+    probed; Yahoo Finance and News RSS are the literal string "online"
+    unconditionally. `latency_ms`, `requests_today`, `requests_month` and
+    `failure_rate` are literals, and `overall_status` is the constant
+    "healthy" — so this page reports a healthy platform during a total provider
+    outage, which is the exact opposite of what an operational dashboard is for.
+
+    Real data for every one of these fields exists: `GET /api/health/detailed`
+    runs live dependency probes (PH2.5/PH3.7) and
+    `provider_requests_total{provider,operation,outcome}` plus
+    `provider_request_duration_seconds` carry real counts and latencies.
+    Rewiring is PH3.9; PH3.8 makes the gap visible rather than shipping a
+    half-migrated health page inside an audit.
+    """
     apis = [
         {"name": "Yahoo Finance", "type": "market_data", "status": "online", "latency_ms": 450, "requests_today": 0, "requests_month": 0, "quota_remaining": "unlimited", "failure_rate": 0.0},
         {"name": "Claude API", "type": "ai", "status": "online" if claude_configured() else "offline", "latency_ms": 1200, "requests_today": 0, "requests_month": 0, "quota_remaining": "usage-based", "failure_rate": 0.0},
@@ -5336,37 +5569,123 @@ async def admin_api_health(user: dict = Depends(require_admin)):
         {"name": "Razorpay", "type": "payment", "status": "configured", "latency_ms": 300, "requests_today": 0, "requests_month": 0, "quota_remaining": "unlimited", "failure_rate": 0.0},
         {"name": "Email (SMTP)", "type": "notification", "status": "configured", "latency_ms": 500, "requests_today": 0, "requests_month": 0, "quota_remaining": "unlimited", "failure_rate": 0.0},
     ]
-    return {"apis": apis, "overall_status": "healthy"}
+    return {
+        "apis": apis,
+        "overall_status": "healthy",
+        "status": analytics_contract.MOCK,
+        "mock_metrics": ["status", "latency_ms", "requests_today", "requests_month",
+                         "failure_rate", "overall_status"],
+        "analytics_note": (
+            "Hardcoded. `status` reflects credential configuration, not reachability; "
+            "latency, request counts and failure rate are literals. Use "
+            "GET /api/health/detailed and the provider_requests_total metric family "
+            "for real values. PH3.9."),
+    }
 
 
 # ---------- Analytics ----------
 
+async def _plan_breakdown() -> dict:
+    """Users grouped by role, aggregated in the database.
+
+    PH3.8 (O-A1). This was an `async for` over `db.users.find({}, {"role": 1})`
+    — an unbounded cursor that pulls one document per registered user into the
+    application to produce a handful of integers, on two separate admin
+    endpoints. At 100,000 users that is 100,000 round-tripped documents per
+    dashboard load. `$group` does the same work inside Mongo and returns one row
+    per distinct role.
+    """
+    out = {}
+    async for row in db.users.aggregate([
+        {"$group": {"_id": "$role", "count": {"$sum": 1}}},
+    ]):
+        out[row.get("_id") or "user"] = int(row.get("count") or 0)
+    return out
+
+
 @admin_router.get("/analytics/users")
 async def admin_analytics_users(user: dict = Depends(require_admin)):
+    """User-growth analytics.
+
+    PH3.8 CLASSIFICATION. `total_users`, `today_signups`, `plan_breakdown` and
+    `conversion_rate` are real or derived. `dau`, `mau`, `retention_rate`,
+    `churn_rate` and `growth_rate` are NOT — they are today's signup count
+    relabelled, the total user count relabelled, and three literals. The values
+    are unchanged so nothing regresses, but the response now carries an
+    `analytics` block that says which is which, and `mock_metrics` lists them by
+    name for a consumer that only wants the flag. Replacement is PH3.9; the
+    specification is in `analytics.registry`.
+    """
+    today = analytics_periods.resolve("today")
     total = await db.users.count_documents({})
-    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    today_signups = await db.users.count_documents({"created_at": {"$regex": f"^{today_str}"}})
-    # Build plan breakdown
-    plan_breakdown = {}
-    async for u in db.users.find({}, {"role": 1}):
-        r = u.get("role", "user")
-        plan_breakdown[r] = plan_breakdown.get(r, 0) + 1
+    today_signups = await db.users.count_documents(
+        today.filter_for("created_at"))
+    plan_breakdown = await _plan_breakdown()
+    conversion = round(
+        (plan_breakdown.get("pro", 0) + plan_breakdown.get("elite", 0)) / max(total, 1) * 100, 1)
+
+    metrics = [
+        analytics_contract.real("total_users", total, source="db.users"),
+        analytics_contract.derived("today_signups", today_signups, period=today,
+                                   source="db.users.created_at"),
+        analytics_contract.derived("conversion_rate", conversion, unit=analytics_contract.PERCENT,
+                                   source="db.users.role",
+                                   note="Conversion to a granted ROLE. Roles are assigned by "
+                                        "an admin without payment, so this is not paid "
+                                        "conversion."),
+        analytics_contract.mock("dau", today_signups, period=today,
+                                source="db.users.created_at",
+                                note="This is today's SIGNUP count relabelled as daily active "
+                                     "users. Real activity data exists in db.sessions "
+                                     "(last_used_at) and is not read here. PH3.9."),
+        analytics_contract.mock("mau", total, source="db.users",
+                                note="This is the TOTAL registered user count relabelled as "
+                                     "monthly actives, so DAU/MAU is meaningless. PH3.9."),
+        analytics_contract.mock("retention_rate", 78.5, unit=analytics_contract.PERCENT,
+                                source="literal",
+                                note="A constant in the source. It does not move when users "
+                                     "leave. Needs cohort analysis over db.sessions. PH3.9."),
+        analytics_contract.mock("churn_rate", 4.2, unit=analytics_contract.PERCENT,
+                                source="literal",
+                                note="A constant in the source. Needs subscription "
+                                     "cancellations, which are not recorded. PH3.9."),
+        analytics_contract.mock("growth_rate", 12.8, unit=analytics_contract.PERCENT,
+                                source="literal",
+                                note="A constant in the source. Computable today from "
+                                     "db.users.created_at period over period. PH3.9."),
+    ]
     return {
         "total_users": total,
         "today_signups": today_signups,
-        "dau": today_signups,  # Simplified; real system tracks active sessions
+        "dau": today_signups,
         "mau": total,
         "retention_rate": 78.5,
         "churn_rate": 4.2,
         "growth_rate": 12.8,
-        "conversion_rate": round((plan_breakdown.get("pro", 0) + plan_breakdown.get("elite", 0)) / max(total, 1) * 100, 1),
+        "conversion_rate": conversion,
         "plan_breakdown": plan_breakdown,
+        "analytics": analytics_contract.envelope(metrics, period=today, surface="admin.users"),
+        "mock_metrics": [m.name for m in metrics if m.provenance == analytics_contract.MOCK],
     }
 
 
 @admin_router.get("/analytics/revenue")
 async def admin_analytics_revenue(user: dict = Depends(require_admin)):
-    # Generate last 30 days mock revenue data for charts
+    """Revenue trend.
+
+    PH3.8: **every number returned by this endpoint is fabricated.** The series
+    is produced by a for-loop — `revenue = 2500 + i*150 + (500 if i % 7 == 0)`,
+    `subscriptions = 3 + i % 5` — with no database access of any kind, and the
+    frontend charts it identically to a real series. It is left in place because
+    ripping a chart out of a dashboard without a replacement is not an
+    improvement; what is added is that the payload now says so, in a field a
+    consumer can branch on, and every point carries `mock: true`.
+
+    The blocker is upstream of this route: `db.payments` has no writer anywhere
+    in the codebase and the platform has no payment integration, so there is no
+    revenue data to aggregate. PH3.9 either wires the payment provider or turns
+    this into an explicit UNAVAILABLE.
+    """
     revenue_data = []
     for i in range(30):
         d = datetime.now(timezone.utc) - timedelta(days=29 - i)
@@ -5374,28 +5693,70 @@ async def admin_analytics_revenue(user: dict = Depends(require_admin)):
             "date": d.strftime("%Y-%m-%d"),
             "revenue": 2500 + (i * 150) + (500 if i % 7 == 0 else 0),
             "subscriptions": 3 + (i % 5),
+            "mock": True,
         })
-    return {"daily_revenue": revenue_data}
+    spec = analytics_registry.get("admin.revenue_series")
+    return {
+        "daily_revenue": revenue_data,
+        "status": analytics_contract.MOCK,
+        "provenance": analytics_contract.MOCK,
+        "note": "Fabricated series generated by a formula. No payment records exist: "
+                "`db.payments` has no writer and the platform has no payment "
+                "integration. Do not report these figures.",
+        "required_source": spec.required_source if spec else "",
+        "mock_metrics": ["revenue", "subscriptions"],
+    }
+
+
+#: The fixed percentages this endpoint has always returned, kept verbatim so the
+#: response does not change shape or value in an audit sprint. They correspond
+#: to nothing — see the note in the route.
+_FEATURE_USAGE_PCT = {
+    "AI Chat": 85, "Trading": 72, "Stock Scanner": 68, "Morning Report": 55,
+    "Portfolio": 50, "News": 45, "Notifications": 40, "SIP Advisor": 25,
+    "Paper Trading": 20, "Backtesting": 15,
+}
 
 
 @admin_router.get("/analytics/features")
 async def admin_analytics_features(user: dict = Depends(require_admin)):
-    chat_count = await db.chat_messages.count_documents({})
-    trade_count = await db.trades.count_documents({})
-    notif_count = await db.notifications.count_documents({})
+    """Feature adoption.
+
+    PH3.8: the `percentage` column is a fixed descending list of literals with
+    no relationship to the `usage_count` beside it, and seven of the ten
+    `usage_count` values are the literal 0 because nothing counts those
+    features. Three rows — AI Chat, Trading, Notifications — carry a real
+    collection count. Each row now declares which of its two numbers is real.
+    """
+    chat_count, trade_count, notif_count = await asyncio.gather(
+        db.chat_messages.count_documents({}),
+        db.trades.count_documents({}),
+        db.notifications.count_documents({}),
+    )
+    counted = {"AI Chat": chat_count, "Trading": trade_count, "Notifications": notif_count}
     features = [
-        {"name": "AI Chat", "usage_count": chat_count, "percentage": 85},
-        {"name": "Trading", "usage_count": trade_count, "percentage": 72},
-        {"name": "Stock Scanner", "usage_count": 0, "percentage": 68},
-        {"name": "Morning Report", "usage_count": 0, "percentage": 55},
-        {"name": "Portfolio", "usage_count": 0, "percentage": 50},
-        {"name": "News", "usage_count": 0, "percentage": 45},
-        {"name": "Notifications", "usage_count": notif_count, "percentage": 40},
-        {"name": "SIP Advisor", "usage_count": 0, "percentage": 25},
-        {"name": "Paper Trading", "usage_count": 0, "percentage": 20},
-        {"name": "Backtesting", "usage_count": 0, "percentage": 15},
+        {
+            "name": name,
+            "usage_count": counted.get(name, 0),
+            "percentage": pct,
+            # The count is real only where a collection backs it.
+            "usage_count_provenance": (
+                analytics_contract.DERIVED if name in counted else analytics_contract.MOCK),
+            "percentage_provenance": analytics_contract.MOCK,
+        }
+        for name, pct in _FEATURE_USAGE_PCT.items()
     ]
-    return {"features": features}
+    return {
+        "features": features,
+        "status": analytics_contract.MOCK,
+        "note": "Every `percentage` is a literal unrelated to the count beside it. Seven "
+                "of ten `usage_count` values are also literals — no feature-usage event "
+                "stream exists. `observability.metrics` counts requests per route "
+                "template and is the cheapest honest substitute. PH3.9.",
+        "mock_metrics": ["percentage"] + [
+            f["name"] for f in features
+            if f["usage_count_provenance"] == analytics_contract.MOCK],
+    }
 
 
 # ---------- Audit Logs ----------
@@ -5660,9 +6021,18 @@ async def admin_system_health(user: dict = Depends(require_admin)):
     return {
         "system": sys_info,
         "mongodb": {"status": mongo_status, **mongo_details},
-        "redis": {"status": "not_configured"},
+        # PH3.8: both literals, and both now wrong rather than merely vague.
+        # `redis.status` has read "not_configured" since before PH2.7 shipped
+        # `infrastructure.redis_client` and PH3.7 registered a real Redis
+        # readiness probe. `scheduler.status` is the constant "running" and stays
+        # "running" after the scheduler dies. `GET /api/health/detailed` answers
+        # both correctly. Rewiring is PH3.9 (see analytics.registry
+        # "admin.redis_status"); flagged here so an operator is not misled
+        # meanwhile.
+        "redis": {"status": "not_configured", "provenance": analytics_contract.MOCK},
         "websockets": {"active_connections": ws_count, "status": "healthy" if ws_count >= 0 else "unknown"},
-        "scheduler": {"status": "running"},
+        "scheduler": {"status": "running", "provenance": analytics_contract.MOCK},
+        "mock_metrics": ["redis.status", "scheduler.status"],
         "platform": {
             "python_version": platform.python_version(),
             "os": platform.system(),
@@ -5803,6 +6173,19 @@ logger = logging.getLogger(__name__)
 obs_health.register_check("mongodb", obs_health.make_mongo_probe(lambda: db), critical=True)
 obs_health.register_check("redis", obs_health.make_redis_probe(), critical=False)
 
+# Configuration (PH3.7). Critical: an instance whose required configuration does
+# not validate must not receive traffic. It reads the verdict `validate_config()`
+# already produced at the top of this file rather than re-validating — readiness
+# is polled every few seconds by every replica, and re-resolving secrets there
+# would put file I/O on that path. Late-bound through a lambda for the same
+# reason as `db` above: `reload_secrets()` replaces the report object, and the
+# probe must see the current one, not the one that existed at registration.
+obs_health.register_check(
+    "configuration",
+    obs_health.make_config_probe(lambda: _config_report),
+    critical=True,
+)
+
 # Publish build metadata as the conventional `app_info` gauge, so a metrics query
 # can join runtime facts onto any other series ("p99 latency, by version").
 obs_metrics.set_app_info(
@@ -5880,6 +6263,38 @@ async def ensure_indexes():
     await db.trades.create_index("user_id")
 
     # ----------------------------------------------------------------------- #
+    # portfolio_snapshots (PH3.8) — the equity curve's source of truth. It had
+    # NO index of any kind, on any field, since Sprint 8 created it.
+    #
+    # Two query shapes hit it, and both were collection scans across EVERY
+    # user's history:
+    #   * `get_performance` filters {user_id} (plus a date range as of PH3.8)
+    #     and sorts by date, on every load of the Portfolio page.
+    #   * `record_snapshot` upserts on {user_id, date} once per user per day, so
+    #     the nightly job scanned the whole collection once per user — O(users²)
+    #     work in a job that runs unattended at 16:05 IST.
+    # The compound index serves the filter, the range and the sort from one
+    # structure, and makes the upsert a point lookup.
+    #
+    # `unique=True` also makes the one-snapshot-per-user-per-day invariant the
+    # database's rule rather than an assumption held only by the upsert. A
+    # duplicate would silently double-count a day on the equity curve;
+    # `analytics.quality.scan_portfolio_snapshots` reports the condition, and
+    # this prevents it.
+    # ----------------------------------------------------------------------- #
+    await db.portfolio_snapshots.create_index([("user_id", 1), ("date", 1)], unique=True)
+
+    # ----------------------------------------------------------------------- #
+    # users.created_at (PH3.8) — signup counts. `GET /api/admin/dashboard` and
+    # `GET /api/admin/analytics/users` both bucket users by signup day, which was
+    # a `$regex` prefix match on an unindexed string: a full scan of the users
+    # collection on every admin page load, growing with total signups forever.
+    # PH3.8 replaced the regex with a half-open range comparison (`analytics.
+    # periods`), which this index can actually serve.
+    # ----------------------------------------------------------------------- #
+    await db.users.create_index("created_at")
+
+    # ----------------------------------------------------------------------- #
     # notifications — polled by the bell badge on every authenticated page.
     # `{user_id, read}` serves the unread count; `{user_id, created_at}` serves
     # the panel's newest-first listing without an in-memory sort.
@@ -5937,6 +6352,13 @@ async def ensure_indexes():
     # ----------------------------------------------------------------------- #
     await db.chat_messages.create_index([("session_id", 1), ("created_at", -1)])
     await db.chat_messages.create_index([("user_id", 1), ("session_id", 1), ("created_at", 1)])
+
+    # `created_at` alone (PH3.8) — the admin dashboard's "AI requests today"
+    # counts messages platform-wide in a date range, with no user_id and no
+    # session_id, so neither compound index above can serve it (a compound index
+    # is only usable from its leading field). This was a full scan of the
+    # busiest collection in the product on every admin page load.
+    await db.chat_messages.create_index("created_at")
 
     await db.broker_accounts.create_index([("user_id", 1), ("broker", 1)], unique=True)
 

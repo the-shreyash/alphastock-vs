@@ -297,3 +297,123 @@ async def redis_diagnostics(request: Request, refresh: bool = False) -> Response
         },
         headers=_NO_STORE,
     )
+
+
+# --------------------------------------------------------------------------- #
+# Client error ingest (PH3.7)                                                   #
+#                                                                               #
+# WHY THIS ENDPOINT EXISTS                                                       #
+#                                                                                #
+# A React render crash, an unhandled promise rejection or a failed chunk load    #
+# produces no server-side evidence of any kind. The request that served the      #
+# bundle returned 200 minutes earlier; nothing raises, nothing logs, and the     #
+# user is looking at a blank page. Every other signal in this codebase says the  #
+# system is perfectly healthy. This is the only path by which a frontend failure #
+# becomes visible to an operator.                                                #
+#                                                                                #
+# WHY IT IS UNAUTHENTICATED                                                      #
+#                                                                                #
+# The failures most worth hearing about happen when the app could not start:     #
+# before login, during a chunk load, inside the auth provider itself. Requiring  #
+# a token would systematically silence exactly that class. The endpoint is       #
+# therefore treated as hostile input and bounded accordingly (below). The        #
+# platform rate limiter already covers it — it is under `/api` and is not on the #
+# middleware's exempt list — so an abusive client is throttled per IP by the     #
+# same mechanism as every other anonymous route.                                 #
+#                                                                                #
+# WHY IT WRITES NOTHING TO THE DATABASE                                          #
+#                                                                                #
+# An unauthenticated endpoint that inserts a document is an unauthenticated      #
+# write amplifier: one HTTP request per disk record, no cap. Reports become a    #
+# counter (bounded label space) and a log line (bounded size). Both are capped   #
+# by construction; a collection is not.                                          #
+# --------------------------------------------------------------------------- #
+
+#: The closed vocabulary of report kinds. Anything else is refused rather than
+#: recorded — `kind` is a metric label, and a label whose values come from an
+#: unauthenticated request body is the textbook cardinality attack.
+_CLIENT_ERROR_KINDS = frozenset({
+    "render",               # a React subtree threw; the error boundary caught it
+    "unhandled_rejection",  # a promise rejected with nothing to catch it
+    "uncaught",             # window.onerror
+    "chunk_load",           # a lazy route's bundle failed to load
+    "api",                  # an API call failed in a way the UI could not handle
+    "websocket",            # the realtime connection failed
+})
+
+#: Hard caps on every free-text field. These are the whole defence for the log
+#: sink: a report becomes a log line, and an uncapped field is an unbounded log
+#: line from an anonymous caller.
+_MAX_MESSAGE = 300
+_MAX_NAME = 100
+_MAX_ROUTE = 200
+_MAX_STACK = 2000
+
+
+def _clip(value: object, limit: int) -> str:
+    """Coerce to a bounded, single-line, control-character-free string.
+
+    Newlines are stripped rather than escaped because these values reach a log
+    line: a newline in an anonymous field is log injection, and the JSON
+    formatter is not the only thing that will ever read these files (grep, an
+    ELK grok pattern, a human with `less`).
+    """
+    if not isinstance(value, str):
+        return ""
+    text = value.replace("\r", " ").replace("\n", " ")
+    text = "".join(ch for ch in text if ch >= " " or ch == "\t")
+    return text[:limit].strip()
+
+
+@router.post("/observability/client-errors", summary="Report a client-side runtime failure")
+async def client_error_report(request: Request) -> Response:
+    """Record one browser-side failure as a metric and a log line.
+
+    Always answers 204, including for a rejected report. A browser that is
+    already broken must not be handed an error response to handle — that is how
+    a reporting path turns into a retry loop against a failing endpoint.
+    Rejections are counted in `frontend_reports_rejected_total` instead, which
+    is where an operator can actually see them.
+
+    The body is parsed defensively rather than through a Pydantic model: this is
+    anonymous input, the shape is tiny, and a 422 is not something a crashing
+    browser can act on.
+    """
+    reason = ""
+    payload: dict = {}
+    try:
+        body = await request.json()
+        if isinstance(body, dict):
+            payload = body
+        else:
+            reason = "not_an_object"
+    except Exception:
+        reason = "unparseable"
+
+    kind = payload.get("kind") if not reason else None
+    if not reason and kind not in _CLIENT_ERROR_KINDS:
+        reason = "unknown_kind"
+
+    if reason:
+        metrics.frontend_reports_rejected_total.inc(labels=(reason,))
+        return Response(status_code=204, headers=_NO_STORE)
+
+    metrics.frontend_errors_total.inc(labels=(str(kind),))
+
+    # One structured line, every field clipped. `route` is the SPA's own path —
+    # the client strips the query string before sending, because a query string
+    # in this application can carry an OAuth code or a recovery token, and the
+    # same rule applies here as in `observability.context`.
+    logger.warning(
+        "client error reported: %s", kind,
+        extra={
+            "event": "frontend_error",
+            "kind": kind,
+            "error_name": _clip(payload.get("name"), _MAX_NAME),
+            "error_message": _clip(payload.get("message"), _MAX_MESSAGE),
+            "route": _clip(payload.get("route"), _MAX_ROUTE),
+            "app_version": _clip(payload.get("appVersion"), _MAX_NAME),
+            "stack": _clip(payload.get("stack"), _MAX_STACK),
+        },
+    )
+    return Response(status_code=204, headers=_NO_STORE)

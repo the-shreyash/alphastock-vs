@@ -1,18 +1,26 @@
-"""Trade journal with AI performance review."""
+"""Trade journal with AI performance review.
+
+SCOPE (PH3.8). Everything in this module reports on REAL-MONEY trading.
+Paper trades share the `trades` collection (`is_paper: True`) and were being
+counted here, so a virtual-money win inflated the win rate and the total P&L a
+trader sees on the Trade Journal page. They are now excluded from every live
+figure and reported separately, under an explicit `paper` key, so nothing is
+hidden — only labelled. Windows are IST days via `analytics.periods`; see
+`docs/architecture/ANALYTICS.md` §5.
+"""
 import logging
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
+
+from analytics import periods, queries
 
 logger = logging.getLogger(__name__)
 
 
 async def get_trade_journal(db, user_id, days=30):
-    """Get trade journal entries for a user."""
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
-    trades = await db.trades.find({
-        "user_id": user_id,
-        "status": {"$ne": "OPEN"},
-        "exit_time": {"$gte": cutoff},
-    }).sort("exit_time", -1).to_list(200)
+    """Get real-money trade journal entries for a user."""
+    trades = await db.trades.find(
+        queries.closed_in_window(periods.window_of_days(days), user_id)
+    ).sort("exit_time", -1).to_list(200)
 
     journal = []
     for t in trades:
@@ -35,37 +43,74 @@ async def get_trade_journal(db, user_id, days=30):
     return journal
 
 
+def calc_stats(trades_list):
+    """Summary statistics over a list of closed trades.
+
+    Win / loss / breakeven are three outcomes, not two. A trade that closed at
+    exactly zero is neither won nor lost, and counting it as a loss (the
+    pre-PH3.8 behaviour, inherited from `pnl > 0 else loss`) understated the win
+    rate — most visibly after a paper-capital reset, which force-closes open
+    positions with `pnl: 0`. `win_rate` keeps its denominator as the FULL trade
+    count so the three outcomes still sum to 100%.
+    """
+    if not trades_list:
+        return {"total": 0, "wins": 0, "losses": 0, "breakeven": 0, "win_rate": 0,
+                "total_pnl": 0, "avg_pnl": 0, "best": 0, "worst": 0}
+    pnls = [t.get("pnl") if t.get("pnl") is not None else 0 for t in trades_list]
+    wins = [p for p in pnls if p > 0]
+    losses = [p for p in pnls if p < 0]
+    breakeven = [p for p in pnls if p == 0]
+    total = sum(pnls)
+    return {
+        "total": len(trades_list),
+        "wins": len(wins),
+        "losses": len(losses),
+        "breakeven": len(breakeven),
+        "win_rate": round(len(wins) / len(trades_list) * 100, 1),
+        "total_pnl": round(total, 2),
+        "avg_pnl": round(total / len(trades_list), 2),
+        "best": round(max(pnls), 2),
+        "worst": round(min(pnls), 2),
+    }
+
+
 async def get_performance_stats(db, user_id, days=7):
-    """Get weekly performance statistics."""
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    """Real-money performance statistics, with paper trading reported apart.
 
-    all_trades = await db.trades.find({"user_id": user_id}).to_list(500)
-    closed = [t for t in all_trades if t.get("status") != "OPEN"]
-    recent = [t for t in closed if (t.get("exit_time") or "") >= cutoff]
+    PH3.8. Three things changed and each was a wrong number, not a style point:
 
-    def calc_stats(trades_list):
-        if not trades_list:
-            return {"total": 0, "wins": 0, "losses": 0, "win_rate": 0, "total_pnl": 0, "avg_pnl": 0, "best": 0, "worst": 0}
-        pnls = [t.get("pnl") if t.get("pnl") is not None else 0 for t in trades_list]
-        wins = [p for p in pnls if p > 0]
-        losses = [p for p in pnls if p < 0]
-        total = sum(pnls)
-        return {
-            "total": len(trades_list),
-            "wins": len(wins),
-            "losses": len(losses),
-            "win_rate": round(len(wins) / len(trades_list) * 100, 1) if trades_list else 0,
-            "total_pnl": round(total, 2),
-            "avg_pnl": round(total / len(trades_list), 2) if trades_list else 0,
-            "best": round(max(pnls), 2) if pnls else 0,
-            "worst": round(min(pnls), 2) if pnls else 0,
-        }
+    * **Paper trades are excluded from `recent` and `all_time`.** They were
+      included, so a ₹9,000 virtual gain and a ₹500 real loss reported as
+      ₹8,500 of profit at a 50% win rate. The paper figures are still returned,
+      under `paper`, because removing them would have hidden information rather
+      than corrected it.
+    * **The window is IST days, half-open**, instead of "the ISO string of the
+      instant `days × 24h` ago", which put the boundary at whatever time of day
+      the request happened to arrive and made the same query return different
+      trade sets an hour apart.
+    * **No 500-document cap.** `find(...).to_list(500)` applied no sort, so an
+      all-time figure for an active trader summed an arbitrary 500 rows.
+    """
+    window = periods.window_of_days(days)
+
+    live_closed = await db.trades.find(queries.closed(queries.live_trades(user_id))).to_list(None)
+    recent = [t for t in live_closed if window.contains(t.get("exit_time"))]
+    paper_closed = await db.trades.find(queries.closed(queries.paper_trades(user_id))).to_list(None)
+    open_count = await db.trades.count_documents(
+        queries.open_positions(queries.live_trades(user_id)))
 
     return {
-        "period": f"Last {days} days",
+        "period": window.label,
+        "window": window.as_dict(),
+        "scope": "live",
+        "basis": "gross",  # no brokerage/STT/GST is recorded anywhere — ANALYTICS.md §6
         "recent": calc_stats(recent),
-        "all_time": calc_stats(closed),
-        "open_positions": len([t for t in all_trades if t.get("status") == "OPEN"]),
+        "all_time": calc_stats(live_closed),
+        "open_positions": open_count,
+        "paper": {
+            "all_time": calc_stats(paper_closed),
+            "note": "Virtual capital. Excluded from every figure above.",
+        },
     }
 
 
@@ -77,8 +122,10 @@ async def get_setup_success_rates(db, user_id):
     list when the user has no closed trades or no setup_type tagging yet —
     the frontend should show an appropriate empty state.
     """
-    all_trades = await db.trades.find({"user_id": user_id}).to_list(500)
-    closed = [t for t in all_trades if t.get("status") != "OPEN"]
+    # Real-money only, and uncapped (PH3.8): a per-setup win rate computed over
+    # an arbitrary 500 of a trader's rows is worse than no win rate, because it
+    # is acted on.
+    closed = await db.trades.find(queries.closed(queries.live_trades(user_id))).to_list(None)
 
     # Group closed trades by setup_type (skip trades without a setup tag).
     groups = {}

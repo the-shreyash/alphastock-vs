@@ -1,7 +1,12 @@
 import { useState, useEffect } from "react";
 import { motion } from "framer-motion";
-import { Users, TrendingUp, Brain, CreditCard, Activity, LifeBuoy, Wifi, Shield, ArrowUpRight, ArrowDownRight } from "lucide-react";
+import { Users, TrendingUp, Brain, CreditCard, Activity, LifeBuoy, Wifi, Shield, ArrowUpRight, ArrowDownRight, AlertTriangle } from "lucide-react";
 import adminService from "../../services/adminService";
+
+/** Is `name` listed in the backend's `mock_metrics` array? (PH3.8) */
+function isMock(mockMetrics, name) {
+  return Array.isArray(mockMetrics) && mockMetrics.includes(name);
+}
 
 const STAT_CARDS = [
   { key: "total_users", label: "Total Users", icon: Users, color: "#6366F1", format: "number" },
@@ -81,11 +86,20 @@ export default function AdminDashboard() {
                 <card.icon size={20} style={{ color: card.color }} />
               </div>
             </div>
-            <div className="mt-3 flex items-center gap-1.5">
-              <ArrowUpRight size={14} style={{ color: "var(--gain)" }} />
-              <span className="text-xs font-medium" style={{ color: "var(--gain)" }}>+12%</span>
-              <span className="text-xs" style={{ color: "var(--text-muted)" }}>vs last month</span>
-            </div>
+            {/* PH3.8 (F-18). Every one of these nine cards carried a hardcoded
+                "+12% vs last month" — the SAME invented growth figure beside
+                user counts, trade counts, MRR, open tickets and broker links
+                alike, styled in the gain colour so it read as a measured
+                period-over-period comparison. There is no backend field behind
+                it and no PH3.9 work item to replace it, because it was never
+                anything: it is deleted rather than flagged. A real comparison
+                needs a previous-period value the dashboard does not fetch. */}
+            {isMock(data?.mock_metrics, card.key) && (
+              <div className="mt-3 flex items-center gap-1.5" title="Simulated data — not measured. Scheduled for replacement in PH3.9.">
+                <AlertTriangle size={12} style={{ color: "#F59E0B" }} />
+                <span className="text-[10px] font-semibold uppercase tracking-wider" style={{ color: "#F59E0B" }}>Simulated</span>
+              </div>
+            )}
           </motion.div>
         ))}
       </div>

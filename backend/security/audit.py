@@ -201,6 +201,48 @@ def classify(event: str) -> tuple[str, str, str]:
 
 
 # --------------------------------------------------------------------------- #
+# Metrics bridge (PH3.7)                                                        #
+#                                                                               #
+# WHY HERE AND NOT AT THE CALL SITES                                            #
+#                                                                               #
+# Every authentication-relevant path in the application already funnels through  #
+# ``AuditLogger.record``. Counting there means the metric is complete by         #
+# construction — a new auth event added next year is counted the day it is       #
+# registered, with nobody remembering to also touch a metrics file — and it      #
+# means the counter and the audit trail can never disagree about what happened.  #
+#                                                                                #
+# WHAT CROSSES THE BOUNDARY                                                      #
+#                                                                                #
+# The event NAME and the OUTCOME. Nothing else. Not the email, not the user id,  #
+# not the IP, not the session id, not the metadata. Those are the fields the     #
+# audit record exists to carry, and the audit collection is access-controlled;   #
+# ``/api/metrics`` is reachable by whatever can reach the service. An            #
+# unregistered event name folds into a single bucket rather than becoming its    #
+# own series, because the event name is a *label* here and a label whose values  #
+# come from a caller is exactly the unbounded-cardinality mistake                #
+# `observability.metrics` is written to prevent.                                 #
+# --------------------------------------------------------------------------- #
+_UNREGISTERED_EVENT_LABEL = "<unregistered>"
+
+
+def _count_event(event: str, outcome: str) -> None:
+    """Publish one audit event to the metrics registry. Never raises.
+
+    Imported lazily: `security.audit` is imported very early (the middleware
+    stack depends on it) and must not pull the metrics registry into that path,
+    for the same boot-order reason `observability.metrics` defers its
+    `log_streams` import.
+    """
+    try:
+        from observability import instruments
+
+        label = event if event in _EVENT_REGISTRY else _UNREGISTERED_EVENT_LABEL
+        instruments.record_auth_event(label, outcome)
+    except Exception:  # pragma: no cover - defensive; audit must never gate a flow
+        pass
+
+
+# --------------------------------------------------------------------------- #
 # Redaction — the one guarantee: a secret never reaches a sink.                  #
 # --------------------------------------------------------------------------- #
 # Substrings that mark a metadata key as sensitive. Matched case-insensitively
@@ -492,6 +534,7 @@ class AuditLogger:
                 target=target,
                 details=_redact(metadata or {}),
             )
+            _count_event(rec.event, rec.outcome)
             await self._sink.emit(rec)
         except Exception as exc:  # observability must never gate a security flow
             logger.warning("audit record failed for %s: %s", event, exc)

@@ -6,6 +6,7 @@ import Navbar from "./Navbar";
 import NotificationPanel from "../notifications/NotificationPanel";
 import NotificationToast from "../notifications/NotificationToast";
 import AIQuickAction from "../AIQuickAction";
+import ErrorBoundary from "../ErrorBoundary";
 
 export default function Layout() {
   // Hover-expand is the primary interaction: the sidebar starts collapsed
@@ -92,7 +93,16 @@ export default function Layout() {
                   </div>
                 }
               >
-                <Outlet />
+                {/* PH3.7. The INNER boundary. `key={location.pathname}` resets
+                    it on navigation, so a page that crashed does not keep its
+                    error screen after the user navigates away — without the
+                    key, one broken route would appear broken from every route.
+                    Keeping the boundary here rather than around the whole app
+                    is what lets the sidebar and navbar survive a page crash, so
+                    the user has a way out that is not the back button. */}
+                <ErrorBoundary key={location.pathname}>
+                  <Outlet />
+                </ErrorBoundary>
               </Suspense>
             </motion.div>
           </AnimatePresence>

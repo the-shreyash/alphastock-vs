@@ -1,12 +1,87 @@
 """Cron job scheduler for AlphaPartner trading platform."""
 import logging
+import time
 from datetime import datetime, timezone
+from apscheduler.events import (
+    EVENT_JOB_ERROR,
+    EVENT_JOB_EXECUTED,
+    EVENT_JOB_MISSED,
+    EVENT_JOB_SUBMITTED,
+)
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from bson import ObjectId
+from bson.errors import InvalidId
+
+from analytics import periods, queries
+from observability import instruments
 
 logger = logging.getLogger(__name__)
 
 scheduler = AsyncIOScheduler(timezone="Asia/Kolkata")
+
+
+# --------------------------------------------------------------------------- #
+# Observability (PH3.7)                                                         #
+#                                                                               #
+# WHY A SCHEDULER LISTENER AND NOT A DECORATOR ON EACH JOB                       #
+#                                                                                #
+# A decorator can only observe a job that RUNS. The failure mode unique to cron  #
+# is a job that does not: APScheduler skips a run whose misfire grace period has #
+# elapsed — because the event loop was blocked, or because the previous run of   #
+# the same job is still going — and emits `EVENT_JOB_MISSED` instead of calling  #
+# the function at all. `trade_monitor` fires every 60 seconds during market      #
+# hours, so a missed run means live positions went unchecked, and nothing inside #
+# the job body can ever report that. The scheduler's own event stream is the     #
+# only place it exists.                                                          #
+#                                                                                #
+# Timing comes from pairing SUBMITTED with EXECUTED/ERROR. The pending map is    #
+# bounded by the number of jobs currently in flight (six registered jobs, with   #
+# `replace_existing=True` and no concurrency), and every terminal event pops its #
+# entry — including the error path, which is where a naive implementation leaks. #
+# --------------------------------------------------------------------------- #
+_job_started_at: dict = {}
+
+
+def _on_job_event(event) -> None:
+    """Translate an APScheduler event into metrics. Never raises.
+
+    APScheduler invokes listeners inline on its own thread; an exception here
+    propagates into the scheduler's dispatch loop, so this is wrapped whole for
+    the same reason every other instrument in this codebase is.
+    """
+    try:
+        job_id = getattr(event, "job_id", None) or "unknown"
+        code = getattr(event, "code", None)
+
+        if code == EVENT_JOB_SUBMITTED:
+            _job_started_at[job_id] = time.monotonic()
+            return
+
+        if code == EVENT_JOB_MISSED:
+            # No submission happened, so there is nothing to pop and no duration
+            # to report — the run did not occur.
+            logger.warning(
+                "Scheduled job missed its run window: %s", job_id,
+                extra={"event": "scheduler_job_missed", "job": job_id},
+            )
+            instruments.record_scheduler_run(job_id, "missed")
+            return
+
+        started = _job_started_at.pop(job_id, None)
+        duration = None if started is None else max(0.0, time.monotonic() - started)
+
+        if code == EVENT_JOB_ERROR:
+            logger.error(
+                "Scheduled job raised: %s", job_id,
+                exc_info=getattr(event, "exception", None),
+                extra={"event": "scheduler_job_error", "job": job_id},
+            )
+            instruments.record_scheduler_run(job_id, "error", duration)
+        elif code == EVENT_JOB_EXECUTED:
+            instruments.record_scheduler_run(job_id, "executed", duration)
+    except Exception:  # pragma: no cover - defensive; see docstring
+        pass
 
 
 async def morning_analysis_job(db, ai_func=None):
@@ -179,56 +254,107 @@ async def exit_reminder_job(db):
 
 
 async def eod_report_job(db):
-    """4:00 PM weekdays: Generate end-of-day report."""
+    """4:00 PM IST weekdays: end-of-day report, per user.
+
+    REWRITTEN IN PH3.8. The previous implementation had two defects, and the
+    second is the one that matters:
+
+    1. **It crashed on every run.** `[t for t in all_trades if
+       t.get("exit_time", "").startswith(today)]` ran over EVERY trade in the
+       collection, and an open trade stores `exit_time: None` explicitly — so
+       `.get(..., "")` returns `None`, not `""`, and `None.startswith` raises
+       `AttributeError`. The outer `except` swallowed it as "EOD report error",
+       so no report was ever written and no user was ever notified, for as long
+       as any position was open. Reproduced with a single OPEN trade.
+
+    2. **The P&L it reported was everybody's.** `total_pnl` summed the closed
+       trades of the WHOLE PLATFORM, and that one figure was then sent to every
+       user as "Today's P&L". A user with no trades was told the aggregate;
+       every user was told a number derived from strangers' positions. Both a
+       wrong personal number and a cross-tenant disclosure of trading
+       performance.
+
+    Now: each user's own closed trades, their own P&L, the IST session date, and
+    real-money only (a virtual paper gain is not an end-of-day trading result).
+    The platform aggregate is still computed — it is genuinely useful — but it
+    is written to `market_analysis` for the admin surface and never sent to a
+    user.
+    """
     logger.info("Generating EOD report...")
     try:
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        all_trades = await db.trades.find({}).to_list(1000)
-        today_closed = [t for t in all_trades if t.get("exit_time", "").startswith(today)]
+        window = periods.resolve("today")
+        session = periods.ist_date().isoformat()
 
-        total_pnl = sum(t.get("pnl", 0) for t in today_closed if t.get("pnl"))
-        wins = len([t for t in today_closed if (t.get("pnl") or 0) > 0])
-        losses = len([t for t in today_closed if (t.get("pnl") or 0) < 0])
+        closed_today = await db.trades.find(
+            queries.closed_in_window(window)).to_list(None)
 
-        # Store EOD report
+        by_user = {}
+        for trade in closed_today:
+            by_user.setdefault(str(trade.get("user_id")), []).append(trade)
+
+        def _tally(rows):
+            pnls = [t.get("pnl") or 0 for t in rows]
+            return (round(sum(pnls), 2),
+                    len([p for p in pnls if p > 0]),
+                    len([p for p in pnls if p < 0]))
+
+        platform_pnl, platform_wins, platform_losses = _tally(closed_today)
+
         await db.market_analysis.update_one(
-            {"date": today},
+            {"date": session},
             {"$set": {
                 "eod_report": {
-                    "total_pnl": round(total_pnl, 2),
-                    "trades_closed": len(today_closed),
-                    "wins": wins,
-                    "losses": losses,
+                    "total_pnl": platform_pnl,
+                    "trades_closed": len(closed_today),
+                    "wins": platform_wins,
+                    "losses": platform_losses,
+                    "traders": len(by_user),
+                    "scope": "platform",
+                    "basis": "gross",
+                    "session_date": session,
                     "generated_at": datetime.now(timezone.utc).isoformat(),
                 }
             }},
             upsert=True
         )
 
-        # Notify all users
+        # Notify only the users who actually traded today, each with their own
+        # figures. Users with no closed trades are no longer sent an EOD P&L —
+        # there is nothing personal to report, and the platform's number is not
+        # theirs to see.
         from services.notification_service import create_notification
-        users = await db.users.find({}, {"_id": 1}).to_list(1000)
-        for u in users:
-            await create_notification(
-                db, str(u["_id"]),
-                type="EOD_REPORT",
-                title="End of Day Report",
-                message=f"Market closed. Today's P&L: INR {'+' if total_pnl >= 0 else ''}{total_pnl:.2f}. Trades: {wins}W / {losses}L.",
-            )
+        for user_id, rows in by_user.items():
+            pnl, wins, losses = _tally(rows)
+            try:
+                await create_notification(
+                    db, user_id,
+                    type="EOD_REPORT",
+                    title="End of Day Report",
+                    message=(f"Market closed. Your P&L today: INR "
+                             f"{'+' if pnl >= 0 else ''}{pnl:.2f} (gross). "
+                             f"Trades: {wins}W / {losses}L."),
+                )
+            except Exception as e:
+                logger.error(f"EOD notification failed for {user_id}: {e}")
+                continue
 
-            # Send email EOD report if user has email_alerts
-            user_full = await db.users.find_one({"_id": u["_id"]}, {"email": 1, "notification_prefs": 1})
+            try:
+                user_full = await db.users.find_one(
+                    {"_id": ObjectId(user_id)}, {"email": 1, "notification_prefs": 1})
+            except (InvalidId, TypeError):
+                user_full = None
             if user_full and (user_full.get("notification_prefs") or {}).get("email_alerts", False):
                 try:
                     from services.email_service import send_notification as email_notify
                     await email_notify(
                         "EOD_REPORT", user_full.get("email", ""),
-                        pnl=f"{total_pnl:.2f}", wins=wins, losses=losses
+                        pnl=f"{pnl:.2f}", wins=wins, losses=losses
                     )
                 except Exception as e:
                     logger.error(f"Email EOD report failed: {e}")
 
-        logger.info(f"EOD report: PnL={total_pnl}, Closed={len(today_closed)}")
+        logger.info(f"EOD report: traders={len(by_user)}, closed={len(closed_today)}, "
+                    f"platform PnL={platform_pnl}")
     except Exception as e:
         logger.error(f"EOD report error: {e}")
 
@@ -319,6 +445,14 @@ def setup_scheduler(db, ai_summary_func, ws_broadcast=None):
         args=[db],
         id="portfolio_snapshot",
         replace_existing=True,
+    )
+
+    # PH3.7. Attached before `start()` so the very first run is observed, and
+    # registered here rather than at import so a module import cannot install a
+    # duplicate listener (which would double every count).
+    scheduler.add_listener(
+        _on_job_event,
+        EVENT_JOB_SUBMITTED | EVENT_JOB_EXECUTED | EVENT_JOB_ERROR | EVENT_JOB_MISSED,
     )
 
     scheduler.start()

@@ -92,6 +92,18 @@ class SimulatedProvider(AIProvider):
         max_tokens: int = 1024,
         temperature: float = 0.7,
     ) -> AIResponse:
+        # PH3.7. THE MOST IMPORTANT AI COUNTER IN THE APPLICATION. Every path
+        # that reaches here has already tried and failed to get a real model,
+        # and the user receives a plausible-looking response rather than an
+        # error — so the request succeeds, the HTTP metrics stay green, no
+        # exception is logged, and the product is silently not working. This
+        # counter is the only thing that shows it. Recorded as `unconfigured`
+        # (no upstream call was made here) rather than `error`, which is
+        # already counted against whichever provider actually failed.
+        from observability import instruments
+
+        with instruments.track_ai("simulated") as call:
+            call.unconfigured()
         text = (
             "AI services are currently offline or unavailable. "
             "Please check that ANTHROPIC_API_KEY and GOOGLE_GEMINI_KEY are configured in your backend .env file "

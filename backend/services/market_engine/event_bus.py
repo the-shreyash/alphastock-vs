@@ -43,6 +43,8 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any, Callable, Coroutine, Dict, List, Optional
 
+from observability import instruments
+
 logger = logging.getLogger(__name__)
 
 EventHandler = Callable[[Dict[str, Any]], Coroutine[Any, Any, None]]
@@ -95,6 +97,12 @@ class EventBus:
                 matched.extend(handlers)
 
         if not matched:
+            # Counted before returning (PH3.7): an event with no listener is
+            # still throughput, and "nobody is subscribed" is itself a defect
+            # worth being able to see — publishes climbing while
+            # `event_bus_handler_failures_total` and every downstream effect
+            # stay at zero is what a lost subscription looks like.
+            instruments.record_event_published(event_type)
             return
 
         # Fire all handlers concurrently
@@ -103,6 +111,10 @@ class EventBus:
             return_exceptions=True,
         )
         failures = sum(1 for r in results if isinstance(r, Exception))
+        # PH3.7. Each failure here is a domain action that silently did not
+        # happen — a portfolio that never resynced, a notification never sent.
+        # Before this it produced one WARNING line and no countable signal.
+        instruments.record_event_published(event_type, failures)
         if failures:
             logger.warning(
                 f"EventBus: {failures}/{len(matched)} handlers failed for '{event_type}'"

@@ -1,11 +1,11 @@
 # StockAssist AI
 ## Testing Documentation
 
-Version: 1.1
+Version: 1.2
 
 Status: Active Development
 
-Last updated: 2026-08-10 (PH3.3)
+Last updated: 2026-08-15 (PH3.7 — observability testing)
 
 ---
 
@@ -22,11 +22,12 @@ command to run, what each marker means, how isolation is enforced — live in
 TEST_ARCHITECTURE.md is describing reality and this document is describing the
 target.
 
-**Current state in one line (PH3.3, 2026-08-10):** the backend has 2,245 tests;
-`pytest` runs 2,150 of them hermetically and green in ~2m46s with no server,
+**Current state in one line (PH3.7, 2026-08-15):** the backend has 2,398 tests;
+`pytest` runs 2,303 of them hermetically and green in ~2m50s with no server,
 database, credentials or network; 95 live-server tests are classified and skip
-cleanly without a deployment; the frontend has 313 tests across 17 suites
-(PH3.2), green in ~8s.
+cleanly without a deployment; the frontend has 364 tests across 20 suites, green
+in ~11s. PH1 security (`pytest -m security`) holds at **452**, unchanged since
+PH1.12.
 
 ---
 
@@ -1255,6 +1256,53 @@ trend data rather than inventing a number alongside the first measurement.
 Full detail and methodology: `docs/testing/TEST_ARCHITECTURE.md` §8 (backend)
 and `docs/testing/PH3.2_FRONTEND_TEST_CERTIFICATION.md` (frontend).
 
+## Observability testing, as built (PH3.7)
+
+Counts as of 2026-08-15: **backend 2,303 passed / 6 xfailed** (was 2,216),
+**frontend 364 passed / 20 suites** (was 324 / 18).
+
+| Suite | Tests | Covers |
+|---|---:|---|
+| `backend/tests/test_observability.py` (PH2.5) | 148 | Health probes, metrics registry, structured logging, request correlation |
+| `backend/tests/test_log_infrastructure.py` (PH2.6) | 61 | Streams, rotation, retention, file-sink redaction |
+| `backend/tests/test_observability_subsystems.py` (**new**) | **87** | Error classification, subsystem/auth/Mongo/WebSocket/task/scheduler/provider/AI/event-bus instrumentation, configuration readiness, client-error ingest, cardinality, redaction |
+| `frontend/src/services/__tests__/telemetry.test.js` (**new**) | **27** | Reporting, route normalisation, chunk detection, caps, and what is never collected |
+| `frontend/src/components/__tests__/ErrorBoundary.test.jsx` (**new**) | **13** | Containment, reporting, production message withholding, one-shot chunk reload |
+
+### Three things these tests assert that ordinary coverage does not
+
+**Cardinality, directly.** A label that becomes unbounded fails nothing locally
+— it takes out the monitoring backend weeks later, in production, under load.
+`TestCardinality` asserts the bound instead of hoping: a **denylist** of
+forbidden label names checked against every registered metric (a denylist, not
+an allowlist, because the failure mode is someone *adding* a label nobody
+reviewed), plus a ceiling test driving 550 distinct label sets and asserting
+they collapse to `MAX_SERIES_PER_METRIC + 1` with the overflow series present
+and `metrics_series_dropped_total` non-zero.
+
+**Redaction as an absence claim.** Two sweeps drive secret-shaped strings —
+API keys, JWTs, connection URIs with passwords, emails, ObjectIds — through
+every path that accepts free text (AI provider error strings, exception
+messages, MongoDB failure documents, browser reports) and assert the strings
+are **absent from the rendered exposition document**. A third proves the closed
+vocabularies actually *refuse* rather than merely log, because a validator that
+warns and then records the value anyway passes every other test in the file.
+"We were careful" is not checkable; "this string does not appear" is.
+
+**That instrumentation does not change control flow.** Every tracker test
+asserts propagation as well as the counter — including `caught.value is
+original`, by identity, because a tracker that wraps or replaces an exception
+destroys the caller's ability to handle it. A tracker that silently swallowed a
+provider failure would turn a visible incident into a wrong answer, and would
+otherwise look like a passing test.
+
+Failure behaviour is additionally exercised outside pytest by a **61-check
+failure-injection drill** run against the real `server.app` (Mongo killed,
+configuration invalidated, hostile ingest payloads, scanner probes), and
+overhead by `backend/scripts/observability_overhead.py`, which is committed so
+the numbers in `docs/architecture/OBSERVABILITY.md` §10 can be re-derived rather
+than trusted.
+
 ## Targets
 
 Frontend
@@ -1374,6 +1422,50 @@ Enterprise QA Dashboard
 Testing should become an automated quality assurance system that continuously validates every layer of StockAssist AI.
 
 Every deployment should be backed by automated tests, performance benchmarks, security checks, and user experience validation, ensuring confidence in every release while enabling rapid development.
+
+---
+
+## Analytics testing, as built (PH3.8)
+
+Counts as of 2026-08-16: **backend 2,429 passed / 6 xfailed** (was 2,303),
+**frontend 375 passed / 21 suites** (was 364 / 20).
+
+| Suite | Tests | Covers |
+|---|---:|---|
+| `backend/tests/test_analytics.py` (**new**) | **122** | IST window resolution and the 05:30 boundary, the metric contract's construction-time invariants, the inventory's structural integrity, trade-scoping filters, ten reproduced financial defects, data-quality checks, empty/single/multi datasets, and analytics authorization |
+| `frontend/src/pages/__tests__/AdminAnalytics.test.jsx` (**new**) | **11** | That fabricated metrics render marked, that genuinely derived ones do not, that the marker degrades safely, and that no growth figure is invented in the frontend |
+| `backend/tests/test_perf_regression.py` (extended) | +4 rows | The four analytics query shapes are index-covered |
+
+### What these assert that ordinary coverage does not
+
+**That the mocks are still labelled.** PH3.8 deliberately did not remove
+seventeen fabricated metrics, so the marker is the only thing between an
+operator and a set of invented business numbers. `TestAdminAnalyticsContract`
+and the frontend suite hold it in place. If a future change strips the
+`mock_metrics` array or the "Simulated" badge, the suite goes red — which is
+the point of flagging rather than deleting.
+
+**That the inventory cannot drift.** `TestRegistry` asserts every endpoint named
+in `analytics/registry.py` exists on the **live route table**, that every entry
+is structurally complete, and that every MOCK entry names the production source
+that would replace it. A markdown table would have been accurate on the day it
+was written and wrong thereafter.
+
+**Wrong values by name, not just right ones.** Where the old behaviour was a
+specific wrong number, the test asserts the right one *and* names the wrong one
+in a comment — "pre-PH3.8 this reported +8,500 at a 50% win rate". A regression
+is then legible in the failure output rather than requiring archaeology.
+
+### One harness defect worth carrying forward
+
+23 of these tests passed in isolation and failed in the full run with
+`RuntimeError: There is no current event loop`, because a suite earlier in the
+alphabet closes the main-thread loop. The cause was `asyncio.get_event_loop()`
+in the suite's own coroutine-driver helper, **not the application** — and it
+presented exactly like an application defect. The helper now creates a private
+loop and restores the previous policy state, so it neither inherits the problem
+nor exports it to whatever runs next. Bare `asyncio.run()` would have done the
+latter: it leaves the policy's current loop set to `None`.
 
 ---
 

@@ -27,6 +27,8 @@ writer, and FakeDB only supports $set.
 import logging
 from datetime import datetime, timezone
 
+from analytics import periods, queries
+
 logger = logging.getLogger(__name__)
 
 # Risk-per-trade guideline as % of capital, keyed by the user's risk level.
@@ -268,6 +270,12 @@ def apply_partial_exit(trade: dict, price: float, quantity: int, reason: str) ->
     Closes the trade (status from `reason`) when nothing remains open, with
     pnl = realized partials + this exit; else keeps it OPEN with updated
     quantity_open / realized_pnl.
+
+    PH3.8 adds a `bookings` timeline. `realized_pnl` is a running total with no
+    timestamp, so profit booked at target 1 could be counted in an all-time
+    figure but never attributed to the day it happened — which is what made it
+    invisible to the daily loss budget and to every period-scoped P&L metric.
+    Each entry records what was booked, when, at what price and why.
     """
     qty_open = _qty_open(trade)
     quantity = max(0, min(int(quantity), qty_open))
@@ -277,7 +285,10 @@ def apply_partial_exit(trade: dict, price: float, quantity: int, reason: str) ->
     realized = round((trade.get("realized_pnl") or 0) + booked, 2)
     remaining = qty_open - quantity
 
-    update = {"quantity_open": remaining, "realized_pnl": realized}
+    bookings = list(trade.get("bookings") or [])
+    bookings.append({"at": _now_iso(), "quantity": quantity, "price": price,
+                     "pnl": booked, "reason": reason})
+    update = {"quantity_open": remaining, "realized_pnl": realized, "bookings": bookings}
     if remaining == 0:
         invested = (trade.get("entry_price") or 0) * (trade.get("quantity") or 0)
         update.update({
@@ -467,19 +478,39 @@ async def run_cycle(db, quotes: dict, broker_engine=None, ws_push=None) -> dict:
 
 # ─── Risk summary (dashboard) ────────────────────────────────────────────────
 
+def _partial_pnl_in_window(trade: dict, window) -> float:
+    """P&L booked by partial exits on a still-OPEN trade, inside `window`.
+
+    Only for trades that are still open: once a trade closes, its `pnl` is the
+    total of every booking and counting the bookings again would double it.
+    """
+    if trade.get("status") != "OPEN":
+        return 0.0
+    return round(sum(
+        b.get("pnl") or 0 for b in (trade.get("bookings") or [])
+        if window.contains(b.get("at"))), 2)
+
+
 async def build_risk_summary(db, user: dict) -> dict:
-    """Live view of today's risk usage vs the user's own limits."""
+    """Live view of today's risk usage vs the user's own limits.
+
+    PH3.8: "today" is the IST session day (was the UTC day, which rolls at
+    05:30 IST), and `realized_today` now includes profit booked by PARTIAL
+    exits. That second change is a risk control, not a display fix — this
+    figure feeds `max_daily_loss` and the `trading_halted` flag, and a trade
+    that booked half its size at target 1 wrote `realized_pnl` but not `pnl`,
+    so the loss budget could not see it.
+    """
     user_id = str(user["_id"])
-    today = _today()
-    all_trades = await db.trades.find(
-        {"user_id": user_id, "is_paper": {"$ne": True}}).to_list(500)
+    window = periods.resolve("today")
+    all_trades = await db.trades.find(queries.live_trades(user_id)).to_list(None)
 
     open_trades = [t for t in all_trades if t.get("status") == "OPEN"]
-    trades_today = len([t for t in all_trades
-                        if (t.get("entry_time") or "").startswith(today)])
-    realized_today = round(sum(
-        t.get("pnl") or 0 for t in all_trades
-        if t.get("pnl") is not None and (t.get("exit_time") or "").startswith(today)), 2)
+    trades_today = len([t for t in all_trades if window.contains(t.get("entry_time"))])
+    realized_today = round(
+        sum(t.get("pnl") or 0 for t in all_trades
+            if t.get("pnl") is not None and window.contains(t.get("exit_time")))
+        + sum(_partial_pnl_in_window(t, window) for t in open_trades), 2)
 
     open_risk = 0.0
     open_exposure = 0.0

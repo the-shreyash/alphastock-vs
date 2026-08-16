@@ -61,7 +61,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any, Coroutine, Dict, List, Optional
+
+from observability import instruments
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +79,12 @@ class BackgroundTaskRegistry:
 
     def __init__(self) -> None:
         self._tasks: Dict[str, asyncio.Task] = {}
+        # Start times, for the lifetime histogram (PH3.7). Keyed by the task
+        # object's id rather than its name, so a task that is restarted under
+        # the same name cannot inherit the previous run's start time and report
+        # a lifetime spanning both. Entries are removed in `_on_done`, which
+        # runs for every terminal state, so this cannot grow.
+        self._started_at: Dict[int, float] = {}
 
     # -- lifecycle ----------------------------------------------------------- #
     def spawn(self, name: str, coro: Coroutine[Any, Any, Any]) -> Optional[asyncio.Task]:
@@ -98,11 +107,13 @@ class BackgroundTaskRegistry:
 
         task = asyncio.create_task(coro, name=name)
         self._tasks[name] = task
+        self._started_at[id(task)] = time.monotonic()
         task.add_done_callback(self._on_done)
         logger.info(
             "Background task started: %s", name,
             extra={"event": "background_task_started", "task": name},
         )
+        instruments.record_task_start(name)
         return task
 
     def _on_done(self, task: asyncio.Task) -> None:
@@ -116,10 +127,21 @@ class BackgroundTaskRegistry:
         name = task.get_name()
         if self._tasks.get(name) is task:
             del self._tasks[name]
+        # Popped unconditionally, before any early return below: `_on_done` runs
+        # for every terminal state including cancellation, and a start time left
+        # behind on the cancelled path would be the exact shape of leak this
+        # module exists to prevent (PH3.6).
+        started = self._started_at.pop(id(task), None)
+        lifetime = None if started is None else max(0.0, time.monotonic() - started)
 
         if task.cancelled():
+            instruments.record_task_end(name, "cancelled", lifetime)
             return
         exc = task.exception()
+        if exc is not None:
+            instruments.record_task_end(name, "failed", lifetime)
+        else:
+            instruments.record_task_end(name, "completed", lifetime)
         if exc is not None:
             # Retrieved deliberately: an unretrieved task exception is reported
             # by asyncio at garbage-collection time, detached from the moment it
@@ -194,6 +216,7 @@ class BackgroundTaskRegistry:
         """Drop the registry without awaiting. Tests that spawned real tasks
         must call :meth:`cancel_all` instead."""
         self._tasks.clear()
+        self._started_at.clear()
 
 
 #: Process-wide registry. One per process, like the Redis manager.

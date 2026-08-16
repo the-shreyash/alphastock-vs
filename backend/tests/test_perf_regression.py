@@ -275,6 +275,23 @@ class TestIndexCoverage:
         ("chat_messages", ("user_id", "session_id"), "created_at", "GET /api/chat/history"),
         ("users", ("email",), None, "login / registration"),
         ("broker_accounts", ("user_id", "broker"), None, "broker_engine"),
+        # PH3.8 — analytics query shapes.
+        #
+        # `portfolio_snapshots` had NO index of any kind since Sprint 8 created
+        # it, and two hot shapes read it: the Performance tab filters {user_id}
+        # and sorts by date, and the 16:05 IST snapshot job upserts on
+        # {user_id, date} once per user per night — a full collection scan per
+        # user, which is O(users²) work in an unattended job.
+        ("portfolio_snapshots", ("user_id",), "date", "GET /api/portfolio/performance"),
+        ("portfolio_snapshots", ("user_id", "date"), None,
+         "portfolio_engine.record_snapshot upsert"),
+        # Platform-wide signup and AI-usage counts have no user_id to lean on,
+        # so no compound index above can serve them (an index is only usable
+        # from its leading field). Both were `$regex` prefix matches on
+        # unindexed string fields — full scans on every admin page load — until
+        # PH3.8 replaced the regex with a range comparison an index can serve.
+        ("users", ("created_at",), None, "GET /api/admin/dashboard signups"),
+        ("chat_messages", ("created_at",), None, "GET /api/admin/dashboard AI requests"),
     ]
 
     @pytest.mark.parametrize(

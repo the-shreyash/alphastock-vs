@@ -14,6 +14,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+from observability import instruments
 from services.market_engine.event_bus import event_bus
 from services.market_engine.normalizer import (
     normalize_stock_quote,
@@ -69,8 +70,18 @@ class MarketGateway:
         """Fetch, normalize, validate a single stock quote."""
         from services.real_market import fetch_real_stock_quote
 
+        # PH3.7. The tracker sits INSIDE the existing try, around the provider
+        # call only. It observes the failure and re-raises untouched, so the
+        # except below still swallows exactly what it swallowed before —
+        # instrumentation must not change which errors reach the caller. The
+        # operation label is the gateway verb, never the symbol: one series per
+        # traded symbol is the cardinality mistake this codebase is careful
+        # about (see observability/metrics.py).
         try:
-            raw = await fetch_real_stock_quote(symbol)
+            with instruments.track_provider("market_data", "get_quote") as call:
+                raw = await fetch_real_stock_quote(symbol)
+                if not raw:
+                    call.empty()
         except Exception as exc:
             logger.warning(f"Gateway: quote fetch failed for {symbol}: {exc}")
             return None
@@ -102,7 +113,10 @@ class MarketGateway:
         from services.real_market import fetch_all_universe_quotes
 
         try:
-            raw_quotes = await fetch_all_universe_quotes()
+            with instruments.track_provider("market_data", "get_universe_quotes") as call:
+                raw_quotes = await fetch_all_universe_quotes()
+                if not raw_quotes:
+                    call.empty()
         except Exception as exc:
             logger.warning(f"Gateway: universe fetch failed: {exc}")
             return []
@@ -129,7 +143,10 @@ class MarketGateway:
         from services.real_market import fetch_real_market_overview
 
         try:
-            overview = await fetch_real_market_overview()
+            with instruments.track_provider("market_data", "get_indices") as call:
+                overview = await fetch_real_market_overview()
+                if not overview:
+                    call.empty()
         except Exception as exc:
             logger.warning(f"Gateway: overview fetch failed: {exc}")
             return {}
@@ -155,7 +172,10 @@ class MarketGateway:
         from services.real_market import fetch_real_sectors
 
         try:
-            raw_sectors = await fetch_real_sectors()
+            with instruments.track_provider("market_data", "get_sectors") as call:
+                raw_sectors = await fetch_real_sectors()
+                if not raw_sectors:
+                    call.empty()
         except Exception as exc:
             logger.warning(f"Gateway: sector fetch failed: {exc}")
             return []
@@ -180,19 +200,36 @@ class MarketGateway:
 
     # ── Gainers / Losers ─────────────────────────────────
 
+    # The methods below deliberately do NOT catch: their callers own the error
+    # handling, and adding a try/except here to make instrumentation tidier
+    # would change which failures reach a route handler. The tracker records
+    # the failure and re-raises, which is the whole contract it was written to.
+
     async def get_gainers(self, count: int = 5) -> List[Dict[str, Any]]:
         from services.real_market import fetch_real_gainers
-        return await fetch_real_gainers(count)
+        with instruments.track_provider("market_data", "get_gainers") as call:
+            result = await fetch_real_gainers(count)
+            if not result:
+                call.empty()
+            return result
 
     async def get_losers(self, count: int = 5) -> List[Dict[str, Any]]:
         from services.real_market import fetch_real_losers
-        return await fetch_real_losers(count)
+        with instruments.track_provider("market_data", "get_losers") as call:
+            result = await fetch_real_losers(count)
+            if not result:
+                call.empty()
+            return result
 
     # ── Global markets ───────────────────────────────────
 
     async def get_global_markets(self) -> List[Dict[str, Any]]:
         from services.real_market import fetch_real_global_markets
-        return await fetch_real_global_markets()
+        with instruments.track_provider("market_data", "get_global_markets") as call:
+            result = await fetch_real_global_markets()
+            if not result:
+                call.empty()
+            return result
 
     # ── Gift Nifty ───────────────────────────────────────
 
@@ -200,33 +237,59 @@ class MarketGateway:
         """Pre-market Nifty futures read. Always returns a payload; check
         `available` — no licensed NSE IX feed is connected by default."""
         from services.market_engine.gift_nifty import get_gift_nifty
-        return await get_gift_nifty()
+        with instruments.track_provider("market_data", "get_gift_nifty") as call:
+            result = await get_gift_nifty()
+            # `available: false` is this endpoint's normal state without a
+            # licensed feed, so it is recorded as `empty` rather than `ok` —
+            # otherwise a permanently unavailable feed reads as a healthy one.
+            if not result or not result.get("available"):
+                call.empty()
+            return result
 
     # ── Economic calendar ────────────────────────────────
 
     async def get_calendar(self, days_ahead: int = 30, days_behind: int = 7) -> Dict[str, Any]:
         from services.market_engine.economic_calendar import get_calendar
-        return await get_calendar(days_ahead=days_ahead, days_behind=days_behind)
+        with instruments.track_provider("market_data", "get_calendar") as call:
+            result = await get_calendar(days_ahead=days_ahead, days_behind=days_behind)
+            if not result:
+                call.empty()
+            return result
 
     # ── Commodities ──────────────────────────────────────
 
     async def get_commodities(self) -> List[Dict[str, Any]]:
         from services.real_market import fetch_real_commodities
-        return await fetch_real_commodities()
+        with instruments.track_provider("market_data", "get_commodities") as call:
+            result = await fetch_real_commodities()
+            if not result:
+                call.empty()
+            return result
 
     # ── FII / DII ────────────────────────────────────────
 
     async def get_fii_dii(self) -> Dict[str, Any]:
         from services.real_market import fetch_real_fii_dii
-        return await fetch_real_fii_dii()
+        with instruments.track_provider("market_data", "get_fii_dii") as call:
+            result = await fetch_real_fii_dii()
+            if not result:
+                call.empty()
+            return result
 
     # ── News (via news_service) ──────────────────────────
 
     async def get_news(self, force: bool = False) -> List[Dict[str, Any]]:
         from services.news_service import fetch_news
 
+        # Labelled provider="news", not "market_data": a news outage and a price
+        # outage have different owners, different severities and different
+        # user-visible effects, and a single `provider` bucket for both would
+        # make the one alert that fires say nothing about which.
         try:
-            raw_articles = await fetch_news(force=force)
+            with instruments.track_provider("news", "get_news") as call:
+                raw_articles = await fetch_news(force=force)
+                if not raw_articles:
+                    call.empty()
         except Exception as exc:
             logger.warning(f"Gateway: news fetch failed: {exc}")
             return []
@@ -238,13 +301,21 @@ class MarketGateway:
 
     async def get_chart(self, symbol: str, period: str = "1D") -> Dict[str, Any]:
         from services.real_market import fetch_real_chart_data
-        return await fetch_real_chart_data(symbol, period)
+        with instruments.track_provider("market_data", "get_chart") as call:
+            result = await fetch_real_chart_data(symbol, period)
+            if not result:
+                call.empty()
+            return result
 
     # ── Chart patterns ───────────────────────────────────
 
     async def get_patterns(self, symbol: str) -> Dict[str, Any]:
         from services.real_market import detect_chart_patterns
-        return await detect_chart_patterns(symbol)
+        with instruments.track_provider("market_data", "get_patterns") as call:
+            result = await detect_chart_patterns(symbol)
+            if not result:
+                call.empty()
+            return result
 
 
 # Module-level singleton

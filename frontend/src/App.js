@@ -4,6 +4,7 @@ import { AuthProvider, useAuth } from "./context/AuthContext";
 import { ThemeProvider } from "./context/ThemeContext";
 import { RealtimeProvider } from "./context/RealtimeProvider";
 import Layout from "./components/layout/Layout";
+import ErrorBoundary from "./components/ErrorBoundary";
 import "./App.css";
 
 /*
@@ -144,11 +145,21 @@ function App() {
   return (
     <BrowserRouter>
       <ThemeProvider>
-        <AuthProvider>
-          <RealtimeProvider>
-            <AppRouter />
-          </RealtimeProvider>
-        </AuthProvider>
+        {/* PH3.7 — the OUTER boundary, and the last line of defence.
+            Inside ThemeProvider so the recovery screen renders with the user's
+            theme variables rather than unstyled, and outside AuthProvider and
+            RealtimeProvider so that a throw in *either* of them is caught: a
+            crash in the auth provider is precisely the one that would otherwise
+            leave a white page with no route out. The inner, per-page boundaries
+            live in the two layouts (components/layout/Layout.jsx and
+            components/admin/AdminLayout.jsx), so a page crash keeps the shell. */}
+        <ErrorBoundary>
+          <AuthProvider>
+            <RealtimeProvider>
+              <AppRouter />
+            </RealtimeProvider>
+          </AuthProvider>
+        </ErrorBoundary>
       </ThemeProvider>
     </BrowserRouter>
   );

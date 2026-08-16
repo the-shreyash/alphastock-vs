@@ -373,7 +373,15 @@ function PortfolioSummaryCard({ summary }) {
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
         {[
           { label: "Portfolio Value", value: summary?.current_value ? `₹${formatNumber(summary.current_value)}` : summary?.total_value ? `₹${formatNumber(summary.total_value)}` : "—", numeric: summary?.current_value ?? summary?.total_value },
-          { label: "Today's P/L", value: summary?.total_pnl ? `₹${formatNumber(summary.total_pnl)}` : "—", numeric: summary?.total_pnl, color: (summary?.total_pnl ?? 0) >= 0 ? "var(--gain)" : "var(--loss)" },
+          /* PH3.8 (F-7): this card was labelled "Today's P/L" and bound to
+             `/api/portfolio/summary`.`total_pnl`, which is LIFETIME UNREALISED
+             P&L — it has never been a daily figure. A trader reading it as
+             today's move would misjudge every position. The label now matches
+             the number; the backend exposes `unrealized_pnl` as the
+             unambiguous alias, with `total_pnl` kept for older consumers. A
+             genuine daily P&L needs `/api/trades/pnl`.`today_pnl`, which is a
+             different (realised) quantity and belongs on its own card. */
+          { label: "Unrealised P&L", value: (summary?.unrealized_pnl ?? summary?.total_pnl) != null ? `₹${formatNumber(summary.unrealized_pnl ?? summary.total_pnl)}` : "—", numeric: summary?.unrealized_pnl ?? summary?.total_pnl, color: (summary?.unrealized_pnl ?? summary?.total_pnl ?? 0) >= 0 ? "var(--gain)" : "var(--loss)" },
           { label: "Investments", value: summary?.total_invested ? `₹${formatNumber(summary.total_invested)}` : "—" },
           { label: "Holdings", value: summary?.holdings_count ?? "—" },
         ].map(item => (

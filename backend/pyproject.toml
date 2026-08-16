@@ -125,17 +125,26 @@ known_first_party = ["security", "services", "server", "models", "tests", "scrip
 # ------------------------------------------------------------------------------
 # mypy
 #
-# Scoped to backend/security/ for now (14 files, 2 findings — both false
-# positives from `bool(x) and ...` not narrowing Optional). Type-checking the
+# Scoped to backend/security/ and backend/analytics/. **10 findings, all
+# pre-existing and none in either package**: mypy follows imports, and
+# `security` reaches into `observability` (PH3.7), which is not annotated and is
+# not in `files`. `mypy security` alone reported the same 10 before PH3.8 added
+# `analytics`, which contributes zero. Type-checking the
 # whole backend today would emit thousands of errors against a codebase written
 # without annotations, and an error list nobody reads is not a quality gate.
 # The security package is the right first perimeter: it is the newest code, the
 # most annotated, and the code where a type confusion has the highest cost.
 # Expand the `files` list as packages are annotated.
+#
+# PH3.8 adds `analytics` — clean at this setting on the day it was written, and
+# added on that day precisely because a perimeter is cheap to hold and expensive
+# to reclaim. The three findings it surfaced were all real Optional-narrowing
+# gaps in code whose whole purpose is to distinguish "no value" from zero, which
+# is the argument for having it here rather than a coincidence.
 # ------------------------------------------------------------------------------
 [tool.mypy]
 python_version = "3.11"
-files = ["security"]
+files = ["security", "analytics"]
 ignore_missing_imports = true          # no stubs published for motor/litellm/etc.
 warn_unused_ignores = true
 warn_redundant_casts = true

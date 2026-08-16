@@ -73,31 +73,54 @@ async def get_paper_trades(user_id: str, db) -> list:
 
 
 async def get_paper_pnl(user_id: str, db) -> dict:
-    """Compute total realized + unrealized P&L for all paper trades."""
-    trades = await db.trades.find({"user_id": user_id, "is_paper": True}).to_list(500)
+    """Compute total realized + unrealized P&L for all paper trades.
 
-    realized = sum(t.get("pnl") or 0 for t in trades if t.get("status") == "CLOSED")
+    PH3.8 changes, none of them cosmetic:
+
+    * **Closed means `status != "OPEN"`, not `status == "CLOSED"`.** The
+      lifecycle also writes TARGET_HIT and SL_HIT; a paper trade that exited at
+      a target contributed nothing to realised P&L and was not counted as open
+      either, so it vanished from the account entirely.
+    * **The 500-document cap is gone** — it silently truncated the account.
+    * **A missing quote is reported, not swallowed.** Every open position whose
+      quote could not be fetched used to contribute exactly ₹0 of unrealised
+      P&L, which is indistinguishable from a position that has not moved. The
+      count is now returned as `marks_unavailable` so the UI can say the figure
+      is partial instead of presenting a degraded number as a complete one.
+    """
+    trades = await db.trades.find({"user_id": user_id, "is_paper": True}).to_list(None)
+
+    realized = sum(t.get("pnl") or 0 for t in trades if t.get("status") != "OPEN")
     open_trades = [t for t in trades if t.get("status") == "OPEN"]
 
     unrealized = 0.0
+    marks_unavailable = 0
     from services.real_market import fetch_real_stock_quote
     for t in open_trades:
         try:
             q = await fetch_real_stock_quote(t["symbol"])
-            if q:
-                multiplier = 1 if t.get("type") == "BUY" else -1
-                unrealized += multiplier * (q["price"] - t["entry_price"]) * t["quantity"]
         except Exception:
-            pass
+            q = None
+        if q and q.get("price") is not None:
+            multiplier = 1 if t.get("type") == "BUY" else -1
+            unrealized += multiplier * (q["price"] - t["entry_price"]) * t["quantity"]
+        else:
+            marks_unavailable += 1
 
     total_pnl = round(realized + unrealized, 2)
     return {
         "realized_pnl": round(realized, 2),
         "unrealized_pnl": round(unrealized, 2),
         "total_pnl": total_pnl,
+        # Denominator is the FIXED starting capital by design — a return on the
+        # account's inception, which stays stable as positions open and close.
         "total_pnl_pct": round((total_pnl / DEFAULT_CAPITAL) * 100, 2),
         "open_trades": len(open_trades),
         "closed_trades": len(trades) - len(open_trades),
+        "marks_unavailable": marks_unavailable,
+        "complete": marks_unavailable == 0,
+        "scope": "paper",
+        "basis": "gross",
     }
 
 
@@ -209,9 +232,17 @@ async def close_paper_trade(trade_id: str, user_id: str, db) -> dict:
 
 async def reset_paper_capital(user_id: str, db):
     """Reset paper_capital to ₹1,00,000 and close all open paper trades."""
+    # `close_reason` (PH3.8): these positions are not closed at breakeven, they
+    # are ABANDONED at a fabricated ₹0 because the account was reset. Without a
+    # marker they are indistinguishable from real breakeven exits and pollute
+    # every paper win-rate and average-P&L figure with a synthetic outcome. The
+    # marker lets analytics exclude them deliberately rather than by guessing at
+    # `pnl == 0`.
     await db.trades.update_many(
         {"user_id": user_id, "is_paper": True, "status": "OPEN"},
-        {"$set": {"status": "CLOSED", "pnl": 0, "pnl_percent": 0, "exit_time": datetime.now(timezone.utc).isoformat()}},
+        {"$set": {"status": "CLOSED", "pnl": 0, "pnl_percent": 0,
+                  "close_reason": "capital_reset",
+                  "exit_time": datetime.now(timezone.utc).isoformat()}},
     )
     await db.users.update_one(
         {"_id": ObjectId(user_id)},

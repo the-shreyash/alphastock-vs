@@ -45,10 +45,30 @@ Home for the cross-cutting instrumentation that makes a running deployment
   time the request, count it, stamp `X-Request-ID`, emit one access log line.
   One middleware rather than three, because each additional layer is a real
   per-request cost on every route.
+* `observability.errors` (PH3.7) — the closed vocabulary of thirteen failure
+  classes, and the one function that maps any exception onto it. The shared
+  noun set for metric labels, structured-log fields and alert rules: bounded, so
+  a class is safe as a label; stable, so an alert written today still means the
+  same thing after someone rewords an exception. Like `context`, it imports
+  nothing from this codebase — classification is by MRO name-matching rather
+  than `isinstance`, precisely so the module every subsystem depends on does not
+  drag in `pymongo`, `redis`, `httpx` and `anthropic`.
+* `observability.instruments` (PH3.7) — the API call sites actually use. Holds
+  the closed `subsystem` / `provider` vocabularies and the helpers that update a
+  whole metric family together, so a call site cannot increment two of three
+  counters and leave a dashboard subtly inconsistent. Everything funnels to
+  `subsystem_errors_total`, which makes "which subsystem is failing?" answerable
+  from one series.
+* `observability.mongo_monitor` (PH3.7) — MongoDB command and connection-pool
+  metrics, registered as pymongo listeners on the client rather than wrapped
+  around several hundred call sites. Reads the command *name* and the duration
+  and nothing else: the command document carries emails, password hashes and
+  broker tokens, and a failure document carries the credentialed URI.
 * `observability.routes` (PH2.5) — the operational HTTP surface:
   `/api/health/live`, `/api/health/ready`, `/api/health/startup`, `/api/health`,
   `/api/metrics`, `/api/diagnostics`, plus the production access gate on the
-  latter two.
+  latter two, and (PH3.7) `POST /api/observability/client-errors`, the only path
+  by which a browser-side failure becomes visible to an operator.
 
 Design rules for anything added here:
 
@@ -59,10 +79,19 @@ Design rules for anything added here:
 2. **Cost is paid at scrape time, not request time.** The request path only
    increments integers; aggregation, rendering and process introspection happen
    when someone asks.
-3. **A secret must never reach a log line or a diagnostic payload.** Redaction
-   reuses `security.audit`'s markers so there is one list, not two.
+3. **A secret must never reach a log line, a metric label or a diagnostic
+   payload.** Redaction reuses `security.audit`'s markers so there is one list,
+   not two. A value derived from free text (an exception message, a provider
+   error string, a server failure document, a browser report) may be used to
+   *choose* a class from a closed vocabulary; it may never become the label.
+4. **A label value that can come from outside the process is a bug.** Route
+   templates, not paths; frozen vocabularies, not caller strings; and
+   `METRICS_MAX_SERIES` as the backstop for whatever the first two missed. An
+   unbounded label is how a metrics change takes down the system it observes.
 
-See `docs/operations/MONITORING.md` for the operator-facing documentation, and
-`docs/operations/LOGGING.md` for the log infrastructure specifically (streams,
-rotation, retention, redaction, Docker logging drivers).
+See `docs/architecture/OBSERVABILITY.md` for the architecture, the rules that
+bind anything added here, and the alert catalogue — **read it before adding an
+instrument**. `docs/operations/MONITORING.md` is the operator-facing manual, and
+`docs/operations/LOGGING.md` covers the log infrastructure specifically
+(streams, rotation, retention, redaction, Docker logging drivers).
 """

@@ -506,3 +506,58 @@ def make_redis_probe() -> Callable[[], Awaitable[Optional[bool]]]:
         return (await redis_client.ping()) is not None
 
     return probe
+
+
+def make_config_probe(
+    report_provider: Callable[[], object],
+) -> Callable[[], Awaitable[Optional[bool]]]:
+    """A readiness probe over the boot-time configuration verdict (PH3.7).
+
+    WHY READINESS SHOULD ASSERT THIS AT ALL, GIVEN THE BOOT ALREADY DOES
+
+    `server.py` calls `secrets.validate_config()` at import, which raises and
+    fails the process closed when a *required* value is missing. So on the happy
+    path this probe can only ever pass, and that is a fair objection to it.
+
+    It earns its place on the unhappy paths, which are the ones readiness exists
+    for. The requirement set is environment-dependent: a value that is merely a
+    warning in development becomes an error in production, so an instance whose
+    `APP_ENV` is wrong is exactly the instance whose boot validation was too
+    lenient. Configuration is also reloadable (`secrets.reload_secrets`), and a
+    reload that degrades the verdict has to be able to remove the instance from
+    the load balancer rather than leave it serving. And an operator reading
+    `/api/health/ready` during an incident should be able to rule configuration
+    in or out from the response itself instead of inferring it from the absence
+    of a crash.
+
+    WHY IT COSTS NOTHING
+
+    It does not re-validate. It reads the report object produced once at boot —
+    an attribute access — which is what keeps readiness cheap enough to poll
+    every few seconds. Re-resolving secrets here would mean file I/O on every
+    poll from every replica, against the one subsystem where a partial read is
+    most dangerous.
+
+    WHY IT LEAKS NOTHING
+
+    `ConfigReport` is presence-only by construction: names and booleans, never
+    values. Only the boolean `ok` crosses into the probe result, and the failure
+    detail is the count of failing names, not the names — an unauthenticated
+    caller learning *which* secret a deployment is missing is a reconnaissance
+    gift, and the names are already in the boot log where they belong.
+    """
+
+    async def probe() -> Optional[bool]:
+        report = report_provider()
+        if report is None:
+            # Nothing wired the report in. Reported as "not configured" rather
+            # than as a failure: a missing probe input is an instrumentation
+            # gap, and failing readiness on it would take a healthy instance out
+            # of service because of a monitoring bug.
+            return None
+        errors = getattr(report, "errors", None) or []
+        if errors:
+            raise RuntimeError(f"configuration invalid ({len(errors)} error(s))")
+        return True
+
+    return probe

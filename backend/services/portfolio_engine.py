@@ -20,6 +20,8 @@ from __future__ import annotations
 import logging
 from typing import Awaitable, Callable, Optional
 
+from analytics import periods, queries
+
 logger = logging.getLogger(__name__)
 
 # Concentration guidelines (kept identical to the values the frontend used to
@@ -397,10 +399,14 @@ async def build_intelligence(db, user: dict, quotes_map_func: QuotesMapFunc,
     AI review and the dashboard."""
     holdings = await build_holdings(db, user, quotes_map_func)
 
-    closed = await db.trades.find(
-        {"user_id": user["_id"], "status": {"$ne": "OPEN"}}
-    ).to_list(500)
-    realized = round(sum(_num(t.get("pnl")) for t in closed), 2)
+    # PH3.8. This total used to read every closed trade including PAPER ones,
+    # capped at 500 with no sort — inside the same function whose holdings half
+    # (`build_holdings`, above) explicitly skips paper trades. One payload
+    # therefore carried two different definitions of "my portfolio": unrealised
+    # P&L over real positions, realised P&L over real positions *plus* virtual
+    # ones. Now filtered and summed in the database, uncapped.
+    realized, _closed_count = await queries.sum_pnl(
+        db, queries.closed(queries.live_trades(user["_id"])))
 
     allocation = compute_allocation(holdings)
     diversification = compute_diversification(holdings)
@@ -437,6 +443,14 @@ async def build_intelligence(db, user: dict, quotes_map_func: QuotesMapFunc,
 # --------------------------------------------------------------------------- #
 # Performance / equity curve (built forward from real daily snapshots)
 # --------------------------------------------------------------------------- #
+#: Range keys the Performance tab offers, as CALENDAR days.
+#:
+#: PH3.8: these were previously applied as `snaps[-days:]` — a slice of the
+#: LIST, so the unit was "snapshots", not days. Snapshots are only written by
+#: the 4:05 PM IST job, only for users who hold something, and only on days the
+#: job ran, so the two units diverge immediately: a fixture of one snapshot per
+#: month returned THIRTY MONTHS of history for `range=1M`, labelled "1M". Every
+#: range key was wrong for every user whose snapshot history has a single gap.
 _RANGE_DAYS = {"1M": 30, "3M": 90, "6M": 180, "1Y": 365, "ALL": None}
 
 
@@ -449,7 +463,11 @@ async def record_snapshot(db, user: dict, quotes_map_func: QuotesMapFunc) -> Opt
         return None
     invested = round(sum(_num(h.get("invested")) for h in holdings), 2)
     current = round(_total_value(holdings), 2)
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    # The IST trading date, not the UTC one (PH3.8). The job that calls this
+    # runs at 16:05 IST on an `Asia/Kolkata` scheduler, so it is stamping an
+    # end-of-session mark; the date on that mark must be the session's date, and
+    # the range filter in `get_performance` now compares against IST dates.
+    today = periods.ist_date().isoformat()
     snapshot = {
         "user_id": user["_id"],
         "date": today,
@@ -470,16 +488,28 @@ async def get_performance(db, user_id: str, range_key: str = "ALL") -> dict:
     """Equity curve + returns from stored snapshots. Returns ``available: False``
     while fewer than two snapshots exist — the curve is built forward from real
     end-of-day marks, never back-filled with synthetic history."""
-    snaps = await db.portfolio_snapshots.find({"user_id": user_id}).to_list(1000)
-    snaps = sorted(snaps, key=lambda s: s.get("date", ""))
-    days = _RANGE_DAYS.get((range_key or "ALL").upper())
+    key = (range_key or "ALL").upper()
+    if key not in _RANGE_DAYS:
+        # Loud rather than silently widening to ALL: a typo'd range that quietly
+        # returns a different span is exactly the failure this sprint removes.
+        raise ValueError(f"Unknown range {range_key!r}. Valid: {', '.join(_RANGE_DAYS)}.")
+    days = _RANGE_DAYS[key]
+
+    # Sort in the DATABASE, then bound. The previous `to_list(1000)` took Mongo's
+    # natural order and sorted afterwards, so a user past 1,000 snapshots (about
+    # four trading years) silently lost their most recent history — the half of
+    # the curve they actually look at.
+    query = {"user_id": user_id}
     if days is not None:
-        snaps = snaps[-days:]
+        cutoff = periods.window_of_days(days).start_iso[:10]
+        query["date"] = {"$gte": cutoff}
+    snaps = await db.portfolio_snapshots.find(query).sort("date", 1).to_list(None)
+    snaps = sorted(snaps, key=lambda s: s.get("date") or "")
     if len(snaps) < 2:
         return {"available": False,
                 "reason": "Performance history is still being recorded. Your equity curve "
                           "appears after a couple of end-of-day snapshots.",
-                "curve": [], "points": len(snaps)}
+                "curve": [], "points": len(snaps), "range": key}
 
     curve = [{"date": s["date"], "value": _num(s.get("current_value")),
               "invested": _num(s.get("invested")), "pnl": _num(s.get("pnl"))} for s in snaps]
@@ -487,11 +517,32 @@ async def get_performance(db, user_id: str, range_key: str = "ALL") -> dict:
     abs_return = round(last["value"] - first["value"], 2)
     pct_return = round((last["value"] - first["value"]) / first["value"] * 100, 2) if first["value"] else 0.0
 
+    # EXTERNAL CAPITAL FLOWS (PH3.8, finding F-8).
+    #
+    # `pct_return` is a change in portfolio VALUE, and value rises both when
+    # holdings gain and when the user puts more money in. A trader who deposits
+    # ₹1L into a ₹1L portfolio sees "+100%" — measured, and completely wrong as
+    # a performance figure.
+    #
+    # A correct time-weighted return needs a dated ledger of contributions and
+    # withdrawals, which this platform does not record, so PH3.8 does NOT invent
+    # one. What it does is stop the number from lying silently: `invested` is
+    # stored on every snapshot, so a change in cost basis across the window is a
+    # reliable *detector* of a flow even though it cannot size the return
+    # correction. When one is detected the payload says so, and the frontend can
+    # caveat the figure instead of presenting it as performance.
+    invested_change = round(last["invested"] - first["invested"], 2)
+    flows_detected = abs(invested_change) > 0.01
+
     # Best / worst single-day move across the window.
     best_day = worst_day = None
     for prev, cur in zip(curve, curve[1:]):
         if prev["value"]:
             chg = round((cur["value"] - prev["value"]) / prev["value"] * 100, 2)
+            # A day whose cost basis moved is a day money went in or out; a
+            # deposit is not a "best day" and must not be reported as one.
+            if abs(cur["invested"] - prev["invested"]) > 0.01:
+                continue
             if best_day is None or chg > best_day["pct"]:
                 best_day = {"date": cur["date"], "pct": chg}
             if worst_day is None or chg < worst_day["pct"]:
@@ -501,10 +552,21 @@ async def get_performance(db, user_id: str, range_key: str = "ALL") -> dict:
         "available": True,
         "curve": curve,
         "points": len(curve),
+        "range": key,
         "start_date": first["date"],
         "end_date": last["date"],
         "abs_return": abs_return,
         "pct_return": pct_return,
+        "return_basis": "value_change",
+        "flow_adjusted": False,
+        "flows_detected": flows_detected,
+        "invested_change": invested_change,
+        "caveat": (
+            "Cost basis changed by ₹{:,.2f} over this period, so part of the value "
+            "change is money you added or withdrew rather than performance. A "
+            "flow-adjusted return is not available.".format(invested_change)
+            if flows_detected else ""
+        ),
         "best_day": best_day,
         "worst_day": worst_day,
     }

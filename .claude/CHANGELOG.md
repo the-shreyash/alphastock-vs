@@ -5,6 +5,293 @@ This file records documentation-system versions and, from v1.0 launch onward, pr
 
 ---
 
+# Sprint PH3.8 — Analytics & Data Integrity — 2026-08-16
+
+**Full report:** `docs/architecture/ANALYTICS.md` — the architecture, the complete
+metric inventory, financial semantics, the timezone strategy, and the PH3.9
+mock-removal specification.
+
+**Numbering.** The sprint brief labelled this work PH3.8. This repository's roadmap
+numbers PH3.8 as *Accessibility & Responsive Audit* (**not started, untouched**).
+This sprint delivers the audit half of roadmap **PH3.2 — Mock Data Eradication**,
+plus scope PH3.2 never named. Same brief-label drift as PH3.2–PH3.7. Read "PH3.9"
+in this entry as *the mock-removal sprint*, which is roadmap PH3.2's remaining half.
+
+**Scope discipline: this was an audit, and it stayed one.** The brief was explicit
+that PH3.8 must not silently replace mock analytics with invented calculations, and
+the temptation was real — several fabricated numbers have a plausible formula
+sitting right next to them. **Seventeen mock metrics were left in place**, values
+unchanged. What changed is that every one now declares itself in its API response
+(`provenance`, `status`, `note`, `mock_metrics`) and renders behind a visible
+"Simulated" marker. The flag is now the only thing between an operator and a set of
+invented business metrics, so tests hold it in place until PH3.9 removes it.
+
+**The inventory is code, not prose.** `backend/analytics/registry.py` classifies
+every metric REAL / DERIVED / MOCK / UNAVAILABLE with its source, calculation,
+window, consumer and — for mocks — the production source that would replace it.
+`tests/test_analytics.py` asserts every endpoint it names exists on the live route
+table and every mock carries a replacement plan, so the inventory cannot drift.
+**Totals: 4 REAL, 26 DERIVED, 17 MOCK, 5 UNAVAILABLE.**
+
+**Ten defects found, all reproduced before being fixed.** **F-2 (P0): the
+end-of-day report job crashed on every single run** — it iterated every trade and
+called `t.get("exit_time", "").startswith(today)`, but an open trade stores
+`exit_time: None` *explicitly*, so `.get` returns `None` and `None.startswith`
+raised `AttributeError`, swallowed by a broad `except` into one log line. No EOD
+report was ever written and no user was ever notified, for as long as any position
+was open. **F-2b (P0): the P&L it would have reported was everybody's** — the job
+summed the closed trades of the entire platform and sent that one figure to every
+user as "Today's P&L" (measured: users at +₹1,000 and −₹400 both told "+₹600") —
+a wrong personal number *and* a cross-tenant disclosure of other users' trading
+performance. **F-1 (P1): paper trades contaminated every real-money statistic** —
+a ₹9,000 virtual gain beside a ₹500 real loss reported as +₹8,500 at a 50% win
+rate; `build_intelligence` excluded paper trades from holdings and included them in
+realised P&L *in the same function*. **F-6 (P1): partial exits were invisible to
+the daily loss limit** — after booking ₹500 at target 1, `realized_pnl_today` read
+₹0, because every realised-P&L metric keys off `pnl`, which is written only at full
+close. That is a risk control, not a display bug. **F-10 (P1): equity-curve ranges
+sliced snapshot count, not calendar days** — `snaps[-30:]` on a monthly cadence
+returned thirty *months* labelled "1M". **F-8 (P1): portfolio return counts
+deposits as performance** — depositing ₹1L into a ₹1L portfolio reported +100%
+return and a +100% "best day". **F-11 (P1): the synthetic backtest was
+non-deterministic** — seeded from `hash(str)`, which Python salts with
+`PYTHONHASHSEED`, so identical input returned 80% / 60% / 80% win rates on three
+consecutive processes; and `randint(10, 16)` of 20 trades means a losing strategy
+cannot be represented. Also **F-5** (`to_list(500)` with no sort silently
+truncating all-time figures to an arbitrary 500 rows), **F-3** (breakeven scored as
+a loss, compounded by `reset_paper_capital` closing at exactly ₹0), **F-4** (every
+window a UTC day on an IST exchange — the daily trade counter and loss budget reset
+at 05:30 IST), **F-7** (the Dashboard labelled lifetime unrealised P&L as "Today's
+P/L"), **F-9** (an unfetchable quote contributing ₹0 of unrealised paper P&L,
+indistinguishable from an unmoved position) and **F-18** (nine admin dashboard
+cards each carrying a hardcoded "+12% vs last month" in the gain colour — deleted
+rather than flagged, since there was never anything behind it).
+
+**New package `backend/analytics/`** — five modules, and it computes no business
+metrics of its own. `periods` (the one documented timezone strategy: storage UTC,
+boundaries IST, half-open `[start, end)` windows), `contract` (the metric envelope,
+with construction-time invariants that make "unavailable" unrepresentable as zero),
+`registry` (the inventory), `queries` (canonical trade-scoping **filters only** — no
+arithmetic, so `portfolio_engine`/`trading_engine` remain the single source of truth
+for the math), `quality` (source-data validation that reports and never repairs).
+
+**The structural finding: `db.payments` has no writer anywhere in the codebase.**
+The platform has no payment integration. Three admin endpoints read the collection
+and startup indexes it; nothing has ever written to it. Every revenue figure —
+MRR, ARR, the 30-day chart, the four window totals, the three payment-state counts
+— is therefore fabricated, and `revenue_today` reads ₹0 only *because the collection
+is empty*: the first record to land would report ₹499 of "today's revenue" whatever
+it was for. MRR additionally counts comped and admin-granted accounts as paying,
+because `role` is assigned through `grant-plan` with no payment involved.
+
+**Three indexes added.** `portfolio_snapshots {user_id, date}` unique — the
+collection had **no index of any kind** since Sprint 8, so every Portfolio page
+load scanned every user's history and the nightly 16:05 IST job scanned the whole
+collection once per user (O(users²) in an unattended job); the uniqueness also makes
+one-snapshot-per-day the database's rule rather than the upsert's assumption. Plus
+`users {created_at}` and `chat_messages {created_at}` — the admin dashboard's signup
+and AI-request counts were `$regex` prefix matches on unindexed string fields, full
+scans on every page load, and neither existing compound index can serve a query that
+constrains neither `user_id` nor `session_id`. All three are pinned in
+`tests/test_perf_regression.py::HOT_QUERIES`.
+
+**No caching was added and Redis was deliberately not used.** Caching these
+endpoints would have been easy and wrong at this point: correctness semantics were
+the thing under repair, and a TTL over a metric whose window semantics had just
+changed would freeze the old answer and make the next defect much harder to see.
+
+**Tests: 122 backend + 11 frontend added. Backend 2,303 → 2,425 passed, 0 failed,
+6 xfailed, ~2m38s. Frontend 364 → 375 passed, 21 suites, ~6s.** Every pre-existing
+test passed unchanged — the contract is additive by construction. Production build
+green (`DISABLE_ESLINT_PLUGIN=true`, the pre-existing FE-007 eslint-version defect
+is unrelated and still open). Blocking lint gate clean; the new package is
+flake8-clean at the full standard, and net advisory findings went **down** by two.
+
+**One test-harness defect found and fixed in this sprint's own suite** — worth
+recording because it is the failure mode that wastes an afternoon: 23 tests passed
+in isolation and failed in the full run with `RuntimeError: There is no current
+event loop`, because a suite earlier in the alphabet closes the main-thread loop.
+`asyncio.get_event_loop()` was the culprit, not the application. The helper now
+uses a private loop and restores the previous policy state, so it neither inherits
+nor exports the problem.
+
+---
+
+# Sprint PH3.7 — Monitoring & Observability — 2026-08-15
+
+**Full report:** `docs/architecture/OBSERVABILITY.md` (architecture, rules and the
+alert catalogue). Operator-facing material stays in `docs/operations/MONITORING.md`,
+updated to v1.2.
+
+**Numbering.** The sprint brief labelled this work PH3.7. This repository's roadmap
+numbers PH3.7 as *Performance Benchmarking & Load Testing* (**complete**, both
+halves). This sprint delivers the **outstanding half of roadmap PH2.10 —
+Monitoring, Metrics & Alerting** — plus scope PH2.10 never named. Same brief-label
+drift as PH3.2–PH3.6.
+
+**The audit came first, and it changed the shape of the sprint.** The premise of a
+monitoring brief is usually that there is no monitoring. Here there was a great
+deal: PH2.5 delivered structured JSON logging, request correlation, three health
+probes and the four golden signals; PH2.6 added stream separation, rotation and
+retention; PH2.7 added nine Redis metric families; PH3.6 added six resource gauges.
+**Steps 3, 4 and most of 5 of the brief were already satisfied**, and rebuilding
+them would have been the worst available outcome. What the audit found instead was
+that instrumentation stopped at the process boundary: every dependency the
+application talks to was uninstrumented. **MongoDB had one bit** (`dependency_up`)
+and no latency, no failures and no pool visibility. **WebSockets had gauges but no
+flow** — you could see 200 connections but not whether they were the same 200 or a
+churn of reconnects. **Background tasks, market-data providers, broker APIs, news,
+AI providers and the event bus had nothing at all.** So the sprint's real question
+was not "is there monitoring" but **"which subsystem is failing?" — and nothing in
+the system could answer it.**
+
+**The keystone is one metric.** `subsystem_errors_total{subsystem, error_class}` is
+the series every failure path in the backend now writes to, and it exists because
+that question deserves a single answer rather than a tour of nine dashboards. Both
+labels are closed vocabularies — 14 subsystems, 13 error classes — so the metric
+that everything writes to is also the metric that cannot grow unbounded.
+
+**Error classification is the vocabulary, and it deliberately does not use
+`isinstance`.** `backend/observability/errors.py` maps any exception onto thirteen
+classes by walking the MRO and matching `module.QualName` against a fixed table.
+The obvious implementation — a chain of `isinstance(exc, pymongo.errors...)` —
+would make the one module every subsystem depends on import `pymongo`, `redis`,
+`httpx` and `anthropic`, invert the layering, and fail at import in any environment
+missing an optional client. String matching needs no imports, cannot raise, and
+degrades to `internal` for anything unrecognised. **Two rules decide the overlaps:**
+*the subsystem wins over the failure mode* (a `ServerSelectionTimeoutError` is
+`database`, not `timeout`, because "MongoDB is unreachable" routes to an owner and
+"something timed out" routes to nobody — `is_timeout()` is the escape hatch for
+retry decisions), and *cancellation is classified but never counted*, because a
+clean shutdown cancels every in-flight operation and counting those would make
+every deploy look like an incident.
+
+**MongoDB is instrumented through the driver, not the call sites.** There are
+several hundred `await db.<collection>.<op>()` calls in this backend. Any scheme
+that wraps them instruments what was written before the sprint and nothing written
+after it — and the first query someone adds during an incident is exactly the one
+that would be invisible. `observability/mongo_monitor.py` registers a
+`CommandListener` and a `ConnectionPoolListener` on the client, so every command is
+covered by construction and no call site knows it exists. **It reads the command
+*name* and the duration and nothing else:** `CommandStartedEvent.command` is the
+full BSON document, which for this application means a user's email in a login
+lookup, a bcrypt hash in a password update and a broker access token in a
+credential write. `CommandFailedEvent.failure` is likewise reduced to its integer
+`code` through a fixed table, because `errmsg` embeds the failing query and, on a
+connection fault, the credentialed connection URI. **The pool listener earns its
+place separately:** pool exhaustion is the MongoDB failure that produces *no
+errors at all* — every command waits, every percentile rises together, nothing is
+logged — and `checked_out` against `max` is the only direct evidence. PH3.6 fixed
+`maxIdleTimeMS` (M-8) and left the pool unmeasured.
+
+**A design decision that turned on a measurement.** A WebSocket fan-out to 500
+sockets, four times a second, is 2,000 sends. Counting each one would put 2,000
+lock acquisitions per second on the realtime hot path — measured at 0.52 µs per
+counter increment, that is ~260 µs per broadcast **growing with every connected
+user**. Fan-outs are therefore counted **once per fan-out**, with failures added in
+a single sized increment: two increments regardless of audience, **0.6 µs, constant
+in the number of users**. It is the one place in this sprint where instrumentation
+cost could plausibly have mattered, and the only place the design bent around it.
+
+**Three counters cover failures that leave every other panel green**, which is the
+category this sprint was most worth doing for. `provider_requests_total{outcome=
+"empty"}` — a market-data provider answering 200 with no rows, so the error rate
+stays at zero while the product serves yesterday's prices. `ai_requests_total
+{provider="simulated"}` — every real model failed, the user received a plausible
+canned response, and the **request succeeded**, so HTTP metrics, logs and health
+all read normal. `frontend_errors_total` — the browser is showing a blank page and
+the request that served the bundle returned 200 several minutes ago.
+
+**The AI providers needed an explicit failure report, and the reason generalises.**
+Every provider in this codebase catches broadly and returns
+`AIResponse(error=...)` rather than raising — correct, because a model outage
+should degrade the feature instead of failing the user's request. But it means a
+context manager that only watches for exceptions would have recorded a **total
+provider outage as 100% success**. `track_ai(...).failed(detail)` is the explicit
+path, and the error *string* is used only to pick a class; it is never recorded,
+because a provider error message can carry a request id, an account identifier or
+an echoed prompt.
+
+**The frontend had no error boundary at all.** Since React 16 an uncaught render
+error unmounts the entire tree — a white page, cause visible only in a console the
+user will never open, and no server-side trace of any kind. Added: two levels of
+boundary (outer, wrapping the providers so a throw inside `AuthProvider` is caught;
+inner, keyed by pathname in both layouts so a page crash keeps the sidebar and the
+user has a route out that is not the back button), global `unhandledrejection` and
+`error` handlers, and chunk-load detection with **one** auto-reload per tab — a
+stale `index.html` after a deploy is fixed by one reload, and reloading again is an
+infinite refresh against a failing origin from every affected browser at once. In
+production the boundary shows **no message and no stack**: a React error message can
+quote component props, which here means positions, prices and account values.
+
+**Client telemetry is deliberately small and deliberately paranoid.** No Sentry, no
+session replay, no analytics. Reports go to this application's own
+`POST /api/observability/client-errors` and become a counter plus one log line —
+**no database write**, because an unauthenticated endpoint that inserts a document
+is an unauthenticated write amplifier. The endpoint is unauthenticated *by
+necessity* (the failures most worth hearing about are the ones where the app could
+not start), so it is treated as hostile input: a closed `kind` vocabulary validated
+against a frozen set, hard field caps, newline stripping to prevent log-line
+forgery, and CSRF exemption justified twice over — it changes no state, and it is
+delivered by `sendBeacon`, which cannot set a header. The client sends **only the
+pathname**, id-normalised, never `search` or `hash`, because a query string in this
+application carries Google OAuth codes, broker callback tokens and password-recovery
+tokens. It reads nothing from `localStorage`. A hard cap of 20 reports per session
+plus signature deduplication comes *before* anything is sent: a render loop throws
+thousands of times a second, and an error inside a reporting path is the classic
+way to turn one bug into a self-inflicted denial of service.
+
+**Two defects found in this sprint's own work, both by its own tests.** PyMongo
+validates listeners with `isinstance`, not duck typing, so the first
+implementation's duck-typed listeners were rejected at client construction with a
+`TypeError` — which would have taken the **entire application down at import**, on
+every environment, immediately. Caught by the first test run; the listeners now
+subclass the ABCs behind a guarded import, and
+`test_the_listeners_satisfy_pymongos_type_check` exists specifically so it cannot
+regress. Second: a redaction sweep revealed that four `record_*` helpers accepted
+their outcome/reason/kind labels as unvalidated strings. Every current call site
+passes a source literal, so nothing leaked — but "every current call site" is not a
+property, and the fix (frozen sets plus a `_bounded` helper that logs an
+`instrumentation_defect` and folds to `<unknown>`) makes it one.
+
+**Verification.** Backend **2,303 passed / 0 failed** (baseline 2,216 — the delta is
+exactly the 87 new tests; zero regressions). Frontend **364 passed / 20 suites**
+(baseline 324 / 18 — exactly the 40 new tests). Production build compiles clean.
+Flake8 clean on every changed file, with the twelve pre-existing findings verified
+against `HEAD` as pre-existing. A **61-check failure-injection drill** against the
+real application: Mongo killed → readiness 503 while liveness stays 200 and recovers
+when Mongo returns; configuration invalidated → readiness 503 naming no secret;
+every new metric family exposed and well-formed; scanner probes collapsing to one
+`<unmatched>` bucket; and secret-shaped strings driven through every free-text path
+and asserted **absent** from the rendered exposition document. One drill check fails
+for an environmental reason and is documented: `TestClient` runs each request in a
+fresh event loop while Motor binds to its creating loop, so the second
+Mongo-touching request in a process raises `Event loop is closed` — a pre-existing
+harness artifact (it also produces the rate-limiter tracebacks in the drill output),
+proved unrelated by re-running the same recovery sequence inside one loop, where it
+passes.
+
+**Overhead was measured, not asserted**, and the script that measures it is
+committed as `backend/scripts/observability_overhead.py` so the numbers in the
+document can be re-derived rather than trusted. Counter increment **0.49 µs**,
+classification **0.92 µs**, the always-on Mongo listener **2.02 µs per command**
+(~0.02–0.2% of a command that just did network I/O), `/api/metrics` render **0.76 ms**.
+**These are single-threaded microbenchmarks and are labelled as such** — they cannot
+show lock contention under concurrency, which is the only mechanism by which any of
+them could become interesting, and that needs a staging environment this project
+still does not have.
+
+**The honest gap: nothing watches any of this.** The alert catalogue in
+OBSERVABILITY.md §9 defines six critical and twenty-two warning conditions, each with
+a threshold, a severity, an expected response and a false-positive analysis. There
+is still **no Prometheus server, no Alertmanager, no notification channel and no
+uptime check** — detection remains manual, which dominates recovery time. Every
+threshold is also an engineering estimate rather than a measurement, because there
+is no staging baseline to derive one from. Both belong to roadmap PH2.10 and PH2.12
+and are recorded as required-before-production rather than done.
+
+---
+
 # Sprint PH3.6 — Memory & Resource Stability — 2026-08-15
 
 **Full report:** `docs/performance/PH3_MEMORY_STABILITY.md`.

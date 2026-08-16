@@ -7,6 +7,7 @@ import {
   ArrowLeft, Shield, ChevronRight, Menu, X
 } from "lucide-react";
 import { useAuth } from "../../context/AuthContext";
+import ErrorBoundary from "../ErrorBoundary";
 
 const ADMIN_NAV = [
   { to: "/admin/dashboard", icon: LayoutDashboard, label: "Dashboard" },
@@ -131,7 +132,10 @@ export default function AdminLayout() {
               exit={{ opacity: 0, y: -8 }}
               transition={{ duration: 0.25, ease: "easeOut" }}
             >
-              <Outlet />
+              {/* PH3.7 — see the note in components/layout/Layout.jsx. */}
+              <ErrorBoundary key={location.pathname}>
+                <Outlet />
+              </ErrorBoundary>
             </motion.div>
           </AnimatePresence>
         </main>

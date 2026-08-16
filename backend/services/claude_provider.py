@@ -7,6 +7,8 @@ Configure with environment variable: ANTHROPIC_API_KEY
 import os
 import logging
 from typing import Optional
+
+from observability import instruments
 from services.ai_provider import AIProvider, AIMessage, AIResponse
 
 logger = logging.getLogger(__name__)
@@ -44,6 +46,15 @@ class ClaudeProvider(AIProvider):
     ) -> AIResponse:
         key = _get_key()
         if not key:
+            # PH3.7. Recorded as `unconfigured`, not as an error: no call was
+            # made, nothing is broken, and counting it as a failure would make
+            # a deployment that has simply never had a key look like one whose
+            # provider is down. It is still counted, because
+            # ai_requests_total{outcome="unconfigured"} climbing is how you
+            # discover users are receiving simulated answers while every other
+            # panel is green.
+            with instruments.track_ai("claude") as call:
+                call.unconfigured()
             return AIResponse(
                 content="Claude AI is not configured. Please add ANTHROPIC_API_KEY.",
                 provider="claude",
@@ -53,6 +64,28 @@ class ClaudeProvider(AIProvider):
 
         target_model = model or self.default_model
 
+        with instruments.track_ai("claude") as _ai_call:
+            return await self._complete_instrumented(
+                _ai_call, key, target_model, messages, max_tokens
+            )
+
+    async def _complete_instrumented(
+        self,
+        _ai_call,
+        key: str,
+        target_model: str,
+        messages: list[AIMessage],
+        max_tokens: int,
+    ) -> AIResponse:
+        """The original completion path, with the failure branch reported.
+
+        Split out so the instrumentation wrapper above stays one line. The
+        `except` below returns a *successful-looking* AIResponse carrying an
+        error string — deliberate, so a model outage degrades the feature
+        instead of failing the user's request — which is exactly why
+        `_ai_call.failed()` has to be called explicitly: without it, every
+        provider outage in this codebase would record as a success.
+        """
         try:
             import anthropic
 
@@ -82,6 +115,10 @@ class ClaudeProvider(AIProvider):
 
         except Exception as e:
             error_str = str(e)
+            # Classified from the exception, which is richer than the string —
+            # the string is used for nothing but the user-facing message below
+            # and never reaches a metric label.
+            _ai_call.failed(e)
             logger.error(f"Claude provider error: {error_str}")
 
             # Friendly error messages

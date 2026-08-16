@@ -259,9 +259,33 @@ def _compute_metrics(trades, equity_curve, initial_capital, final_capital):
 # ─── Fallback synthetic data ──────────────────────────────────────────────────
 
 def _synthetic_backtest(symbol, strategy, start_date, end_date, stop_pct, tgt_pct, capital):
-    """Return a plausible synthetic result when yfinance data is unavailable."""
+    """Return a plausible synthetic result when yfinance data is unavailable.
+
+    PH3.8 CLASSIFICATION: **MOCK, and structurally flattering.** ``wins`` is
+    drawn from ``randint(10, 16)`` out of 20 trades, so the win rate is always
+    between 50% and 80% — a losing strategy cannot be represented. Entry and
+    exit dates are invented 2025 strings unrelated to the requested period, and
+    the resulting Sharpe ratio, max drawdown and total return are computed by
+    the same ``_compute_metrics`` the real path uses, so they arrive looking
+    exactly like measured statistics.
+
+    The seed was ``hash(f"{symbol}{strategy}")``. Python salts ``hash()`` of a
+    ``str`` with ``PYTHONHASHSEED``, so this was not even reproducible: the same
+    backtest of the same symbol returned 80%, 60% and 80% win rates on three
+    consecutive processes. PH3.8 seeds from a stable digest of the inputs so the
+    fabricated result is at least *deterministic* — a fabricated number that
+    changes on every deploy is a second, independent defect, and pinning it is
+    what lets a test assert this path's behaviour at all.
+
+    Removal is PH3.9 (``analytics.registry`` → ``research.backtest.synthetic``),
+    where the right outcome is an explicit failure rather than invented
+    performance.
+    """
+    import hashlib
     import random
-    random.seed(hash(f"{symbol}{strategy}"))
+    digest = hashlib.sha256(
+        f"{symbol}|{strategy}|{start_date}|{end_date}".encode()).hexdigest()
+    random.seed(int(digest[:16], 16))
     n = 20
     wins = random.randint(10, 16)
     losses = n - wins
@@ -352,6 +376,7 @@ async def run_backtest(
         )
         final_capital = equity_curve[-1]["capital"] if equity_curve else initial_capital
 
+    synthetic = data_source == "synthetic"
     return {
         "symbol": symbol.upper(),
         "strategy": strategy,
@@ -359,6 +384,21 @@ async def run_backtest(
         "initial_capital": initial_capital,
         "final_capital": round(final_capital, 2),
         "data_source": data_source,
+        # PH3.8: `data_source` alone was the only signal, and it is easy for a
+        # consumer to miss. `provenance` and `mock_metrics` name the affected
+        # figures explicitly so a client cannot render a fabricated Sharpe ratio
+        # without having been told.
+        "provenance": "mock" if synthetic else "derived",
+        "mock_metrics": ([
+            "win_rate", "total_return_pct", "max_drawdown_pct", "sharpe_ratio",
+            "best_trade_pct", "worst_trade_pct", "avg_trade_pct", "trades",
+            "equity_curve", "final_capital",
+        ] if synthetic else []),
+        "analytics_note": (
+            "Fabricated: historical market data was unavailable, so this result was "
+            "generated from a random series whose win rate is drawn from 50–80% by "
+            "construction. It is not a backtest of this strategy and must not be "
+            "acted on." if synthetic else ""),
         **metrics,
         "trades": trades[-50:],  # cap to last 50 for response size
         "equity_curve": equity_curve,

@@ -7,6 +7,8 @@ Configure with environment variable: GOOGLE_GEMINI_KEY
 import os
 import logging
 from typing import Optional
+
+from observability import instruments
 from services.ai_provider import AIProvider, AIMessage, AIResponse
 
 logger = logging.getLogger(__name__)
@@ -44,6 +46,10 @@ class GeminiProvider(AIProvider):
     ) -> AIResponse:
         key = _get_key()
         if not key:
+            # See the matching note in claude_provider: unconfigured is counted
+            # but is not an error (PH3.7).
+            with instruments.track_ai("gemini") as call:
+                call.unconfigured()
             return AIResponse(
                 content="Gemini AI is not configured. Please add GOOGLE_GEMINI_KEY.",
                 provider="gemini",
@@ -53,6 +59,26 @@ class GeminiProvider(AIProvider):
 
         target_model = model or self.default_model
 
+        with instruments.track_ai("gemini") as _ai_call:
+            return await self._complete_instrumented(
+                _ai_call, key, target_model, messages, temperature
+            )
+
+    async def _complete_instrumented(
+        self,
+        _ai_call,
+        key: str,
+        target_model: str,
+        messages: list[AIMessage],
+        temperature: float,
+    ) -> AIResponse:
+        """The original completion path, with the failure branch reported.
+
+        The `except` returns an AIResponse carrying an error string rather than
+        raising, so the failure has to be reported explicitly — otherwise every
+        Gemini outage would be recorded as a successful request. See the fuller
+        note on the Claude equivalent.
+        """
         try:
             from google import genai
             from google.genai import types
@@ -90,6 +116,7 @@ class GeminiProvider(AIProvider):
 
         except Exception as e:
             error_str = str(e)
+            _ai_call.failed(e)
             logger.error(f"Gemini provider error: {error_str}")
 
             if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
