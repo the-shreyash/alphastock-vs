@@ -16,7 +16,10 @@ To detail the system design, components, integrations, and architectural decisio
   displays, classified REAL / DERIVED / MOCK / UNAVAILABLE; the source-of-truth
   model, financial metric semantics (gross basis, sign conventions, partial
   exits, flow adjustment), the IST time-window strategy, data-quality rules,
-  and the PH3.9 mock-removal inventory
+  and the record of the mock-removal sprint. **No metric is classified MOCK**
+  (4 REAL / 32 DERIVED / 0 MOCK / 17 UNAVAILABLE); §11 says what happened to
+  each of the seventeen that used to be, and §10.4 names what every remaining
+  unavailable metric would need to become answerable
 
 Cross-cutting backend packages, each with exactly one authoritative
 implementation of its concern:

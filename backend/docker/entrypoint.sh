@@ -101,18 +101,30 @@ case "${WEB_CONCURRENCY}" in
 esac
 [ "${WEB_CONCURRENCY}" -ge 1 ] || fail "WEB_CONCURRENCY must be at least 1."
 
-# The application runs an in-process APScheduler, a heartbeat engine and an
-# in-memory WebSocket connection registry (server.py startup). Every uvicorn
-# worker is a separate OS process, so N workers means N schedulers firing the
-# same jobs N times and a WebSocket broadcast reaching only the clients attached
-# to the worker that published it. Until those are externalised (PH2.8 —
-# Redis-backed fan-out and a single-leader scheduler) more than one worker is a
-# correctness bug, not a performance win. Warn loudly instead of silently
-# capping: the operator stays in control, but cannot claim they were not told.
+# The application runs an in-process APScheduler (server.py startup, no env
+# guard and no leader election), a heartbeat engine and an in-memory WebSocket
+# connection registry. Every uvicorn worker is a separate OS process, so N
+# workers means N schedulers firing the same jobs N times.
+#
+# PH3.10 CORRECTION — this block used to advise "scale with additional
+# replicas, not workers", and that advice was dangerous. A replica is also a
+# separate process running `setup_scheduler()`, so it duplicates the scheduler
+# exactly as a worker does. The WebSocket half of multi-process was solved in
+# PH2.7 (Redis pub/sub fan-out), which is probably why replicas looked safe —
+# but the scheduler half was not. `trade_monitor` runs every 60 s during market
+# hours and calls `trading_engine.run_cycle`, which places REAL BROKER EXIT
+# ORDERS on stop-loss and target hits. Two schedulers means two exit orders for
+# one position, in a live brokerage account, with real money.
+#
+# Until a single-leader scheduler exists, the deployment is ONE backend process:
+# one worker, one replica. Warn loudly instead of silently capping — the
+# operator stays in control, but cannot claim they were not told.
 if [ "${WEB_CONCURRENCY}" -gt 1 ]; then
-    log "WARNING: WEB_CONCURRENCY=${WEB_CONCURRENCY}. The in-process scheduler and"
-    log "WARNING: WebSocket registry are NOT yet multi-process safe (see PH2.8)."
-    log "WARNING: Scale with additional replicas, not workers, until then."
+    log "WARNING: WEB_CONCURRENCY=${WEB_CONCURRENCY}. The in-process scheduler is NOT"
+    log "WARNING: multi-process safe: each process runs the trade monitor, which"
+    log "WARNING: places real broker exit orders. Duplicate orders are possible."
+    log "WARNING: Run exactly ONE backend process (1 worker, 1 replica) until a"
+    log "WARNING: single-leader scheduler ships. Do NOT scale with replicas either."
 fi
 
 # 2b. Full secret resolution + configuration validation, delegated to the

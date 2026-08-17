@@ -1,12 +1,61 @@
 # StockAssist AI — Production Readiness Report
 
-> **⚠️ LIVING DOCUMENT.** The most recent update is **PH3.7b — Memory & Resource
-> Stability** (2026-08-15), immediately below; the **PH1.12 security update**
-> (2026-07-22) follows it and remains the standing release decision. The original
+> **⚠️ LIVING DOCUMENT.** The most recent update is **PH3.10 — Final Production
+> Audit** (2026-08-17), immediately below; **PH3.7b — Memory & Resource
+> Stability** (2026-08-15) follows it, then the **PH1.12 security update**
+> (2026-07-22). The original
 > **Sprint 12 baseline audit** (2026-07-17,
 > verdict *NOT READY*) is preserved unchanged from the divider marked
 > *"Sprint 12 Baseline Audit"* onward, as the historical record that seeded the
 > Production Hardening program. Do not delete it.
+
+---
+
+# PH3.10 Update — Final Production Audit (2026-08-17)
+
+**Full report:** `docs/production/PH3.10_FINAL_PRODUCTION_AUDIT.md`
+
+**Recommendation: GO TO PH3.11**, on seven conditions. Matrix across 35
+categories: **24 PASS · 8 PASS WITH CONDITIONS · 3 BLOCKED · 0 FAIL.**
+
+**Two production blockers were found and fixed.** Both had been invisible to every
+preceding phase, and the reason is the important part:
+
+* **The realtime layer had no authorization at all.** `/api/ws` took the identity
+  it fans per-user events out on — notifications, portfolio, trade-engine and
+  broker order updates — from an unauthenticated query parameter. Any anonymous
+  caller could connect as `?user_id=<victim>` and read that account's private
+  stream. **Reproduced against the live production container** before the fix.
+  Tracked since PH1.9 as "S-2", deferred, never scheduled. PH1 certified security
+  with this open because PH1 explicitly scoped WebSocket authorization out; PH3.3's
+  201-route authorization sweep missed it because it walks `APIRoute` and a
+  WebSocket route is not one.
+* **The frontend had not built since 2026-08-03.** A commit added an ESLint config
+  extending `react-app` without adding `eslint-config-react-app` as a dependency.
+  `npm run build` exited 1 for fourteen days; there was no deployable artifact.
+
+**They share a cause: no CI job has ever built or tested the frontend.** 395
+passing frontend tests and a completely broken production build reported green on
+every check for two weeks. A `frontend-ci` workflow now gates both.
+
+**Also fixed:** administrative account blocking did nothing — `blocked: True` was
+written and audited but never read on any authentication path, so a blocked user
+kept full access and could log straight back in; a `react-router` open-redirect
+advisory in the shipped bundle; and deployment guidance in four documents telling
+operators to "scale with replicas", which would have run a second scheduler and
+**placed duplicate real broker exit orders** on live positions.
+
+**Standing architectural constraint:** the platform supports **exactly one backend
+process** (one worker, one replica). The in-process scheduler has no leader
+election, and the job that duplicates places real money orders.
+
+**No regression:** backend **2,534 → 2,559** tests passing (+25), frontend **395**
+unchanged, production build now green, container builds, boots healthy in 0.68 s
+and shuts down cleanly with exit 0. No trading logic, AI decision logic, prompt,
+model selection, rate-limit policy or API contract was changed.
+
+**Still BLOCKED — unbuilt capabilities, not defects:** email delivery (simulated),
+off-host backup copy, and therefore disaster recovery for host loss.
 
 ---
 

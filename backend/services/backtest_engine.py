@@ -1,7 +1,9 @@
 """Backtesting Engine — simulates trading strategies on historical NSE data via yfinance."""
 import logging
 import math
-from datetime import datetime, timezone
+# PH3.9: `datetime`/`timezone` were imported only by `_synthetic_backtest`, to
+# manufacture the invented 2025 entry and exit dates. Both dropped with it — the
+# real path takes its dates from the price series index.
 
 logger = logging.getLogger(__name__)
 

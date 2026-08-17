@@ -87,6 +87,7 @@ from services.scheduler import setup_scheduler
 # cleared through this module so the Secure/HttpOnly/SameSite/Path/Max-Age
 # posture stays consistent across login, register, refresh, logout and OAuth.
 from security.cookies import (
+    ACCESS_TOKEN_COOKIE,
     set_auth_cookies,
     set_access_cookie,
     clear_auth_cookies,
@@ -476,6 +477,27 @@ async def _issue_session(user_id: str, email: str, request: Request,
     return access
 
 
+def account_is_active(user: dict) -> bool:
+    """False when the account has been blocked by an administrator.
+
+    PH3.10. ``POST /api/admin/users/{id}/block`` has always written
+    ``blocked: True`` and written an audit record saying so, and the admin user
+    list has always filtered on it — but nothing on any authentication path ever
+    read it. Blocking an abusive account therefore did nothing at all: the
+    target's existing tokens kept working and they could log in again
+    immediately, while the console reported success. That is the same failure
+    shape as the PH3.3 refund stub (D-4) — an administrative control that
+    reports an action it does not perform — and it is worse here, because the
+    action is the one an operator reaches for during an active incident.
+
+    Read at every point an identity is resolved (`get_current_user`, `login`,
+    `authenticate_websocket`) rather than only at login, so revocation takes
+    effect within the access token's 15-minute life rather than at the blocked
+    user's convenience.
+    """
+    return not user.get("blocked", False)
+
+
 async def get_current_user(request: Request) -> dict:
     token = request.cookies.get("access_token")
     if not token:
@@ -500,6 +522,11 @@ async def get_current_user(request: Request) -> dict:
     user = await db.users.find_one({"_id": ObjectId(payload["sub"])})
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
+    # An administrator blocked this account (PH3.10). 403, not 401: the
+    # credential itself is valid and refreshing it would change nothing, so a
+    # client that retries on 401 would spin. See `account_is_active`.
+    if not account_is_active(user):
+        raise HTTPException(status_code=403, detail="Account is blocked")
     # Global invalidation lever: any token minted before the account's
     # password_changed_at (set by a future password change or a security event)
     # is stale, even if it has not yet expired. Access AND refresh both honor it.
@@ -1176,6 +1203,17 @@ async def login(data: UserLogin, response: Response, request: Request):
                              reason="invalid_credentials")
         raise HTTPException(status_code=401, detail="Invalid email or password")
 
+    # Credentials are correct, but an administrator blocked this account
+    # (PH3.10). Checked AFTER the password comparison on purpose: answering
+    # "blocked" to a wrong password would turn the endpoint into an oracle for
+    # which addresses hold blocked accounts. The failure budget is deliberately
+    # NOT reset here — a blocked account gets no relief from the brute-force
+    # counter.
+    if not account_is_active(user):
+        await log_auth_event(audit.LOGIN_FAILURE, request, email=email,
+                             user_id=str(user["_id"]), reason="account_blocked")
+        raise HTTPException(status_code=403, detail="Account is blocked")
+
     # Success: clear the failure budget so prior typos don't linger.
     await limiter.reset(ratelimit.LOGIN, identifier)
     user_id = str(user["_id"])
@@ -1251,6 +1289,11 @@ async def refresh_token(request: Request, response: Response):
     user = await db.users.find_one({"_id": ObjectId(payload["sub"])})
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
+    # A blocked account cannot mint fresh access from an outstanding refresh
+    # token either (PH3.10) — otherwise a block would only take effect once the
+    # refresh token itself expired, seven days later.
+    if not account_is_active(user):
+        raise HTTPException(status_code=403, detail="Account is blocked")
     # Global invalidation lever (password change / security event) applies to
     # refresh too — a stale refresh token cannot be rotated into fresh access.
     if jwt_service.token_issued_before(payload, user.get("password_changed_at")):
@@ -3101,8 +3144,12 @@ class ConnectionManager:
         # news/…) instead of every global broadcast.
         self.channels: dict[WebSocket, Set[str]] = {}
 
-    async def connect(self, ws: WebSocket, user_id: str = None):
-        await ws.accept()
+    async def connect(self, ws: WebSocket, user_id: str = None, subprotocol: str = None):
+        # `subprotocol` is echoed back on the handshake. A browser that offered
+        # subprotocols CLOSES the connection unless the server selects one of
+        # them, so this is load-bearing for the auth path in
+        # `authenticate_websocket`, not cosmetic.
+        await ws.accept(subprotocol=subprotocol)
         self.active.add(ws)
         self.channels.setdefault(ws, set())
         if user_id:
@@ -3290,11 +3337,117 @@ def _collect_resource_gauges() -> None:
 obs_metrics.registry.add_collector(_collect_resource_gauges)
 
 
+#: Close code sent to a socket that failed authentication. 1008 is the RFC 6455
+#: "policy violation" code — the closest standard match for "your credentials do
+#: not permit this connection", and what browser clients surface as a clean
+#: `CloseEvent` rather than a network error.
+WS_CLOSE_POLICY_VIOLATION = 1008
+
+
+#: Subprotocol marker the client offers alongside its access token, and the one
+#: value the server ever selects. See `authenticate_websocket`.
+WS_AUTH_SUBPROTOCOL = "stockassist.auth"
+
+
+def _websocket_credential(websocket: WebSocket) -> tuple[Optional[str], Optional[str]]:
+    """``(access_token, subprotocol_to_echo)`` from a handshake, or ``(None, None)``.
+
+    Two transports, because a browser can attach neither a header nor a body to
+    a WebSocket handshake — `new WebSocket(url)` accepts a URL and a subprotocol
+    list, and nothing else:
+
+    1. the ``access_token`` cookie, sent automatically on a same-origin
+       handshake — the preferred path, and the one that keeps working across a
+       token refresh without the socket knowing anything about it;
+    2. the ``Sec-WebSocket-Protocol`` header, offered by the client as
+       ``["stockassist.auth", "<token>"]``.
+
+    **Why not `?token=`, which is the more common pattern.** It was the first
+    implementation here and it was wrong: uvicorn's access log records the
+    request line verbatim, so every handshake wrote a live 15-minute credential
+    into the container logs — and from there into whatever aggregator ships
+    them. Observed directly during the PH3.10 audit. Query strings also land in
+    proxy logs and browser history. The subprotocol header carries the same
+    value in a place nothing logs by default.
+
+    The server must echo one of the offered subprotocols or the browser closes
+    the connection, so the marker — never the token — is returned for echoing.
+    """
+    cookie_token = websocket.cookies.get(ACCESS_TOKEN_COOKIE)
+    if cookie_token:
+        return cookie_token, None
+
+    offered = [p.strip() for p in
+               (websocket.headers.get("sec-websocket-protocol") or "").split(",")
+               if p.strip()]
+    if WS_AUTH_SUBPROTOCOL in offered:
+        # Any value that is not the marker is the credential. Positional
+        # ("the second one") would break the moment a client offered a third
+        # subprotocol for an unrelated reason.
+        for value in offered:
+            if value != WS_AUTH_SUBPROTOCOL:
+                return value, WS_AUTH_SUBPROTOCOL
+    return None, None
+
+
+async def authenticate_websocket(websocket: WebSocket) -> Optional[tuple[str, Optional[str]]]:
+    """Resolve ``(user_id, subprotocol)`` for a WebSocket handshake, or ``None``.
+
+    PH3.10 (S-2, carried since PH1.9). The identity this returns is the key
+    `ConnectionManager.send_to_user` fans per-user events out on — notifications,
+    portfolio and trade-engine updates, and broker order events. Before this
+    function existed the endpoint took that key straight from
+    ``websocket.query_params["user_id"]``, so **any anonymous caller could bind
+    itself to any account** by guessing or harvesting a 24-character ObjectId and
+    then receive that account's private event stream in real time. The query
+    parameter is now ignored entirely: identity comes only from a signed token.
+
+    The credential arrives by cookie or subprotocol — see
+    `_websocket_credential` for which, and for why it is deliberately not a
+    query parameter.
+
+    Validation deliberately mirrors ``get_current_user`` exactly rather than
+    stopping at the signature: same ``expected_type="access"``, same
+    ``password_changed_at`` invalidation, same account-state check. A socket that
+    outlived a password reset, an account deletion or an admin block would
+    otherwise remain a live private-data feed for as long as it stayed open —
+    which is precisely the window those controls exist to close.
+    """
+    token, subprotocol = _websocket_credential(websocket)
+    if not token:
+        return None
+    try:
+        payload = jwt_service.decode_token(token, expected_type="access")
+    except jwt_service.TokenError:
+        return None
+
+    try:
+        user = await db.users.find_one({"_id": ObjectId(payload["sub"])})
+    except Exception:
+        return None
+    if not user or not account_is_active(user):
+        return None
+    if jwt_service.token_issued_before(payload, user.get("password_changed_at")):
+        return None
+    return str(user["_id"]), subprotocol
+
+
 @app.websocket("/api/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    """WebSocket for real-time market data and trade updates."""
-    user_id = websocket.query_params.get("user_id", "anonymous")
-    await ws_manager.connect(websocket, user_id)
+    """WebSocket for real-time market data and trade updates.
+
+    Authentication is required (PH3.10). An unauthenticated handshake is closed
+    with 1008 *before* `accept()`, so an anonymous caller never occupies a
+    connection slot, never appears in the manager's tracking maps, and never
+    reaches the subscribe/broadcast surface.
+    """
+    identity = await authenticate_websocket(websocket)
+    if identity is None:
+        obs_instruments.record_ws_connection("rejected")
+        await websocket.close(code=WS_CLOSE_POLICY_VIOLATION)
+        return
+    user_id, subprotocol = identity
+    await ws_manager.connect(websocket, user_id, subprotocol=subprotocol)
     try:
         while True:
             # Keep connection alive, listen for client messages

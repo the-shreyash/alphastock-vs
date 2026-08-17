@@ -223,10 +223,26 @@ Is this strategy viable for live trading? What are the key risks? What improveme
       {/* Results */}
       {result && !loading && (
         <div className="space-y-5">
-          {/* Data source note */}
-          {result.data_source === "synthetic" && (
-            <div className="flex items-center gap-2 text-xs p-3 rounded-xl" style={{ background: "var(--ai-accent-soft)", color: "var(--ai-accent)" }}>
-              <Info size={13} /> Using simulated historical data (yfinance unavailable). Install it with: <code className="font-mono">pip install yfinance</code>
+          {/* PH3.9 — the "simulated historical data" banner is gone, along with
+              the path that produced it. There is no longer a synthetic result
+              to warn about: when historical prices are unavailable the request
+              fails with 503 and lands in the error state above, rather than
+              returning invented trades whose win rate was drawn from a 50–80%
+              range by construction.
+
+              What replaces it is the caveat that IS true of every real run: the
+              figures are gross of charges. On Indian intraday equity, brokerage,
+              STT, exchange charges, GST, SEBI turnover fee and stamp duty
+              routinely exceed the edge on a small trade, so a positive gross
+              return here is not necessarily a profitable strategy. This is the
+              number a trader sizes a real position from. */}
+          {result.charges_note && (
+            <div className="flex items-start gap-2 text-xs p-3 rounded-xl" style={{ background: "var(--bg-surface)", color: "var(--text-secondary)" }}>
+              <Info size={13} className="mt-0.5 shrink-0" />
+              <span>
+                <b>Gross of charges.</b> {result.charges_note}
+                {result.bars ? ` Simulated over ${result.bars} real trading days.` : ""}
+              </span>
             </div>
           )}
 

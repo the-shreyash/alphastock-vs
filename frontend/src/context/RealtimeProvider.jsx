@@ -127,7 +127,26 @@ export function RealtimeProvider({ children }) {
       s.setConnection("connecting");
       let ws;
       try {
-        ws = new WebSocket(`${WS_URL}/api/ws?user_id=${userId}`);
+        // PH3.10. The socket's identity is the ACCESS TOKEN, never a user id.
+        // This used to send `?user_id=<id>`, which the server trusted as the
+        // key it fans per-user events out on — so anyone could bind to anyone
+        // else's account by supplying their id. The server now ignores that
+        // parameter entirely and derives identity from the credential below.
+        //
+        // The token rides in the subprotocol list rather than the query string:
+        // a browser cannot set headers on a WebSocket handshake, and a query
+        // string is written verbatim into server access logs, proxy logs and
+        // browser history — which for a live credential is a leak. The server
+        // echoes the `stockassist.auth` marker back (it must select one of the
+        // offered subprotocols, or the browser drops the connection).
+        //
+        // When the handshake is same-origin the `access_token` cookie already
+        // authenticates it and the server prefers that; this list is what makes
+        // a cross-origin deployment work with the localStorage token.
+        const token = localStorage.getItem("token");
+        ws = token
+          ? new WebSocket(`${WS_URL}/api/ws`, ["stockassist.auth", token])
+          : new WebSocket(`${WS_URL}/api/ws`);
       } catch {
         scheduleReconnect();
         return;

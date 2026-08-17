@@ -75,7 +75,9 @@ export default function AIQuickAction() {
   const [messages, setMessages] = useState([]); // in-memory session history
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState(false);
+  // No `error` state: failures are surfaced per-message via the `isError` flag
+  // on the assistant reply below, which is what the message list actually
+  // renders. A parallel boolean was written here and never read.
   const [sessionId] = useState(() => `quick-${Date.now()}`);
 
   const scrollRef = useRef(null);
@@ -109,7 +111,6 @@ export default function AIQuickAction() {
     if (!text || loading) return;
 
     setInput("");
-    setError(false);
     // Display the clean question; the context prefix is only sent to the AI.
     setMessages((prev) => [...prev, { role: "user", content: text }]);
     setLoading(true);
@@ -125,7 +126,6 @@ export default function AIQuickAction() {
       const reply = data?.response || "I couldn't generate a response. Please try again.";
       setMessages((prev) => [...prev, { role: "assistant", content: reply }]);
     } catch {
-      setError(true);
       setMessages((prev) => [
         ...prev,
         { role: "assistant", content: "Sorry, I ran into an issue reaching the AI. Please try again.", isError: true },

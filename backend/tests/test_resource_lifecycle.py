@@ -49,7 +49,11 @@ class FakeSocket:
         self.received = []
         self.dead = dead
 
-    async def accept(self):
+    # Signature mirrors `starlette.websockets.WebSocket.accept` (PH3.10), which
+    # `ConnectionManager.connect` now calls with the subprotocol selected by the
+    # auth handshake.
+    async def accept(self, subprotocol=None, headers=None):
+        self.accepted_subprotocol = subprotocol
         return None
 
     async def send_text(self, payload):

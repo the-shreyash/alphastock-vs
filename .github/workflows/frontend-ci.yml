@@ -1,0 +1,215 @@
+# ==============================================================================
+# StockAssist AI — Frontend CI (PH3.10)
+#
+# WHAT PROBLEM THIS SOLVES
+# ------------------------
+# Nothing in CI has ever built or tested the frontend. `backend-ci` covers the
+# backend, `docker-build` covers the backend image, `dependency-audit` and
+# `codeql` read frontend *dependencies* and *source* but never execute either.
+# So the repository had 395 passing frontend tests and a production build that
+# nobody ran.
+#
+# The consequence was not hypothetical. Commit 930432d (2026-08-03) added
+# `frontend/.eslintrc.json` with `extends: ["react-app"]` without adding
+# `eslint-config-react-app` to the project's dependencies. `npm run build`
+# failed from that commit onward — there was no deployable frontend artifact for
+# fourteen days — and it was found by the PH3.10 production audit rather than by
+# a pipeline, because no pipeline was looking. That is the exact class of defect
+# a build gate exists to catch, and it is invisible to every other check in this
+# repository: the tests pass (jest does not run the ESLint webpack plugin), the
+# dependency audit passes (the package is missing, not vulnerable), and CodeQL
+# passes (the source is fine).
+#
+# JOB LAYOUT — mirrors backend-ci deliberately, including the aggregate gate, so
+# a contributor reading one pipeline can read both.
+#
+#     ┌────────────┐  ┌────────────┐
+#     │    test     │  │   build    │      (parallel)
+#     │  jest, CI   │  │ production │
+#     │  mode       │  │ bundle     │
+#     └─────┬───────┘  └─────┬──────┘
+#           └────────────────┘
+#                    ▼
+#             ┌────────────┐
+#             │ frontend-ci│   ← the single required status check
+#             └────────────┘
+#
+# BOTH JOBS ARE BLOCKING. The build either produces a deployable artifact or it
+# does not, and there is no version of "ship anyway". ESLint *warnings* are the
+# one advisory signal, for the reason spelled out on the build step: this tree
+# carries 62 of them today, and a gate that is red on arrival teaches everyone
+# to ignore red — the same adoption model, and the same reasoning, as
+# backend-ci.yml's formatting checks.
+#
+# Full documentation: docs/deployment/GITHUB_ACTIONS.md
+# ==============================================================================
+name: frontend-ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# No `paths:` filter, for the reason documented at length in backend-ci.yml: a
+# path-filtered required check that never starts reports "Expected — waiting for
+# status" forever and blocks the PR with no way to clear it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: "20"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. TEST — the jest suite, in CI mode
+  # ---------------------------------------------------------------------------
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      # `npm ci`, never `npm install`: it installs exactly the lockfile and
+      # fails if package.json and the lock disagree. That disagreement is
+      # precisely how the eslint-config-react-app defect above would have been
+      # reintroduced, so the stricter command is load-bearing here.
+      #
+      # --legacy-peer-deps matches how this tree is installed locally: the
+      # project pins eslint 9 for editor use while react-scripts 5 carries its
+      # own nested eslint 8 toolchain, and npm's strict peer resolution refuses
+      # that combination. Removing this flag requires migrating off CRA — see
+      # the PH3.10 audit report, deferred items.
+      - name: Install dependencies
+        run: npm ci --legacy-peer-deps
+
+      - name: Run tests
+        env:
+          CI: "true"
+        run: npm test -- --watchAll=false
+
+  # ---------------------------------------------------------------------------
+  # 2. BUILD — the production bundle
+  # ---------------------------------------------------------------------------
+  build:
+    name: Production build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci --legacy-peer-deps
+
+      # CI IS DELIBERATELY UNSET FOR THIS STEP — read before "fixing" it.
+      #
+      # `CI=true` makes react-scripts treat ESLint warnings as errors. Turning
+      # it on today fails the build on 62 pre-existing warnings across 20 files
+      # (59 `no-unused-vars`, 3 `react-hooks/exhaustive-deps`), none of which
+      # affects the emitted bundle. That is the same situation the backend faced
+      # with black/isort/flake8, and `backend-ci.yml` records the reasoning at
+      # length: a gate that is red on arrival trains everyone to ignore red,
+      # which is worse than having no gate. Clearing the backlog is a 20-file
+      # sweep that belongs in its own reviewed change, not smuggled into the
+      # commit that introduces the pipeline.
+      #
+      # The gate is still meaningful without it. The defect that motivated this
+      # workflow — a missing `eslint-config-react-app` making ESLint unable to
+      # load its config — is a *compile failure*, not a warning, and fails this
+      # step either way. That was confirmed against the broken tree before it
+      # was fixed. Warnings are counted below and reported, so the backlog is
+      # visible and can only shrink.
+      #
+      # To tighten this later: clear the 62 warnings, then set CI: "true" here.
+      - name: Build
+        env:
+          # The bundle is compiled against whatever origin the deployment sets;
+          # a placeholder keeps the build deterministic without baking a real
+          # host into a CI artifact that is never deployed.
+          REACT_APP_BACKEND_URL: "https://ci.invalid"
+        run: |
+          set -o pipefail
+          npm run build 2>&1 | tee build.log
+
+      # Advisory, like the backend's format/lint steps: report the number so it
+      # is impossible to miss and impossible to trip over.
+      - name: Lint warnings (advisory)
+        if: always()
+        run: |
+          count=$(grep -cE '^\s+Line [0-9]+' build.log || true)
+          echo "### Frontend build" >> "$GITHUB_STEP_SUMMARY"
+          echo "ESLint warnings: **${count}** (baseline at PH3.10: 62)" >> "$GITHUB_STEP_SUMMARY"
+          if [ "${count:-0}" -gt 62 ]; then
+            echo "::warning::ESLint warnings rose to ${count} (PH3.10 baseline 62)."
+          fi
+
+      # Assert the ARTIFACT, not the exit code. `react-scripts build` has
+      # historically exited 0 while emitting an unusable tree; checking that an
+      # entrypoint and hashed assets actually exist is the difference between
+      # "the command finished" and "there is something to deploy".
+      - name: Verify the artifact exists
+        run: |
+          set -euo pipefail
+          [ -f build/index.html ] || { echo "::error::no build/index.html"; exit 1; }
+          js=$(find build/static/js -name '*.js' | wc -l)
+          [ "$js" -gt 0 ] || { echo "::error::no JS bundles emitted"; exit 1; }
+          echo "✓ artifact present: index.html + ${js} JS bundle(s), $(du -sh build | cut -f1) total"
+
+      # Nothing consumes this yet — there is no frontend image and no CD (PH2
+      # certification, open findings H4/H5). Keeping it means a failed deploy
+      # can be compared against the exact bytes CI produced.
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-build-${{ github.sha }}
+          path: frontend/build
+          retention-days: 7
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # 3. AGGREGATE — one check name for branch protection to require
+  # ---------------------------------------------------------------------------
+  frontend-ci:
+    name: frontend-ci
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [test, build]
+    # `if: always()` so this job runs even when a dependency FAILED — without it
+    # the aggregate is skipped, and a skipped required check is reported to
+    # branch protection as neutral rather than failing, which un-gates the very
+    # thing it exists to gate.
+    if: always()
+    steps:
+      - name: Verify every required job succeeded
+        run: |
+          set -euo pipefail
+          test='${{ needs.test.result }}'
+          build='${{ needs.build.result }}'
+          printf 'test=%s build=%s\n' "$test" "$build"
+          for r in "$test" "$build"; do
+            [ "$r" = "success" ] || { echo "::error::frontend-ci gate failed — a required job did not succeed."; exit 1; }
+          done
+          echo "✓ frontend CI green"

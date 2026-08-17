@@ -260,7 +260,9 @@ Application variables (`MONGO_URL`, `JWT_SECRET`, `CORS_ALLOWED_ORIGINS`, …) a
 > - N workers fire every scheduled job **N times** (N morning reports, N EOD emails);
 > - a WebSocket broadcast reaches only the clients attached to the *publishing* worker.
 >
-> Until fan-out moves to Redis and a single scheduler leader is elected (**PH2.8**), more than one worker is a **correctness bug, not a performance win**. Scale with additional container replicas behind a load balancer (with sticky sessions for WebSockets), not with workers.
+> **PH3.10 correction — replicas are not a workaround.** This paragraph previously said to scale with additional container replicas instead of workers. That is wrong and unsafe. WebSocket fan-out *was* moved to Redis in PH2.7, but **no scheduler leader is elected**: `server.py` calls `setup_scheduler()` unconditionally at startup, so every replica runs the full cron set — including `trade_monitor`, which runs every 60 s during market hours and calls `trading_engine.run_cycle` to place **real broker exit orders** on stop-loss and target hits. Two processes means two exit orders for one position, in a live brokerage account.
+>
+> Until a single-leader scheduler ships, the supported production topology is **exactly one backend process: one worker, one replica.** Horizontal scaling is blocked on leader election, not on load balancing.
 >
 > The entrypoint warns loudly rather than silently capping — the operator stays in control, but cannot claim they were not told.
 

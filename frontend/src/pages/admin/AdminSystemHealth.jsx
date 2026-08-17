@@ -46,23 +46,53 @@ export default function AdminSystemHealth() {
         <GaugeCard icon={HardDrive} label="Disk" value={sys.disk_percent || 0} unit="%" color="#EC4899" detail={`${sys.disk_used_gb || 0} / ${sys.disk_total_gb || 0} GB`} />
       </div>
 
-      {/* Service Status */}
+      {/* Service Status.
+          PH3.9: Redis and Scheduler used to be literals. Redis read
+          "not_configured" from before PH2.7 shipped a Redis client, so a
+          working Redis reported as absent; Scheduler was the constant "running"
+          and stayed "running" after the scheduler died — green exactly when it
+          needed to be red. Both now come from real probes. */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
         <ServiceCard name="MongoDB" status={health?.mongodb?.status} details={[
-          { label: "Collections", value: health?.mongodb?.collections || 0 },
-          { label: "Data Size", value: `${health?.mongodb?.data_size_mb || 0} MB` },
-          { label: "Storage", value: `${health?.mongodb?.storage_size_mb || 0} MB` },
+          { label: "Collections", value: health?.mongodb?.collections ?? 0 },
+          { label: "Data Size", value: `${health?.mongodb?.data_size_mb ?? 0} MB` },
+          { label: "Storage", value: `${health?.mongodb?.storage_size_mb ?? 0} MB` },
         ]} icon={Database} />
-        <ServiceCard name="Redis" status={health?.redis?.status} details={[
-          { label: "Status", value: health?.redis?.status || "—" },
+        <ServiceCard name="Redis" status={health?.redis?.status} note={health?.redis?.note} details={[
+          { label: "Probe", value: health?.redis?.source ? "live" : "none" },
+          ...(health?.redis?.duration_ms !== undefined
+            ? [{ label: "Latency", value: `${health.redis.duration_ms} ms` }] : []),
         ]} icon={Database} />
         <ServiceCard name="WebSockets" status={health?.websockets?.status} details={[
-          { label: "Active", value: health?.websockets?.active_connections || 0 },
+          { label: "Active", value: health?.websockets?.active_connections ?? 0 },
         ]} icon={Wifi} />
         <ServiceCard name="Scheduler" status={health?.scheduler?.status} details={[
-          { label: "Status", value: health?.scheduler?.status || "—" },
+          { label: "Jobs", value: health?.scheduler?.jobs ?? 0 },
         ]} icon={Activity} />
       </div>
+
+      {/* Every registered readiness probe, so a failing dependency that has no
+          card of its own is still visible rather than averaged away. */}
+      {health?.dependencies && Object.keys(health.dependencies).length > 0 && (
+        <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className="p-5 rounded-2xl"
+                    style={{ background: "var(--bg-card-glass)", backdropFilter: "blur(24px)", border: "1px solid var(--border)" }}>
+          <h3 className="card-title mb-3">Dependency Probes</h3>
+          <div className="space-y-2">
+            {Object.entries(health.dependencies).map(([name, probe]) => (
+              <div key={name} className="flex items-center justify-between">
+                <span className="text-xs" style={{ color: "var(--text-secondary)" }}>
+                  {name}{probe.critical ? "" : " (non-critical)"}
+                </span>
+                <span className="text-xs font-mono font-semibold"
+                      style={{ color: probe.healthy === true ? "#00D68F"
+                        : probe.healthy === false ? "#FF6B6B" : "var(--text-muted)" }}>
+                  {probe.healthy === null ? "not configured" : probe.status} · {probe.duration_ms} ms
+                </span>
+              </div>
+            ))}
+          </div>
+        </motion.div>
+      )}
 
       {/* Platform Info */}
       <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className="p-5 rounded-2xl" style={{ background: "var(--bg-card-glass)", backdropFilter: "blur(24px)", border: "1px solid var(--border)" }}>
@@ -99,10 +129,24 @@ function GaugeCard({ icon: Icon, label, value, unit, color, detail }) {
   );
 }
 
-function ServiceCard({ name, status, details, icon: Icon }) {
-  const color = status === "healthy" || status === "running" ? "#00D68F" : status === "not_configured" ? "#F59E0B" : "#FF6B6B";
+/** `not_configured` and `not_measured` are grey, not amber and not green.
+ *  An unconfigured Redis is a valid deployment (services/cache.py falls back to
+ *  an in-process dict), so it is not a fault — and it is not a green light
+ *  either. "We are not watching this" deserves its own colour. */
+const SERVICE_COLORS = {
+  healthy: "#00D68F",
+  running: "#00D68F",
+  degraded: "#FFB224",
+  unhealthy: "#FF6B6B",
+  stopped: "#FF6B6B",
+  not_configured: "#6B7280",
+  not_measured: "#6B7280",
+};
+
+function ServiceCard({ name, status, details, icon: Icon, note }) {
+  const color = SERVICE_COLORS[status] || "#6B7280";
   return (
-    <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className="p-5 rounded-2xl" style={{ background: "var(--bg-card-glass)", backdropFilter: "blur(24px)", border: "1px solid var(--border)" }}>
+    <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className="p-5 rounded-2xl" title={note} style={{ background: "var(--bg-card-glass)", backdropFilter: "blur(24px)", border: "1px solid var(--border)" }}>
       <div className="flex items-center justify-between mb-3">
         <div className="flex items-center gap-2">
           <Icon size={16} style={{ color: "var(--text-muted)" }} />

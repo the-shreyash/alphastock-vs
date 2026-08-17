@@ -1425,36 +1425,73 @@ Every deployment should be backed by automated tests, performance benchmarks, se
 
 ---
 
-## Analytics testing, as built (PH3.8)
+## Analytics testing, as built (PH3.8 audit → PH3.9 removal)
 
-Counts as of 2026-08-16: **backend 2,429 passed / 6 xfailed** (was 2,303),
-**frontend 375 passed / 21 suites** (was 364 / 20).
+Counts as of 2026-08-16: **backend 2,534 passed / 4 xfailed** (2,303 pre-PH3.8,
+2,425 post-PH3.8), **frontend 395 passed / 22 suites** (364 → 375 → 395).
 
 | Suite | Tests | Covers |
 |---|---:|---|
-| `backend/tests/test_analytics.py` (**new**) | **122** | IST window resolution and the 05:30 boundary, the metric contract's construction-time invariants, the inventory's structural integrity, trade-scoping filters, ten reproduced financial defects, data-quality checks, empty/single/multi datasets, and analytics authorization |
-| `frontend/src/pages/__tests__/AdminAnalytics.test.jsx` (**new**) | **11** | That fabricated metrics render marked, that genuinely derived ones do not, that the marker degrades safely, and that no growth figure is invented in the frontend |
-| `backend/tests/test_perf_regression.py` (extended) | +4 rows | The four analytics query shapes are index-covered |
+| `backend/tests/test_analytics.py` | **154** | IST window resolution and the 05:30 boundary, the metric contract's construction-time invariants, the inventory's structural integrity, trade-scoping filters, ten reproduced financial defects, data-quality checks, analytics authorization — and, since PH3.9, `TestAdminAnalyticsMockRemoval`, the endpoint-level proof that each fabricated metric is gone |
+| `backend/tests/test_ph39_mock_removal.py` (**new**) | **75** | The units PH3.9 added — `analytics.sources`, `analytics.platform_health`, `periods.preceding` — plus counter-tests naming each removed formula, authorization and tenant isolation on the new sources, and query-cost bounds |
+| `backend/tests/test_backtesting.py` (**rewritten**) | 11 | Missing history → 503, never a fabricated 200; and the real simulation exercised against a deterministic in-test price series |
+| `frontend/src/pages/__tests__/AdminAnalytics.test.jsx` (**rewritten**) | 20 | That no fabricated metric renders, that `null` never renders as `0`, that a real `0` still does, and that a failed load is not an empty platform |
+| `frontend/src/components/__tests__/Unavailable.test.jsx` (**new**) | 10 | The `null` vs `0` rule at the component that owns it |
+| `backend/tests/test_perf_regression.py` (extended) | +5 rows | The analytics query shapes are index-covered, including PH3.9's `sessions {last_used_at, user_id}` |
 
 ### What these assert that ordinary coverage does not
 
-**That the mocks are still labelled.** PH3.8 deliberately did not remove
-seventeen fabricated metrics, so the marker is the only thing between an
-operator and a set of invented business numbers. `TestAdminAnalyticsContract`
-and the frontend suite hold it in place. If a future change strips the
-`mock_metrics` array or the "Simulated" badge, the suite goes red — which is
-the point of flagging rather than deleting.
+**That no fabricated metric can come back.** PH3.8's suite held a "Simulated"
+marker in place over seventeen invented metrics. PH3.9 removed them, so the
+assertion inverted: `test_no_metric_is_classified_mock` requires the registry's
+MOCK count to be zero, and a parametrised sweep over every admin analytics route
+walks the whole payload rejecting `provenance: "mock"` anywhere in it.
 
-**That the inventory cannot drift.** `TestRegistry` asserts every endpoint named
-in `analytics/registry.py` exists on the **live route table**, that every entry
-is structurally complete, and that every MOCK entry names the production source
-that would replace it. A markdown table would have been accurate on the day it
-was written and wrong thereafter.
+**Each removed formula by name.** A test that only checks "the field is not
+mock-flagged" goes green the moment somebody reinstates the formula and forgets
+the flag — which is how these numbers reached production in the first place. So
+each counter-test *names the old arithmetic* and seeds data chosen to make the
+old answer and the new answer unmistakably different: three payment documents so
+the old `count × ₹499` would answer 1497; two pro users and one elite so the old
+`role count × price` would answer 1997; three signups today and two *different*
+users active, so DAU-as-signups answers 3 where the truth is 2.
+
+**That `null` does not become `0` on the way to a screen.** The backend change is
+undone by a single `{stats?.mrr || 0}` — it renders `₹0` in the same typeface,
+weight and colour as a measured figure, and nothing fails. The frontend tests
+therefore assert **the absence of `₹0`** rather than the presence of an em-dash,
+and `Unavailable.test.jsx` pins the rule at the component: `0` renders as `0`,
+`false` renders as `false`, `null` and `undefined` render as unavailable, and the
+formatter is never called with an absent value.
+
+**That the inventory cannot drift, and neither can the record of the removal.**
+`TestRegistry` asserts every endpoint named in `analytics/registry.py` exists on
+the **live route table**, that every entry is structurally complete, that every
+UNAVAILABLE entry names the production source that would answer it, and that all
+seventeen PH3.8 mocks carry a `ph39_resolution` saying what happened to them.
+
+**Guarantees at the layer that provides them.** The retention-horizon gate is a
+property of `analytics.sources.active_users`, not of an HTTP route, so it is
+tested there — including that it *self-corrects* when the refresh TTL is raised.
+This follows PH3.8's own method note: three of its suites "found" a HIGH defect
+that did not exist because they asserted a guarantee at the wrong layer.
 
 **Wrong values by name, not just right ones.** Where the old behaviour was a
 specific wrong number, the test asserts the right one *and* names the wrong one
 in a comment — "pre-PH3.8 this reported +8,500 at a 50% win rate". A regression
 is then legible in the failure output rather than requiring archaeology.
+
+### A green suite that was testing nothing
+
+`test_backtesting.py` is worth its own note. `yfinance` is not installed in this
+venv, so before PH3.9 every one of its assertions ran against
+`_synthetic_backtest` — "win rate is between 0 and 100" passed because a random
+number between 10 and 16 out of 20 is, and "equity_curve is a list of
+{date, capital}" passed against invented 2025 dates. Five green tests, zero
+coverage of the strategy engine. The rewrite drives the real simulation through a
+stub `yfinance` module over a deterministic sawtooth, so the metric assertions
+have known correct answers, and adds the case the old suite could not express:
+missing history must fail.
 
 ### One harness defect worth carrying forward
 
@@ -1466,6 +1503,65 @@ presented exactly like an application defect. The helper now creates a private
 loop and restores the previous policy state, so it neither inherits the problem
 nor exports it to whatever runs next. Bare `asyncio.run()` would have done the
 latter: it leaves the policy's current loop set to `None`.
+
+---
+
+## Security testing, as built (PH3.10 final audit)
+
+Counts as of 2026-08-17: **backend 2,559 passed / 4 xfailed** (was 2,534),
+**frontend 395 passed / 22 suites** (unchanged). Full report:
+`docs/production/PH3.10_FINAL_PRODUCTION_AUDIT.md`.
+
+| Suite | Tests | Covers |
+|---|---:|---|
+| `backend/tests/test_ws_authentication.py` (**new**) | **17** | WebSocket handshake authentication, identity binding, credential transport, account state at handshake |
+| `backend/tests/test_account_blocking.py` (**new**) | **8** | Administrative block enforced at every identity point; reversibility; enumeration resistance |
+
+### The gap these suites close, and why it survived nine sprints
+
+`/api/ws` bound its per-user event delivery key to an **unauthenticated query
+parameter**. Any anonymous caller could receive any account's private realtime
+stream. It survived PH1 (which scoped WebSocket authorization out as "PH1.9(rt)"),
+PH2 (infrastructure), and PH3.3's 201-route authorization sweep.
+
+**PH3.3's sweep is the instructive one, because it is a genuinely good technique
+that could not have caught this.** It classifies routes by resolved dependency
+graph — deliberately not by URL — and parametrises anonymous-rejection and
+forged-token tests over the result. But it iterates `server.app.routes` filtering
+`isinstance(route, APIRoute)`, and a WebSocket route is a `WebSocketRoute`. The
+one endpoint in the application with no authorization was the one endpoint the
+authorization sweep structurally could not see.
+
+**Rule to carry forward: a mechanical sweep must state what it does not cover.**
+`tests/_routes.py` guards against its derived lists going empty, which is the
+right instinct; the missing guard is one asserting that the union of classified
+routes equals the application's *entire* route table, so a route of an unhandled
+type fails the suite instead of vanishing from it.
+
+### Two test-design points worth keeping
+
+**Non-vacuity was verified, not assumed.** The new WebSocket suite was run against
+the pre-fix `server.py` restored from `HEAD`. It did not fail — it *hung*, because
+the anonymous connect succeeded and then blocked awaiting a frame that never came.
+A suite that hangs against the broken code is proving something; a suite that
+passes against it is proving nothing. Worth checking explicitly whenever a test is
+written after the fix.
+
+**A test double that diverges from the real interface is a latent false pass.**
+Adding the `subprotocol` argument to `ConnectionManager.connect` broke 14 tests
+across three files whose `FakeWS.accept()` took no arguments — the doubles had
+never matched `starlette.websockets.WebSocket.accept`. That is the same
+stub-agrees-with-bug pattern PH2.12 found hiding a silent no-op rollback. All
+three doubles now mirror the real signature and record the selected subprotocol
+rather than discarding it.
+
+### Frontend CI
+
+`frontend-ci.yml` (PH3.10) is the first workflow to execute the frontend at all.
+Before it, 395 passing tests and a production build that had been failing for
+fourteen days both reported green, because nothing ran either. Both jobs are
+blocking; ESLint warnings are advisory against a baseline of 62, following the
+adoption model `backend-ci.yml` documents.
 
 ---
 

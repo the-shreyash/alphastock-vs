@@ -292,6 +292,18 @@ class TestIndexCoverage:
         # PH3.8 replaced the regex with a range comparison an index can serve.
         ("users", ("created_at",), None, "GET /api/admin/dashboard signups"),
         ("chat_messages", ("created_at",), None, "GET /api/admin/dashboard AI requests"),
+        # PH3.9 — the DAU query. Daily active users now come from real session
+        # activity instead of today's signup count relabelled, which means a
+        # range match on `last_used_at` followed by a distinct-user grouping.
+        #
+        # None of the three pre-existing sessions indexes can serve it:
+        # `session_id` and `user_id` do not constrain the field, and the
+        # `expires_at` TTL index is on a different one. Without this index every
+        # admin analytics load is a full scan of a collection that grows with
+        # logins-per-user rather than with users — the growth shape that looks
+        # fine in development forever and then does not.
+        ("sessions", ("last_used_at",), "user_id",
+         "GET /api/admin/analytics/users DAU"),
     ]
 
     @pytest.mark.parametrize(

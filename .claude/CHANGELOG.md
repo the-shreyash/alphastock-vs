@@ -5,6 +5,246 @@ This file records documentation-system versions and, from v1.0 launch onward, pr
 
 ---
 
+# Sprint PH3.10 — Final Production Audit — 2026-08-17
+
+**Report:** `docs/production/PH3.10_FINAL_PRODUCTION_AUDIT.md`
+**Recommendation:** **GO TO PH3.11** on seven conditions.
+**Matrix:** 24 PASS · 8 PASS WITH CONDITIONS · 3 BLOCKED · 0 FAIL (35 categories).
+
+An audit-and-verification sprint. Every category was verified **against the
+current tree and a live production container**, not against prior completion
+reports — those were read only to establish what had been claimed, so divergence
+could be found.
+
+## P0 — found, fixed, verified live
+
+**1. `/api/ws` had no authentication.** The endpoint took the identity it fans
+per-user events out on directly from an unauthenticated query parameter:
+
+```python
+user_id = websocket.query_params.get("user_id", "anonymous")
+await ws_manager.connect(websocket, user_id)
+```
+
+`ConnectionManager.send_to_user` is the delivery path for notifications, per-user
+portfolio and trade-engine events, and broker order updates. Any anonymous client
+could connect as `wss://host/api/ws?user_id=<victim>` and read that account's
+private realtime stream. **Reproduced against the production container** before
+the fix.
+
+Authentication is now required and resolved **before `accept()`**, so a rejected
+caller never occupies a connection slot or enters a tracking map. Identity is the
+verified `sub` of a valid access token; `user_id` is ignored entirely. Validation
+mirrors `get_current_user` — same token type, same `password_changed_at` kill
+switch, same account-state check — because a socket is a long-lived private feed
+and a password reset must close it.
+
+**The credential moved off the query string mid-fix.** The first implementation
+used `?token=`; the live container then showed uvicorn logging the request line
+verbatim, writing a live 15-minute credential into container logs on every
+handshake. It now travels by `access_token` cookie or `Sec-WebSocket-Protocol`,
+and the query-string transport is explicitly rejected by a regression test.
+
+*Not a new regression* — tracked as "S-2" since PH1.9, deferred, never scheduled.
+PH1 certified security with it open because PH1 scoped WebSocket authorization
+out. PH3.3's 201-route authorization sweep could not see it: the sweep iterates
+`server.app.routes` filtering `isinstance(route, APIRoute)`, and a WebSocket route
+is a `WebSocketRoute`. **The one endpoint with no authorization was the one the
+authorization sweep structurally could not reach.**
+
+**2. The frontend had not built since 2026-08-03.** Commit `930432d` added
+`frontend/.eslintrc.json` extending `react-app` without adding
+`eslint-config-react-app` to the project's dependencies — npm had nested it under
+`react-scripts/node_modules` (the project pins eslint 9; the config peer-requires
+eslint 8), so ESLint could not resolve it from the project root. `npm run build`
+exited 1 for fourteen days and `frontend/build/` held a single stray `logo.svg`.
+Fixed by adding the exact dependency; build now exits 0 with 48 JS bundles.
+
+## P1 — found, fixed
+
+**3. No CI coverage of the frontend** — the reason (2) stayed invisible. Nothing
+had ever built or tested it: `backend-ci` covers the backend, `docker-build` the
+backend image, `dependency-audit`/`codeql` read frontend files without executing
+them. So 395 passing tests and a completely broken build both reported green.
+`frontend-ci.yml` added, mirroring the backend's structure including the single
+aggregate check name for branch protection.
+
+**4. Administrative account blocking did nothing.** `POST /api/admin/users/{id}/block`
+wrote `blocked: True`, wrote an audit record, and drove the admin list's filter —
+but **no authentication path ever read the flag**. A blocked user's tokens kept
+working, their refresh token kept minting new access for seven more days, and they
+could log straight back in, while the console reported success. Same shape as the
+PH3.3 refund stub, and worse: it is the control an operator reaches for during an
+active incident. Fixed with one predicate read at all four identity points, so a
+block takes effect within the access token's 15-minute life. The check runs
+*after* the password comparison so it cannot become an enumeration oracle.
+
+**5. `react-router` open redirect in the shipped bundle** (high severity, via
+backslash in `<Link>`/`useNavigate`). Patched 7.17.0 → 7.18.2, non-breaking.
+
+**6. "Scale with replicas" guidance would have duplicated live broker orders.**
+Four files told operators to scale with replicas rather than workers.
+`server.py` calls `setup_scheduler()` unconditionally with **no leader election**
+(verified: no advisory lock, no `SETNX`, no leader anywhere), so a replica is
+another process running `trade_monitor` — which fires every 60 s during market
+hours and places **real broker exit orders**. Two processes, two exit orders, one
+position, real money. Redis pub/sub (PH2.7) fixed the *WebSocket* half of
+multi-process, which is likely why replicas looked safe; the scheduler half was
+never addressed. All four corrected; the boot warning now names the consequence.
+
+## Standing constraint
+
+**The platform supports exactly one backend process** (1 worker, 1 replica).
+Horizontal scaling is blocked on leader election, not load balancing.
+
+## Regression
+
+Backend **2,534 → 2,559 passed** (+25 new), 4 xfailed, **0 failed**. Frontend
+**395 passed / 22 suites**, unchanged. Production build green. Container builds,
+boots healthy in **0.68 s**, connects to authenticated Mongo (62 indexes) and
+Redis, and shuts down cleanly in 1–2 s with exit 0, releasing every resource.
+
+**14 test failures were introduced and fixed within the sprint:** adding the
+`subprotocol` argument to `ConnectionManager.connect` broke three WebSocket
+doubles whose `accept()` had never matched Starlette's real signature — the
+stub-agrees-with-bug pattern PH2.12 identified. All three now mirror the real
+interface.
+
+No trading logic, AI decision logic, prompt, model selection, rate-limit policy or
+API contract was changed. One intentional behaviour change: an unauthenticated
+WebSocket handshake is refused.
+
+## Still BLOCKED — unbuilt capabilities, not defects
+
+Email delivery (simulated), off-host backup copy, and therefore disaster recovery
+for host loss. Each carries forward from PH2.12 unchanged. Classified BLOCKED
+rather than complete: scripts and runbooks existing is not the same as the
+capability being operational.
+
+---
+
+# Sprint PH3.9 — Mock Removal & Production Data Integrity — 2026-08-16
+
+**Full report:** `docs/architecture/ANALYTICS.md` §11 — what happened to each of
+the seventeen, the three departures from the PH3.8 inventory, and the two
+labelling rules the counter-backed metrics now enforce.
+
+**Numbering.** Same brief-label drift as PH3.2–PH3.8. This delivers the *removal*
+half of roadmap **PH3.2 — Mock Data Eradication**, whose audit half shipped
+yesterday under the label "PH3.8". This repository's roadmap PH3.9 is *End-to-End
+Critical Journeys* — untouched.
+
+**There are no MOCK metrics left in the product: 17 → 0.** Totals moved from
+4 REAL / 26 DERIVED / 17 MOCK / 5 UNAVAILABLE to **4 / 32 / 0 / 17**. Six became
+real numbers, eleven became explicit UNAVAILABLE. `test_no_metric_is_classified_
+mock` asserts the zero and `test_every_ph38_mock_records_what_ph39_did_to_it`
+names all seventeen, so neither the removal nor its record can drift.
+
+**The rule that governed the sprint: never replace mock data with fake realistic
+data.** Its sharpest application is that **revenue is gated on whether a payment
+integration exists, not on whether `db.payments` is empty.** Gating on emptiness
+is how the first stray document flips revenue back to "available" and reports it
+as fact — the same defect PH3.8 found (`count(payments) × ₹499` read ₹0 only
+because nothing had ever been written), in a new implementation. The gate is one
+named predicate, `analytics.sources.payments_integration()`, so wiring a provider
+is a single reviewed edit. The aggregation behind it is **written and tested
+now**, including that `created`/`pending`/`authorized` are intents rather than
+revenue — the classic revenue-reporting bug, much cheaper to pin before any money
+exists than to discover from a finance discrepancy.
+
+**Three of PH3.8's own recommendations were wrong, and following them would each
+have replaced a fabricated number with a systematically wrong one** — worse,
+because a wrong number that came from a real query is far harder to spot.
+**(1) MAU.** The inventory prescribed a 30-day distinct-user query over
+`db.sessions`. That collection has a TTL index deleting a session one refresh
+lifetime after last use — **seven days by default** — so the query returns a
+7-day count under a 30-day label, undercounting more the longer ago a user
+churned. `active_users` checks the window against the retention horizon and
+refuses it; raise `JWT_REFRESH_TTL_SECONDS` past thirty days and the same call
+starts answering. **(2) API health.** "Rewire" could not apply to the row list:
+it named *vendors* (Yahoo Finance, Alpha Vantage) with individual latencies, and
+the Market Gateway deliberately hides which upstream served a request
+(`MARKET_DATA_ARCHITECTURE.md`), which is why `instruments.PROVIDERS` is a closed
+vocabulary of logical providers. Only `market_data` and `news` have call sites;
+the rest report `not_measured` rather than a green badge. **The Razorpay row was
+deleted outright** — `status: "configured"` beside a 300ms latency for an
+integration that exists nowhere in the codebase. **(3) AI requests today.**
+Rewiring it to `ai_requests_total` would trade a durable database count for an
+in-process counter that resets on every deploy and covers one worker of N. It was
+**renamed** to `chat_messages_today` instead — what it always counted, both turns,
+so it overstated provider calls by ~2×. The value was right; the name was a claim
+it could not support.
+
+**Two labelling rules the honest sources forced, both enforced by tests.**
+Counters are process-scoped, so every counter-derived field is named
+`*_since_start` and ships a `scope` block — a test asserts no field produced by
+`analytics.platform_health` contains the substring `today`. And latency is a
+**p95 bucket bound, never a mean**: ninety-nine 10ms calls and one 10s call
+average to 110ms and every dashboard looks calm. No traffic reads `None`, never
+`0` — "instantaneous" and "never measured" are opposite facts.
+
+**The most dangerous removal was not an admin number.** `_synthetic_backtest`
+generated 20 invented trades with the win count drawn from `randint(10, 16)`, so
+**the win rate was always 50–80% and a losing strategy could not be
+represented** — then passed them through the *same* `_compute_metrics` as the
+real path, so the Sharpe ratio, drawdown and return arrived looking like measured
+statistics in the same UI cards. It was reached on **any** yfinance failure, so a
+transient network blip produced flattering fabricated performance rather than an
+error. A fabricated backtest is investment advice built on noise. Deleted; the
+endpoint answers **503** (retryable upstream gap, not a server fault).
+
+**D-4 fixed, carried since PH3.5.** `POST /api/admin/payments/{id}/refund`
+returned `{"success": true}` for any string while writing `payment.refunded` to
+the immutable audit log. The audit half is the worse one: a log containing
+invented events is not a weaker audit log, it is a misleading one. Now **501,
+and no audit record.** The two `xfail`s PH3.5 left expecting 404/400 were written
+assuming PH3.9 would *implement* refunds; it removed the lie instead, which is
+correct while no provider exists, so they are replaced with real assertions
+rather than left to report a misleading XPASS.
+
+**Five further defects found and fixed** (ANALYTICS.md §13.1): the Razorpay
+phantom integration; the backtest fallback catching every exception; `api_health`
+and `server_health` as literals reading "healthy" during a total outage (the
+former deleted, the latter now `"serving"` — the only claim a health field served
+*by* a process can honestly make about it); seven feature rows reporting
+`usage_count: 0` as a literal for features nothing measures (deleted, not zeroed
+— "0 uses" is a measurement claim); and a per-user AI cost rendered with a dollar
+sign over an INR-denominated product.
+
+**The frontend is where this sprint could have been silently undone.** `null`
+arrives from the backend and one `{stats?.mrr || 0}` turns it into `₹0` in the
+same typeface, weight and colour as a measured figure, with no test failing. So
+every admin metric routes through a single `MetricValue` component, and the tests
+assert **the absence of `₹0`** rather than the presence of an em-dash. The
+converse is asserted too: a genuine `0` still renders as `0`, because "nobody
+signed up today" is a measurement and suppressing it is the same defect reversed.
+Charts are **empty rather than flat at zero** — thirty points at ₹0 still claims
+we measured thirty days.
+
+**New: one index and two modules.** `sessions {last_used_at, user_id}` serves the
+DAU query, which none of the three existing sessions indexes could
+(`session_id`/`user_id` do not constrain the field; the `expires_at` TTL index is
+on a different one) — without it every admin analytics load is a full scan of a
+collection that grows with logins-per-user. Pinned in `HOT_QUERIES`. Query costs
+are **counted in tests, not assumed**: DAU is 1 query flat in session count,
+growth is 2, and every revenue metric is **0** because the gate short-circuits
+before touching the database.
+
+**Tests: +109 backend (2,425 → 2,534 green), +20 frontend (375 → 395 green).**
+PH1 security regression **452 passed, unchanged**. Production frontend build
+clean. Static mock scan reviewed: every remaining match is a comment describing a
+removal, the retained `MOCK` contract vocabulary, retry jitter, a request-id
+generator, or a test fixture.
+
+**Remaining unavailable, with owners:** everything revenue-shaped is one payment
+integration (MRR/ARR additionally need subscription records — a one-off capture is
+not recurring revenue). Retention, MAU and feature adoption need a durable
+activity or event stream; **none of the three is back-fillable** — an event never
+written cannot be reconstructed. AI cost needs token accounting. Profit factor
+and net P&L need per-fill broker charges.
+
+---
+
 # Sprint PH3.8 — Analytics & Data Integrity — 2026-08-16
 
 **Full report:** `docs/architecture/ANALYTICS.md` — the architecture, the complete
@@ -731,7 +971,7 @@ silently vanish and report green.
 | ID | Sev | Defect | Status |
 |---|---|---|---|
 | D-11 | HIGH | Blank `SMTP_PORT` → `int("")` → ValueError. 500ed `GET /api/data-sources` and **broke all outbound email**, including password-reset and verification delivery, on any install scaffolded from `.env.example`. | Fixed |
-| D-4 | HIGH | `POST /api/admin/payments/{id}/refund` is a stub — returns `success: true` for any string, and writes a `payment.refunded` audit record for a refund that never happened. | **Assigned to PH3.9** |
+| D-4 | HIGH | `POST /api/admin/payments/{id}/refund` is a stub — returns `success: true` for any string, and writes a `payment.refunded` audit record for a refund that never happened. | **FIXED in PH3.9 (2026-08-16)** — now 501, and no audit record |
 | D-1 | MED | `page=0` → negative Mongo `skip` → 500; `limit=0` → ZeroDivisionError. All 4 paginated admin endpoints; `limit` was also unbounded (full-collection scan). | Fixed |
 | D-3 | MED | `grant-plan` `duration_days` went from raw JSON into `timedelta(days=...)` — TypeError / OverflowError → 500. | Fixed |
 | D-6 | MED | 18 routes read `await request.json()` with no model, so a malformed or truncated body raised `JSONDecodeError` → 500. | Fixed |

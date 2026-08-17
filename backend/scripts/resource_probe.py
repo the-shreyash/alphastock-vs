@@ -159,7 +159,9 @@ class _FakeSocket:
         self.sent = 0
         self.dead = dead
 
-    async def accept(self) -> None:
+    # Mirrors `starlette.websockets.WebSocket.accept` (PH3.10) — the manager
+    # passes the subprotocol chosen by the auth handshake.
+    async def accept(self, subprotocol=None, headers=None) -> None:
         return None
 
     async def send_text(self, payload: str) -> None:

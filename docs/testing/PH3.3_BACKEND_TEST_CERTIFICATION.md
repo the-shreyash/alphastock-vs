@@ -822,7 +822,7 @@ rewritten rather than the application (§10.1, §7, §13).
 | ID | Severity | Defect | Status |
 |---|---|---|---|
 | **D-11** | **HIGH** | Blank `SMTP_PORT` → `int("")` → ValueError. 500s `GET /api/data-sources` and **breaks all outbound email**, including password-reset and email-verification delivery, on any deployment that declares the variable without a value — i.e. every install scaffolded from `.env.example`. | ✅ Fixed |
-| **D-4** | **HIGH** | `POST /api/admin/payments/{id}/refund` is a stub: reads no payment, calls no provider, returns `{"success": true, "message": "Refund initiated"}` for any string. The admin UI tells an operator the customer was refunded when nobody was, and the immutable audit log records `payment.refunded` for a refund that never happened. | ⚠️ Documented — **assigned to PH3.9** |
+| **D-4** | **HIGH** | `POST /api/admin/payments/{id}/refund` is a stub: reads no payment, calls no provider, returns `{"success": true, "message": "Refund initiated"}` for any string. The admin UI tells an operator the customer was refunded when nobody was, and the immutable audit log records `payment.refunded` for a refund that never happened. | ✅ **FIXED in PH3.9 (2026-08-16)** — 501 and **no audit record**. The two `xfail`s here expected 404/400, assuming PH3.9 would *implement* refunds; it removed the lie instead, which is correct while no payment provider exists, so they are replaced with real assertions in `TestRefundEndpointIsNotImplemented` |
 | **D-1** | MEDIUM | `page=0` → negative Mongo `skip` (driver rejects) → 500; `limit=0` → ZeroDivisionError in the page-count expression. All 4 paginated admin endpoints. Also unbounded `limit` allowed a full collection scan. | ✅ Fixed |
 | **D-3** | MEDIUM | `grant-plan` `duration_days` went from an untyped JSON body straight into `timedelta(days=...)` — TypeError for a string/null/list, OverflowError for a huge int. Both 500. | ✅ Fixed |
 | **D-6** | MEDIUM | 18 routes read `await request.json()` without a Pydantic model, bypassing FastAPI's body parsing; a malformed or truncated body raised `JSONDecodeError` → 500. A dropped mobile connection mid-POST produced a server error, and any authenticated caller had a trivial 500 generator. | ✅ Fixed |
@@ -873,12 +873,21 @@ IDs from its own rendered list.
 
 ### Deliberately not fixed
 
-**D-4 (refund stub)** — fixing it means implementing refunds against a payment
-provider. That is PH3.9 (Mock Removal), not a change to make quietly inside a
-testing sprint. Recorded as two `xfail` tests asserting the *correct* behaviour,
-so they report XPASS the moment PH3.9 lands and demand promotion to real
-assertions. A third test pins the audit behaviour that exists today so it is not
-lost in the rewrite.
+**D-4 (refund stub)** — fixing it meant implementing refunds against a payment
+provider, which was not a change to make quietly inside a testing sprint. It was
+recorded as two `xfail` tests asserting the *correct* behaviour (404 for an
+unknown payment, 400 for a malformed id), plus a third pinning the audit
+behaviour that existed.
+
+**Resolved in PH3.9 (2026-08-16), and not the way this section anticipated.**
+The `xfail`s assumed refunds would be implemented. PH3.9 found there is still no
+payment provider to refund through, so it removed the lie instead: the endpoint
+answers **501 Not Implemented** and writes **no audit record**. That is the
+correct outcome while no integration exists — a missing feature that says so is
+strictly better than an admin-visible action that reports success. The three
+tests are replaced by `TestRefundEndpointIsNotImplemented`, whose load-bearing
+assertion is the *absence* of the audit entry: a log containing invented events
+is not a weaker audit log, it is a misleading one.
 
 **D-10 (email validation)** — `/api/auth/*` is PH1-certified surface. Switching
 to `EmailStr` changes an authentication contract, adds the `email-validator`
@@ -908,11 +917,11 @@ not silently expand scope.
 5. **`services/stock_details.py` (28%), `scheduler.py` (15%), `trade_stream.py`
    (22%), `zerodha_service.py` (20%)** — background workers and streaming paths,
    which need either a scheduler harness or the integration layer.
-6. **Analytics arithmetic is not verified.** The admin analytics endpoints are
-   asserted to render on empty and populated databases; the correctness of the
-   revenue and feature-usage numbers is not asserted against fixtures. Some of
-   those numbers are acknowledged placeholders in the source
-   (`revenue_today = total_payments * 499`), which PH3.9 owns.
+6. ~~**Analytics arithmetic is not verified.**~~ **Closed by PH3.8 (audit) and
+   PH3.9 (removal).** The placeholder named here — `revenue_today =
+   total_payments * 499` — is gone, along with sixteen other fabricated metrics;
+   the registry now holds zero MOCK entries and a test asserts it. See
+   `docs/architecture/ANALYTICS.md`.
 7. **WebSocket routes are untested hermetically.** `/api/ws` remains live-only.
 8. **No E2E journeys.** PH3.9.
 9. **`test_backup_restore.py::TestRetention` still sleeps ~43s** (PH3.1
@@ -981,7 +990,7 @@ Carried forward, with owners:
 
 | Item | Owner | Note |
 |---|---|---|
-| **D-4 — implement or remove the refund stub** | **PH3.9** | Two `xfail` tests will XPASS when done. An admin-visible action that lies is worse than a missing feature. |
+| **D-4 — implement or remove the refund stub** | ✅ **Done — PH3.9 (2026-08-16)** | Removed rather than implemented: there is no payment provider to refund through, so the endpoint answers 501 and writes nothing. The audit half was the load-bearing one — a log containing invented events is not a weaker audit log, it is a misleading one. |
 | **D-10 — registration email validation** | **Next auth-touching sprint** | Needs an `EmailStr` decision *and* a migration plan for accounts already stored with invalid addresses. Four `xfail` tests waiting. |
 | Integration job with `REQUIRE_LIVE_BACKEND=1` | PH2.6 | Without the flag, a dead stack skips to green. |
 | Coverage job, branch coverage, `fail_under` | PH3.11 | Set the threshold from trend data, not from this measurement. |
@@ -989,7 +998,7 @@ Carried forward, with owners:
 | WebSocket hermetic coverage | PH3.9 | `/api/ws` is live-only today. |
 | E2E journeys | PH3.9 | None exist. |
 | `server.py` decomposition | PH3.6 | The 1,115 new contract tests are the safety net that makes it survivable. |
-| Analytics arithmetic verification | PH3.9 | Placeholder revenue maths still in the source. |
+| ~~Analytics arithmetic verification~~ | ✅ **Done — PH3.8 + PH3.9** | The placeholder revenue maths is gone; the registry holds zero MOCK entries and a test asserts it. |
 
 **What PH3.4 inherits:** a backend where every route's authorization posture is
 asserted mechanically, every identifier-shaped parameter is fuzzed for

@@ -184,9 +184,12 @@ services:
       APP_ENV: ${APP_ENV:-production}
       HOST: 0.0.0.0
       PORT: ${BACKEND_CONTAINER_PORT:-8000}
-      # See production.env.example: the in-process scheduler and the in-memory
-      # WebSocket registry are not multi-process safe until PH2.8. Scale with
-      # replicas, not workers.
+      # MUST stay 1, and the service must stay at ONE replica (PH3.10).
+      # The in-process scheduler has no leader election, so every additional
+      # process — worker OR replica — runs `trade_monitor` again, and that job
+      # places real broker exit orders. See backend/docker/entrypoint.sh for the
+      # full reasoning; this is a correctness and money constraint, not a
+      # performance preference.
       WEB_CONCURRENCY: ${WEB_CONCURRENCY:-1}
 
       # ── Logging (PH2.6) ─────────────────────────────────────────────────────

@@ -838,7 +838,7 @@ StockAssist AI's security architecture, as of PH1.9 completion, is **production-
 | Rate limiting | ✅ Complete | §21, PH1.7 |
 | Secrets/env validation | ✅ Complete | §23–§24, PH1.9 (`security/secrets.py`, boot-time `validate_config`) |
 | Security audit logging & monitoring | ✅ Complete | §31b, PH1.10 (`security/audit.py`: taxonomy, redaction, pluggable sinks, fail-safe) |
-| WebSocket security | ❌ Not started | §32, PH1.9 (Real-Time — next) |
+| WebSocket security | 🟡 **Connection authentication complete (PH3.10)** | §32. `/api/ws` authenticates the handshake before `accept()`: identity is the verified `sub` of a valid access token (cookie or `Sec-WebSocket-Protocol`, **never** a query string — uvicorn logs those verbatim), and the client-supplied `user_id` is ignored. Same `password_changed_at`, account-state and token-type checks as `get_current_user`. **This closed a live authorization bypass** — the identity used for per-user event fan-out was previously an unauthenticated query parameter, so any anonymous caller could read any account's realtime stream (tracked as "S-2" since PH1.9). **Still open:** per-channel subscription authorization (any authenticated socket may subscribe to any channel, including `"*"`) and per-connection rate limiting |
 | Admin/session management | ❌ Not started | §9, PH1.10b |
 | Dependency scanning | 🟡 Partial | §25, PH1.9 (CI pip-audit/npm audit/gitleaks + full pinning); PH1.11 for Dependabot/split |
 | Security certification | ❌ Not started | §34, PH1.12 |

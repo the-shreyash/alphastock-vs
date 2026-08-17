@@ -54,9 +54,14 @@ describe("populated state", () => {
     renderAdminDashboard((m) => m.onGet("/admin/dashboard").reply(HTTP.OK, testAdminDashboard));
 
     expect(await screen.findByRole("heading", { name: "Dashboard" })).toBeInTheDocument();
-    // Formatted with Indian digit grouping — 1280 users, ₹2,45,000 MRR.
+    // Formatted with Indian digit grouping — 1,280 users.
     await waitFor(() => expect(screen.getByText("1,280")).toBeInTheDocument());
-    expect(screen.getByText("₹2,45,000")).toBeInTheDocument();
+    expect(screen.getByText("3,400")).toBeInTheDocument();
+    // PH3.9: the MRR assertion here was `₹2,45,000` — a figure the backend
+    // produced as `pro count × ₹499 + elite count × ₹999`, over roles that
+    // admins grant without payment. There is no MRR to assert now; the card
+    // renders the unavailable treatment, which
+    // AdminAnalytics.test.jsx covers directly.
   });
 
   it("labels every metric it displays", async () => {

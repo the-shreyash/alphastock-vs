@@ -1,6 +1,6 @@
 # Analytics Architecture & Data Integrity
 
-**Status:** Current as of PH3.8 (2026-08-16)
+**Status:** Current as of PH3.9 (2026-08-16) — **mock removal complete**
 **Scope:** Every number this product displays to a user or an administrator —
 where it comes from, what time window it covers, which timezone that window is
 anchored in, and whether a reader may act on it.
@@ -48,7 +48,7 @@ Every metric in the product carries exactly one:
 |---|---|---|
 | **REAL** | Read directly from persisted production records | The value |
 | **DERIVED** | Computed deterministically from persisted production records | The value |
-| **MOCK** | Fabricated — hardcoded, formula-invented, or randomised | The value, **visibly marked "Simulated"** |
+| **MOCK** | Fabricated — hardcoded, formula-invented, or randomised | **Nothing. No metric may carry this class.** The vocabulary is retained so a fabricated value added in future must declare itself and fail the suite, rather than blending in |
 | **UNAVAILABLE** | A legitimate metric whose required source data does not exist | An explicit empty state, **never a zero** |
 
 **An endpoint existing is not evidence a metric is real.** Each classification
@@ -66,27 +66,56 @@ accuracy on the day somebody reads it, and a markdown table drifts silently
 forever after it is written. The registry is imported by
 `backend/tests/test_analytics.py`, which asserts that every endpoint it names
 still exists on the live route table, that every entry carries a valid
-classification, and that every MOCK entry names the production source that
-would replace it. A mock removed without updating its entry fails the suite; an
-analytics endpoint added without an entry fails the suite.
+classification, that **no entry is classified MOCK**, that every UNAVAILABLE
+entry names the production source that would answer it, and that each of the
+seventeen PH3.8 mocks records what PH3.9 did to it. A mock removed without
+updating its entry fails the suite; an analytics endpoint added without an entry
+fails the suite; a new fabricated metric fails the suite.
 
 The tables in §10 of this document are a **rendering** of that registry, not a
 second source of truth. When they disagree, the registry is right.
 
 ### 2.2 Current totals
 
-| Class | Count |
-|---|---|
-| REAL | 4 |
-| DERIVED | 26 |
-| MOCK | 17 |
-| UNAVAILABLE | 5 |
+| Class | PH3.8 | PH3.9 |
+|---|---|---|
+| REAL | 4 | 4 |
+| DERIVED | 26 | **32** |
+| MOCK | 17 | **0** |
+| UNAVAILABLE | 5 | **17** |
 
-Seventeen fabricated metrics remain in production. **PH3.8 did not remove
-them** — that is PH3.9's sprint, and pulling a chart out of a dashboard without
-its replacement is not an improvement. What PH3.8 removed is the *impression*
-that they are measured. Every one now declares itself in its API response and
-renders behind a visible marker.
+**There are no MOCK metrics left in the product.** PH3.8 classified seventeen
+and left them in place behind a visible marker, because pulling a chart out of a
+dashboard without its replacement is not an improvement. PH3.9 removed all
+seventeen, and the split is the interesting part:
+
+- **Six became real numbers** — DAU, signup growth, external API health, AI
+  provider latency/failures, Redis and scheduler status. Every one was
+  computable from data the platform already had.
+- **Eleven became explicit UNAVAILABLE** — everything revenue-shaped, plus
+  retention, churn, feature adoption, AI cost, MAU, and the synthetic backtest.
+
+`test_analytics.py::test_no_metric_is_classified_mock` asserts the zero, and
+`test_every_ph38_mock_records_what_ph39_did_to_it` names all seventeen so a
+future reader can see what happened to each without archaeology.
+
+### 2.3 The rule PH3.9 was governed by
+
+> **Never replace mock data with fake realistic data.**
+
+Two applications of it decided most of the sprint, and both are worth stating
+because both meant *doing less* than the inventory asked:
+
+1. **A metric is available only when the stored data can answer the question the
+   metric's name asks** — not when a query returns rows. Revenue is gated on
+   whether a payment integration exists (`analytics.sources.
+   payments_integration`), *not* on whether `db.payments` happens to be empty.
+   Gating on emptiness is how the first stray document flips revenue back to
+   "available" and reports it as fact — which is the same defect PH3.8 found,
+   wearing a new implementation.
+2. **Where PH3.8's prescribed source could not actually answer, PH3.9 refused
+   rather than approximated.** Three of its recommendations were wrong on
+   inspection; see §11.1.
 
 ---
 
@@ -100,9 +129,9 @@ renders behind a visible marker.
 | Portfolio equity history | `db.portfolio_snapshots` | One row per user per IST day. Built forward from real marks; **never back-filled.** |
 | Live prices | Market Gateway → `real_quotes_map` | Never a provider call from business logic (`MARKET_DATA_ARCHITECTURE.md`). |
 | Users & plans | `db.users` | `role` is the plan field. **Granted by admins, not by payment** — see §7. |
-| Revenue | *(nothing)* | `db.payments` **has no writer anywhere in the codebase.** |
-| Sessions / activity | `db.sessions` (`last_used_at`) | Real activity data, **not currently read by any analytics.** |
-| AI & provider usage | `observability.metrics` | Real counters and histograms, **not currently read by the admin portal.** |
+| Revenue | *(nothing)* | `db.payments` **has no writer anywhere in the codebase.** Every revenue metric is UNAVAILABLE — §7. |
+| Sessions / activity | `db.sessions` (`last_used_at`) | Read by DAU since PH3.9. **Retains one refresh lifetime only** (TTL index, 7 days by default) — which bounds what it can answer; see §11.1. |
+| AI & provider usage | `observability.metrics` | Real counters and histograms, read by the admin portal since PH3.9. **Process-scoped**: they reset on restart and describe one worker — §11.2. |
 
 Two rules, both violated somewhere before PH3.8:
 
@@ -179,13 +208,32 @@ yet" is a true fact about this user; "we cannot compute revenue because no
 payment records exist anywhere" is a gap in the platform. Conflating them tells
 a new user the product is broken.
 
-### 4.1 The contract is additive
+### 4.1 The contract is additive, and PH3.9 kept it that way
 
-PH3.8 is an audit sprint. Every existing flat key is preserved and an
-`analytics` block is added *beside* it, along with a `mock_metrics` array for
-consumers that only want the flag. Nothing regressed: all 2,303 pre-existing
-backend tests and all 364 pre-existing frontend tests pass unchanged. PH3.9 may
-retire the flat keys once the mocks behind them are gone.
+PH3.8 was an audit sprint: every existing flat key was preserved and an
+`analytics` block added *beside* it, plus a `mock_metrics` array for consumers
+that only wanted the flag.
+
+**PH3.9 did not retire the flat keys**, though it could have. It changed their
+*values* — a metric that cannot be computed now serves `null` there instead of a
+fabricated number — and added `unavailable_metrics` beside `mock_metrics`. Three
+reasons for keeping the shape:
+
+- The change a consumer must absorb is already the meaningful one. Making them
+  absorb a renamed envelope at the same time buries it.
+- `mock_metrics` is retained and now always `[]`. That is a positive assertion
+  a consumer can read — "this surface fabricates nothing" — rather than the
+  absence of a field, which is indistinguishable from an old server.
+- **`null` is not silently compatible.** A client doing `value || 0` gets `0`
+  and shows a plausible wrong number, so the frontend routes every admin metric
+  through one `MetricValue` component and tests assert the absence of `₹0`
+  rather than the presence of an em-dash. See §7.2 and
+  `frontend/src/components/ui/Unavailable.jsx`.
+
+Two keys were renamed, because the old names were themselves claims the data did
+not support: `ai_requests_today` → `chat_messages_today` (it counts stored
+messages, both turns) and `request_count` → `message_count` on
+`/api/admin/ai/usage`.
 
 ---
 
@@ -384,16 +432,15 @@ units diverge on the first gap: a fixture with one snapshot per month returned
 
 ## 7. Revenue: the structural gap
 
-Every revenue metric in the admin portal is fabricated, and the reason is not a
-coding slip:
+The gap is unchanged; what changed is that the product no longer papers over it.
 
 > **`db.payments` has no writer anywhere in the codebase. The platform has no
-> payment integration.** The collection is read by three admin endpoints and
-> indexed at startup. Nothing has ever written to it.
+> payment integration.** The collection is read by admin endpoints and indexed
+> at startup. Nothing has ever written to it.
 
-Consequently:
+### 7.1 What was there before PH3.9
 
-| Metric | What it actually is |
+| Metric | What it actually was |
 |---|---|
 | `mrr` | role counts × a hardcoded ₹499/₹999 |
 | `arr` | the above × 12 |
@@ -403,21 +450,48 @@ Consequently:
 | `pending_payments` / `refunds` / `failed_payments` | literal `0` |
 | 30-day revenue series | `2500 + i×150 + (500 if i % 7 == 0)` — no database access at all |
 
-Two consequences worth stating plainly:
+Three things made these worse than merely imprecise:
 
-- **`mrr` counts comped accounts as paying.** `role` is assigned by an admin
+- **`mrr` counted comped accounts as paying.** `role` is assigned by an admin
   through `POST /api/admin/users/{id}/grant-plan` with no payment involved, so
-  every internal account, every beta tester and every comped user is revenue.
-- **`revenue_today` reads ₹0 only because the collection is empty.** The first
-  record to land reports ₹499 of "today's revenue" whatever it was actually for.
-- **`refunds: 0` is contradicted by the product itself.** PH3.5 found that
-  `POST /api/admin/payments/{id}/refund` is a stub returning success while
-  writing a `payment.refunded` audit record for a refund that never happened
-  (D-4, owned by PH3.9). Refunds read as zero while the audit log says otherwise.
+  every internal account, every beta tester and every comped user was revenue.
+- **`revenue_today` read ₹0 only because the collection was empty.** The first
+  record to land would have reported ₹499 of "today's revenue" whatever it was
+  actually for.
+- **`refunds: 0` was contradicted by the product itself.** `POST /api/admin/
+  payments/{id}/refund` returned success while writing a `payment.refunded`
+  audit record for a refund that never happened (PH3.5's D-4).
 
-Plan prices are now the named constant `_ASSUMED_PLAN_PRICE_INR` rather than
-magic numbers inline — not because that makes the estimate correct, but so the
-assumption is greppable when PH3.9 replaces it.
+### 7.2 What PH3.9 did
+
+**Every one of them now returns `null` with a reason**, resolved through
+`analytics.sources`. Four decisions inside that are worth keeping:
+
+- **The gate is `payments_integration()`, one predicate about the platform**,
+  not a check on whether the collection is empty — see §2.3. The day a provider
+  is wired, that is a single reviewed edit and every revenue metric becomes
+  available at once.
+- **The aggregation is written and tested now, not deferred.** `_sum_captured`
+  sums captured payments per IST window and the accounting policy is pinned by
+  tests: `created`, `pending` and `authorized` are *intents*, not revenue
+  (authorized is a hold, not a capture), and `failed`/`cancelled` are neither.
+  That is the classic revenue-reporting bug, and it is much cheaper to pin
+  before any money exists than to discover from a finance discrepancy.
+- **MRR needs strictly more than payment records.** A one-off capture is not
+  recurring revenue, so summing captures over a month is not MRR. It needs
+  subscription records — plan, price, currency, interval, status, period end.
+  Recorded so a future sprint does not "deliver MRR" by summing captures.
+- **The 30-day series is empty, not zero-filled, and is marked
+  `backfillable: false`.** Thirty points at ₹0 is still a claim — that we
+  measured thirty days and found no revenue — and it is false. Nor can history
+  before an integration be reconstructed once one exists.
+
+**D-4 is fixed in the same change.** The refund endpoint returns **501** and
+writes **no audit record**. The audit half is the load-bearing one: a log
+containing invented events is not a weaker audit log, it is a misleading one.
+
+`_ASSUMED_PLAN_PRICE_INR` is deleted. It existed so the fabricated price was
+greppable; there is no longer a fabricated price.
 
 ---
 
@@ -469,10 +543,27 @@ computed without this data.
 |---|---|---|
 | `portfolio_snapshots {user_id, date}` **unique** | Performance tab filter + range + sort; the nightly upsert | **No index of any kind since Sprint 8.** Every Portfolio page load scanned every user's history, and the 16:05 job scanned the whole collection once per user — O(users²) work in an unattended job. `unique` also makes one-snapshot-per-user-per-day the database's rule rather than the upsert's assumption. |
 | `users {created_at}` | Admin signup counts | A `$regex` prefix match on an unindexed string — a full scan of the users collection on every admin page load, growing with total signups forever |
-| `chat_messages {created_at}` | "AI requests today" | Same. Neither existing compound index can serve it: they lead with `user_id`/`session_id`, and this query constrains neither |
+| `chat_messages {created_at}` | Chat-message day counts | Same. Neither existing compound index can serve it: they lead with `user_id`/`session_id`, and this query constrains neither |
+| `sessions {last_used_at, user_id}` **(PH3.9)** | The DAU query | Nothing — none of the three existing `sessions` indexes can serve it (`session_id` and `user_id` do not constrain the field; the `expires_at` TTL index is on a different one). Without it, every admin analytics load is a full scan of a collection that grows with *logins per user*, not with users. Compound so the window filter and the distinct-user grouping are both served without touching a document |
 
 Every one is pinned in `tests/test_perf_regression.py::HOT_QUERIES`, so removing
 an index or changing a query shape fails the suite.
+
+### 9.1.1 Query cost of the metrics PH3.9 made real
+
+Replacing a literal with a database read is exactly how an N+1 gets introduced,
+so the new queries are **counted in tests**, not assumed:
+
+| Metric | Queries | Shape |
+|---|---|---|
+| `dau` | **1**, flat in session count | `$match` window → `$group` by `user_id` → `$group` count. Two `$group` stages so the *count* crosses the wire rather than the user list |
+| `growth_rate` | **2** | One `count_documents` for the window, one for its preceding window |
+| Every revenue metric | **0** | The integration gate short-circuits before touching the database. An admin dashboard load must not scan a collection to conclude it has no source |
+| `api_health`, `ai/status`, `system/health` | **0** | Read in-process counters and cached probe results |
+
+`admin_dashboard` also lost a query: the `list_collection_names()` guard and the
+`db.payments.count_documents({})` behind it existed only to feed the fabricated
+revenue figure.
 
 ### 9.2 Unbounded work removed
 
@@ -517,7 +608,7 @@ work.
 |---|---|---|
 | `GET /api/journal/stats`, `setup-stats` | O(user's closed trades) documents | Needs best/worst/average over the set, which `$group` in this codebase's FakeDB-compatible subset cannot express. Bounded by the **user's own** data, not by total signups — a different growth shape from the pre-PH3.4 scans. Revisit past ~10k trades/user. |
 | `GET /api/portfolio/performance?range=ALL` | Payload ∝ snapshot count | ~1,000 points ≈ 60 KiB after four years. Bounded ranges are cheap; `ALL` should gain downsampling before it matters. |
-| `GET /api/paper/pnl`, `/api/paper/trades` | One market-data call **per open position, sequentially** | A genuine N+1 over the network. Not fixed here: the fan-out helper (`real_quotes_map`) is the right tool and swapping it in touches the paper-trading write path, which is out of an analytics sprint's scope. **Carried as PH3.9 debt.** |
+| `GET /api/paper/pnl`, `/api/paper/trades` | One market-data call **per open position, sequentially** | A genuine N+1 over the network. Still not fixed: the fan-out helper (`real_quotes_map`) is the right tool and swapping it in touches the paper-trading write path, which was outside a mock-removal sprint's scope too. **Carried forward as debt** — it is a latency defect, not a data-integrity one. |
 
 ### 9.5 Caching policy
 
@@ -557,70 +648,128 @@ Rendered from `backend/analytics/registry.py`. **The registry is authoritative.*
 | Portfolio value, unrealised, realised | `GET /api/portfolio/summary` | Broker-primary merge |
 | Allocation, HHI, risk score, movers, dividends | `GET /api/portfolio/intelligence` | Risk score is a declared **heuristic**, not a VaR |
 | Equity curve, return over period | `GET /api/portfolio/performance` | Not flow-adjusted — §6.5 |
-| Backtest metrics (yfinance path only) | `POST /api/backtest` | The fallback path is MOCK |
+| Backtest metrics | `POST /api/backtest` | Real historical bars only. **There is no fallback path**: missing history is a 503, never an invented result |
 | Conversion rate | `GET /api/admin/analytics/users` | Conversion to a **granted role**, not to a paid plan |
 | Top AI users | `GET /api/admin/ai/usage` | The count is real; the cost beside it is not |
 
-### 10.3 MOCK — the PH3.9 removal inventory
+### 10.3 MOCK
 
-See §11.
+**Empty.** See §11 for what each of the seventeen became.
 
 ### 10.4 UNAVAILABLE
 
-| Metric | Blocked on | Recommendation |
+Seventeen metrics. The five PH3.8 identified, plus the twelve PH3.9 could not
+honestly compute. Each names the production data that would make it answerable;
+`analytics.registry.ph39_inventory()` returns the list programmatically and a
+test asserts every entry carries a required source, a priority and a reason.
+
+| Metric | Blocked on | Backfillable? |
 |---|---|---|
-| `portfolio.time_weighted_return` | A dated external cash-flow ledger | Show UNAVAILABLE. Do **not** approximate |
-| `trading.net_pnl_after_charges` | Per-fill charges from broker contract notes | Show UNAVAILABLE; keep the gross label until then |
-| `trading.profit_factor` | The same charges | Show UNAVAILABLE — §6.1 |
-| `trading.avg_win_avg_loss` | Nothing; computable today | Surface it deliberately, with the gross caveat |
-| `admin.arpu` | Payment records | Show UNAVAILABLE |
+| `admin.mrr`, `admin.arr` | Active subscription records (plan, price, currency, interval, status, period end) | No |
+| `admin.revenue_today`, `admin.revenue_window_totals` | Captured payment records, summed per IST window | No |
+| `admin.revenue_series` | The same, aggregated by IST day | **No** — history before an integration cannot be reconstructed |
+| `admin.payment_states` | Payment status maintained by provider webhooks | No |
+| `admin.arpu` | Captured payments ÷ active users; both terms missing | No |
+| `admin.churn_rate` | Cancellations over an active-subscription base | No |
+| `admin.mau` | A durable per-user activity record outliving the session TTL | No |
+| `admin.retention_rate` | Per-user activity history spanning weeks, plus a durable "first seen" | **No** — an event never written cannot be reconstructed |
+| `admin.feature_usage_pct` | A feature-usage event stream (feature, user_id, timestamp) | **No** |
+| `admin.ai_estimated_cost` | Token counts from provider responses, priced per model | No |
+| `research.backtest.synthetic` | Real historical OHLCV — the endpoint now fails explicitly | n/a |
+| `portfolio.time_weighted_return` | A dated external cash-flow ledger | **No** |
+| `trading.net_pnl_after_charges` | Per-fill charges from broker contract notes | No |
+| `trading.profit_factor` | The same charges — §6.1 | No |
+| `trading.avg_win_avg_loss` | Nothing; computable today. Needs a surface and the gross caveat | n/a |
 
 ---
 
-## 11. PH3.9 mock-removal inventory
+## 11. What PH3.9 did to each of the seventeen
 
-Seventeen metrics, priority-ordered. `analytics.registry.ph39_inventory()`
-returns this list programmatically, and a test asserts every entry names a
-required source, a priority and a reason.
+`analytics.registry.ph39_resolutions()` returns this programmatically, and
+`test_every_ph38_mock_records_what_ph39_did_to_it` asserts that all seventeen
+carry a resolution. The registry is authoritative; this is a rendering of it.
 
-### P1 — misleading in a way that affects decisions
+### Became real numbers (6)
 
-| # | Metric | Current implementation | Required production source | Backfill? | Recommendation |
-|---|---|---|---|---|---|
-| 1 | `admin.mrr` / `admin.arr` | Role counts × hardcoded ₹499/₹999 | Active subscription records (plan, price, currency, interval, status, period end) reconciled against captured payments | No | **UNAVAILABLE** until a payment provider is wired |
-| 2 | `admin.revenue_today` | Count of all payment docs × ₹499 | Captured payments with amount, currency, status, `captured_at` | No | **UNAVAILABLE** |
-| 3 | `admin.revenue_window_totals` | Literals `0` / `mrr` / `arr` | As above, summed per IST window | No | **UNAVAILABLE** |
-| 4 | `admin.revenue_series` | `2500 + i×150 + …`, no DB access | Captured payments aggregated by IST day | **Yes** | **UNAVAILABLE** — remove the chart until real |
-| 5 | `admin.payment_states` | Literals `0` | Payment status maintained by provider webhooks | No | **UNAVAILABLE**. Fix D-4 (stub refund) in the same change |
-| 6 | `admin.api_health` | Hardcoded list; `status` reflects **credential configuration**, never reachability; `overall_status` is the constant `"healthy"` | `observability.health` probes + `provider_requests_total{provider,operation,outcome}` + `provider_request_duration_seconds` — **all already exist** | No | **Rewire.** This page reports healthy during a total outage |
-| 7 | `admin.ai_provider_latency` | `latency_ms` 1200/900, `failures: 0`, `fallbacks: 0` | `ai_request_duration_seconds`, `ai_requests_total{provider,outcome}`, `ai_request_errors_total` — **all already exist** | No | **Rewire.** `failures: 0` beside a live failure counter hides an outage being measured |
-| 8 | `admin.redis_status` | Literal `"not_configured"`; scheduler literal `"running"` | `observability.health` dependency probes | No | **Rewire.** Stale since PH2.7; stays `"running"` after the scheduler dies |
-| 9 | `research.backtest.synthetic` | 20 invented trades, `randint(10,16)` wins ⟹ win rate always 50–80%, invented 2025 dates | Real historical OHLCV via the market-data gateway | No | **Fail explicitly.** A fabricated backtest is investment advice built on noise |
+| # | Metric | Now | Source |
+|---|---|---|---|
+| 6 | `admin.api_health` | DERIVED | `observability.health` probes + `provider_requests_total` / `provider_request_duration_seconds` |
+| 7 | `admin.ai_provider_latency` | DERIVED | `ai_requests_total{provider,outcome}`, `ai_request_errors_total`, `ai_request_duration_seconds` |
+| 8 | `admin.redis_status` | DERIVED | The registered Redis readiness probe; the scheduler asked directly |
+| 10 | `admin.dau` | DERIVED | `db.sessions.last_used_at` — distinct users in the IST day |
+| 14 | `admin.growth_rate` | DERIVED | `db.users.created_at`, this window vs `periods.preceding(window)` |
+| — | `admin.dashboard_health_badges` | DERIVED | Real probes; `api_health: "healthy"` deleted |
 
-### P2 — wrong, but less directly actionable
+### Became explicit UNAVAILABLE (11)
 
-| # | Metric | Current implementation | Required production source | Backfill? | Recommendation |
-|---|---|---|---|---|---|
-| 10 | `admin.dau` | Today's **signup** count relabelled | `db.sessions` — distinct `user_id` with `last_used_at` in the IST day | No | **Compute it.** The data already exists; only the query is missing |
-| 11 | `admin.mau` | **Total** user count relabelled | `db.sessions` over a rolling 30 IST days | No | **Compute it.** DAU/MAU is currently meaningless |
-| 12 | `admin.retention_rate` | Literal `78.5` | Cohort retention over `db.sessions` | **Yes** | **UNAVAILABLE** until cohorts exist |
-| 13 | `admin.churn_rate` | Literal `4.2` | Cancellations / expiries over an active-subscription base | No | **UNAVAILABLE** — depends on #1 |
-| 14 | `admin.growth_rate` | Literal `12.8` | Signups this period vs previous, over `db.users.created_at` | No | **Compute it.** Available today |
-| 15 | `admin.feature_usage_pct` | Fixed descending literals unrelated to the counts beside them; 7 of 10 counts are also literal `0` | A feature-usage event stream (does not exist). `observability.metrics` per-route counters are the cheapest honest substitute | **Yes** | **UNAVAILABLE** for the percentage; keep the three real counts |
-| 16 | `admin.ai_estimated_cost` | Messages × flat per-message rate; ambiguous currency; arbitrary 50/50 provider split | Token counts from provider responses, priced per model | No | **UNAVAILABLE** until tokens are recorded |
-| 17 | `admin.ai_requests_today` | Stored chat messages (≈2× provider calls: user turn **and** assistant turn) | `ai_requests_total` from `observability.metrics` | No | **Rewire** |
+| # | Metric | Why not computed |
+|---|---|---|
+| 1 | `admin.mrr` / `admin.arr` | No subscription records — and MRR needs more than payments |
+| 2 | `admin.revenue_today` | No captured payment records |
+| 3 | `admin.revenue_window_totals` | The same |
+| 4 | `admin.revenue_series` | The same; series is **empty**, not zero-filled |
+| 5 | `admin.payment_states` | No payment status source. D-4 fixed alongside |
+| 9 | `research.backtest.synthetic` | Deleted; 503 on missing history |
+| 11 | `admin.mau` | Session TTL truncates the window — §11.1 |
+| 12 | `admin.retention_rate` | No retained activity history; not back-fillable |
+| 13 | `admin.churn_rate` | Depends on #1 |
+| 15 | `admin.feature_usage_pct` | No feature-usage event stream; seven zero rows deleted |
+| 16 | `admin.ai_estimated_cost` | No token accounting |
 
-### P3
+### 11.1 Three departures from the PH3.8 inventory
 
-`admin.arpu`, `trading.profit_factor`, `trading.avg_win_avg_loss`,
-`portfolio.time_weighted_return` — see §10.4.
+PH3.8's recommendations were written from the audit's vantage point. Three did
+not survive contact with the source, and following them would each have
+replaced a fabricated number with a *systematically wrong* one — which is worse,
+because a wrong number that came from a real query is much harder to spot.
 
-### Sequencing note
+**#11 `admin.mau` — "compute it from `db.sessions` over a rolling 30 IST days".**
+`db.sessions` carries a TTL index that deletes a session at `last_used_at +
+JWT_REFRESH_TTL_SECONDS` (seven days by default). A 30-day window asks for rows
+the database has already removed, so the query returns a **7-day count under a
+30-day label**, undercounting more the longer ago a user churned.
+`analytics.sources.active_users` checks the window against the retention horizon
+and refuses it. The refusal is self-correcting: raise the refresh TTL past
+thirty days and the same call starts returning a value, because the data really
+would be there. DAU is unaffected — a single day sits far inside the horizon.
 
-**#6, #7, #8 and #17 need no new data.** PH3.7 already ships real health probes
-and real provider/AI metrics; those four are wiring, not instrumentation, and
-they are the highest value-per-hour items in this list. Everything revenue-shaped
-is blocked on a payment integration and should be one change, not five.
+**#6 `admin.api_health` — "rewire".** Not a straight rewire, because the row
+list itself was unanswerable. The old table named *vendors* — Yahoo Finance,
+Alpha Vantage — with individual latencies, and the Market Gateway's Source
+Manager picks an upstream per request with that choice deliberately invisible
+above the gateway (`MARKET_DATA_ARCHITECTURE.md`). `instruments.PROVIDERS` is a
+closed vocabulary of **logical** providers for exactly that reason, and only
+`market_data` and `news` have instrumentation call sites at all. So the page now
+reports logical providers, states plainly which integrations are `not_measured`,
+and reports `configured` as its own column rather than as evidence of health.
+**The Razorpay row was deleted outright** — it reported `status: "configured"`
+beside a 300ms latency for an integration that exists nowhere in this codebase.
+
+**#17 `admin.ai_requests_today` — "rewire to `ai_requests_total`".** That would
+trade a durable database count for an in-process counter that resets on every
+deploy and, on a multi-worker deployment, covers one worker of N — a worse
+source for a figure labelled "today". The field was **renamed** to
+`chat_messages_today` instead, which is what it always counted (both the user
+turn and the assistant turn, so it overstated provider calls by roughly 2×). The
+value was always correct; only the claim was wrong. Real provider counts are
+reported separately as `*_since_start`, where the process scope is stated.
+
+### 11.2 Two labelling rules the counter-backed metrics enforce
+
+Both exist because the honest source has a property the fabricated one did not.
+
+- **Counters are process-scoped.** They answer "since this process started",
+  never "today". Every counter-derived field is named `*_since_start` and ships
+  with a `scope` block carrying `process_uptime_seconds` and the restart caveat.
+  A test asserts no field produced by `analytics.platform_health` contains the
+  substring `today`.
+- **Latency is a p95 bucket bound, never a mean.** `sum / count` is the number
+  that hides an outage: ninety-nine 10ms calls and one 10s call average to 110ms
+  and every dashboard looks calm. `_latency_bound` reports the stored bucket
+  boundary at or below which 95% of observations fell — a true bound, not an
+  interpolation inventing precision the histogram does not have. **No traffic
+  returns `None`, never `0`**: "instantaneous" and "never measured" are opposite
+  facts.
 
 ---
 
@@ -662,6 +811,19 @@ the old code.
 | **F-9** | P2 | An unfetchable quote contributed ₹0 of unrealised paper P&L, indistinguishable from an unmoved position. |
 | **F-18** | P2 | **Nine admin dashboard cards each carried a hardcoded "+12% vs last month"** in the gain colour — the same invented growth figure beside user counts, MRR, open tickets and broker links alike. Deleted rather than flagged: there was never anything behind it. |
 
+### 13.1 Defects PH3.9 fixed
+
+Mock removal was the mandate; these came out of it.
+
+| ID | Sev | Defect |
+|---|---|---|
+| **D-4** | **HIGH** | **The refund endpoint wrote audit records for refunds that never happened.** Carried since PH3.5. `POST /api/admin/payments/{id}/refund` read no payment, called no provider, and returned `{"success": true}` for *any* string, while appending `payment.refunded` to the immutable audit log. Two harms, and the second is worse: an operator was told a customer had been refunded, and the artefact whose entire purpose is to record what happened was recording an event that did not. Now **501, and no audit record.** |
+| **F-19** | P1 | **`admin.api_health` reported an integration that does not exist.** The hardcoded list carried a Razorpay row at `status: "configured"` with a 300ms latency; there is no payment integration anywhere in the codebase. Row deleted. |
+| **F-20** | P1 | **The backtest fallback was reached on *any* exception**, not only a missing library — so a transient network blip, a rate limit or a delisted symbol produced a flattering fabricated result rather than an error. The `except Exception` that swallowed it is gone with the fallback. |
+| **F-21** | P2 | **`server_health` and `api_health` were literals that checked nothing.** They read `"healthy"` during a total outage. `api_health` is deleted; `server_health` is `"serving"` — the only claim a health field served *by* the process can honestly make about that process. |
+| **F-22** | P2 | **Seven feature-usage rows reported `usage_count: 0` as a literal.** Nothing counts the scanner, morning report, portfolio, news, SIP advisor, paper trading or backtesting. "0 uses" is a measurement claim; the rows are deleted rather than zeroed. |
+| **F-23** | P2 | **A per-user AI cost was rendered with a dollar sign over an INR-denominated product**, from rates that read as USD, against per-token billing. Column removed. |
+
 ---
 
 ## 14. Rules for adding an analytics metric
@@ -675,10 +837,23 @@ the old code.
    or a closed-status filter.
 5. **If it cannot be computed correctly, mark it UNAVAILABLE.** Do not
    approximate, and do not return a zero.
-6. **If money is involved, say `"basis": "gross"`** until charges are recorded.
-7. **Do not cache it** unless invalidation is understood and staleness is
+6. **Ask whether the stored data answers the question the metric's NAME asks** —
+   not merely whether a query returns rows. This is the rule that caught MAU:
+   the query runs, and the answer is a 7-day count wearing a 30-day label.
+   Where a source has a retention horizon, a sampling scope or a proxy
+   relationship to what you are claiming, that constraint belongs in the code as
+   a gate, not in a comment.
+7. **Never label a counter-derived figure with a calendar window.** In-process
+   counters reset on restart and describe one worker; name them `*_since_start`
+   and ship the scope. Never average a latency histogram — report a bucket
+   bound, and report `None` for no observations.
+8. **If money is involved, say `"basis": "gross"`** until charges are recorded.
+9. **Do not cache it** unless invalidation is understood and staleness is
    acceptable *for that specific number*.
-8. **Check the index.** If the query has no `user_id` prefix, it probably needs
+10. **On the frontend, route it through `MetricValue`.** Never `value || 0`:
+    `null` means unavailable and `0` is a measurement, and one falsy check turns
+    the first into the second in the same typeface as a real figure.
+11. **Check the index.** If the query has no `user_id` prefix, it probably needs
    its own index and a row in `HOT_QUERIES`.
 
 ---
@@ -686,10 +861,24 @@ the old code.
 ## 15. Related documentation
 
 - [`OBSERVABILITY.md`](OBSERVABILITY.md) — system metrics, health probes, the
-  alert catalogue. The real source for #6, #7, #8 and #17 above.
+  alert catalogue. The real source now read by the four rewired metrics in §11,
+  and the place to understand the process-scope caveat in §11.2.
 - [`../performance/PH3.4_PERFORMANCE_CERTIFICATION.md`](../performance/PH3.4_PERFORMANCE_CERTIFICATION.md)
   — the index-justification method §9.1 follows.
 - [`../../.claude/MARKET_DATA_ARCHITECTURE.md`](../../.claude/MARKET_DATA_ARCHITECTURE.md)
-  — provider behaviour; analytics never calls a provider directly.
+  — provider behaviour; analytics never calls a provider directly. **The reason
+  §11.1 gives for refusing a per-vendor API-health breakdown.**
 - [`../testing/PH3.3_BACKEND_TEST_CERTIFICATION.md`](../testing/PH3.3_BACKEND_TEST_CERTIFICATION.md)
-  — D-4, the stub refund endpoint referenced in §7 and §11.
+  — where D-4, the stub refund endpoint, was found. Fixed in PH3.9; see §13.1.
+
+### Where the code lives
+
+| Module | Owns |
+|---|---|
+| `backend/analytics/registry.py` | The classification of every metric, and what PH3.9 did to each of the seventeen |
+| `backend/analytics/sources.py` | The two gates — payment integration, session retention horizon — and the DB-backed metrics behind them |
+| `backend/analytics/platform_health.py` | Health and provider metrics read from real probes and counters |
+| `backend/analytics/periods.py` | Windows, and `preceding()` for period-over-period comparison |
+| `frontend/src/components/ui/Unavailable.jsx` | The `null` vs `0` rule, expressed once |
+| `backend/tests/test_ph39_mock_removal.py` | The units above, plus counter-tests naming each removed formula |
+| `backend/tests/test_analytics.py` | Endpoint-level removal assertions and the registry invariants |

@@ -199,7 +199,7 @@ overall release, not the security certification): Packaging & Deployability
 | OR-6 | Email delivery runs in **simulated** mode until a real SMTP/SendGrid provider is provisioned | Medium | Accepted for PH1; recovery flow is provider-agnostic and ready. Provision before launch. |
 | — | Deferred CVEs: `starlette` (pinned by FastAPI), `litellm` (AI dep), `ecdsa` (no fix; we use PyJWT HS256, not ECDSA) | Medium/Low | Accepted with documented remediation plan — `SECRETS.md §8` |
 | — | `email: str` not yet `EmailStr` | Low | PH1.5b follow-up; cosmetic validation tightening |
-| PH1.9(rt) | Real-Time / WebSocket connection & room authorization | Medium | Deferred within PH1; Socket.IO auth handshake — schedule in PH1 tail or PH2 |
+| PH1.9(rt) | Real-Time / WebSocket connection & room authorization | **Critical (re-rated)** | **Connection authorization CLOSED in PH3.10.** This was rated Medium and deferred here; the PH3.10 audit found it was **Critical** and exploitable: the deferred item was not "add a handshake" but "the endpoint has no authentication at all", and because per-user event fan-out was keyed on an unauthenticated `user_id` query parameter, any anonymous caller could read any account's private realtime stream. Reproduced against a live production container. Fixed and re-verified — see `docs/production/PH3.10_FINAL_PRODUCTION_AUDIT.md` §14. **Room/channel authorization remains open.** *Lesson: a deferred security item's severity should be established by testing it, not by assuming the surface behaves like the rest of the system.* |
 | PH1.10b | Admin session management (force-logout, session list) | Medium | Deferred; RBAC + audit already in place |
 | — | MFA | Low (design-only) | Post-launch roadmap |
 

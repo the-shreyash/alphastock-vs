@@ -32,7 +32,12 @@ class FakeWS:
         self.raw_sent = []  # pre-serialized payloads (Sprint R9 fan-out path)
         self.fail = fail
 
-    async def accept(self):
+    # Signature mirrors `starlette.websockets.WebSocket.accept` (PH3.10). The
+    # selected subprotocol is recorded rather than dropped: it is how the auth
+    # handshake echoes its marker back, and a double that silently ignored the
+    # argument would keep passing after the real call stopped working.
+    async def accept(self, subprotocol=None, headers=None):
+        self.accepted_subprotocol = subprotocol
         return None
 
     async def send_json(self, message):
