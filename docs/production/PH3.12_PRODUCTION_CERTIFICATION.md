@@ -1275,6 +1275,58 @@ docker build --no-cache --pull -f backend/Dockerfile -t stockassist-rc:ph312r ba
 
 ---
 
+## Live verification — the release image, booted as production
+
+Everything above is hermetic. This section is the same two blockers re-measured
+the way PH3.12 measured them originally: against the **release image**
+(`stockassist-rc:ph312r`, built `--no-cache --pull` from the release commit),
+running with `APP_ENV=production` against an **authenticated MongoDB sidecar** —
+not against a test double, and not against a prior report.
+
+```
+container: running, restarts=0
+/api/health/live    200
+/api/health/ready   200
+/docs               404      <- was 200 (Swagger UI)
+/redoc              404      <- was 200
+/openapi.json       404      <- was 200 (121 KB, 188 paths, 23 admin routes)
+/api/docs           404      <- was 404, and always meaningless (PH3.11's probe)
+```
+
+**B-1, the PH3.12 exploit, replayed verbatim** — a payload valid in every field
+except `quantity`:
+
+```
+POST /api/paper/trade  {"symbol":"INFY","stock_name":"Infosys","quantity":-1000,
+                        "entry_price":1000,"type":"BUY","stop_loss":900,"target1":1200}
+
+-> HTTP 422
+   {"detail":[{"loc":["body","quantity"],"msg":"Input should be greater than 0",
+               "type":"greater_than"}]}
+
+balance before: 100000.0     balance after: 100000.0      (was 86,840 -> 1,086,840)
+```
+
+The rejection names `quantity`, so it cannot be an artefact of the payload being
+malformed some other way. Four further hostile bodies — `quantity: 0`,
+`entry_price: -100`, `type: "NONSENSE"`, `symbol: "<script>alert(1)</script>"` —
+and the raw-text `entry_price: Infinity` all returned **422**.
+
+**And the account still works.** A valid trade returned **200**, debited the
+balance correctly (Rs 1,00,000 -> Rs 90,000 for 10 x Rs 1,000), and the P&L
+endpoint marked the open position against a **live quote** with
+`marks_unavailable: 0`:
+
+```
+{"realized_pnl":0,"unrealized_pnl":1151.0,"total_pnl":1151.0,"open_trades":1,
+ "marks_unavailable":0,"complete":true,"scope":"paper","basis":"gross"}
+```
+
+Registration, login, JWT issuance, authenticated reads, paper writes, health and
+readiness were all exercised in the course of this and all behaved normally.
+
+---
+
 ## Remaining blockers
 
 **None from B-1, B-2 or L-1.** All three are closed with falsifiable evidence.

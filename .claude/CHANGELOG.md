@@ -92,14 +92,16 @@ Resolved. RC is now a commit, not a working tree.
 
 | Item | Value |
 |---|---|
-| Release commit | `PH312R_CODE_SHA` on `main` (code + tests + docs) |
+| Release commit | `5c1ceab` on `main` — full SHA `5c1ceabdbdd9f69f2be79c78b6e58a0bc453b070` |
 | Parent | `32437e8` |
 | Image tag | `stockassist-rc:ph312r` |
 | Image ID | `sha256:0cab81d747d4fc3f06d8dfb6fc4fe6c190fcf41eebff7c59293583cf77279d0c` |
 | Config digest | `sha256:a3013575a76c89d871b391f3e8c16dc1f1cc6027776c35ac3351126ab5d2c273` |
 | Size | 425 MB |
 | Build | `docker build --no-cache --pull -f backend/Dockerfile -t stockassist-rc:ph312r backend` |
-| Working tree | clean after commit |
+| Working tree | clean after commit (this row was filled in by a docs-only
+follow-up commit — a commit cannot contain its own SHA; the follow-up touches
+no file inside the `backend/` build context, so it produces an identical image) |
 
 **Stated rather than glossed:** `--no-cache --pull` builds are **not
 bit-reproducible** (pip resolution and layer timestamps vary), so two builds of
@@ -107,6 +109,18 @@ one commit yield different image IDs. The property that was verified is that the
 **application source inside the image matches the committed source**. An image ID
 is a build identity, not a source identity, and treating it as the latter would
 be one more control that cannot fail.
+
+## Live verification — release image as production
+
+Re-measured the way PH3.12 measured it originally: the release image running
+`APP_ENV=production` against an authenticated MongoDB sidecar, 0 restarts.
+`/docs`, `/redoc`, `/openapi.json` -> **404** (all three were 200). The exploit
+replayed verbatim with a payload valid in every field except `quantity` ->
+**422 reported against `quantity`**, balance **1,00,000 -> 1,00,000** (was 86,840
+-> 10,86,840). Four further hostile bodies and raw-text `Infinity` -> 422. A
+valid trade -> **200**, balance correctly debited to Rs 90,000, P&L marked
+against a live quote with `marks_unavailable: 0`. Health and readiness 200
+throughout.
 
 ## Verification
 
