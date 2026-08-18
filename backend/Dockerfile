@@ -307,7 +307,23 @@ RUN install -d -o appuser -g appuser -m 0750 /var/log/stockassist
 # response — the window during which a rolling deploy is running at reduced
 # capacity. `|| true`: a compile warning in an unreachable module must not fail
 # the build, since the bytecode is a cache, not a correctness requirement.
-RUN python -m compileall -q /app > /dev/null 2>&1 || true
+#
+# `--invalidation-mode checked-hash` (PH3.12 finding C-3). By default a `.pyc`
+# header stores the SOURCE FILE'S MTIME, so two builds of the same commit
+# produce different bytes: a `git archive` export stamps every file with the
+# commit time, a working-directory checkout carries whatever mtime the developer
+# happens to have. Measured before this flag: all 115 source files in the image
+# were byte-identical across the two builds and all 107 `.pyc` differed — with
+# *identical marshalled code objects*. The only varying bytes were that mtime
+# field. Hash-based invalidation replaces it with a hash of the source, which is
+# a function of the commit, so the whole `/app` tree is now reproducible.
+#
+# `checked-hash` rather than `unchecked-hash`: both are deterministic, but
+# unchecked bytecode is trusted without ever looking at the source, so a
+# bind-mounted source tree (the standard local-debug move) would silently run
+# stale code. Checked-hash pays one source hash per module at import to make
+# that impossible.
+RUN python -m compileall -q --invalidation-mode checked-hash /app > /dev/null 2>&1 || true
 
 # Everything above this line ran as root (installing packages, creating users,
 # setting modes — all of which need it). Everything from here on, including the

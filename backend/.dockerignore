@@ -204,3 +204,122 @@ docs/
 Dockerfile
 .dockerignore
 docker-compose*.yml
+
+# ── DEPTH-INDEPENDENT TWINS FOR EVERY RULE ABOVE (PH3.12 finding C-3) ─────────
+# Everything above this line, apart from the C-1 block, is a BARE pattern, and a
+# bare pattern is anchored to the build-context root. `__pycache__/` excludes
+# `backend/__pycache__/` and nothing else; `analytics/__pycache__/`,
+# `services/__pycache__/` and every other nested one were copied straight into
+# the image. Measured on the release tree: **109 host `.pyc` files** entered the
+# build context — 104 `cpython-311` and 5 `cpython-314`, the latter compiled by
+# a Python the container cannot even load.
+#
+# WHY THAT IS NOT COSMETIC
+#   * REPRODUCIBILITY. `compileall` in the Dockerfile keeps any `.pyc` whose
+#     header still matches its source, so the HOST's bytecode ships. A build
+#     from a working directory and a build from `git archive` of the SAME commit
+#     produce different images. The artifact stops being a function of the
+#     commit — the exact property C-1 was raised for, reached through a
+#     different pattern.
+#   * INFORMATION DISCLOSURE. A code object embeds `co_filename`. 100 of those
+#     109 files carry an absolute developer path such as
+#     `/Users/<developer>/Files/alpha_stock/alpha-stock-main/backend/analytics/
+#     registry.py`, where a clean build carries `/app/analytics/registry.py`.
+#     Those strings surface in production tracebacks.
+#   * SECRETS. The same anchoring applies to the secret rules at the top of this
+#     file. `.env` and `*.key` protect the context ROOT only — a
+#     `services/.env` or `services/broker.key` would have been copied in. No
+#     such file exists today; the twins below make sure one never can.
+#
+# WHY THE GUARD DID NOT CATCH IT, WHICH IS THE REAL FINDING
+# `tests/test_build_context.py` modelled Docker's matcher with `fnmatch`, whose
+# `*` crosses `/`. Docker's does not. The guard therefore evaluated
+# `analytics/registry.pyc` against the root-anchored `*.py[cod]` and reported it
+# EXCLUDED while Docker copied it in — 110 such false negatives on the release
+# tree. The guard now runs `tests/_dockerignore.py`, a port of
+# `moby/patternmatcher`, proven cell-for-cell equivalent to Docker 29.4.0 by
+# differential test. A guard that models another tool is only as good as its
+# model, and this one was wrong in the direction that reports a leak as clean.
+#
+# WHAT IS DELIBERATELY *NOT* TWINNED
+# `env/` and `ENV/` keep no `**/` twin. Those names are ordinary English words —
+# a future `services/env/` package would be silently deleted from the image and
+# the container would fail at import with no trace back to this file. Root-level
+# virtualenvs are the real risk and stay covered. Same reasoning is why no rule
+# here is broadened past a named artifact class: an over-exclusion is an outage,
+# and `tests/test_build_context.py` asserts every git-tracked backend file that
+# is not in a declared-excluded category still reaches the image.
+
+# Secrets — the twins that matter most.
+**/.env
+**/.env.*
+**/*.env
+**/*.pem
+**/*.key
+**/credentials.json
+**/*credentials.json*
+**/*token.json*
+**/.credentials
+
+# Virtualenvs (root-level names only — see the note on `env/` above).
+**/venv/
+**/.venv/
+
+# Python bytecode & compiled artifacts — the C-3 defect itself.
+**/__pycache__/
+**/*.py[cod]
+**/*$py.class
+**/*.so
+**/.Python
+
+# Test inputs.
+**/tests/
+**/test_*.py
+**/*_test.py
+**/conftest.py
+**/pytest.ini
+**/requirements-dev.txt
+
+# VCS & CI metadata.
+**/.git/
+**/.gitignore
+**/.gitattributes
+**/.github/
+**/.gitconfig
+
+# Editor / IDE / OS noise.
+**/.vscode/
+**/.idea/
+**/*.swp
+**/*.swo
+**/*~
+**/.DS_Store
+**/Thumbs.db
+
+# Build outputs & JS toolchain.
+**/node_modules/
+**/dist/
+**/build/
+**/*.egg-info/
+
+# Logs, temp files, local databases.
+**/logs/
+**/*.log
+**/tmp/
+**/temp/
+**/dump.rdb
+**/*.sqlite
+**/*.sqlite3
+**/*.db
+
+# Documentation. `*.md` was root-anchored too, so `services/AI_WORKSPACE.md` was
+# shipping into the production image against the stated intent of the block
+# above — the same defect class, found by the same differential run.
+**/*.md
+**/docs/
+
+# Container tooling. docker/entrypoint.sh and docker/healthcheck.sh ARE needed
+# and are NOT matched by any rule here.
+**/Dockerfile
+**/.dockerignore
+**/docker-compose*.yml

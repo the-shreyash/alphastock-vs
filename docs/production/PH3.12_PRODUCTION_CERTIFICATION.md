@@ -22,6 +22,17 @@ for the commit it examined.
 > build context, so a working-directory build is not a function of the commit,
 > and the C-1 regression guard has a proven false negative for that case. §32
 > carries the identifiers, the re-run evidence and the blocker.
+>
+> **LATER THE SAME DAY — C-3 is CLOSED. See §33.** The remediation replaced the
+> guard's `fnmatch` model with a port of `moby/patternmatcher` (proven equivalent
+> to Docker 29.4.0 over 32,309 paths, twice), twinned every root-anchored
+> `.dockerignore` rule, and made `compileall` deterministic. A build from a
+> deliberately-dirtied working directory and a build from a clean export of the
+> same tree now produce **222 files under `/app`, all byte-identical**. Four
+> deliberate mutations prove the new guard bites, including one that breaks the
+> model itself and is caught by a real `docker buildx` build. §33 carries the
+> identifiers and the full evidence. **The change is NOT committed** — §33.9
+> explains why and what identifies the verified tree.
 
 ## 1. Executive Summary
 
@@ -1343,3 +1354,342 @@ Nothing was deployed. No blocker was silently repaired. PH3.13 was not started.
 ---
 
 *Closure pass 2026-08-19 against commit `6b53b3b`, image `sha256:9de7b850…bb2cc4`.*
+---
+
+# 33. PH3.12F-C3 — C-3 remediation pass (2026-08-19)
+
+*Appended. Nothing in §§1–32 is edited: the PH3.12 NO-GO, the PH3.12R
+remediation, the GO-CONDITIONAL verdict, the C-1 closure and the original C-3
+finding all stand as written. This section records only what changed after them.*
+
+**Scope of this pass: C-3 only.** No application logic was modified. PH3.13 was
+not started. Nothing was committed and nothing was deployed.
+
+## 33.1 C-3 root cause
+
+`backend/.dockerignore` excluded Python bytecode with two **bare** patterns:
+
+```
+__pycache__/
+*.py[cod]
+```
+
+Docker does not interpret those the way they read. The build context is filtered
+by `moby/patternmatcher`, and two of its rules decide this finding:
+
+| Rule | Consequence here |
+|---|---|
+| A bare pattern is anchored to the **build-context root** | `__pycache__/` excludes `backend/__pycache__/` and nothing else. `backend/services/__pycache__/` is not matched. |
+| `*` matches any run of characters **except `/`** | `*.py[cod]` compiles to `^[^/]*\.py[cod]$`. It cannot match `services/x.pyc` at all. |
+
+Every nested `__pycache__` in the repository therefore entered the build context
+and was copied into the image by `COPY . .`.
+
+**Measured on the release tree at `6b53b3b`**, by dumping the real build context
+with `docker buildx build -f (FROM scratch; COPY . /) --output type=local`:
+
+| Measure | Value |
+|---|---|
+| Files in the build context | **225** |
+| Host `.pyc` among them | **109** |
+| — compiled by the container's Python (`cpython-311`) | 104 |
+| — compiled by the **host's Python 3.14** (`cpython-314`), unloadable in the image | 5 |
+| `.pyc` embedding an absolute developer path in `co_filename` | **100** |
+| Nested `__pycache__` directories copied in | 9 |
+
+A representative embedded string, read straight out of the context:
+
+```
+/Users/<developer>/Files/alpha_stock/alpha-stock-main/backend/analytics/registry.py
+```
+
+A clean build carries `/app/analytics/registry.py` in the same position. Those
+strings are what a production traceback prints.
+
+**The same anchoring bug reached past bytecode.** The differential run found
+`services/AI_WORKSPACE.md` being copied into the production image as well: the
+`*.md` rule is root-anchored too, so the block that says docs are "dead weight in
+a server image" was not achieving that below the root. Every secret rule
+(`.env`, `*.key`, `*.pem`, `credentials.json`) was root-anchored for the same
+reason — no nested secret file exists in the tree today, so nothing leaked, but
+the control only ever protected the context root.
+
+**Why this is a certification finding and not housekeeping.** The image stops
+being a function of the commit. Two engineers building "the same release" get
+different artifacts, and the one built from a working directory carries the
+builder's filesystem layout inside it. That is the identical property C-1 was
+raised for, reached through a different pattern.
+
+## 33.2 Why the previous guard was insufficient
+
+`tests/test_build_context.py::_excluded` modelled Docker's matcher with Python's
+`fnmatch`. `fnmatch`'s `*` **crosses `/`**; Docker's does not. The guard
+therefore evaluated `analytics/registry.pyc` against the root-anchored
+`*.py[cod]`, matched it, and reported the file excluded — while Docker copied it
+in.
+
+Quantified against the pre-fix release tree, comparing the guard's verdict to the
+observed contents of the real build context:
+
+| Measure | Value |
+|---|---|
+| Paths Docker actually copied in that the guard reported **EXCLUDED** | **110** |
+| — nested host `.pyc` | 109 |
+| — `services/AI_WORKSPACE.md` | 1 |
+| C-3 probe paths reported EXCLUDED by the pre-fix guard | **16 of 16** |
+
+The last row is the finding. Had the C-3 test cases been written against the
+pre-fix guard, **all sixteen would have passed** while the leak was live. The
+guard was not incomplete; it was **unfalsifiable for the exact class it existed
+to defend** — the same defect shape that let C-1 survive three sprints and let
+PH3.11 certify B-2 closed while it was open.
+
+The rule this pass encodes: **a guard that models another tool's matcher must be
+checked against that tool.**
+
+## 33.3 Remediation
+
+Five files. No application logic.
+
+| File | Change |
+|---|---|
+| `backend/tests/_dockerignore.py` | **NEW.** A port of the Go code Docker actually runs: `dockerignore.ReadAll` (the parser) and `moby/patternmatcher` `MatchesOrParentMatches` (the matcher), including `filepath.Clean` semantics and the pattern→regexp compilation. |
+| `backend/tests/test_dockerignore_semantics.py` | **NEW.** Pins each semantic rule, then proves the port against real Docker with differential builds. |
+| `backend/.dockerignore` | Depth-independent `**/` twins for every root-anchored rule that needs one. |
+| `backend/Dockerfile` | `compileall --invalidation-mode checked-hash` — see §33.6. |
+| `backend/tests/test_build_context.py` | Matching switched to the port; C-3 regression and over-reach coverage added. |
+
+**The matcher is proven, not asserted.** Equivalence was measured over the whole
+repository rather than a sample — every candidate path walked, the model's
+verdict compared against the contents of a real Docker build context:
+
+| Run | Candidate paths | Docker kept | Model kept | Divergences |
+|---|---|---|---|---|
+| Pre-fix `.dockerignore` | 32,309 | 225 | 225 | **0** |
+| Post-fix `.dockerignore` | 32,309 | 115 | 115 | **0** |
+
+`test_dockerignore_semantics.py` keeps that honest going forward: 15 synthetic
+pattern/path cases plus this repository's own `.dockerignore` are re-measured
+against `docker buildx` on every run where a daemon is reachable, and the
+hermetic table is asserted against Docker's answer — so a wrong expectation
+cannot hide behind a matching wrong model.
+
+**The `.dockerignore` fix is scoped, not broad.** It adds `**/` twins for
+bytecode, caches, test inputs and outputs, secrets, VCS/editor/OS noise, build
+outputs, logs and docs. It deliberately does **not** twin `env/` and `ENV/`:
+those are ordinary English words, and a future `services/env/` package would be
+silently deleted from the image, producing an import failure with no trace back
+to the ignore file. An over-exclusion is an outage, not a hardening win.
+
+**Effect on the build context** (real tree, measured against Docker):
+
+| | Pre-fix | Post-fix |
+|---|---|---|
+| Files in build context | 225 | **115** |
+| Host `.pyc` | 109 | **0** |
+| Stray `.md` | 1 | **0** |
+| Files added by the fix | — | **0** |
+
+The removed set is exactly 109 bytecode files plus `services/AI_WORKSPACE.md`.
+No production file changed state.
+
+## 33.4 Falsifiability evidence
+
+Each control was deliberately broken, the suite re-run, and the file restored
+and re-verified by checksum. Baseline is **173 passed**.
+
+| # | Mutation | Result | What it proves |
+|---|---|---|---|
+| A | Delete `**/__pycache__/` and `**/*.py[cod]` from `.dockerignore` | **21 failed** | The C-3 rules are load-bearing, not decorative. |
+| B | Delete `**/.env`, `**/*.key`, `**/*.pem` | **2 failed** | The secret twins are individually covered. |
+| C | Add `**/*.py` (a plausible over-broad edit) | **20 failed** | Over-exclusion is caught, naming the modules it would delete. |
+| D | Make `*` cross `/` in `_dockerignore.py` — i.e. reintroduce the exact C-3 root cause **in the model** | **6 failed**, including `test_model_matches_real_docker[star-does-not-cross-separator]` | The model itself is guarded, and it is guarded *by real Docker*. |
+
+Mutation D is the one that matters. The pre-fix guard had no equivalent: breaking
+its model changed nothing that any test could observe. This one fails against an
+actual `docker buildx` build.
+
+Restoration verified: `.dockerignore` → `855bad4cde63f94c…`,
+`_dockerignore.py` → `fa5cb5ad5d7c1cf5…`, suite back to 173 passed.
+
+## 33.5 Reproducibility evidence
+
+Both images built with `--no-cache --pull`, back to back, from the same tree.
+
+**The working-directory build was deliberately dirtied first**, so it had every
+opportunity to differ:
+
+| Artifact planted in `backend/` | Count |
+|---|---|
+| `.pyc` files (excluding `venv/`) | **307** |
+| — `cpython-314` (host Python; the container cannot load them) | 109 |
+| `__pycache__` directories | 12 |
+| `test-results/junit.xml` (root **and** nested under `services/`) | 2 |
+| `services/.coverage`, `services/htmlcov/index.html` | 2 |
+| Stray `.pyc` outside any `__pycache__` | 2 |
+
+**Result:**
+
+| Check | Result |
+|---|---|
+| File list under `/app` | **IDENTICAL** — 222 files each |
+| File contents (sha256 of every one) | **ALL 222 BYTE-IDENTICAL** |
+| Aggregate digest of the `/app` manifest | `93c2a76f9d991172c08e0ee6e48e8df6454ae029420878deaf4252d9b0674cb3` (both) |
+| Host bytecode (`cpython-312/313/314`) in the image | **0** (both) |
+| `test-results/` / `junit.xml` | **0** (both) |
+| Coverage / `.pytest_cache` / `tests/` / `conftest.py` / `test_*.py` | **0** (both) |
+| Files containing a `/Users/` path | **0** (both) |
+
+The 222 files are 115 source files — exactly the post-fix build context — plus
+107 `.pyc` the image compiles for itself. Those are not host artifacts:
+
+| Property of the in-image bytecode | Value |
+|---|---|
+| `co_filename` root, all 107 | `/app` (never `/Users`) |
+| Magic number | matches the container's own interpreter |
+| Invalidation mode | `3` = checked-hash, on all 107 |
+
+## 33.6 A second reproducibility defect, found and closed in this pass
+
+The first pair of rebuilds came back with **all 115 source files byte-identical
+and all 107 `.pyc` different**. Inspecting the bytes rather than assuming:
+
+```
+first pyc mtime/size:  1783405893 3243   (working-directory build)
+first pyc mtime/size:  1787084476 3243   (clean git-archive build)
+sha256 of CODE only :  ccfbc8358c32453f973a3d20b59b337b   ← identical in both
+```
+
+The marshalled code objects were identical. The only varying bytes were the
+**source mtime** in the `.pyc` header, which `compileall` writes by default:
+`git archive` stamps every file with the commit time, a working directory
+carries whatever mtime the developer's checkout has.
+
+So the `.dockerignore` fix alone would have left the image *still* not a pure
+function of the commit — for a completely different reason, and one that would
+have been easy to wave away as "only bytecode". `backend/Dockerfile` now compiles
+with `--invalidation-mode checked-hash`, which stores a hash of the source
+instead of its mtime. `checked-hash` rather than `unchecked-hash`: both are
+deterministic, but unchecked bytecode is trusted without reading the source, so a
+bind-mounted source tree — the standard local-debug move — would silently run
+stale code. Checked-hash pays one source hash per module at import to make that
+impossible.
+
+After the flag, the two builds are byte-identical (§33.5).
+
+## 33.7 Regression suites
+
+| Suite | Result | Baseline |
+|---|---|---|
+| Backend regression (`pytest -q`) | **2,916 passed**, 0 failed, 4 xfailed, 95 deselected (170.24 s) | 2,787 (2,743 + 44 build-context) |
+| Security (`pytest -q -m security`) | **452 passed**, 0 failed (32.50 s) | 452 |
+| Build-context guard (`test_build_context.py`) | **92 passed** | 44 |
+| Docker-semantics guard (`test_dockerignore_semantics.py`) | **81 passed**, incl. 16 real-Docker differential | new |
+
+The frontend suite and the frontend production build were **not re-run**: no
+frontend file was touched in this pass. The last measured values stand
+(§32.6 — 395 tests / 22 suites, build exit 0).
+
+## 33.8 B-1 and B-2, re-verified against the final image
+
+Both probed against a **running container of the final image**, with a real
+MongoDB 7 and a real password-protected Redis 7.
+
+**B-1 — paper-trade input validation.** 15 hostile payloads, **0 accepted**;
+paper balance byte-identical across the whole matrix.
+
+| Payload | Result |
+|---|---|
+| `quantity: -1000` (the original exploit) | **422** |
+| `quantity` `0` / `1.5` / `"-1000"` / missing / `null` / `10**12` | 422 |
+| `entry_price` negative / `0` / `Infinity` / `NaN` | 422 |
+| `stop_loss` negative | 422 |
+| `type: "WITHDRAW"` | 422 |
+| `symbol` empty / `"REL$IANCE; DROP"` | 422 |
+| **Non-rejected hostile payloads** | **0 of 15** |
+| Balance across the matrix | `100000.0` → `100000.0` |
+
+Replayed against an account **holding an open position**: `quantity: -1000` →
+**422**, balance `90000.0` → `90000.0`, trade count still 1 (the one legitimate
+BUY). Valid trading is unaffected — BUY 10 @ ₹1,000 debits exactly ₹10,000
+(`100000.0` → `90000.0`).
+
+**B-2 — API documentation exposure**, both directions, same image:
+
+| Probe | `APP_ENV=production` | Same image, `APP_ENV=development` |
+|---|---|---|
+| `/docs` | **404** | **200** |
+| `/redoc` | **404** | **200** |
+| `/openapi.json` | **404** | **200**, **188 paths** |
+| `/api/docs` | **404** | — |
+
+The probe is falsifiable: flipping one environment variable on the *same image*
+turns every 404 into a 200. A 404 here is evidence of the control, not evidence
+of a mistyped path — the failure mode that invalidated PH3.11's B-2 evidence.
+
+## 33.9 Release identifiers
+
+| Item | Value |
+|---|---|
+| Base commit (parent) | `ed926a9b4db4f6528459be2c56299b372edd1218` |
+| Candidate tree | `3e755e2a1e1296dde7c469c9ce1cdfbfc79fb201` |
+| Candidate commit object (not on any branch) | `4ec097aa9c4abc70748e0fb96e7975c99e5dad37` |
+| Production image, clean git-archive build | `sha256:65d2bc67ea24f8e2d806f44953480e42fb1d65eb6ed90412e24bea15b0bbdccf` |
+| Production image, working-directory build | `sha256:057596aa2df12a64494863e0274c1466c3d39bc03dc864a7d796d5ec9a5699e0` |
+| `/app` manifest digest (identical in both) | `93c2a76f9d991172c08e0ee6e48e8df6454ae029420878deaf4252d9b0674cb3` |
+| Docker | 29.4.0, buildx v0.33.0 |
+| Base image | `python:3.11-slim-bookworm`, `--pull` on both builds |
+
+**The release commit SHA does not exist yet, deliberately.** The instruction for
+this pass was not to commit. The candidate tree above is the exact content
+verified; `git commit-tree` was used to obtain a stable identifier for it without
+touching any branch, index or working tree.
+
+This is now a weaker caveat than it would have been before this pass. The two
+image IDs differ only in layer metadata; the `/app` trees are byte-identical, and
+that identity was produced from a dirtied working directory and a clean export of
+the same content. Committing the tree and rebuilding will therefore reproduce the
+same `/app` — which is the property C-3 was about.
+
+## 33.10 C-3 status
+
+**C-3: CLOSED.**
+
+| Closure criterion | Evidence |
+|---|---|
+| Reproduced against the pre-fix tree | §33.1 — 109 host `.pyc` in the real build context |
+| Previous guard proven to give the wrong answer | §33.2 — 110 false negatives; 16/16 C-3 probes wrongly "excluded" |
+| Matching follows Docker's real semantics | §33.3 — port of `moby/patternmatcher`, 0 divergences over 32,309 paths, twice |
+| Root / recursive / `**/` / negation / directory / nested / wildcard-vs-separator all distinguished | `test_dockerignore_semantics.py`, each pinned and each differentially verified |
+| Bytecode and cache/test artifacts excluded at any depth | §33.3, §33.5 — 0 in context, 0 in image |
+| No over-exclusion | §33.3 — 0 files added; `server.py`, `models.py`, `entrypoint.sh` and all 107 production modules asserted present |
+| Guard is falsifiable | §33.4 — four mutations, including one that breaks the model and is caught by real Docker |
+| Dual `--no-cache --pull` rebuild | §33.5 — identical file lists, all 222 files byte-identical |
+| B-1 / B-2 still pass | §33.8 |
+
+## 33.11 New observation — not C-3, not repaired
+
+**C-4 (minor, operational): `LOG_LEVEL` is passed to uvicorn without case
+normalisation.**
+
+`backend/docker/entrypoint.sh:246` passes `${LOG_LEVEL}` straight to
+`uvicorn --log-level`, which accepts lowercase names only. Setting
+`LOG_LEVEL=INFO` makes the container exit **2** at startup with
+`Invalid value for '--log-level': 'INFO' is not one of 'critical', 'error', …`.
+
+Observed during this pass while booting the release image. `production.env.example:109`
+correctly says `LOG_LEVEL=info`, so the documented container path is safe;
+`backend/.env.example:45` says `LOG_LEVEL=INFO`, which is correct for the
+local-dev dotenv that Python's `logging` reads but is the value an operator is
+most likely to copy. The entrypoint validates everything else carefully and then
+fails on this one with a message from uvicorn rather than from its own checks.
+
+Impact: startup fails loudly and immediately; no data or security consequence.
+Not repaired here — the instruction for this pass was C-3 only, and reporting a
+finding rather than silently fixing it is the standing rule.
+
+---
+
+*C-3 closure pass 2026-08-19 against candidate tree `3e755e2a…fb201`,
+image `sha256:65d2bc67…bbdccf`. Nothing committed, nothing deployed, PH3.13 not
+started.*
