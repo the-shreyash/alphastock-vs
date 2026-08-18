@@ -5,9 +5,218 @@ This file records documentation-system versions and, from v1.0 launch onward, pr
 
 ---
 
+# Sprint PH3.12C — Conditional Remediation (C-1 / C-2) — 2026-08-18
+
+**Report:** `docs/production/PH3.12_PRODUCTION_CERTIFICATION.md` §31
+**Scope:** close the two conditions attached to the PH3.12 rerun verdict. No feature
+work, no unrelated code touched, no test weakened, no exit code masked.
+**Audit trail:** the 2026-08-17 NO-GO certification and its PH3.12R remediation
+addendum are preserved verbatim at
+`docs/production/PH3.12_PRODUCTION_CERTIFICATION_NOGO_ARCHIVE.md`. The rerun
+report reoccupied the original filename, which would have left the superseded
+verdict readable only in git history; a release decision reached across four
+passes is auditable only if every pass is still on disk. All references in this
+changelog, `TASK.md` and `PRODUCTION_ROADMAP.md` now resolve to the pass they
+actually describe.
+
+## C-1 — CLOSED
+
+A git-ignored artifact written by the project's own CI command
+(`pytest --junit-xml=test-results/junit.xml`) was being baked into the release
+image, because `.dockerignore` excluded test **inputs** but not test **outputs**.
+
+**One empirical finding changed the shape of the fix.** A probe context built
+against Docker 29.4.0 showed that a `.dockerignore` pattern is **anchored to the
+build-context root**: with a bare `test-results/` rule, `sub/test-results/junit.xml`
+and `sub/junit.xml` were both still copied in. Only the `**/`-prefixed form is
+depth-independent — and `**/foo` does not match a root-level `foo`, so every rule
+now ships **both** forms and neither is redundant. The same twins were added for
+the generated tool artifacts already in the caches block (`.pytest_cache/`,
+`.coverage`, `htmlcov/`, `.tox/`, `.mypy_cache/`, …), which had the identical gap.
+
+**Guard:** `backend/tests/test_build_context.py` — 44 hermetic tests that parse
+`.dockerignore` and never invoke Docker, so they run in the default suite. Proven
+able to fail before being trusted: **26 failed** against `HEAD`'s pre-fix file,
+**44 pass** after. It also asserts the rules do not over-reach — `server.py`,
+`models.py`, `requirements.txt`, `security/api_docs.py` and `docker/entrypoint.sh`
+must stay *included*, since an over-broad exclusion is an outage, not hardening.
+
+**Proof.** Both images built `--no-cache --pull`, with `test-results/junit.xml` and
+`.coverage` deliberately left on disk so the check could not pass vacuously:
+
+| Build | Files in `/app` |
+|---|---|
+| From the working directory | **116** |
+| From a clean `git archive` export | **116** |
+| `diff` | **identical** |
+| Previously certified image | 117 |
+
+0 content mismatches, 0 image-only files, and no `junit*.xml` / `coverage.xml` /
+`report.xml` anywhere under `/app`. Image `stockassist-rc:ph312-c1fix`, 425 MB,
+`sha256:cdfcd0b3…a9af03`.
+
+## C-2 — WITHDRAWN: the certification finding was wrong
+
+**No defect exists and no application code was changed.**
+
+The rerun reported "exit 137 on shutdown after a Redis outage," reproduced 4/4. The
+reproduction was real; the attribution was not. A control container — 20 lines of
+Python, a textbook SIGTERM handler, 1.2 s of simulated teardown, no Redis, no
+asyncio, **no application code** — reproduces it exactly:
+
+| Control container | Result |
+|---|---|
+| `docker stop` (no `-t`) | **exit 137, 6/6** |
+| `docker stop -t 10` / `-t 30` / `-t 60` | **exit 0, 3/3** |
+| Teardown shortened to 0.2 s, bare `docker stop` | **exit 0, 3/3** |
+
+On this host (Docker Desktop 29.4.0, macOS) `docker stop` **without an explicit
+`--timeout` SIGKILLs at ~1.3 s**, far short of the documented 10 s grace. The
+application's teardown takes **1.5–2.3 s** and straddles that window; a Redis flap
+lengthens it slightly. The certification used bare `docker stop` for the flap runs
+and explicit `-t 30`/`-t 60` for the baselines, so **every 137 came from a bare stop
+and every 0 from an explicit `-t`**. Redis was never the variable under test.
+
+Sending SIGTERM directly, bypassing `docker stop`: **exit 0 in 3/3** (1.94 s /
+1.47 s / 2.28 s), ordered teardown complete every time, and **zero**
+`Task was destroyed`, unretrieved-exception or never-awaited-coroutine warnings —
+so the fire-and-forget pool-reset task in `infrastructure/redis_client.py` is not
+leaking either.
+
+Nothing was changed because there is nothing in the application to fix: the SIGKILL
+originates in the host's `docker stop` client, and the app already exits 0 with a
+complete teardown on the signal an orchestrator actually sends. Masking the exit
+code was never an option and was not done.
+
+## Verification
+
+Targeted regression **379 passed**; the new guard **44 passed**. On the remediated
+image: `/docs`, `/redoc`, `/openapi.json` → **404/404/404**; `quantity=-1000` →
+**422** with the balance unchanged at `100000.0`; valid BUY → **200**, balance
+**90000.0**.
+
+## Files changed
+
+`backend/.dockerignore` and `backend/tests/test_build_context.py` (new). **No
+application module, dependency, workflow or configuration file was modified.**
+
+## Remaining condition
+
+The remediation is **uncommitted**, so L-1's clean-tree property does not currently
+hold. Both files must be committed and the image rebuilt from that commit before
+deploy. Operational prerequisites are unchanged: payments not implemented,
+backup/DR has no off-host target, rollback has no deployment ledger.
+
+---
+
+# Sprint PH3.12 (RERUN) — Final Production Certification — 2026-08-18
+
+**Report:** `docs/production/PH3.12_PRODUCTION_CERTIFICATION.md` (30 sections, rewritten)
+**Certified commit:** `a4ee79f3e8ba5f689e265a8c804c9e9674717173` on `main`, working tree **clean**
+**Release image:** `stockassist-rc:ph312-cert`, 425 MB, `sha256:42d12ddf…abf8ce`, built `--no-cache --pull`
+**Verdict:** **GO — CONDITIONAL.**
+
+Independent re-certification. Nothing was carried over from PH3.11, PH3.12 or
+PH3.12R; every number was re-measured and every control re-probed against a
+production image built from scratch during the sprint. **No application code was
+changed** — the tree was verified clean at start and at end.
+
+## Baselines reproduced exactly — zero unexplained deltas
+
+| Suite | Result | Baseline |
+|---|---|---|
+| Backend | **2,743 passed**, 4 xfailed | 2,743 |
+| PH1 security | **452 passed** | 452 |
+| Frontend | **395 passed**, 22 suites | 395 |
+| Production build | **exit 0**, 62 ESLint warnings | PASS / 62 |
+| Dependency gate | **exit 0** | PASS |
+| Routes | 201 HTTP + 1 WS · **97/29/75** | 201 · 97/29/75 |
+| MOCK analytics | **0 of 53** | 0 |
+
+Two apparent deltas, both resolved: the raw route table has 202 entries because
+it includes the one `APIWebSocketRoute` the classifier excludes; and the frontend
+build exits 1 only under `CI=true`, which the project's own pipeline deliberately
+does not set (`frontend-ci.yml:146`). Both runs are reported.
+
+## All three prior blockers independently CLOSED — with probes that could fail
+
+**B-1** — 15/15 hostile paper-trade payloads (`quantity=-1000`, `0`, `99999999`,
+negative/zero price, `NaN`, `±Infinity`, `1e309`, non-numeric, unknown fields
+`broker`/`is_paper`, `type:"HACK"`, symbol injection, negative `target2`) all
+answer **422**, each naming the offending field, with the paper balance
+**byte-for-byte unchanged** (`100000.0` → `100000.0`). Re-verified against an
+account **holding an open position**. Valid trading arithmetic is exact: BUY
+10×RELIANCE@₹1,000 debits to ₹90,000; close at a live ₹1,322.90 mark credits to
+₹103,229 with realized P&L ₹3,229.
+
+**B-2** — `/docs`, `/redoc`, `/openapi.json` all **404**, and the live route table
+registers **0** documentation routes. The probe was made falsifiable: the *same
+image* at `APP_ENV=development` serves all three with **200** and 188 paths. This
+is precisely the check PH3.11 got wrong by probing `/api/docs`.
+
+**L-1** — the RC is a real commit with a clean tree; **0 content mismatches**
+across all 117 image files against the committed blobs.
+
+## PH1, WebSocket and infrastructure
+
+Seventeen PH1 controls re-probed **live** against the production binary — cookie
+flags, CORS origin rejection, password policy, JWT forgery, refresh **rotation +
+replay rejection + whole-family revocation**, CSRF (missing 403 / forged 403 /
+**valid 200**), rate limiting (429 first on attempt **#6**, matching the
+configured `5/900`), the full security-header set with no `Server` header.
+**None regressed.** WebSocket: 4/4 attacks rejected (anonymous, spoofed
+`user_id`, query-token, forged subprotocol), 2/2 legitimate paths connected.
+Redis loss degrades gracefully with **0 restarts**; Mongo loss holds liveness at
+200 and flips readiness to 503 in 7 s; both recover automatically with data
+intact.
+
+## Gates proven to bite, not merely to pass
+
+The dependency gate fails three distinct ways on demand: expired suppression →
+exit 1, synthetic stale register entry → exit 1, missing auditor → exit **2**
+(a distinct tooling state). Production configuration **fails closed** — the
+container refused to start three times on unauthenticated Mongo, passwordless
+Redis, and a placeholder-shaped API key. gitleaks over the image `/app` reports
+**no leaks**; **0** of 7 configured secrets appear in live logs. A full backup
+and restore drill ran end-to-end: encrypted AES-256-CBC artifact, checksum and
+structural verification, restore reconciling **19 collections matched exactly**.
+
+## Two NEW findings — neither security nor financial
+
+**C-1 — an untracked, git-ignored host artifact is baked into the release image.**
+`backend/test-results/junit.xml` sits at `/app/test-results/junit.xml` but is
+absent from the commit: `backend/.dockerignore` excludes `tests/` and `test_*.py`
+but **not** `test-results/`. Proven by construction — a build from the working
+directory yields **117** files in `/app`; a build from a clean `git archive` of
+the *same commit* yields **116**. The image is therefore not a pure function of
+the commit, and the file carries the developer's machine hostname. It is inert
+(never imported, executed or served). PH3.12R missed it because its check covered
+only `.py` files — the same scoping failure that let B-2 survive PH3.11.
+
+**C-2 — exit 137 (SIGKILL) on shutdown after a Redis outage-and-recovery.**
+Reproduced 4/4 with the default `docker stop`; the no-outage baseline exits 0
+(4/4) and a 60 s stop timeout exits 0. Application teardown itself completes in
+order. The impact is orchestrator signalling — a real crash becomes
+indistinguishable from a routine stop — not data integrity; nothing was lost in
+any scenario.
+
+## Decision
+
+**GO — CONDITIONAL.** The committed source at `a4ee79f` is certified production
+ready. The image built this sprint must be **rebuilt after the one-line C-1 fix**
+before it is deployed. Payments (**not implemented** — no provider integration
+exists; the refund endpoint returns 501 and writes no audit record), Backup/DR
+(**no off-host target**) and Rollback (**no deployment ledger**) are recorded as
+**NOT OPERATIONALLY VERIFIED** deployment prerequisites, not as blockers.
+
+No blocker was repaired during certification. Nothing was deployed. PH3.13 was
+not started.
+
+---
+
 # Sprint PH3.12R — Production Certification Blocker Remediation — 2026-08-18
 
-**Report:** `docs/production/PH3.12_PRODUCTION_CERTIFICATION.md` — *PH3.12R Blocker Remediation Addendum*
+**Report:** `docs/production/PH3.12_PRODUCTION_CERTIFICATION_NOGO_ARCHIVE.md` — *PH3.12R Blocker Remediation Addendum* (archived verbatim; that filename was reoccupied by the 2026-08-18 rerun)
 **Verdict:** **REMEDIATION COMPLETE — READY FOR A FRESH PH3.12 CERTIFICATION RERUN.**
 **PH3.12 certification is NOT passed.** This sprint fixes what blocked it; the rerun decides the release.
 
@@ -159,7 +368,7 @@ a GO. **Recommend a fresh PH3.12 certification rerun.**
 
 # Sprint PH3.12 — Production Certification & Final Release Decision — 2026-08-17
 
-**Report:** `docs/production/PH3.12_PRODUCTION_CERTIFICATION.md` (30 sections)
+**Report:** `docs/production/PH3.12_PRODUCTION_CERTIFICATION_NOGO_ARCHIVE.md` (30 sections; archived verbatim — that filename was reoccupied by the 2026-08-18 rerun)
 **Verdict:** **NO-GO — PRODUCTION CERTIFICATION BLOCKED**
 
 **No application code was changed.** The tracked diff hashes to

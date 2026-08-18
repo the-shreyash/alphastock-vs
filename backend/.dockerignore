@@ -86,6 +86,78 @@ conftest.py
 pytest.ini
 requirements-dev.txt
 
+# ── Test & CI RESULT artifacts (PH3.12 finding C-1) ───────────────────────────
+# The rules above exclude the tests. They do NOT exclude what RUNNING the tests
+# leaves behind, and that gap put a file into a certified release image.
+#
+# `backend-ci.yml` runs pytest with `--junit-xml=test-results/junit.xml`, so the
+# moment anyone executes the project's own test command — in CI or locally — a
+# `test-results/` directory appears in the build context. It is git-ignored
+# (.gitignore:69), so it is invisible to `git status` and absent from every
+# commit, and `COPY . .` swept it into the image anyway. PH3.12 measured the
+# result: a build from a working directory produced 117 files under /app, while
+# a build from a clean `git archive` of the SAME commit produced 116. The image
+# was therefore not a function of the commit — two engineers building "the same
+# release" got different artifacts, and the extra one carried a developer's
+# machine hostname and a record of a failing test.
+#
+# WHY THE PATTERNS ARE BROADER THAN THE ONE FILE THAT WAS FOUND
+# The specific leak was `test-results/junit.xml`. Excluding exactly that would
+# fix this instance and none of the next ones: every entry below is a path some
+# common runner writes by default, and each would leak the same way. The rule
+# being encoded is "test INPUTS and test OUTPUTS are both build-context
+# garbage", not "this one filename".
+#
+# NOTE ON WHY .gitignore IS NOT ENOUGH. Docker does not read .gitignore. Any
+# git-ignored artifact under backend/ enters the image unless it is ALSO named
+# here — which is precisely the class of defect C-1 belongs to. When adding a
+# new generated-artifact path to .gitignore, add it here too.
+#
+# WHY EVERY ENTRY IS WRITTEN TWICE, PLAIN AND `**/`-PREFIXED
+# A .dockerignore pattern is matched against the path relative to the build
+# context ROOT, so a bare `test-results/` excludes `<context>/test-results/` and
+# nothing else. Verified empirically against Docker 29.4.0 rather than assumed:
+# with only the bare patterns, `sub/test-results/junit.xml` and `sub/junit.xml`
+# were both still copied into the image. The `**/`-prefixed form is what makes
+# the rule depth-independent. Both forms are kept because `**/foo` does not
+# match a root-level `foo` — dropping the bare pattern would reopen the exact
+# hole this block closes.
+test-results/
+**/test-results/
+test_reports/
+**/test_reports/
+junit*.xml
+**/junit*.xml
+*.junit.xml
+**/*.junit.xml
+coverage.xml
+**/coverage.xml
+nosetests.xml
+**/nosetests.xml
+report.xml
+**/report.xml
+.benchmarks/
+**/.benchmarks/
+.hypothesis/
+**/.hypothesis/
+
+# Depth-independent twins for the generated tool artifacts already listed in
+# "Python caches & compiled artifacts" above. Those entries are correct but
+# root-anchored, so a `services/htmlcov/` or a nested `.coverage` written by a
+# per-package test run would still have been copied in. Same defect class as
+# C-1; closed here, beside the reasoning, rather than doubling the length of
+# the block above.
+**/.pytest_cache/
+**/.coverage
+**/.coverage.*
+**/coverage/
+**/htmlcov/
+**/.tox/
+**/.nox/
+**/.mypy_cache/
+**/.ruff_cache/
+**/.pytype/
+
 # ── VCS & CI metadata ─────────────────────────────────────────────────────────
 # `.git` in particular can be enormous and contains the FULL history — including
 # any secret ever committed and later removed from the working tree.
