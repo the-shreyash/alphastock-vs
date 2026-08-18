@@ -5,6 +5,483 @@ This file records documentation-system versions and, from v1.0 launch onward, pr
 
 ---
 
+# Sprint PH3.12R — Production Certification Blocker Remediation — 2026-08-18
+
+**Report:** `docs/production/PH3.12_PRODUCTION_CERTIFICATION.md` — *PH3.12R Blocker Remediation Addendum*
+**Verdict:** **REMEDIATION COMPLETE — READY FOR A FRESH PH3.12 CERTIFICATION RERUN.**
+**PH3.12 certification is NOT passed.** This sprint fixes what blocked it; the rerun decides the release.
+
+Both blockers had been present for the whole of PH3, and both survived for the
+same reason: **the probe that should have caught them could not have failed.**
+Every fix below therefore ships with tests that were run against the pre-fix
+code and *observed to fail*, with the counts recorded.
+
+## B-1 — `PaperTradeCreate` input validation
+
+**Root cause was duplication, not a missing bound.** The trade-entry contract was
+written down twice — `TradeCreate` in `models.py` with every constraint, and
+`PaperTradeCreate` declared inline in `server.py` ~5,000 lines away with none —
+and nothing linked them, so bounds added to one were never added to the other.
+`total_cost = entry_price * quantity` then went negative and the BUY branch
+called `update_paper_balance(user_id, -total_cost)`, **crediting** ₹10,00,000.
+
+**Fix:** the contract now exists **once**, as shared constrained types
+(`TradeSide`, `TradeQuantity`, `TradePrice`, `OptionalTradePrice`,
+`TradeSymbol`), and `PaperTradeCreate` moved into `models.py` directly beneath
+`TradeCreate` and rewritten in them. Adjacency is part of the fix. Validation is
+model-layer, so it completes before the handler body runs and therefore before
+any balance, position, trade or P&L write is reachable — malformed input answers
+**422** and mutates nothing. `execute_paper_trade` re-validates against the
+*same model* (not a copy of its rules) for callers that never touch FastAPI.
+
+**A second, latent instance of the same class was found and closed:** Python's
+`json.loads` — which Starlette parses bodies with — accepts `Infinity`/`NaN`, and
+a plain `gt=0` float **admits `Infinity`** (`inf > 0` is True). `entry_price:
+Infinity` passed every bound on the **real** trade endpoint too. Verified
+empirically, closed by `allow_inf_nan=False`.
+
+**Tests:** `backend/tests/test_paper_trade_validation.py`, **132 tests** — the
+literal `quantity=-1000` exploit (rejected *on the quantity field*, balance
+identical after three repeats, no document written); a 28-case hostile matrix;
+every one of those 28 re-run against an account **holding an open position** so
+balance, positions, unrealised P&L and journal all carry non-trivial values, each
+asserting a full account snapshot is byte-identical afterwards; valid BUY/SELL,
+seven real symbol shapes (`M&M`, `BAJAJ-AUTO`, lowercase), all eleven UI setup
+types, quantity exactly at the 100,000 ceiling, insufficient-capital still 400
+not 422; direct service-layer calls; and metadata-identity assertions proving the
+two models can no longer drift. **Pre-fix: 94 failed / 38 passed. Fixed: 132
+passed.**
+
+## B-2 — production API documentation exposure
+
+**Root cause:** `server.py:357` was `FastAPI(title="AlphaPartner API")` — every
+doc URL at its framework default, no environment gating anywhere. **It survived
+because PH3.11 §9 probed `/api/docs`** — a path this application never served —
+**saw the generic unknown-path 404, and recorded the control as verified.**
+
+**Fix:** new `backend/security/api_docs.py`; `server.py` now builds
+`FastAPI(title=..., **api_docs.docs_kwargs())`. Production → `/docs`, `/redoc`
+and `/openapi.json` all **404**; development, testing and staging → all **200**.
+Four decisions, each against a specific failure mode: all three switch **together
+from one function** (disabling Swagger alone leaves the machine-readable schema
+served — the half that matters); `None` rather than a 403 guard, so the routes are
+never registered and disclose nothing by difference; the environment is read
+through `security.secrets.app_env()` so docs exposure cannot disagree with the
+cookie policy; and **no variable can enable docs in production** —
+`API_DOCS_ENABLED=false` only ever tightens, mirroring `cookies.cookie_secure()`,
+because an enable-flag means one typo reopens exactly this hole.
+`app.openapi()` still works — the schema is unpublished, not ungenerable.
+
+**Tests:** `backend/tests/test_api_docs_exposure.py`, **52 tests**, plus harness
+`backend/tests/_prod_app_probe.py`. Real paths as **literals**, never derived from
+the constant under test. Policy matrix across all four environments; the partial
+fix proven impossible; real `TestClient` requests to the real paths in both
+directions; an explicit test that **`/api/docs` is 404 in both environments**,
+documenting why PH3.11's evidence was empty. The decisive class boots the **real
+`server` module in a clean interpreter as `APP_ENV=production`** and measures the
+real routes — necessary because `server` builds `app` at import time, so under the
+suite's own `testing` environment a regressed constructor would be
+*indistinguishable from the fix*. **Pre-fix line: 5 failed. Half-fix (Swagger
+hidden, `/openapi.json` still served): 7 failed. Fixed: 52 passed.**
+
+## L-1 — release reproducibility
+
+Resolved. RC is now a commit, not a working tree.
+
+## Release Reproducibility
+
+| Item | Value |
+|---|---|
+| Release commit | `PH312R_CODE_SHA` on `main` (code + tests + docs) |
+| Parent | `32437e8` |
+| Image tag | `stockassist-rc:ph312r` |
+| Image ID | `sha256:0cab81d747d4fc3f06d8dfb6fc4fe6c190fcf41eebff7c59293583cf77279d0c` |
+| Config digest | `sha256:a3013575a76c89d871b391f3e8c16dc1f1cc6027776c35ac3351126ab5d2c273` |
+| Size | 425 MB |
+| Build | `docker build --no-cache --pull -f backend/Dockerfile -t stockassist-rc:ph312r backend` |
+| Working tree | clean after commit |
+
+**Stated rather than glossed:** `--no-cache --pull` builds are **not
+bit-reproducible** (pip resolution and layer timestamps vary), so two builds of
+one commit yield different image IDs. The property that was verified is that the
+**application source inside the image matches the committed source**. An image ID
+is a build identity, not a source identity, and treating it as the latter would
+be one more control that cannot fail.
+
+## Verification
+
+**2,743 backend passed** / 0 failed / 4 xfailed (baseline 2,559 + 184 new) ·
+**452 security** unchanged · 138 paper trading · 52 API-docs · 17 WebSocket ·
+867 authz/route/validation sweeps · 210 health/readiness · 71 trading engine ·
+**395 frontend** / 22 suites · build exit 0 · dependency audit **exit 0**.
+
+Route inventory: **193 development → 189 production**, removing exactly
+`/docs`, `/docs/oauth2-redirect`, `/openapi.json`, `/redoc` and nothing else;
+`/api` route count unchanged; **188 OpenAPI paths**, matching PH3.12 §7.
+
+## Scope deviations, recorded not buried
+
+`TradeCreate` also gained `allow_inf_nan=False` via the shared alias — a real
+behaviour change to `/api/trades` (`entry_price: Infinity` now 422). Same defect
+class, same field, and `Infinity` is not valid JSON; leaving the real endpoint
+deliberately weaker than the paper one to stay inside the letter of the brief was
+judged the worse call. `extra="forbid"` on `PaperTradeCreate` was verified
+against the frontend, which submits exactly the ten declared fields — **note for
+the rerun:** PH3.12's reproduction `curl` sends `"action":"BUY"`, an unknown key,
+and will now be rejected for *that* reason; use a payload valid in every field
+except `quantity`, which is what the regression suite asserts. JWT, refresh
+rotation, cookies, CORS, CSRF, rate limiting, OAuth, Redis, payments, analytics
+and the trading engine beyond the shared aliases are unchanged.
+
+## Remaining
+
+None from B-1, B-2 or L-1. Unchanged and still open: the eight PH3.10 deployment
+conditions (C-1…C-8) and the three **NOT OPERATIONALLY VERIFIED** categories —
+payments, backup/off-host DR, rollback. Those are unbuilt operational
+capabilities, not defects, and they are why this sprint does not convert §30 into
+a GO. **Recommend a fresh PH3.12 certification rerun.**
+
+---
+
+# Sprint PH3.12 — Production Certification & Final Release Decision — 2026-08-17
+
+**Report:** `docs/production/PH3.12_PRODUCTION_CERTIFICATION.md` (30 sections)
+**Verdict:** **NO-GO — PRODUCTION CERTIFICATION BLOCKED**
+
+**No application code was changed.** The tracked diff hashes to
+`b2f4921d…b32725` at both the start and the end of the sprint, verified after
+teardown.
+
+## Certified release candidate
+
+`32437e8` (`main`) **+ the uncommitted PH3.11 remediation working tree**. Image
+`stockassist-rc:ph312`, 425 MB, `sha256:f373296b…638b142`, built
+`--no-cache --pull`.
+
+## Every headline baseline reproduced
+
+| Measure | Result |
+|---|---|
+| Backend | **2,559 passed** / 0 failed / 4 xfailed / 95 deselected |
+| Security | **452 passed** |
+| Frontend | **395 passed** / 22 suites |
+| Build | exit 0, **48 bundles**, 14 MB, 0 secrets in bundle |
+| Routes | **97 protected / 29 admin / 75 public = 201** |
+| Analytics | `{real:4, derived:32, mock:0, unavailable:17}` — **0 MOCK** |
+| Database | 19 collections / **61 indexes** / 3 TTL |
+| Startup / shutdown | **0.242 s** / **2 s exit 0** |
+
+## Dependency gate re-proven, not accepted
+
+`dependency_audit.py --ecosystem all` → **exit 0** (7 python + 16 npm, all
+triaged). Seven negative tests confirmed the gate bites: past-expiry fails,
+the expiry date itself passes, the warn window warns without failing, all-expired
+fails with 23 `EXPIRED`, a deleted entry → `UNTRIAGED`, a bogus entry → `STALE`,
+and an unavailable auditor → **exit 2**, distinct from both pass and policy
+failure. The register was restored **byte-identical** (`6868a4e2…dcaa4cc`) after
+every mutation.
+
+## Live verification (from-scratch production image)
+
+WebSocket P0 matrix fully closed — anonymous, spoofed `?user_id`, query-string
+token and forged subprotocol all **403**; a valid token plus a spoofed `user_id`
+binds to the **token's** subject. Refresh rotates; replay → 401 and revokes the
+family; logout-all revoked **4** sessions including the caller's. CSRF 403 on
+missing *and* forged. Rate limit `401×5 → 429×3`. JWT exactly 900 s with
+`iss`/`aud`. All three cookies `Secure`. **0** occurrences of all 7 configured
+secrets across 442 log lines. Redis loss degrades without an outage; Mongo loss
+keeps liveness 200 and readiness 503; both recover with **0 restarts**. 60
+WebSocket connections accepted and fully released, every gauge back to 0.
+
+## Two new blockers
+
+**B-1 — `PaperTradeCreate` (`server.py:5125`) performs no input validation.**
+`quantity: -1000` produces `total_cost: -1000000`, which is **credited**: a paper
+balance moved ₹86,840 → **₹1,086,840** in one request. Negative prices and
+arbitrary trade types are also accepted. The canonical `TradeCreate`
+(`models.py:124`) enforces `gt=0` on quantity/entry_price/stop_loss/target1 plus
+a `^(BUY|SELL)$` pattern and returns **422** for identical payloads. Bounded:
+paper only, own data only (a second user's balance stayed exactly ₹100,000), no
+real money, no broker order, no authorization crossed — but it falsifies paper
+P&L, the trade journal and per-user analytics.
+
+**B-2 — `/docs`, `/redoc`, `/openapi.json` return 200 anonymously in
+production**, disclosing 188 paths, 23 admin routes and 26 schemas.
+**PH3.11 §9 certified this as 404** — that evidence was wrong, probed at
+`/api/docs` (which *is* 404) rather than `/docs`. Root cause is one line:
+`server.py:357` has no `docs_url=None` and no environment gating. No secrets
+exposed and authorization fully intact (all 23 admin paths 401 anonymously).
+
+Neither was fixed: the brief forbids silently repairing a newly-found blocker
+mid-certification, and a fix applied during certification invalidates the
+artifact being certified.
+
+**L-1** — the release candidate is an **uncommitted working tree**, so it cannot
+be checked out, tagged or reproduced, and DR assumption A6 does not hold.
+
+## Scorecard
+
+**15 PASS · 4 PASS WITH CONDITIONS · 2 BLOCKED · 3 NOT OPERATIONALLY VERIFIED.**
+Nothing was promoted to PASS without evidence. The three unverified categories
+(payments, backup/DR, rollback) are unbuilt operational capabilities, not
+defects.
+
+## Method note
+
+One apparent finding was again an artifact of my own probe: three sessions read
+as unauthenticated *before* logout-all because eight earlier deliberate bad
+logins had tripped the rate limiter and those logins' 429s were never captured.
+Re-run with a fresh identity and explicit status capture, revocation was total.
+PH3.11 closed by warning that *a gate nobody executes reports nothing*. Both
+blockers here are that lesson one level deeper — B-2 was probed at the wrong
+path, and B-1 was never probed at all because every trading test used well-formed
+input. **A control is only certified if the probe that tested it could have
+failed.**
+
+---
+
+# Sprint PH3.11 — Dependency Remediation (blocker B-1 closure) — 2026-08-17
+
+**Report:** `docs/production/PH3.11_REMEDIATION_REPORT.md`
+**Verdict:** **READY FOR PH3.12 CERTIFICATION**
+**Protocol:** `docs/qa/RELEASE_TEST_PROTOCOL.md` (resolves the roadmap's expected deliverable)
+
+The blocker was closed by **fixing what could be fixed**, not by suppressing it.
+
+## Fixed outright
+
+| Ecosystem | Change | Clears |
+|---|---|---|
+| Python | `aiohttp` 3.14.1 → **3.14.3** | PYSEC-2026-3545 / 3546 / 3547 |
+| Python | `cryptography` 48.0.1 → **50.0.0** | PYSEC-2026-3552 / 3553 / 3554 |
+| npm | `overrides`: brace-expansion 1.1.18, fast-uri 3.1.5, js-yaml 4.3.1, nanoid 3.3.18, underscore 1.13.8 | 7 packages |
+| npm | `postcss` devDependency 8.4.49 → **8.5.26** | 5 GHSAs on the direct copy |
+
+**18 high npm advisories → 11. All 6 Python advisories → 0.**
+
+The `cryptography` jump crosses two majors and was taken on evidence rather than
+assumption: no dependent caps it (every constraint is a lower bound), the
+application's entire API surface is one `from cryptography.fernet import Fernet`
+import, and **a token encrypted under 48.0.0 decrypts correctly under 50.0.0** —
+verified directly, because existing broker tokens in a production database must
+stay readable. Full suite, broker tests, and a Fernet round-trip *inside the
+rebuilt container* all pass.
+
+`resolutions` is declared alongside `overrides` because `package.json` names
+yarn as its `packageManager` while CI uses npm, and **yarn 1 ignores `overrides`
+entirely**. A fix that silently fails to apply under the declared tool would be
+worse than no fix.
+
+## Deleted: 8 suppressions that had rotted
+
+They named `litellm` (7) and `ecdsa` (1) — packages already removed from
+`requirements.txt`. They suppressed nothing, and the CI job summary still
+advertised them as pending remediation.
+
+## A third defect, found during remediation
+
+The dev-requirements audit step ran with **no suppressions** over a file whose
+line 17 is `-r requirements.txt` — so it re-audited every runtime package and
+failed on the very advisories the runtime step deliberately accepted. Its comment
+claimed "dev tooling never reaches production", which is false for a file that
+transitively includes the entire runtime set. **That job could never have passed
+since the day the suppression policy was written.**
+
+## New: an enforced triage register
+
+`.github/dependency-triage.yml`, enforced by `.github/scripts/dependency_audit.py`,
+covering **both** ecosystems. Every entry carries package, advisory, severity,
+reason, reachability, **re-runnable evidence**, mitigation, owner and expiry.
+
+| Rule | Effect |
+|---|---|
+| Finding with no entry | **FAIL** (`UNTRIAGED`) |
+| Entry past expiry | **FAIL** (`EXPIRED`) — no grace period |
+| Entry matching nothing | **FAIL** (`STALE`) |
+| Expiring within 30 days | warn only |
+| Auditor unusable | **exit 2** — distinct from pass *and* from policy failure |
+
+`not-reachable` is the stronger claim and the enforcer **rejects the register**
+if such an entry omits `evidence`, so it cannot be asserted without proof.
+
+## The expiry date was re-argued, not extended
+
+`SUPPRESSION_REVIEW_BY: 2026-08-22` is gone. The blanket "pinned by fastapi"
+justification covering all 7 starlette advisories split **5 / 2** on re-triage:
+
+* **5 are structurally unreachable** — no form or multipart parsing anywhere in
+  the backend, no `HTTPEndpoint`, no `StaticFiles`, and PYSEC-2026-2281 is a
+  Windows-only defect on a Linux image → **2027-02-15**.
+* **2 (PYSEC-2026-161 / 248) got a *shorter* leash than before — 2026-11-15.**
+  The app reads only `request.url.path`, never the reconstructed absolute URL
+  (`str(request.url)`, `base_url` and `url_for` appear nowhere; every redirect
+  is built from `FRONTEND_URL`). That makes them unreachable **by convention
+  rather than by control**, which is not good enough for a long deadline.
+
+## The gate is itself tested
+
+Eight negative tests, every mutation reverted and the revert verified: expired
+entry fails · the expiry date itself still passes · the day after fails · the
+30-day warning fires without failing · a deleted entry raises `UNTRIAGED` · a
+bogus entry raises `STALE` · downgrading `aiohttp` raises 3 × `UNTRIAGED` ·
+removing an npm override raises `UNTRIAGED`.
+
+## Full protocol re-run — every check reproduced its baseline
+
+2,559 backend (0 failed, 4 xfailed) · 452 security · 395 frontend / 22 suites ·
+build exit 0 with 48 bundles / 14 MB · routes **97 / 29 / 75 = 201** unchanged ·
+analytics **0 MOCK** of 53 · trading-engine mutation check fails then reverts
+clean · WebSocket P0 matrix fully closed · Redis loss keeps the API serving ·
+Mongo loss gives readiness 503 with liveness 200 and no leakage · **0 restarts** ·
+shutdown 2 s exit 0 · **0** secrets in logs · image rebuilt `--no-cache --pull`
+(425 MB) with Fernet verified inside the container.
+
+One incidental confirmation: the first live boot **failed closed** because the
+`METRICS_TOKEN` supplied was 20 characters against a 32-character minimum. That
+is the configuration gate working, not a regression.
+
+**No application code was changed in either pass** — only dependency manifests,
+the CI workflow, new tooling and documentation.
+
+---
+
+# Sprint PH3.11 — Final Regression & Release Candidate Verification — 2026-08-17
+
+**Report:** `docs/production/PH3.11_RELEASE_CANDIDATE_REPORT.md`
+**Verdict:** **BLOCKED — REGRESSION REMEDIATION REQUIRED** *(superseded — see the remediation entry above)*
+**Matrix:** 24 PASS · 5 PASS WITH CONDITIONS · 3 BLOCKED · 1 FAIL (33 categories).
+**RC commit:** `32437e858970505db70201ddc0174afd85bd19be` (`main`)
+
+A freeze-and-verify sprint. **No code was changed** — the working tree is
+byte-identical to the commit it started from, because no confirmed regression
+was found that required a fix.
+
+## Regression result — clean, and identical to PH3.10 on every axis
+
+| Measure | PH3.10 | PH3.11 |
+|---|---|---|
+| Backend | 2,559 passed / 4 xfail / 95 deselected | **identical** (2,658 collected, 187.63s) |
+| Security-marked | 452 | **452** |
+| Frontend | 395 / 22 suites | **identical** |
+| Production build | exit 0, 48 bundles, 14 MB | **identical** |
+| Route surface | 97 protected / 29 admin / 75 public = 201 | **identical** |
+| Analytics provenance | 0 MOCK | **0 MOCK** (4 REAL / 32 DERIVED / 17 UNAVAILABLE of 53) |
+
+Nothing is skipped, disabled, weakened or newly xfailed. Every numeric delta is
+explained: the Python difference is the *host* interpreter (the image is
+unchanged); `server.py` 6,954 → 6,998 because PH3.10 measured mid-sprint and its
+own commit added +163 lines; and Mongo 20/62 → 19/61 collections/indexes because
+`ensure_indexes()` declares **42** indexes across **18** collections, so
+42 + 19 implicit `_id_` = 61 — **the declared set is identical**, and the extra
+collection in PH3.10 was created lazily by that session's traffic.
+
+## Verified live, not from prior reports
+
+Against a from-scratch `--no-cache --pull` production image (424 MB, non-root
+uid 10001, pip absent, no `.env` baked, no `--reload`) booting in **0.534 s**
+with `APP_ENV=production` against authenticated Mongo and Redis.
+
+**PH3.10's P0 holds under re-attack.** Anonymous, spoofed `?user_id=<victim>`,
+query-string token and forged-subprotocol WebSocket handshakes all **403**. Only
+a cookie or `Sec-WebSocket-Protocol: stockassist.auth,<token>` connects — and a
+valid token *plus* a spoofed `user_id` binds to the **token's** subject. Two
+users on concurrent sockets saw zero foreign identifiers.
+
+Session security is total: refresh rotates, replay returns 401 and **revokes the
+family**, and logout-all revoked 6 sessions with all three subsequent refreshes
+401 **including the caller's**. Live JWT lifetime exactly **900 s**; cookies
+HttpOnly+Secure; CSRF 403 on missing *and* forged; no ACAO for a disallowed
+origin; all 6 security headers; `401×5 → 429×3`; OpenAPI **404**; and **zero**
+configured secrets in container logs, measured against the real values in use.
+
+**Fault injection produced controlled degradation every time, with 0 process
+restarts.** Redis loss keeps the API serving (readiness reports
+`redis: fail, critical:false`); Mongo loss flips readiness to **503** while
+liveness stays 200 and the body leaks nothing; both recover automatically.
+`docker stop` completes in **1 s, exit 0**, draining readiness first, then
+stopping all 4 background tasks and closing every pool. Churn of 60 sockets
+returned every tracked gauge to zero.
+
+**The chartered stale test was proven rather than assumed.**
+`test_run_cycle_trails_and_books_targets` keeps an exact-equality assertion — the
+repair added `closed_trades` to the *expectation* rather than relaxing the
+comparison — and is **mutation-checked**: injecting a spurious key into
+`run_cycle`'s return contract makes it fail. Mutation reverted, `git diff` clean.
+
+## 🚫 The blocker — and it is not a regression
+
+**The repository's own `dependency-audit` CI workflow is red on both jobs, and no
+prior sprint ever ran it.** PH3.10 reported CI/CD as "PASS WITH CONDITIONS" after
+adding `frontend-ci`, but never executed the supply-chain gate.
+
+* **Backend** — `pip-audit` with CI's 15 suppressions exits 1 on **6 advisories
+  against pinned runtime dependencies**: `cryptography` 48.0.1
+  (PYSEC-2026-3552/3553/3554) and `aiohttp` 3.14.1 (PYSEC-2026-3545/3546/3547),
+  all published after the suppression list was written.
+* **Frontend** — `npm audit --audit-level=high` exits 1 on **18 high advisories
+  with no triage mechanism at all**. The Python gate has a documented allowlist
+  with a mechanical expiry; the npm gate was never given one, so it fails
+  unconditionally with nothing an engineer can act on.
+* **`SUPPRESSION_REVIEW_BY` expires 2026-08-22** — five days from this report.
+
+**Reachability was analysed, not assumed, and it changes the severity without
+changing the status.** `cryptography` is used only for Fernet broker-token
+encryption — the codebase contains no `pkcs7`, no `x509.verification`, no
+`PolicyBuilder` — and `aiohttp` is **client-only**, which rules out the
+server-side request-smuggling advisory outright. Of the 18 npm advisories,
+**zero** vulnerable packages reach the shipped bundle, verified by grep against
+`build/static/js/` (the `svgo` hits are minifier-generated variable names, not
+the library). `npm audit --omit=dev` fails to filter them only because
+`react-scripts` sits in `dependencies`, which is CRA's own layout.
+
+**So the product is not known to be vulnerable, and a required gate is still
+red.** Those are different claims, and this report keeps them apart. Declaring
+the candidate ready while a blocking job fails would repeat the error PH3.10
+named: mistaking a written verdict for a working capability.
+
+**Deliberately not fixed here.** Bumping `cryptography` across a major version,
+or migrating off `react-scripts`, is architectural work during a freeze — exactly
+what the core rule forbids. Suppressing the advisories to manufacture green is
+worse: it is the "mark a failure as passed" outcome the brief prohibits, and it
+would retire an accepted-risk register days before it is due to be re-argued.
+
+**Remediation for approval:** **R-1** bump `aiohttp` 3.14.1 → 3.14.3
+(patch-level, in-pin; `SECRETS.md` §8 records this exact class of fix applied
+before); **R-2** evaluate `cryptography` 48 → 49/50 in a dedicated sprint with
+regression coverage; **R-3** give the npm gate the Python gate's triage
+mechanism, or schedule the CRA migration; **R-4** re-argue the suppression
+expiry. Once R-1, R-3 and R-4 land, every other stop condition is already met.
+
+## P3 observations, all pre-existing
+
+Plain-HTTP `FRONTEND_URL` accepted in production (mitigated — production forces
+`Secure` cookies, so a plaintext origin breaks the session rather than
+downgrading it silently); uvicorn's access log echoing caller-supplied query
+strings, so a client that sends `?token=` writes a live credential to logs (the
+platform's own client never does); a Redis **client-pool** exhaustion transient
+at boot that self-heals in ~7 ms; Mongo outage surfacing as 500 rather than the
+semantically correct 503; and `source: yahoo_finance` disclosed in quote
+payloads, which `MARKET_DATA_ARCHITECTURE.md` forbids in *error* surfaces and is
+silent on for success payloads.
+
+## Method note — two apparent findings were artifacts of the probes
+
+A logout-all test reported the caller's session surviving; it was confounded
+twice over — the earlier session had been refreshed without persisting the
+rotated cookie, so its 401 was replay detection rather than revocation, and the
+logout-all call itself carried no CSRF header and was rejected 403. And a
+fail-closed matrix aimed at `validate_config()` flagged wildcard CORS, insecure
+cookies and debug mode, when the first two are enforced at their own layer
+(`cors.py` strips, `cookies.py` forces) and **debug mode has no code path to
+reject** — there is no `--reload`, no `app.debug`, no debug flag anywhere.
+
+Both looked like security findings. Re-running before reporting is what
+separated them from the real blocker — which is the lesson worth carrying into
+PH3.12 alongside the one PH3.10 left: **a gate nobody executes reports nothing,
+and a gate nobody watches is indistinguishable from a gate that passes.**
+
+---
+
 # Sprint PH3.10 — Final Production Audit — 2026-08-17
 
 **Report:** `docs/production/PH3.10_FINAL_PRODUCTION_AUDIT.md`

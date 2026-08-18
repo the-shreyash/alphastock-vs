@@ -124,6 +124,39 @@ async def get_paper_pnl(user_id: str, db) -> dict:
     }
 
 
+def _validate(**kwargs) -> None:
+    """Re-run `PaperTradeCreate`'s constraints on service-layer arguments.
+
+    Imported lazily: `models` pulls in the security/password layer, and this
+    service is imported inside request handlers where that cost is paid once
+    per process anyway — keeping it out of module scope keeps `paper_trade`
+    importable in isolation (its unit tests construct a bare FakeDB).
+
+    The Pydantic error is flattened into a single readable sentence because it
+    surfaces to the user as an HTTP 400 `detail` string, not as a structured
+    422 body (that path belongs to FastAPI's own model binding).
+    """
+    from pydantic import ValidationError
+
+    from models import PaperTradeCreate
+
+    payload = dict(kwargs)
+    payload["type"] = payload.pop("trade_type")
+    # `None` means "caller omitted it" for the optional text/target fields;
+    # let the model's own defaults apply rather than failing on a null.
+    for optional_field in ("stock_name", "setup_type", "notes", "target2"):
+        if payload.get(optional_field) is None:
+            payload.pop(optional_field, None)
+
+    try:
+        PaperTradeCreate(**payload)
+    except ValidationError as exc:
+        problems = "; ".join(
+            f"{'.'.join(str(p) for p in e['loc'])}: {e['msg']}" for e in exc.errors()
+        )
+        raise ValueError(f"Invalid paper trade: {problems}") from exc
+
+
 async def execute_paper_trade(
     user_id: str,
     symbol: str,
@@ -138,7 +171,26 @@ async def execute_paper_trade(
     notes: str,
     db,
 ) -> dict:
-    """Execute a paper trade. Checks balance for BUY. Returns the inserted trade doc."""
+    """Execute a paper trade. Checks balance for BUY. Returns the inserted trade doc.
+
+    Validates its own arguments FIRST (PH3.12R / B-1). The HTTP route binds
+    `PaperTradeCreate`, so a request that reaches here has already been
+    validated — but "the caller validated it" is exactly the assumption that
+    produced B-1, and this function is importable by any future scheduler,
+    backfill or AI action that will not go through FastAPI. Re-validating
+    against the *same* model rather than a hand-written copy of its rules keeps
+    the two layers from disagreeing the way `TradeCreate` and the old inline
+    `PaperTradeCreate` disagreed.
+
+    Raises `ValueError` (which the route maps to 400) before touching the
+    balance, the trades collection or anything else.
+    """
+    _validate(
+        symbol=symbol, stock_name=stock_name, quantity=quantity,
+        entry_price=entry_price, trade_type=trade_type, stop_loss=stop_loss,
+        target1=target1, target2=target2, setup_type=setup_type, notes=notes,
+    )
+
     symbol = symbol.upper()
     total_cost = round(entry_price * quantity, 2)
 

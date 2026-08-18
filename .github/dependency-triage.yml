@@ -1,0 +1,566 @@
+# ==============================================================================
+# StockAssist AI — Dependency advisory triage register
+#
+# WHAT THIS FILE IS
+# -----------------
+# The single, machine-readable record of every dependency advisory this project
+# knowingly ships with, for BOTH ecosystems (Python and npm). It is enforced by
+# `.github/scripts/dependency_audit.py`, which the `dependency-audit` workflow runs.
+#
+# WHY IT EXISTS (PH3.11 remediation)
+# ----------------------------------
+# Before this file, suppressions lived in a `--ignore-vuln` string inside the
+# workflow YAML, and only for Python. Three things went wrong with that, and all
+# three are the reason this file has the shape it does:
+#
+#   1. **npm had no triage path at all.** The frontend gate was a bare
+#      `npm audit --audit-level=high`, so it failed unconditionally on advisories
+#      nobody could act on. A gate that cannot be satisfied is a gate the team
+#      learns to ignore.
+#   2. **Suppressions rotted silently.** 8 of the 15 Python suppressions named
+#      `litellm` and `ecdsa` — packages that had already been REMOVED from
+#      `requirements.txt`. They suppressed nothing and nobody noticed, because
+#      nothing checked that a suppression still matched a real finding.
+#   3. **The reasons were prose in a comment.** "Not reachable" was asserted, not
+#      evidenced, and could not be re-checked mechanically.
+#
+# So: every entry below is enforced, every entry expires, and an entry that
+# stops matching a real finding FAILS the build rather than lingering.
+#
+# SCHEMA
+# ------
+#   id            Advisory identifier. PYSEC-*/GHSA-* for Python; GHSA-* for npm.
+#                 Use `via: <package>` instead when a package is flagged only
+#                 because a dependency of it is vulnerable (npm reports these
+#                 with no advisory of their own).
+#   ecosystem     `python` | `npm`
+#   package       Package name exactly as the auditor reports it.
+#   affected      Version present in the pinned/locked tree when triaged.
+#   severity      As reported by the auditor.
+#   classification  `not-reachable`      — the vulnerable code path cannot be
+#                                          executed by this application. Requires
+#                                          `evidence` that a reviewer can re-run.
+#                   `temporarily-accepted` — reachable or not provably
+#                                          unreachable; accepted for now with a
+#                                          mitigation and a short expiry.
+#   reason        Why this is not being fixed right now.
+#   reachability  The reachability finding, stated as a fact about this codebase.
+#   evidence      A command a reviewer can run to re-verify `reachability`.
+#   mitigation    What limits the impact in the meantime.
+#   fixed_in      Version that fixes it, or `none` if none is published.
+#   blocked_by    What prevents taking that fix.
+#   owner         Who re-argues this entry at expiry.
+#   expires       ISO date. From this date the gate FAILS. There is no grace
+#                 period: a date that can slip silently is not a deadline.
+#
+# RULES
+# -----
+# * An advisory not listed here fails the build. That is the point.
+# * An entry listed here that matches nothing fails the build (stale-entry
+#   check) — this is what would have caught the litellm/ecdsa rot.
+# * Extending `expires` requires editing this file in a reviewed change, with
+#   the reason updated. Moving a date without re-arguing the case is the exact
+#   failure this register was built to prevent.
+# ==============================================================================
+
+version: 1
+
+policy:
+  # npm severities that must be triaged or fixed. Matches the historical
+  # `--audit-level=high` threshold, now applied through the register.
+  npm_fail_severities: [high, critical]
+  # Python: pip-audit reports every advisory regardless of severity, and every
+  # one must be triaged or fixed. No severity threshold.
+  warn_within_days: 30
+
+entries:
+
+  # ---------------------------------------------------------------------------
+  # PYTHON — starlette 0.37.2
+  #
+  # All seven are pinned in place by `fastapi==0.110.1`, which requires
+  # `starlette<0.38`; every fix is 0.40.0 or later. Taking any of them means a
+  # coordinated FastAPI + Starlette major upgrade, which is a dedicated sprint
+  # with its own regression pass — not a dependency bump.
+  #
+  # PH3.11 re-triaged all seven against the actual codebase rather than carrying
+  # the previous blanket "pinned by fastapi" justification. Five turned out to be
+  # structurally unreachable. Two are not provably unreachable and got a shorter
+  # leash. That split is the point of re-arguing rather than re-dating.
+  # ---------------------------------------------------------------------------
+
+  - id: PYSEC-2026-249
+    ecosystem: python
+    package: starlette
+    affected: "0.37.2"
+    severity: high
+    classification: not-reachable
+    reason: >-
+      request.form() does not enforce max_fields / max_part_size for
+      urlencoded bodies, allowing resource exhaustion.
+    reachability: >-
+      This application parses no form data. There is no UploadFile, no File(),
+      no Form(), and no request.form() call anywhere in the backend — every
+      endpoint consumes JSON. The vulnerable parser is never entered.
+    evidence: >-
+      grep -rnE "UploadFile|File\(|Form\(|request\.form\(" backend/ --include=*.py
+      → no application matches
+    mitigation: Request body size is additionally bounded by the reverse proxy.
+    fixed_in: "1.3.1"
+    blocked_by: "fastapi==0.110.1 requires starlette<0.38"
+    owner: platform-security
+    expires: "2027-02-15"
+
+  - id: PYSEC-2026-1941
+    ecosystem: python
+    package: starlette
+    affected: "0.37.2"
+    severity: high
+    classification: not-reachable
+    reason: >-
+      Multipart parsing of files larger than the spool size performs excessive
+      disk writes, enabling a denial of service.
+    reachability: >-
+      Same as PYSEC-2026-249 — no multipart endpoint exists in this application.
+    evidence: >-
+      grep -rnE "UploadFile|File\(|multipart" backend/ --include=*.py
+      → only email.mime.multipart (outbound SMTP), unrelated to request parsing
+    mitigation: No file-upload surface is exposed.
+    fixed_in: "0.47.2"
+    blocked_by: "fastapi==0.110.1 requires starlette<0.38"
+    owner: platform-security
+    expires: "2027-02-15"
+
+  - id: PYSEC-2026-1943
+    ecosystem: python
+    package: starlette
+    affected: "0.37.2"
+    severity: high
+    classification: not-reachable
+    reason: >-
+      multipart/form-data parts without a filename are buffered as unbounded
+      byte strings, allowing memory exhaustion.
+    reachability: >-
+      Same as PYSEC-2026-249 — no multipart endpoint exists in this application.
+    evidence: >-
+      grep -rnE "UploadFile|File\(|Form\(" backend/ --include=*.py → no matches
+    mitigation: No multipart surface is exposed.
+    fixed_in: "0.40.0"
+    blocked_by: "fastapi==0.110.1 requires starlette<0.38"
+    owner: platform-security
+    expires: "2027-02-15"
+
+  - id: PYSEC-2026-2280
+    ecosystem: python
+    package: starlette
+    affected: "0.37.2"
+    severity: high
+    classification: not-reachable
+    reason: >-
+      HTTPEndpoint selects its handler by lowercasing the HTTP method and
+      looking it up with getattr, without restricting the attribute set.
+    reachability: >-
+      The application defines no class-based views. Every route is a FastAPI
+      APIRoute; starlette's HTTPEndpoint is never imported or subclassed.
+    evidence: 'grep -rn "HTTPEndpoint" backend/ --include=*.py → no matches'
+    mitigation: n/a — the vulnerable dispatch mechanism is not in use.
+    fixed_in: "1.1.0"
+    blocked_by: "fastapi==0.110.1 requires starlette<0.38"
+    owner: platform-security
+    expires: "2027-02-15"
+
+  - id: PYSEC-2026-2281
+    ecosystem: python
+    package: starlette
+    affected: "0.37.2"
+    severity: high
+    classification: not-reachable
+    reason: >-
+      StaticFiles on Windows is vulnerable to SSRF via a UNC path, which causes
+      os.path.realpath to open an outbound SMB connection.
+    reachability: >-
+      Unreachable twice over: the application mounts no StaticFiles route, and
+      the runtime image is Linux (python:3.11-slim), while the defect is
+      Windows-specific.
+    evidence: >-
+      grep -rn "StaticFiles" backend/ --include=*.py → no matches;
+      backend/Dockerfile FROM python:${PYTHON_VERSION}-slim-${DEBIAN_RELEASE}
+    mitigation: n/a — no static file serving from the API process.
+    fixed_in: "1.1.0"
+    blocked_by: "fastapi==0.110.1 requires starlette<0.38"
+    owner: platform-security
+    expires: "2027-02-15"
+
+  - id: PYSEC-2026-161
+    ecosystem: python
+    package: starlette
+    affected: "0.37.2"
+    severity: high
+    classification: temporarily-accepted
+    reason: >-
+      request.url is reconstructed from the Host header with no validation, so
+      an attacker can inject path segments into the host portion.
+    reachability: >-
+      Not reachable as currently written, but not structurally prevented. The
+      application reads only request.url.path (CSRF exempt-path matching and
+      rate-limit keying), never the reconstructed absolute URL; str(request.url)
+      and request.base_url appear nowhere, and every RedirectResponse target is
+      built from the FRONTEND_URL environment variable rather than from the
+      request. The safety therefore rests on a coding convention, not a control
+      — which is why this is accepted rather than dismissed.
+    evidence: >-
+      grep -rnE "str\(request\.url\)|request\.base_url|url_for" backend/ → no matches;
+      grep -rn "RedirectResponse" backend/server.py → all targets use the
+      FRONTEND_URL-derived `frontend` / `frontend_base` variables
+    mitigation: >-
+      Deploy behind a reverse proxy that validates the Host header (already
+      required by PH3.10 condition C-7). Adding TrustedHostMiddleware would turn
+      this from a convention into a control and is the recommended follow-up.
+    fixed_in: "1.0.1"
+    blocked_by: "fastapi==0.110.1 requires starlette<0.38"
+    owner: platform-security
+    expires: "2026-11-15"
+
+  - id: PYSEC-2026-248
+    ecosystem: python
+    package: starlette
+    affected: "0.37.2"
+    severity: high
+    classification: temporarily-accepted
+    reason: >-
+      The request path is not validated before being used to rebuild
+      request.url by concatenating scheme, host and path.
+    reachability: >-
+      Same surface and same reasoning as PYSEC-2026-161. The one security
+      decision taken from the path — the CSRF exempt-path check in
+      security/csrf.py — compares request.url.path, which is the raw ASGI scope
+      path, against an exact-match allowlist, and the router dispatches from
+      that same scope value, so the two cannot disagree.
+    evidence: >-
+      security/csrf.py:256 `if request.url.path in exempt_paths` (exact-match set);
+      security/rate_limit.py:441 uses request.url.path as a bucket key only
+    mitigation: Same as PYSEC-2026-161 — Host validation at the proxy.
+    fixed_in: "1.3.0"
+    blocked_by: "fastapi==0.110.1 requires starlette<0.38"
+    owner: platform-security
+    expires: "2026-11-15"
+
+  # ---------------------------------------------------------------------------
+  # NPM — the react-scripts (Create React App) build chain
+  #
+  # Every entry below is build-time tooling. None of it is imported by
+  # application source, and none of it is present in the shipped bundle. The
+  # single remediation that clears the whole group is migrating off
+  # `react-scripts`, which is a roadmap item, not a dependency bump: npm reports
+  # the fix for each as `react-scripts@0.0.0` (isSemVerMajor), i.e. "remove it".
+  #
+  # Everything that COULD be fixed without that migration was fixed in PH3.11
+  # rather than triaged: brace-expansion, fast-uri, js-yaml, nanoid, underscore
+  # (via `overrides`, all patch-level within the same major) and the direct
+  # postcss devDependency (8.4.49 → 8.5.26). That took the high count from 18 to
+  # 11. What remains is what genuinely cannot move.
+  #
+  # Shared reachability evidence for every npm entry:
+  #   1. no application import:
+  #        grep -rE "from '<pkg>'|require\('<pkg>'\)" frontend/src/ → 0 matches
+  #      for all eighteen originally-flagged packages.
+  #   2. reached only through the build toolchain: walking
+  #        npm ls --omit=dev --all --json
+  #      every path to these packages passes through `react-scripts`.
+  #   3. absent from the shipped bundle:
+  #        grep -r "<pkg>" frontend/build/static/js/ → 0 matches
+  #      (the historical `svgo` hit was a minifier-generated variable name, not
+  #      the library — checked, and the reason this list cites paths rather than
+  #      name-matching alone).
+  # ---------------------------------------------------------------------------
+
+  - id: GHSA-rp65-9cf3-cjxr
+    ecosystem: npm
+    package: nth-check
+    affected: "<2.0.1"
+    severity: high
+    classification: not-reachable
+    reason: Inefficient regular expression complexity (ReDoS) in CSS selector parsing.
+    reachability: >-
+      Build-time only. Reached exclusively as
+      react-scripts > @svgr/webpack > @svgr/plugin-svgo > svgo > css-select >
+      nth-check, which runs during SVG optimisation at build time and processes
+      only repository-controlled assets. No attacker-supplied input reaches it,
+      and it is not in the shipped bundle.
+    evidence: 'npm ls nth-check --omit=dev → all paths begin with react-scripts'
+    mitigation: >-
+      Inputs are the project's own SVG assets, committed to the repository, not
+      user data.
+    fixed_in: "2.0.1 (unreachable — pinned by the react-scripts dependency tree)"
+    blocked_by: "react-scripts@5.0.1; npm reports the only fix as react-scripts@0.0.0"
+    owner: frontend
+    expires: "2026-11-15"
+
+  - id: GHSA-2p49-hgcm-8545
+    ecosystem: npm
+    package: svgo
+    affected: "<=3.3.2"
+    severity: high
+    classification: not-reachable
+    reason: The removeScripts plugin leaves some executable scripts in the output SVG.
+    reachability: >-
+      Build-time only, via react-scripts > @svgr/webpack > @svgr/plugin-svgo.
+      SVGO processes the repository's own SVG assets during the build; it never
+      sees user-supplied SVG, so there is no untrusted input to sanitise.
+    evidence: 'npm ls svgo --omit=dev → react-scripts > @svgr/webpack > @svgr/plugin-svgo > svgo'
+    mitigation: The application accepts no SVG upload of any kind.
+    fixed_in: "none within the react-scripts tree"
+    blocked_by: "react-scripts@5.0.1"
+    owner: frontend
+    expires: "2026-11-15"
+
+  - id: GHSA-5c6j-r48x-rmvq
+    ecosystem: npm
+    package: serialize-javascript
+    affected: "<6.0.2"
+    severity: high
+    classification: not-reachable
+    reason: Remote code execution via RegExp.flags during serialization.
+    reachability: >-
+      Build-time only, via react-scripts > css-minimizer-webpack-plugin and
+      react-scripts > workbox-webpack-plugin > workbox-build >
+      rollup-plugin-terser. It serialises build configuration, not runtime data,
+      and does not ship.
+    evidence: 'npm ls serialize-javascript --omit=dev → all paths begin with react-scripts'
+    mitigation: Serialised values originate from the build config, not user input.
+    fixed_in: "6.0.2 (present at one path; the vulnerable 4.0.0 is pinned by rollup-plugin-terser)"
+    blocked_by: "react-scripts@5.0.1 → workbox-build → rollup-plugin-terser@7"
+    owner: frontend
+    expires: "2026-11-15"
+
+  - id: GHSA-qj8w-gfj5-8c6v
+    ecosystem: npm
+    package: serialize-javascript
+    affected: "<6.0.2"
+    severity: high
+    classification: not-reachable
+    reason: CPU-exhaustion denial of service.
+    reachability: Same path and same reasoning as GHSA-5c6j-r48x-rmvq.
+    evidence: 'npm ls serialize-javascript --omit=dev'
+    mitigation: Build-time only; a slow build is not a production outage.
+    fixed_in: "6.0.2"
+    blocked_by: "react-scripts@5.0.1 → workbox-build → rollup-plugin-terser@7"
+    owner: frontend
+    expires: "2026-11-15"
+
+  - id: GHSA-7fh5-64p2-3v2j
+    ecosystem: npm
+    package: postcss
+    affected: "7.0.39"
+    severity: high
+    classification: not-reachable
+    reason: Line-return parsing error in postcss.
+    reachability: >-
+      The project's own postcss was upgraded to 8.5.26 in PH3.11 and is clean.
+      The only remaining vulnerable copy is postcss@7.0.39, reached solely as
+      react-scripts > resolve-url-loader@4.0.0 > postcss@7. It rewrites URLs in
+      the project's own stylesheets at build time. It cannot be overridden to 8
+      because postcss 7 → 8 is a breaking plugin-API change that
+      resolve-url-loader@4 does not support.
+    evidence: >-
+      npm ls postcss --all → postcss@8.5.26 everywhere except
+      resolve-url-loader@4.0.0 > postcss@7.0.39; npm audit now reports postcss
+      with isDirect=false, where it was isDirect=true before the bump
+    mitigation: Processes repository-controlled CSS at build time only.
+    fixed_in: "8.4.31 (not applicable to the 7.x line)"
+    blocked_by: "react-scripts@5.0.1 → resolve-url-loader@4.0.0"
+    owner: frontend
+    expires: "2026-11-15"
+
+  - id: GHSA-qx2v-qp2m-jg93
+    ecosystem: npm
+    package: postcss
+    affected: "7.0.39"
+    severity: high
+    classification: not-reachable
+    reason: XSS via an unescaped `</style>` in the CSS stringifier.
+    reachability: Same nested postcss@7 path as GHSA-7fh5-64p2-3v2j.
+    evidence: 'npm ls postcss --all'
+    mitigation: >-
+      The stringifier runs at build time over the project's own CSS. No
+      user-supplied CSS is ever processed.
+    fixed_in: "8.5.10 (not applicable to the 7.x line)"
+    blocked_by: "react-scripts@5.0.1 → resolve-url-loader@4.0.0"
+    owner: frontend
+    expires: "2026-11-15"
+
+  - id: GHSA-6g55-p6wh-862q
+    ecosystem: npm
+    package: postcss
+    affected: "7.0.39"
+    severity: high
+    classification: not-reachable
+    reason: Arbitrary file read and information disclosure via source-map handling.
+    reachability: Same nested postcss@7 path as GHSA-7fh5-64p2-3v2j.
+    evidence: 'npm ls postcss --all'
+    mitigation: >-
+      Source maps are generated from repository files inside the build
+      container; there is no untrusted source-map input.
+    fixed_in: "8.5.11 (not applicable to the 7.x line)"
+    blocked_by: "react-scripts@5.0.1 → resolve-url-loader@4.0.0"
+    owner: frontend
+    expires: "2026-11-15"
+
+  - id: GHSA-fxqj-rqcc-2cmp
+    ecosystem: npm
+    package: postcss
+    affected: "7.0.39"
+    severity: high
+    classification: not-reachable
+    reason: Incomplete fix of GHSA-6g55-p6wh-862q.
+    reachability: Same nested postcss@7 path as GHSA-7fh5-64p2-3v2j.
+    evidence: 'npm ls postcss --all'
+    mitigation: Same as GHSA-6g55-p6wh-862q.
+    fixed_in: "8.5.22 (not applicable to the 7.x line)"
+    blocked_by: "react-scripts@5.0.1 → resolve-url-loader@4.0.0"
+    owner: frontend
+    expires: "2026-11-15"
+
+  - id: GHSA-r28c-9q8g-f849
+    ecosystem: npm
+    package: postcss
+    affected: "7.0.39"
+    severity: high
+    classification: not-reachable
+    reason: Path traversal in previous-source-map auto-loading.
+    reachability: Same nested postcss@7 path as GHSA-7fh5-64p2-3v2j.
+    evidence: 'npm ls postcss --all'
+    mitigation: Same as GHSA-6g55-p6wh-862q.
+    fixed_in: "8.5.17 (not applicable to the 7.x line)"
+    blocked_by: "react-scripts@5.0.1 → resolve-url-loader@4.0.0"
+    owner: frontend
+    expires: "2026-11-15"
+
+  # --- packages npm flags only because something they depend on is vulnerable ---
+  # These carry no advisory of their own. They clear automatically when the
+  # entries above clear, and are listed so the register accounts for every
+  # package the auditor names rather than silently ignoring the chain.
+
+  - id: "via:svgo"
+    ecosystem: npm
+    package: "@svgr/plugin-svgo"
+    affected: "<=5.5.0"
+    severity: high
+    classification: not-reachable
+    reason: Flagged only because it depends on svgo.
+    reachability: Build-time only; inherits GHSA-2p49-hgcm-8545.
+    evidence: 'npm audit --json → via: ["svgo"], no advisory of its own'
+    mitigation: See GHSA-2p49-hgcm-8545.
+    fixed_in: "clears with svgo"
+    blocked_by: "react-scripts@5.0.1"
+    owner: frontend
+    expires: "2026-11-15"
+
+  - id: "via:@svgr/plugin-svgo"
+    ecosystem: npm
+    package: "@svgr/webpack"
+    affected: "<=5.5.0"
+    severity: high
+    classification: not-reachable
+    reason: Flagged only because it depends on @svgr/plugin-svgo.
+    reachability: Build-time only.
+    evidence: 'npm audit --json → via: ["@svgr/plugin-svgo"]'
+    mitigation: See GHSA-2p49-hgcm-8545.
+    fixed_in: "clears with svgo"
+    blocked_by: "react-scripts@5.0.1"
+    owner: frontend
+    expires: "2026-11-15"
+
+  - id: "via:nth-check"
+    ecosystem: npm
+    package: css-select
+    affected: "<=3.1.0"
+    severity: high
+    classification: not-reachable
+    reason: Flagged only because it depends on nth-check.
+    reachability: Build-time only; inherits GHSA-rp65-9cf3-cjxr.
+    evidence: 'npm audit --json → via: ["nth-check"]'
+    mitigation: See GHSA-rp65-9cf3-cjxr.
+    fixed_in: "clears with nth-check"
+    blocked_by: "react-scripts@5.0.1"
+    owner: frontend
+    expires: "2026-11-15"
+
+  - id: "via:serialize-javascript"
+    ecosystem: npm
+    package: rollup-plugin-terser
+    affected: "*"
+    severity: high
+    classification: not-reachable
+    reason: Flagged only because it depends on serialize-javascript.
+    reachability: Build-time only; the package is deprecated upstream.
+    evidence: 'npm audit --json → via: ["serialize-javascript"]'
+    mitigation: See GHSA-5c6j-r48x-rmvq.
+    fixed_in: "none — deprecated upstream"
+    blocked_by: "react-scripts@5.0.1 → workbox-build"
+    owner: frontend
+    expires: "2026-11-15"
+
+  - id: "via:rollup-plugin-terser"
+    ecosystem: npm
+    package: workbox-build
+    affected: "<=6.5.4"
+    severity: high
+    classification: not-reachable
+    reason: Flagged only because it depends on rollup-plugin-terser.
+    reachability: >-
+      Build-time only. Generates the service worker during the build; the
+      generated output is plain JavaScript that contains none of this code.
+    evidence: 'npm audit --json → via: ["rollup-plugin-terser"]'
+    mitigation: See GHSA-5c6j-r48x-rmvq.
+    fixed_in: "clears with rollup-plugin-terser"
+    blocked_by: "react-scripts@5.0.1"
+    owner: frontend
+    expires: "2026-11-15"
+
+  - id: "via:workbox-build"
+    ecosystem: npm
+    package: workbox-webpack-plugin
+    affected: "<=6.5.4"
+    severity: high
+    classification: not-reachable
+    reason: Flagged only because it depends on workbox-build.
+    reachability: Build-time only.
+    evidence: 'npm audit --json → via: ["workbox-build"]'
+    mitigation: See GHSA-5c6j-r48x-rmvq.
+    fixed_in: "clears with workbox-build"
+    blocked_by: "react-scripts@5.0.1"
+    owner: frontend
+    expires: "2026-11-15"
+
+  - id: "via:build-chain"
+    ecosystem: npm
+    package: react-scripts
+    affected: ">=0.1.0"
+    severity: high
+    classification: not-reachable
+    reason: >-
+      The Create React App build toolchain itself, flagged because it depends on
+      @svgr/webpack, css-minimizer-webpack-plugin, jest, resolve-url-loader,
+      webpack-dev-server and workbox-webpack-plugin.
+    reachability: >-
+      react-scripts is the build system. It runs on a developer machine or a CI
+      runner and is never installed into a production image or served to a
+      browser. It appears under `dependencies` rather than `devDependencies`
+      because that is Create React App's own layout — which is also why
+      `npm audit --omit=dev` does not filter this group, and why reachability
+      here is argued from the dependency graph and the shipped bundle instead.
+    evidence: >-
+      grep -rE "from 'react-scripts'" frontend/src/ → 0 matches;
+      the production image contains no node_modules (backend/Dockerfile);
+      grep -r "webpack-dev-server\|sockjs" frontend/build/static/js/ → 0 matches
+    mitigation: >-
+      Not deployed. The only artifact that reaches a user is the contents of
+      frontend/build/.
+    fixed_in: "none — npm reports the fix as react-scripts@0.0.0 (removal)"
+    blocked_by: >-
+      Migrating off Create React App (to Vite or an equivalent) is a roadmap
+      item carried from PH2 H5 / PH3.10 P2-4. It replaces the entire build
+      pipeline and needs its own sprint and regression pass.
+    owner: frontend
+    expires: "2026-11-15"

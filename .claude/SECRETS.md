@@ -254,9 +254,17 @@ Until that exists (SECRETS.md §8, L5), rotation in practice means restart.
   The same table is mirrored in `.claude/TESTING.md` (QA gate) and referenced by
   `.github/dependabot.yml`.
 - **Updating.** Bump one package (or a coherent group) at a time; run the test
-  suite; commit with the advisory id in the message. To temporarily accept an
-  unfixable advisory, add `--ignore-vuln <ID>` in the workflow **with a
-  justification recorded in §8**.
+  suite; commit with the advisory id in the message.
+- **Accepting an advisory you cannot fix (PH3.11 onward).** Add an entry to
+  **`.github/dependency-triage.yml`** — not a flag in the workflow, which is how
+  the previous mechanism rotted. The entry must carry `package`, `severity`,
+  `classification` (`not-reachable` or `temporarily-accepted`), `reason`,
+  `reachability`, `mitigation`, `owner` and `expires`; a `not-reachable` entry
+  must additionally carry `evidence`, a **command a reviewer can re-run**, and
+  the gate rejects the register outright if it does not. Verify with
+  `python .github/scripts/dependency_audit.py --ecosystem all` before pushing. Both
+  ecosystems go through the same register — npm included, which it previously
+  was not. Then mirror the entry in §8 for human readers.
 - **New dependencies.** Justify in the PR (why, maintenance health, transitive
   weight). Prefer the standard library. Every add must keep `pip check` clean and
   land in the correct file (runtime vs. dev).
@@ -265,15 +273,58 @@ Until that exists (SECRETS.md §8, L5), rotation in practice means restart.
 
 ## 8. Known/accepted advisories (remediation backlog)
 
-Snapshot from the PH1.9 audit (2026-07-22). Safe in-pin security patches were
-applied (aiohttp, cryptography, httplib2, pillow, pyasn1, pymongo,
-python-multipart). The following remain and are tracked:
+> **The authoritative, enforced list is `.github/dependency-triage.yml`.** This
+> section is the human-readable summary; the register is what CI reads, and
+> `.github/scripts/dependency_audit.py` fails the build on any advisory not in it, any
+> entry past its expiry, and any entry that no longer matches a real finding.
+> If the two ever disagree, the register is right and this section is stale.
 
-| Package | Advisories | Why deferred | Plan |
-|---------|-----------|--------------|------|
-| `starlette` 0.37.2 | PYSEC-2026-161/248/249/1941/1943/2280/2281 | Hard-pinned by `fastapi==0.110.1` (`starlette<0.38`); cannot bump in isolation | Coordinated FastAPI+Starlette upgrade in a dedicated, tested sprint |
-| `litellm` 1.80.0 | PYSEC-2026-388/390/2597–2600, GHSA-69x8-hrgq-fjj8 | AI engine dependency; out of PH1.9 scope (AI models); fast-moving with breaking changes | AI-dependency upgrade sprint with regression coverage |
-| `ecdsa` 0.19.2 | PYSEC-2026-1325 (Minerva timing) | No fixed release exists; transitive via `python-jose` | Accepted risk — our own tokens use `PyJWT` HS256, not ECDSA; revisit if a fix ships or `python-jose` is dropped |
+**Updated 2026-08-17 (PH3.11 remediation).** The previous version of this table
+was wrong in a way worth recording: it listed `litellm` and `ecdsa` as tracked
+backlog **after both packages had already been removed from
+`requirements.txt`**. Eight of the fifteen suppressions in CI matched nothing.
+Nothing checked, so nothing noticed — which is why the register now fails the
+build on a stale entry.
+
+**Fixed in PH3.11**, rather than deferred:
+
+| Package | Was → Now | Cleared |
+|---------|-----------|---------|
+| `aiohttp` | 3.14.1 → **3.14.3** | PYSEC-2026-3545/3546/3547 |
+| `cryptography` | 48.0.1 → **50.0.0** | PYSEC-2026-3552/3553/3554 |
+| npm `brace-expansion`, `fast-uri`, `js-yaml`, `nanoid`, `underscore` | patch-level `overrides` | 7 packages |
+| npm `postcss` (direct devDependency) | ^8.4.49 → **^8.5.26** | 5 GHSAs |
+
+The `cryptography` upgrade crosses two majors. It was taken because the analysis
+supported it, not because the advisories forced it — all three were already
+unreachable. No dependent caps the version (every constraint is a lower bound),
+the application's entire surface is one `from cryptography.fernet import Fernet`,
+and **a Fernet token written under 48.0.0 decrypts correctly under 50.0.0**,
+which is the property that matters for broker tokens already sitting in a
+production database.
+
+**Still accepted, all with enforced expiry dates:**
+
+| Package | Advisories | Classification | Why | Expires |
+|---------|-----------|----------------|-----|---------|
+| `starlette` 0.37.2 | PYSEC-2026-249/1941/1943/2280/2281 | not-reachable | No form or multipart parsing anywhere in the backend; no `HTTPEndpoint`; no `StaticFiles`; 2281 is Windows-only and the image is Linux | **2027-02-15** |
+| `starlette` 0.37.2 | PYSEC-2026-161/248 | temporarily-accepted | The app reads only `request.url.path`, never the reconstructed absolute URL — unreachable **by convention, not by control**. Mitigation: Host validation at the proxy (C-7); `TrustedHostMiddleware` is the recommended follow-up | **2026-11-15** |
+| npm CRA build chain (11 packages, 16 rows) | see register | not-reachable | Build tooling only: zero imports from `frontend/src/`, every dependency path runs through `react-scripts`, and none appears in the shipped bundle | **2026-11-15** |
+
+All seven `starlette` advisories are pinned in place by `fastapi==0.110.1`
+(`starlette<0.38`); every fix is 0.40.0 or later, so clearing them means a
+coordinated FastAPI + Starlette upgrade in its own sprint. The npm group clears
+only by migrating off Create React App — npm reports the fix for each as
+`react-scripts@0.0.0`, i.e. "remove it".
+
+**On changing an expiry date.** The previous mechanism used a single
+`SUPPRESSION_REVIEW_BY` covering everything, which made "re-argue the case" and
+"move one date" indistinguishable. PH3.11 replaced it with per-entry dates and
+re-argued the old one rather than extending it: the blanket "pinned by fastapi"
+justification split 5/2, and the two advisories that could not be dismissed
+received a **shorter** deadline than they had before. Editing `expires` without
+updating `reason` and `reachability` in the same change is the failure this
+register exists to prevent.
 
 ---
 

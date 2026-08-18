@@ -121,14 +121,72 @@ class TrailingStopConfig(BaseModel):
     value: float = Field(default=0, ge=0)
 
 
+# --------------------------------------------------------------------------- #
+# Canonical trade-entry constraints (PH3.12R / B-1)                             #
+# --------------------------------------------------------------------------- #
+# WHY THESE ARE NAMED TYPES AND NOT INLINE `Field(...)` CALLS
+# -----------------------------------------------------------
+# PH3.12 found that `/api/paper/trade` accepted `quantity: -1000` and answered
+# 200, crediting the caller's paper balance by ₹10,00,000 — while `/api/trades`
+# rejected the identical payload with 422. Both endpoints create a trade in the
+# same collection from the same six numbers. They disagreed because the
+# constraints were written out twice: once here on `TradeCreate`, and once (as
+# bare, unconstrained annotations) on a `PaperTradeCreate` declared 5,000 lines
+# away inside `server.py`.
+#
+# The fix is not "copy the Field() calls across". Copied constraints drift again
+# the moment a third trade-entry surface is added, and the drift is invisible
+# because nothing links the two declarations. So the contract now exists ONCE,
+# as these aliases, and every trade-entry model is spelled in terms of them.
+# Tightening a bound here tightens it everywhere by construction.
+#
+# `allow_inf_nan=False` is load-bearing and not obvious: Python's `json.loads`
+# — which is what Starlette parses request bodies with — accepts the
+# non-standard literals `Infinity`, `-Infinity` and `NaN`. A plain `gt=0` float
+# **admits `Infinity`** (`inf > 0` is True; only `NaN` fails the comparison), so
+# `entry_price: Infinity` would have passed every bound above and written an
+# infinite `total_cost` into the trade journal, poisoning every downstream P&L
+# and performance aggregate with `inf`/`nan`. Verified empirically, not assumed.
+
+#: Trade direction. The only two sides the engine, the journal and the P&L
+#: calculations understand — anything else silently takes the SELL branch of
+#: every `type == "BUY"` check in the codebase.
+TradeSide = Annotated[str, Field(pattern="^(BUY|SELL)$")]
+
+#: Share count. Strictly positive (a negative quantity inverts the sign of every
+#: cost and P&L term) and capped at the same 100,000 ceiling `TradeCreate` has
+#: always enforced, which bounds the notional a single request can express.
+TradeQuantity = Annotated[int, Field(gt=0, le=100000)]
+
+#: Any price that must be a real, tradeable level: entry, stop-loss, target.
+TradePrice = Annotated[float, Field(gt=0, allow_inf_nan=False)]
+
+#: A price whose absence is encoded as 0 rather than null (`target2` on the
+#: paper-trading form). Zero means "not set"; negative is still meaningless.
+OptionalTradePrice = Annotated[float, Field(ge=0, allow_inf_nan=False)]
+
+#: An NSE/BSE ticker. Bounded and character-restricted so a symbol cannot carry
+#: a payload into the trade journal, the activity log or the analytics
+#: group-by keys. `&` and `-` are permitted because real listings use them
+#: (`M&M`, `BAJAJ-AUTO`); lowercase is permitted because the service upper-cases
+#: on the way in. Anchored `^…$` — Pydantic's `pattern` is an unanchored match.
+TradeSymbol = Annotated[str, Field(min_length=1, max_length=32,
+                                   pattern=r"^[A-Za-z0-9][A-Za-z0-9&.\-]{0,31}$")]
+
+#: Free-text fields that are persisted. Unbounded strings in a stored document
+#: are a storage-amplification vector, not a validation nicety.
+TradeFreeText = Annotated[str, Field(max_length=2000)]
+TradeShortText = Annotated[str, Field(max_length=120)]
+
+
 class TradeCreate(BaseModel):
     symbol: str
     stock_name: str
-    type: str = Field(default="BUY", pattern="^(BUY|SELL)$")
-    entry_price: float = Field(gt=0)
-    quantity: int = Field(gt=0, le=100000)
-    stop_loss: float = Field(gt=0)
-    target1: float = Field(gt=0)
+    type: TradeSide = "BUY"
+    entry_price: TradePrice
+    quantity: TradeQuantity
+    stop_loss: TradePrice
+    target1: TradePrice
     target2: Optional[float] = None
     target3: Optional[float] = None
     trailing_stop: Optional[TrailingStopConfig] = None
@@ -146,6 +204,45 @@ class TradeCreate(BaseModel):
     auto_exit: bool = False
     # Acknowledge risk warnings (violations always block regardless).
     override_warnings: bool = False
+
+
+class PaperTradeCreate(BaseModel):
+    """Entry payload for `POST /api/paper/trade` (PH3.12R / B-1).
+
+    LIVES HERE, NEXT TO `TradeCreate`, ON PURPOSE
+    ---------------------------------------------
+    This model used to be declared inline in `server.py` beside its route
+    handler. That is why B-1 existed: nobody editing `TradeCreate` could see
+    that a second model described the same domain, so the two never got
+    tightened together. Keeping them adjacent — and spelled in the same alias
+    vocabulary — makes the divergence visible at a glance and impossible to
+    reintroduce without deleting a shared type.
+
+    Every constraint `TradeCreate` enforces is enforced here. The two models
+    are NOT merged into one because their optional surfaces genuinely differ:
+    a paper trade has no broker, no exchange, no order type, no live-exit
+    consent and no risk-warning override — fields that must not exist on an
+    endpoint that can never place an order.
+    """
+    symbol: TradeSymbol
+    stock_name: TradeShortText = ""
+    quantity: TradeQuantity
+    entry_price: TradePrice
+    type: TradeSide = "BUY"
+    stop_loss: TradePrice
+    target1: TradePrice
+    # 0 is the caller's "no second target" sentinel; `execute_paper_trade`
+    # stores `target2 or target1`. Negative is rejected, unlike before.
+    target2: OptionalTradePrice = 0.0
+    setup_type: TradeShortText = "MOMENTUM"
+    notes: TradeFreeText = ""
+
+    # Reject unknown keys outright. A paper-trading payload carrying `broker`,
+    # `auto_exit` or `is_paper: false` is either a client bug or an attempt to
+    # reach the live-execution surface through the simulated one; silently
+    # dropping it hides both. Real fields are added deliberately, not by a
+    # caller guessing at names.
+    model_config = ConfigDict(extra="forbid")
 
 
 class TradeModify(BaseModel):

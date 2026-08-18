@@ -77,7 +77,9 @@ websockets==16.0             # services/brokers/stream.py — broker market-data
 APScheduler==3.11.2          # services/scheduler.py — market-hours jobs
 
 # Security primitives
-cryptography==48.0.1         # Fernet broker-token encryption; JWT/CSRF crypto backend
+cryptography==50.0.0         # Fernet broker-token encryption; JWT/CSRF crypto backend
+                             # PH3.11-R2: 48.0.1 → 50.0.0 clears PYSEC-2026-3552/3553/3554.
+                             # Fernet tokens written under 48.x decrypt unchanged (verified).
 bcrypt==4.1.3                # password hashing (security)
 PyJWT==2.13.0                # access/refresh JWT signing & verification
 
@@ -99,7 +101,7 @@ psutil==7.2.2                # server.py + observability/metrics.py — CPU/RAM/
 # (dependency closure of the direct set above; do not edit by hand)
 # ------------------------------------------------------------------------------
 aiohappyeyeballs==2.7.1
-aiohttp==3.14.1
+aiohttp==3.14.3            # PH3.11-R1: 3.14.1 → 3.14.3 clears PYSEC-2026-3545/3546/3547
 aiohttp-retry==2.9.1
 aiosignal==1.4.0
 annotated-types==0.7.0

@@ -1565,4 +1565,169 @@ adoption model `backend-ci.yml` documents.
 
 ---
 
+## Release-candidate regression protocol, as executed (PH3.11)
+
+**Report:** `docs/production/PH3.11_RELEASE_CANDIDATE_REPORT.md`.
+**Verdict: BLOCKED** — on a red CI gate, not on a code regression.
+
+This is the protocol PH3.11 actually ran, recorded here so a future release does
+not have to reinvent it.
+
+### The measured baseline (2026-08-17, commit `32437e8`)
+
+| Selector | Count | Result |
+|---|---|---|
+| `pytest` (hermetic default) | 2,559 | **passed**, 0 failed, 187.63s |
+| `pytest -m security` | 452 | **passed**, 35.74s |
+| `pytest -m integration` / `-m live` | 95 | deselected by design |
+| `-m slow` | 6 | in the default run |
+| `-m e2e`, `requires_db`, `requires_redis`, `allow_network` | 0 | registered, unused — **no test claims a network exemption** |
+| xfail | 4 | intentional (D-10) |
+| **Total collected** | **2,658** | 2,559 + 95 + 4 ✓ |
+| Frontend (`craco test`) | 395 / 22 suites | **passed** |
+| Frontend production build | — | exit 0, 48 bundles, 14 MB |
+
+Identical to the PH3.10 baseline on every axis.
+
+### What a regression sprint must verify that a unit suite cannot
+
+The hermetic suite is necessary and not sufficient. These were verified against a
+**from-scratch `--no-cache --pull` production image** running with
+`APP_ENV=production` against authenticated Mongo and Redis:
+
+* **Authorization surface by dependency graph**, not by reading decorators —
+  `tests/_routes.py` classified 97 protected / 29 admin / 75 public = 201,
+  identical to PH3.10. A route whose guard is deleted changes this number.
+* **Live auth journey** — register, login, authenticated request, refresh
+  rotation, **replay → 401 + family revocation**, logout, logout-all across three
+  sessions (all 401, including the caller's).
+* **WebSocket re-attack** — anonymous, spoofed `?user_id=`, query token and
+  forged subprotocol all 403; valid token + spoofed `user_id` binds to the
+  token's subject. The marker is `stockassist.auth`.
+* **Fault injection** — Redis loss (readiness `critical:false`, API still
+  serving), Mongo loss (readiness 503, liveness 200, no leakage), both recovering
+  with **0 process restarts**; `docker stop` in 1 s, exit 0, all 4 background
+  tasks stopped.
+* **Resource churn** — 60 sockets connected and closed; every gauge
+  (`websocket_connections`, `tracked_users`, `channel_subscriptions`, the four
+  caches, Redis in-use) back to zero.
+* **Log leakage measured against the real secrets in use** — zero occurrences of
+  the Mongo password, Redis password, user password, API key or signing secret.
+
+### Mutation-checking, and why it is the only proof a test is real
+
+`test_run_cycle_trails_and_books_targets` had been reported fixed by two prior
+sprints. PH3.11 did not take that on faith: injecting a spurious key into
+`run_cycle`'s return contract in `services/trading_engine.py` made the test
+**fail**, which is the only evidence that its exact-equality assertion still
+bites. The mutation was reverted and `git diff` confirmed clean.
+
+**A green test proves nothing until you have watched it go red.** Apply this to
+any assertion a report claims is load-bearing.
+
+### Running CI's gates locally is part of the protocol
+
+PH3.11's only blocker was found this way. `backend-ci`'s gates all pass locally
+(correctness lint, compile, import-with-synthetic-env, config validation, tests),
+but **`dependency-audit` exited 1 on both of its jobs** — 6 advisories against
+pinned runtime Python dependencies, and 18 high npm advisories with no triage
+mechanism. No previous sprint had ever run it.
+
+**Since remediation the gate is one command**, and it is the command to run:
+
+```bash
+python .github/scripts/dependency_audit.py --ecosystem all
+#   0 = clean · 1 = policy violation · 2 = the audit could not run
+```
+
+Exit **2 is not a pass**. It means the auditor was unusable — a registry
+outage, a missing tool, an unexpected JSON schema — and it is a separate code
+precisely so that "the check could not be performed" can never be read as "the
+check passed". `--strict` is on for the same reason: without it `pip-audit`
+exits 0 when it merely fails to *resolve* a package, so a typo or a yanked
+release would present as a clean audit.
+
+### The supply-chain gate has its own test suite
+
+A gate nobody tests is a gate nobody can trust, and this one had been failing
+unnoticed for long enough to prove the point. Eight negative tests, run by
+mutating and then reverting:
+
+| Mutation | Expected |
+|---|---|
+| Date past an entry's `expires` | exit 1, `EXPIRED` |
+| Date **equal to** `expires` | exit 0 — valid through the stated day |
+| One day later | exit 1 |
+| Date inside the 30-day window | exit 0 **with** an `EXPIRING` warning |
+| Delete a register entry | exit 1, `UNTRIAGED` |
+| Add an entry matching nothing | exit 1, `STALE` |
+| Downgrade a runtime pin to a vulnerable version | exit 1, `UNTRIAGED` |
+| Remove an npm `override`, regenerate the lockfile | exit 1, `UNTRIAGED` |
+
+The `STALE` case is the one worth internalising. Eight of the fifteen original
+Python suppressions named `litellm` and `ecdsa` — **packages that had already
+been removed from `requirements.txt`**. They matched nothing, hid nothing, and
+sat there while the CI summary advertised them as pending remediation. Nothing
+checked that a suppression still corresponded to a real finding, so nothing
+noticed. **A suppression list that cannot go stale-detect is a list that will
+rot**, and the check costs four lines.
+
+Every mutation must be reverted and the revert verified — `git diff` clean and
+the gate green again — before moving on.
+
+### Reachability is argued from the graph and the artifact, not from names
+
+Two traps that produced wrong answers during this work:
+
+* **Name-matching the built bundle gives false positives.** `grep -r svgo build/`
+  hits `svgo = target.getAttribute(...)` — a minifier-generated variable, not the
+  library. Argue from `npm ls --omit=dev --all --json` paths instead, and use the
+  bundle grep only as corroboration.
+* **`npm audit --omit=dev` does not mean "runtime only" here.** `react-scripts`
+  sits under `dependencies`, which is Create React App's own layout, so the whole
+  build chain survives the filter. The dependency graph is the authority.
+
+The equivalent on the Python side is checking the *call site*, not the package:
+`cryptography` was flagged for PKCS#7 and X.509 defects while the application's
+entire use of it is one `from cryptography.fernet import Fernet` import.
+
+Two traps this exposed, both worth repeating:
+
+* **`echo $?` after a pipe reads the wrong command.**
+  `npm audit --audit-level=high | tail -12; echo $?` reports `tail`'s status —
+  which is always 0. The gate looked green and was not. Capture the exit code
+  from the command itself.
+* **`docker logs container 2>&1 > file` sends stderr to the terminal, not the
+  file.** uvicorn's access log is on stderr, so a leakage scan written that way
+  silently measures only half the output. Use `> file 2>&1`.
+
+### Distinguishing "not vulnerable" from "the gate passes"
+
+PH3.11 analysed reachability for every advisory rather than accepting or
+dismissing them wholesale: `cryptography` is used only for Fernet (no `pkcs7`,
+no `x509.verification`), `aiohttp` is client-only, and zero of the 18 npm
+packages appear in `build/static/js/`. **None of that turns a red gate green.**
+A regression report should state both facts and never let one stand in for the
+other.
+
+### Two apparent findings that were artifacts of the probe
+
+Recorded because both looked like security defects and neither was:
+
+1. **Logout-all appeared to spare the caller.** The prior session had been
+   refreshed without persisting the rotated cookie, so its 401 was replay
+   detection rather than revocation; and the logout-all call carried no CSRF
+   header, so it was rejected 403 and revoked nothing. Re-run with three
+   untouched sessions and a proper CSRF token: 6 sessions revoked, all 401.
+2. **A fail-closed matrix aimed at the wrong layer.** Wildcard CORS is stripped
+   in `cors.py`, `COOKIE_SECURE` is forced in `cookies.py`, and debug mode has no
+   code path to reject because there is no `--reload`, no `app.debug` and no
+   debug flag anywhere. Testing all three through `validate_config()` produced
+   three false findings.
+
+**Re-run a suspicious result before reporting it.** In this sprint that step is
+what separated two self-inflicted artifacts from the one real blocker.
+
+---
+
 # End of Testing Documentation

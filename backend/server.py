@@ -94,6 +94,7 @@ from security.cookies import (
     set_oauth_state_cookie,
     clear_oauth_state_cookie,
 )
+from security import api_docs
 from security.cors import apply_cors
 from security.headers import apply_security_headers
 
@@ -172,7 +173,7 @@ from observability.middleware import apply_observability
 from models import (
     UserCreate, UserLogin, UserResponse, UserSettingsUpdate,
     VerifyEmailRequest, ForgotPasswordRequest, ResetPasswordRequest, ChangePasswordRequest,
-    TradeCreate, TradeResponse, TradeModify, TradeExitRequest,
+    TradeCreate, TradeResponse, TradeModify, TradeExitRequest, PaperTradeCreate,
     WatchlistAdd,
     ChatMessage, ChatResponse,
     StockAnalysisRequest, SIPRequest,
@@ -354,7 +355,13 @@ async def prefetch_quote_func(user_id):
     return quote_func
 
 
-app = FastAPI(title="AlphaPartner API")
+# PH3.12R / B-2: the documentation URLs are NOT left at their framework
+# defaults. `docs_kwargs()` resolves `/docs`, `/redoc` and `/openapi.json`
+# together from the deployment environment — all three unrouted in production,
+# all three available everywhere else. See security/api_docs.py for why the
+# policy lives in a function instead of inline here, and why there is no
+# environment variable that can switch them back on in production.
+app = FastAPI(title="AlphaPartner API", **api_docs.docs_kwargs())
 
 
 # Broker errors → consistent HTTP responses. Auth problems use 409 (NOT 401:
@@ -5122,20 +5129,18 @@ async def paper_pnl(user: dict = Depends(get_current_user)):
     from services.paper_trade import get_paper_pnl
     return await get_paper_pnl(user["_id"], db)
 
-class PaperTradeCreate(BaseModel):
-    symbol: str
-    stock_name: str = ""
-    quantity: int
-    entry_price: float
-    type: str = "BUY"
-    stop_loss: float
-    target1: float
-    target2: float = 0.0
-    setup_type: str = "MOMENTUM"
-    notes: str = ""
+# `PaperTradeCreate` is imported from `models` alongside `TradeCreate` (PH3.12R
+# / B-1). It was declared here, inline, with no constraints on any field — so
+# `quantity: -1000` was accepted and *credited* the caller's paper balance,
+# while the identical payload to `/api/trades` was rejected with 422. The two
+# models now share one set of constraint definitions; see models.py.
 
 @paper_router.post("/trade")
 async def paper_trade(data: PaperTradeCreate, user: dict = Depends(get_current_user)):
+    """Place a simulated trade. Validation happens at the model layer, i.e.
+    before this function body runs and therefore before any balance, position,
+    trade or P&L write can occur — malformed input answers 422 and mutates
+    nothing."""
     from services.paper_trade import execute_paper_trade
     try:
         return await execute_paper_trade(

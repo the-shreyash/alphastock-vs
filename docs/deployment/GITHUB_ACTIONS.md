@@ -273,14 +273,28 @@ This is real accepted risk and it is documented here rather than buried in a fla
 | Package | Advisories | Fix available | Remediation |
 |---|---|---|---|
 | `starlette 0.37.2` | 7 (`PYSEC-2026-161`, `-249`, `-248`, `-1943`, `-1941`, `-2281`, `-2280`) | 0.40.0 → 1.3.1 | **Highest priority.** Starlette is the ASGI layer every request traverses. The pin is held by `fastapi==0.110.1`, so this is a coordinated FastAPI + Starlette upgrade, not a version bump. |
-| `litellm 1.80.0` | 7 (`PYSEC-2026-390`, `-388`, `-2597`, `-2599`, `-2598`, `-2600`, `GHSA-69x8-hrgq-fjj8`) | 1.83.0 → 1.84.0 | **Remove, do not upgrade.** PH2.1's image analysis found litellm is not imported by any application code — 55 MB of unused dependency carrying seven advisories. |
-| `ecdsa 0.19.2` | 1 (`PYSEC-2026-1325`) | none released | Not reachable. Transitive via `python-jose`; this application signs JWTs with HS256 (HMAC) and never performs an ECDSA curve operation. |
+| ~~`litellm 1.80.0`~~ | ~~7~~ | — | **Removed from `requirements.txt`.** PH3.11 found the seven suppressions still in CI long after the package itself was gone — they matched nothing. Entries deleted. |
+| ~~`ecdsa 0.19.2`~~ | ~~1~~ | — | **Removed from `requirements.txt`.** Same as above: a suppression for a package that is no longer a dependency. Entry deleted. |
+| `aiohttp 3.14.1` | 3 (`PYSEC-2026-3545/3546/3547`) | 3.14.3 | **FIXED in PH3.11** — patch-level bump, full suite green. |
+| `cryptography 48.0.1` | 3 (`PYSEC-2026-3552/3553/3554`) | 49.0.0 → 50.0.0 | **FIXED in PH3.11** — upgraded to 50.0.0. All three were already unreachable (Fernet is the only API used), but the fix was verifiable, including that tokens written under 48.0.0 still decrypt. |
 
 Suppression is **not** remediation. It exists so the gate can distinguish "debt we have already decided about" from "something new arrived today" — a gate that is red for fifteen old reasons cannot report the sixteenth, new one, which is the entire reason the gate exists.
 
-**The suppression cannot become permanent.** A `SUPPRESSION_REVIEW_BY` date (currently `2026-08-22`) is enforced by a job step: from that date every run emits a warning, and 30 days later the build **fails** until someone re-argues the case. Without a mechanism like this, `--ignore-vuln` is where vulnerabilities go to be forgotten — the engineer who added the flag remembers why, leaves, and three years later nobody can say whether the risk was ever real.
+**The suppression cannot become permanent — rebuilt in PH3.11.** Suppressions no longer live in this workflow's `env` block. They live in **`.github/dependency-triage.yml`** and are enforced by `.github/scripts/dependency_audit.py`, which both jobs run:
 
-`npm audit --audit-level=high` fails on high and critical only. Not laziness: the npm database reports a large volume of low/moderate findings in build-time-only transitive packages, and a gate that is red every morning for reasons nobody can act on is a gate the team learns to bypass. Lower severities are still counted in the job summary and in Dependabot's queue.
+| Rule | Effect |
+|---|---|
+| A finding with no register entry | **FAIL** (`UNTRIAGED`) |
+| An entry past its `expires` date | **FAIL** (`EXPIRED`) — no grace period |
+| An entry that matches no live finding | **FAIL** (`STALE`) |
+| An entry expiring within 30 days | warn, do not fail |
+| The auditor could not run | **exit 2**, distinct from both pass and policy failure |
+
+Three things changed and each fixed a real defect. **Expiry is now per entry with no grace period** — the old single `SUPPRESSION_REVIEW_BY` plus a 30-day cushion made "re-argue the case" and "quietly move one date" indistinguishable. **Stale entries now fail**: eight of the fifteen original suppressions named `litellm` and `ecdsa`, packages already removed from `requirements.txt`, and nothing noticed because nothing checked that a suppression still matched something real. **npm is covered by the same register**, where before it had no triage path at all and therefore failed unconditionally.
+
+Suppression is still **not** remediation. It exists so the gate can distinguish "debt we have already decided about" from "something new arrived today".
+
+The npm severity threshold is `policy.npm_fail_severities` in the register (high and critical). Not laziness: the npm database reports a large volume of low/moderate findings in build-time-only transitive packages, and a gate that is red every morning for reasons nobody can act on is a gate the team learns to bypass. Lower severities are still counted in the job summary and in Dependabot's queue.
 
 ### `security-audit.yml`
 
@@ -420,7 +434,10 @@ The roadmap's PH2.5 acceptance criterion is a pipeline under 10 minutes. Record 
 | Smoke B fails on the secret-leak check | A code path now logs a secret **value** | Fix the logging. Actions logs are retained 90 days and readable by anyone with repo access. |
 | hadolint fails | A new `error`-level rule was hit | Fix the Dockerfile. Ignore a rule only by adding it to `.hadolint.yaml` **with a written reason** — an unexplained ignore is a defect. |
 | `dependency-audit` fails on a *new* advisory | A CVE was published, or Dependabot bumped something | Triage per `.claude/SECRETS.md` §7. Suppress only with a `SECRETS.md` §8 entry. |
-| `dependency-audit` fails with "suppressions passed their hard stop" | The 30-day grace after `SUPPRESSION_REVIEW_BY` elapsed | Re-triage. Remediate, or move the date **with a written justification**. |
+| `dependency-audit` fails with `EXPIRED` | A register entry passed its `expires` date | Re-argue the case in `.github/dependency-triage.yml` — update `reason` and `reachability`, not just the date — or remediate. |
+| `dependency-audit` fails with `UNTRIAGED` | A new advisory with no register entry | Fix the dependency, or add an entry with reachability evidence, an owner and an expiry. |
+| `dependency-audit` fails with `STALE` | A register entry no longer matches any finding | Delete the entry. The advisory is gone or the package was removed. |
+| `dependency-audit` exits 2 | The auditor itself could not run | **Not a pass.** Investigate the tooling: registry outage, missing dependency, or an unexpected JSON schema. |
 | `codeql` reports skipped | Private repository without Advanced Security | Expected — see §8. |
 | A required check is stuck "Expected — waiting for status" | A `paths:` filter was added to a required workflow | Remove it. See §3. |
 
@@ -456,7 +473,7 @@ docker run --rm --env APP_ENV=production stockassist-backend:local   # must FAIL
 | L5 | No test-coverage measurement | The 90 % target in TESTING.md is unmeasured | Needs `pytest-cov` pinned into `requirements-dev.txt` |
 | L6 | Branch protection is not configured — the gates exist but nothing *requires* them | A red pipeline can still be merged | PH2.5 |
 | L7 | No PR template with the PRODUCTION_HARDENING.md §15 checklist | Manual verification stays ad hoc | PH2.5 |
-| L8 | 15 suppressed advisories (§7) | Real, dated, tracked accepted risk | `SUPPRESSION_REVIEW_BY` 2026-08-22 |
+| L8 | 23 triaged advisory rows (7 Python, 16 npm) in `.github/dependency-triage.yml` | Real, dated, evidenced accepted risk; 8 dead entries deleted and 6 advisories fixed outright in PH3.11 | Per-entry expiry: 2026-11-15 / 2027-02-15 |
 | L9 | Third-party actions are pinned by tag, not by commit SHA | A compromised tag could execute in CI | Hardening follow-up |
 | L10 | No image vulnerability scan (Trivy/Grype) on the built image | Base-image CVEs are unmeasured | PH2.6 |
 
