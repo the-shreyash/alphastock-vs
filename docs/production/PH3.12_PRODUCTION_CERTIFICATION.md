@@ -13,6 +13,16 @@ for the commit it examined.
 
 ---
 
+> **STATUS AS OF 2026-08-19 — read §32 before acting on this report.**
+> The PH3.12C remediation is committed at
+> **`6b53b3bcf99c400a0f623d5f4d280ffe87c47776`** and the release image is
+> **`sha256:9de7b850d09bc81ce1d61f49ba9682bed1850e2b25df9fcdcdf8310eb6bb2cc4`**.
+> **C-1 is CLOSED. C-2 is WITHDRAWN** (it was not a defect). A closure pass then
+> found **C-3 — OPEN, BLOCKER**: nested `__pycache__` directories still enter the
+> build context, so a working-directory build is not a function of the commit,
+> and the C-1 regression guard has a proven false negative for that case. §32
+> carries the identifiers, the re-run evidence and the blocker.
+
 ## 1. Executive Summary
 
 This is an independent rerun of the PH3.12 production certification. Nothing in
@@ -48,7 +58,7 @@ is a security compromise, a financial-integrity defect, or an authentication
 bypass.
 
 * **C-1 — a host-local, git-ignored test artifact is baked into the release
-  image.** ✅ **CLOSED by PH3.12C remediation — see §31.** `backend/test-results/junit.xml` is present at `/app/test-results/
+  image.** ✅ **CLOSED by PH3.12C remediation — see §31, verified against the committed release image in §32.2. A sibling defect in the same class, C-3, remains OPEN — see §32.5.** `backend/test-results/junit.xml` is present at `/app/test-results/
   junit.xml` in the image but is **absent from the commit**. Proven conclusively:
   a build from the developer's working directory yields **117** files in `/app`;
   a build from a clean `git archive` of the *same commit* yields **116**. The
@@ -56,7 +66,7 @@ bypass.
   developer's machine hostname. It is inert — never imported, never executed,
   never served — but §2 of this gate explicitly requires that no test-only file
   enter production, and that check fails.
-* **C-2 — WITHDRAWN. This finding was wrong; see §31.2.** It was attributed to a
+* **C-2 — WITHDRAWN. This finding was wrong; see §31.2, re-verified against the release image in §32.3.** It was attributed to a
   Redis outage, but the correlation was spurious: a 20-line control container with
   no application code reproduces the identical exit 137, and the application exits
   **0** on every direct SIGTERM. The original text is left below unedited so the
@@ -1084,3 +1094,252 @@ before deploy.
 The operational items are unchanged and still gate go-live rather than
 certification: payments **not implemented**, backup/DR has **no off-host target**,
 rollback has **no deployment ledger**.
+
+---
+
+# 32. PH3.12F — Release Closure Pass (2026-08-19)
+
+Scope: commit the PH3.12C remediation, rebuild the release image from a clean
+export of that commit, verify the image against the committed tree, and re-run
+the certification-critical checks. No application code was changed. PH3.13 was
+not started.
+
+**This pass found one new blocker. It was not repaired — it is reported below.**
+
+## 32.1 Release identifiers
+
+| Item | Value |
+|---|---|
+| **Final committed release SHA** | `6b53b3bcf99c400a0f623d5f4d280ffe87c47776` |
+| Branch | `main` |
+| Parent | `a4ee79f3e8ba5f689e265a8c804c9e9674717173` (the commit PH3.12-rerun certified) |
+| Working tree at build time | **clean** (`git status --porcelain` empty, verified before the build and after every check) |
+| **Final production image SHA256** | `sha256:9de7b850d09bc81ce1d61f49ba9682bed1850e2b25df9fcdcdf8310eb6bb2cc4` |
+| Image tag | `stockassist-rc:ph312-final` |
+| Image size | 425 MB |
+| Build | `docker build --no-cache --pull` from a `git archive` export of `6b53b3b` — **not** from the working directory |
+| `org.opencontainers.image.revision` | `6b53b3bcf99c400a0f623d5f4d280ffe87c47776` — the image names its own commit |
+| Runtime user | `appuser` (uid 10001); `pip` **absent**; Python 3.11.16 |
+
+The commit contains the `.dockerignore` C-1 fix, the 44-test regression guard,
+this report, the archived NO-GO report, and the status updates. It contains no
+application module, dependency, workflow or configuration change — verified by
+`git diff --name-only a4ee79f..6b53b3b`, whose only non-documentation entries are
+`backend/.dockerignore` and `backend/tests/test_build_context.py`.
+
+## 32.2 C-1 — CLOSED
+
+Verified against the image above, built from a clean export, with the offending
+host artifacts (`backend/test-results/junit.xml`, `backend/.coverage`,
+`backend/.pytest_cache/`) **deliberately left on disk** so no check could pass
+vacuously.
+
+| Check | Result |
+|---|---|
+| `/app/test-results`, `/app/test_reports`, `/app/.coverage`, `/app/htmlcov`, `/app/.pytest_cache` | **all absent** |
+| Any `junit*.xml`, `*.junit.xml`, `coverage.xml`, `nosetests.xml`, `report.xml`, `.benchmarks`, `.hypothesis` anywhere under `/app` | **none** |
+| Any `test_*.py`, `*_test.py`, `conftest.py`, `pytest.ini`, `requirements-dev.txt` under `/app` | **none** |
+| `/app/tests`, `/app/.env`, `/app/.git`, `/app/venv` | **all absent** |
+| Files in `/app` (excluding build-generated `__pycache__`) | **116** |
+| **Files in the image but not in the commit** | **0** |
+| **Content mismatches against the committed blobs** | **0** |
+| Files in the commit but not in the image | 80 — `tests/` (74), `conftest.py`, `.dockerignore`, `.env.example`, `Dockerfile`, `requirements-dev.txt`, plus test helpers; every one intentional |
+| Production source present (`server.py`, `models.py`, `market_data.py`, `requirements.txt`, `docker/entrypoint.sh`, `docker/healthcheck.sh`, `security/`, `services/`, `analytics/`, `observability/`, `infrastructure/`) | **all present** |
+| `test_build_context.py` | **44 passed** |
+
+**C-1 status: CLOSED.** The specific defect — test and CI *result* artifacts
+entering the build context — is fixed and verified absent from the release image.
+
+## 32.3 C-2 — WITHDRAWN (control-container evidence)
+
+Restated here because a withdrawal is only auditable if the evidence travels
+with the decision. Full detail in §31.2.
+
+The rerun reported "the container exits 137 (SIGKILL) on graceful shutdown after
+a Redis outage-and-recovery," reproduced 4/4. The reproduction was real; the
+**attribution** was not. A control container — 20 lines of Python, a textbook
+`SIGTERM` handler, a 1.2 s simulated teardown, **no Redis, no asyncio and no
+application code of any kind** — reproduces it exactly:
+
+| Control container | Result |
+|---|---|
+| `docker stop` (no `-t`) | **exit 137 in 6/6 runs**, "clean exit" never logged |
+| `docker stop -t 10` / `-t 30` / `-t 60` | **exit 0 in 3/3**, clean exit logged |
+| Teardown shortened to 0.2 s, `docker stop` (no `-t`) | **exit 0 in 3/3** |
+
+On this host (Docker Desktop 29.4.0, macOS) a bare `docker stop` SIGKILLs roughly
+1.3 s after SIGTERM, well short of the documented 10 s grace period. The
+application's teardown takes 1.5–2.3 s and therefore straddles that window. The
+certification compounded the confusion by using bare `docker stop` in the flap
+runs and an explicit `-t 30`/`-t 60` in the baselines — so every 137 came from a
+bare `docker stop` and every 0 from an explicit `-t`. **The variable under test
+was never Redis.**
+
+Re-verified against the final release image `sha256:9de7b850…bb2cc4` in this
+pass:
+
+| Probe | Exit code | Teardown |
+|---|---|---|
+| Direct `SIGTERM` to PID 1 (`docker kill --signal=SIGTERM`) | **0** | ordered and complete — draining → background tasks cancelled → *Redis client closed* → *Closed 1 pooled HTTP client(s)* → *Application shutdown complete* → *Finished server process [1]* |
+| `docker stop -t 30` | **0** | complete |
+
+**C-2 status: WITHDRAWN — not a defect. No application lifecycle code was
+changed and no exit code was masked.** The operational advice is unchanged and
+unrelated to any defect: set an explicit termination grace period
+(`stop_grace_period` / `terminationGracePeriodSeconds`, ≥ 30 s), and always pass
+an explicit `-t` when reproducing shutdown behaviour rather than trusting the
+CLI default.
+
+## 32.4 Reproducibility result
+
+Two images were built `--no-cache --pull` from the same commit: **A** from a
+clean `git archive` export, **B** from the developer working directory with the
+host artifacts present.
+
+| Comparison | Result |
+|---|---|
+| Non-`.pyc` files in `/app` — A vs B | **116 = 116, byte-identical, 0 differences** |
+| Non-`.pyc` files — A vs the committed tree | **0 extra, 0 missing, 0 content mismatches** |
+| **All** files in `/app` — A vs B | **223 vs 228 — NOT identical** |
+| Files present only in B | 5 — `analytics/__pycache__/{__init__,contract,periods,quality,registry}.cpython-314.pyc` |
+| `.pyc` present in both but differing | **107** (104 in the marshalled code object, 3 in the header only) |
+
+For the release artifact as built — from a clean export — **the image is a
+function of the commit.** For any build performed from a working directory it is
+still not. That gap is finding C-3.
+
+## 32.5 NEW BLOCKER — C-3: nested `__pycache__` leaks host bytecode into the image
+
+**This is the C-1 defect class, not yet closed. It is reported, not repaired.**
+
+`backend/.dockerignore` excludes `__pycache__/` (line 60) and `*.py[cod]`. Both
+are **bare patterns, and therefore anchored to the build-context root** — the
+exact property the C-1 fix was written around. `backend/__pycache__/` is
+excluded; `backend/analytics/__pycache__/` and every other nested one is not.
+
+**Measured consequence.** A build from the working directory copies host
+`__pycache__` directories into the image, and `compileall` leaves any `.pyc`
+whose header still matches its source, so the *host's* bytecode ships:
+
+* 5 `cpython-314.pyc` files — compiled by the host's Python 3.14, which the
+  container's Python 3.11 can never load. Inert, and absent from the commit.
+* 104 `cpython-311.pyc` files whose marshalled code objects differ from a clean
+  build, because a code object embeds `co_filename`. The working-directory image
+  carries
+  `/Users/<developer>/Files/alpha_stock/alpha-stock-main/backend/analytics/registry.py`
+  where the clean image carries `/app/analytics/registry.py`. Those paths surface
+  in production tracebacks.
+
+This is the same property C-1 was raised for — the image is not a function of the
+commit, and it carries developer-machine identifiers — reached through a
+different pattern.
+
+**The C-1 regression guard does not catch it, and the reason matters.**
+`test_build_context.py::_excluded` models Docker's matcher with `fnmatch`, whose
+`*` crosses `/`. Docker uses Go's `filepath.Match` semantics, whose `*` does not.
+So the guard evaluates `analytics/x.pyc` against the root-anchored `*.py[cod]`
+rule and concludes it is excluded, while Docker copies it in:
+
+| Probe | Guard says | Docker actually does |
+|---|---|---|
+| `analytics/__pycache__/registry.cpython-314.pyc` | excluded | **copied into the image** |
+| `analytics/x.pyc` | excluded | **copied into the image** |
+
+The guard is therefore **unfalsifiable for the very class it was written to
+defend** — the same shape of error that let C-1 survive three sprints and let
+PH3.11 certify B-2 closed while it was open. Fixing `.dockerignore` without
+correcting `_excluded`'s matching model would leave the next instance equally
+invisible.
+
+**Why it was not repaired here.** The instruction for this pass was to report a
+failing certification-critical check as a blocker rather than silently fix it.
+The fix is small — `**/__pycache__/`, `**/*.py[cod]`, and a `_excluded` that does
+not let `*` cross `/` — but it changes the release artifact and must be its own
+reviewed change with its own rebuild.
+
+**C-3 status: OPEN — BLOCKER.**
+
+## 32.6 Certification-critical checks, re-run
+
+| Check | Result | Baseline |
+|---|---|---|
+| Backend regression suite | **2,787 passed**, 0 failed, 4 xfailed, 95 deselected (161.95 s) | 2,743 + the 44 new build-context tests |
+| Security suite (`-m security`) | **452 passed**, 0 failed | 452 |
+| Build-context guard | **44 passed** | new |
+| Frontend tests | **395 passed**, 22 suites | 395 / 22 |
+| Frontend production build | **exit 0**, 48 JS bundles + 1 CSS, 14 MB, 139 files | 48 bundles / 14 MB |
+| Dependency gate (`--ecosystem all`) | **exit 0** — 7 python + 16 npm advisories, all triaged | exit 0 |
+| Dependency gate, falsifiability probe (`--today 2030-01-01`) | **exit 1 EXPIRED** (`starlette` PYSEC-2026-2280) — the gate still bites | exit 1 |
+| Triage register after the probe | **unmodified** (`git status` clean) | unchanged |
+| Docker build-context verification | **0 extras, 0 mismatches** vs the commit (see §32.2); working-directory parity **FAILS** (C-3) | — |
+| Production route inventory (live introspection of the running image) | **201 HTTP + 1 WebSocket**; 97 user-protected / 29 admin / 75 public; **0 documentation routes registered** | 201 / 97-29-75 / 0 |
+
+**B-1 — paper-trade input validation, against the final image.** 15 hostile
+payloads, all **422**; the paper balance is byte-identical across the whole
+matrix (`100000.0` → `100000.0`).
+
+| Payload | Result |
+|---|---|
+| `quantity: -1000` (the original exploit) | 422 |
+| `quantity: 0` / `1.5` / `"-1000"` / missing / `null` | 422 |
+| `entry_price` negative / `0` / `Infinity` / `NaN` | 422 |
+| `stop_loss` negative | 422 |
+| `type: "WITHDRAW"` | 422 |
+| `symbol` empty / `"REL$IANCE; DROP"` | 422 |
+| `quantity: 10**12` | 422 |
+| **Non-rejected hostile payloads** | **0 of 15** |
+
+Replayed against an account **holding an open position**: `quantity: -1000` →
+**422**, balance `90000.0` → `90000.0`. Valid trading is unaffected — a BUY of 10
+@ ₹1,000 debits exactly ₹10,000 (`100000.0` → `90000.0`), and closing a 5-share
+TCS position credits the live exit price and reports P&L consistently
+(`90000.0` → `101400.0`).
+
+**B-2 — API documentation exposure, against the final image, both directions.**
+
+| Probe | Production (`APP_ENV=production`) | Same image, `APP_ENV=development` |
+|---|---|---|
+| `/docs` | **404** | **200** |
+| `/redoc` | **404** | **200** |
+| `/openapi.json` | **404** | **200**, 188 paths |
+| `/api/docs` | **404** | — |
+| Documentation routes in the live route table | **0 of 4 registered** | registered |
+
+The probe is falsifiable: the *same image* serves all three when the environment
+is flipped, so a 404 is evidence of the control rather than evidence of a
+mistyped path. That is the failure mode which invalidated PH3.11's B-2 evidence,
+and it does not recur.
+
+**Incidentally re-verified: production configuration fails closed.** Three
+successive boot attempts of the release image were *rejected before startup* —
+for an unauthenticated `MONGO_URL`, an unauthenticated `REDIS_URL`, a
+`BROKER_TOKEN_KEY` that was not a valid Fernet key, a missing AI provider, and
+then for an `ANTHROPIC_API_KEY` that *looked like a placeholder*. The container
+only booted once every one of those was genuinely satisfied.
+
+## 32.7 Release state
+
+| Item | State |
+|---|---|
+| Committed release SHA | `6b53b3bcf99c400a0f623d5f4d280ffe87c47776` |
+| Production image SHA256 | `sha256:9de7b850d09bc81ce1d61f49ba9682bed1850e2b25df9fcdcdf8310eb6bb2cc4` |
+| C-1 | **CLOSED** |
+| C-2 | **WITHDRAWN** (not a defect; no code change) |
+| B-1, B-2 | **CLOSED**, re-verified against this image |
+| L-1 reproducibility | **holds for the clean-export build**; fails for working-directory builds → C-3 |
+| **C-3** | **OPEN — BLOCKER** |
+| Payments / Backup-DR / Rollback | **NOT OPERATIONALLY VERIFIED** — unchanged deployment prerequisites (§23) |
+
+**The §25 verdict is not upgraded to an unconditional GO in this pass.** The two
+conditions attached to it (C-1, C-2) are discharged, and the source at
+`6b53b3b` passes every certification-critical check. But C-3 keeps the
+reproducibility property from holding in general, and the guard that was supposed
+to defend that property has a proven false negative. The image identified above
+is verified clean and is the only artifact this report certifies; it must not be
+rebuilt from a working directory before deploy.
+
+Nothing was deployed. No blocker was silently repaired. PH3.13 was not started.
+
+---
+
+*Closure pass 2026-08-19 against commit `6b53b3b`, image `sha256:9de7b850…bb2cc4`.*

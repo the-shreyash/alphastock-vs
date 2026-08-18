@@ -5,6 +5,75 @@ This file records documentation-system versions and, from v1.0 launch onward, pr
 
 ---
 
+# Sprint PH3.12F — Release Closure Pass — 2026-08-19
+
+**Report:** `docs/production/PH3.12_PRODUCTION_CERTIFICATION.md` §32
+**Scope:** commit the PH3.12C remediation, rebuild the release image from a clean
+export of that commit, verify the image against the committed tree, re-run the
+certification-critical checks. No application code changed. PH3.13 not started.
+
+**Release identifiers.** Commit `6b53b3bcf99c400a0f623d5f4d280ffe87c47776` on
+`main` (parent `a4ee79f`). Image
+`sha256:9de7b850d09bc81ce1d61f49ba9682bed1850e2b25df9fcdcdf8310eb6bb2cc4`,
+425 MB, built `--no-cache --pull` from a `git archive` export — not from a
+working directory — and stamping its own commit in
+`org.opencontainers.image.revision`. Runs as uid 10001, `pip` absent.
+
+**C-1 CLOSED.** Verified with the offending host artifacts deliberately left on
+disk: no `test-results`, `test_reports`, `.coverage`, `htmlcov`, `.pytest_cache`,
+`junit*.xml`, `coverage.xml` or `report.xml` anywhere under `/app`; no
+`test_*.py`, `conftest.py`, `pytest.ini` or `requirements-dev.txt`; **0 files in
+the image that are not in the commit and 0 content mismatches** across all 116
+non-generated files; every production module present. Guard: 44 passed.
+
+**C-2 WITHDRAWN.** Restated with its control-container evidence — 20 lines of
+Python with no application code reproduce the identical exit 137 under a bare
+`docker stop` (6/6) and exit 0 under any explicit `-t` (3/3). Re-verified against
+the final image: direct SIGTERM → **exit 0** with complete ordered teardown,
+`docker stop -t 30` → **exit 0**. No lifecycle code changed, no exit code masked.
+
+**Checks re-run:** backend **2,787 passed** / 0 failed / 4 xfailed (2,743 + the
+44 new tests); security **452 passed**; frontend **395 passed** in 22 suites;
+production build exit 0 with 48 JS bundles / 14 MB; dependency gate **exit 0**
+(7 python + 16 npm, all triaged) and still falsifiable — `--today 2030-01-01`
+returns **exit 1 EXPIRED**, register unmodified; route inventory re-introspected
+from the running image at **201 HTTP + 1 WS, 97/29/75, 0 documentation routes**.
+B-1: 15 hostile payloads all **422** with the balance byte-identical, replayed
+against an account holding an open position, valid BUY/close arithmetic exact.
+B-2: `/docs`, `/redoc`, `/openapi.json` **404** in production and **200** (188
+paths) from the *same image* under `APP_ENV=development` — falsifiable in both
+directions.
+
+**NEW BLOCKER — C-3, reported and NOT repaired.** `.dockerignore`'s
+`__pycache__/` and `*.py[cod]` are bare patterns and therefore root-anchored, so
+nested `__pycache__` directories still enter the build context. A
+working-directory build of the same commit yields **228 files vs 223**: 5 host
+`cpython-314.pyc` files the container's Python can never load, and **104
+`cpython-311.pyc` whose code objects differ because `co_filename` embeds the
+developer's absolute home path** — which then surfaces in production tracebacks.
+This is the C-1 property (image ≠ commit, developer-machine identifiers inside
+the artifact) reached by a different pattern.
+
+The C-1 regression guard misses it, and that is the more important half:
+`_excluded` models Docker with `fnmatch`, whose `*` crosses `/`, while Docker
+uses Go's `filepath.Match`, whose `*` does not. The guard therefore reports
+`analytics/x.pyc` as excluded while Docker copies it in — **unfalsifiable for the
+exact class it was written to defend**, the same shape of error that let C-1
+survive three sprints and let PH3.11 certify B-2 closed while it was open.
+
+**Audit trail.** The 2026-08-17 NO-GO certification and its PH3.12R remediation
+addendum are preserved verbatim at
+`docs/production/PH3.12_PRODUCTION_CERTIFICATION_NOGO_ARCHIVE.md`; every
+reference in this changelog, `TASK.md` and `PRODUCTION_ROADMAP.md` resolves to
+the pass it describes.
+
+**Release state:** source at `6b53b3b` passes every certification-critical check
+and the image above is verified clean, but the §25 verdict is **not** upgraded to
+an unconditional GO while C-3 is open. Payments, backup/DR and rollback remain
+NOT OPERATIONALLY VERIFIED deployment prerequisites. Nothing was deployed.
+
+---
+
 # Sprint PH3.12C — Conditional Remediation (C-1 / C-2) — 2026-08-18
 
 **Report:** `docs/production/PH3.12_PRODUCTION_CERTIFICATION.md` §31
