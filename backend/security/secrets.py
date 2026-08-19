@@ -568,9 +568,11 @@ SECRET_REGISTRY: List[SecretSpec] = [
     ),
     SecretSpec(
         "LOG_LEVEL", CAT_APPCFG,
-        "Root log level: DEBUG | INFO | WARNING | ERROR. Defaults to INFO; an "
-        "unrecognized value falls back to INFO rather than failing the boot.",
-        example="INFO", rotation="N/A",
+        "Root log level: DEBUG | INFO | WARNING | ERROR (case-insensitive). "
+        "Defaults to INFO; an unrecognized value falls back to INFO rather than "
+        "failing the boot. docker/entrypoint.sh separately normalizes this to "
+        "lowercase for uvicorn's own --log-level flag, which is case-sensitive.",
+        example="info", rotation="N/A",
     ),
     SecretSpec(
         "LOG_FORMAT", CAT_APPCFG,

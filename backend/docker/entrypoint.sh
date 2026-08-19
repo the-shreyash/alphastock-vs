@@ -57,7 +57,16 @@ APP_ENV="${APP_ENV:-production}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8000}"
 WEB_CONCURRENCY="${WEB_CONCURRENCY:-1}"
-LOG_LEVEL="${LOG_LEVEL:-info}"
+# uvicorn's own `--log-level` flag is a case-sensitive `click.Choice` that only
+# accepts lowercase level names — but every other level convention in this repo
+# (backend/.env.example, security/secrets.py's registry, the app's own
+# observability/logging.py) is written and read as uppercase, because that is
+# the value operators actually set (`LOG_LEVEL=INFO`). Normalize the case here,
+# once, in the one place that hands the value to uvicorn's CLI, rather than
+# pushing "must be lowercase" onto every env file and every operator. See 2a
+# below for the validation that turns a genuine typo into this script's clear,
+# fail-fast message instead of a raw click usage error two log lines later.
+LOG_LEVEL="$(printf '%s' "${LOG_LEVEL:-info}" | tr '[:upper:]' '[:lower:]')"
 # Trust `X-Forwarded-For` / `X-Forwarded-Proto` only from the immediate peer by
 # default. A container behind a load balancer needs proxy headers to see the
 # real client IP (the rate limiter in security/rate_limit.py keys anonymous
@@ -100,6 +109,16 @@ case "${WEB_CONCURRENCY}" in
     ''|*[!0-9]*) fail "WEB_CONCURRENCY='${WEB_CONCURRENCY}' is not a number." ;;
 esac
 [ "${WEB_CONCURRENCY}" -ge 1 ] || fail "WEB_CONCURRENCY must be at least 1."
+
+# LOG_LEVEL was already lowercased above; validate against uvicorn's actual
+# accepted set (`uvicorn.config.LOG_LEVELS`) so an unrecognised value fails
+# here, clearly and by name, rather than reaching uvicorn's argument parser
+# and exiting 2 with a `click` usage error that names this script's already-
+# normalized value instead of what the operator actually set.
+case "${LOG_LEVEL}" in
+    critical|error|warning|info|debug|trace) ;;
+    *) fail "LOG_LEVEL='${LOG_LEVEL}' is not one of: critical, error, warning, info, debug, trace (case-insensitive)." ;;
+esac
 
 # The application runs an in-process APScheduler (server.py startup, no env
 # guard and no leader election), a heartbeat engine and an in-memory WebSocket
