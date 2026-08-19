@@ -33,6 +33,16 @@ for the commit it examined.
 > model itself and is caught by a real `docker buildx` build. §33 carries the
 > identifiers and the full evidence. **The change is NOT committed** — §33.9
 > explains why and what identifies the verified tree.
+>
+> **FINAL — 2026-08-19. See §34. Verdict: GO.** §33 also surfaced **C-4**
+> (uppercase `LOG_LEVEL` crash-loops uvicorn) as a new, unrepaired observation.
+> It is now fixed, committed at **`724b11f3f390cb7a61e40f11e77c30efaee857df`**,
+> and rebuilt as **`sha256:470915f4a09b0b9dcb115368ef80e0275a6f3d4da3e844f9b5b599f8d7d8bc30`**.
+> C-1, C-2, C-3 and C-4 are all closed or withdrawn; B-1, B-2 and L-1 hold
+> against the new image. §34 carries the commit, the identifiers, the full
+> certification-critical re-run, and the final sign-off. **This is the
+> certified release artifact** — no earlier image in this document should be
+> deployed.
 
 ## 1. Executive Summary
 
@@ -1693,3 +1703,288 @@ finding rather than silently fixing it is the standing rule.
 *C-3 closure pass 2026-08-19 against candidate tree `3e755e2a…fb201`,
 image `sha256:65d2bc67…bbdccf`. Nothing committed, nothing deployed, PH3.13 not
 started.*
+
+---
+
+# 34. PH3.12 Final Certification Sign-Off (2026-08-19)
+
+*Appended. Nothing in §§1–33 is edited: every prior finding, closure, withdrawal
+and verdict stands as written. This section records C-4's remediation and the
+final release decision for the tree it produced.*
+
+## 34.1 Scope of this pass
+
+Close **C-4** (§33.11) — the only open item carried out of the C-3 closure
+pass — then re-run every certification-critical check against the resulting
+commit and rebuild the release image from it. **No application logic was
+modified**; the change is confined to the container startup script, its
+configuration documentation, and a new regression test. C-1, C-2, C-3, B-1,
+B-2 and L-1 were re-verified, not re-litigated: this pass did not repeat their
+original investigations, only confirmed their conclusions still hold against
+the current tree and image.
+
+## 34.2 C-4 root cause and fix
+
+`docker/entrypoint.sh` passed `LOG_LEVEL` to `uvicorn --log-level` verbatim.
+uvicorn's flag is a case-sensitive `click.Choice` accepting only
+`critical|error|warning|info|debug|trace`. Every other LOG_LEVEL convention in
+the repo — `backend/.env.example`, the `security/secrets.py` registry, the
+app's own tolerant `observability/logging.py` — is written and read as
+uppercase, because that is the value an operator actually sets
+(`LOG_LEVEL=INFO`). A production container built from the documented template
+therefore exited **2** on every boot.
+
+**Reproduced against the pre-fix tree**, not inferred from source reading:
+
+```
+$ LOG_LEVEL=INFO sh docker/entrypoint.sh          # (secrets satisfied)
+Error: Invalid value for '--log-level': 'INFO' is not one of
+'critical', 'error', 'warning', 'info', 'debug', 'trace'.
+exit 2
+
+$ LOG_LEVEL=info sh docker/entrypoint.sh
+Uvicorn running on http://127.0.0.1:18322 …        # boots normally
+```
+
+**Fix — `docker/entrypoint.sh`.** `LOG_LEVEL` is normalized to lowercase once,
+at assignment (`tr '[:upper:]' '[:lower:]'`), before it can reach uvicorn's
+CLI or any exec'd child. It is then validated in the existing structural-checks
+block (2a) against uvicorn's actual accepted set, so a genuine typo
+(`LOG_LEVEL=VERBOSE`) fails **here**, with this script's own `FATAL:` message,
+rather than surfacing as a bare `click` usage error two log lines later.
+
+**Consistency — `security/secrets.py`, `backend/.env.example`.** The
+`LOG_LEVEL` `SecretSpec` example was `INFO`; changed to `info` and its
+description now states the case-insensitivity and cross-references the
+entrypoint's normalization. `backend/.env.example` is generated output
+(`scripts/generate_env_example.py`) — it was regenerated from the updated
+registry, never hand-edited, and `--check` now passes.
+
+**Regression test — `backend/tests/test_entrypoint_log_level.py` (new, 20
+cases).** Runs the real `docker/entrypoint.sh` as a subprocess, not a model of
+it — the same lesson C-3 already established. Covers: every valid level in
+every case combination boots; unset and empty LOG_LEVEL default to `info`
+(the same `${VAR:-default}` idiom every other defaulted variable in the script
+uses); a genuine invalid value fails with `FATAL` + `LOG_LEVEL` in stderr; the
+normalized (not raw-case) value is what an exec'd child process actually
+inherits; `production.env.example`'s documented value is already
+uvicorn-safe.
+
+## 34.3 Commit
+
+Staged exactly four files — the three touched by the fix plus the new test —
+and confirmed no other path was staged before committing:
+
+```
+$ git status --short
+ M backend/.env.example
+ M backend/docker/entrypoint.sh
+ M backend/security/secrets.py
+?? backend/tests/test_entrypoint_log_level.py
+```
+
+| Item | Value |
+|---|---|
+| Branch | `main` |
+| Commit | `724b11f3f390cb7a61e40f11e77c30efaee857df` |
+| Message | `fix: close PH3.12 blocker C-4 (uppercase LOG_LEVEL crash-loops uvicorn)` |
+| Files changed | 4 (`+174 / -6`) |
+| Working tree after commit | clean |
+
+## 34.4 Release artifact
+
+Built from the **committed tree**, not the working directory — a `git archive`
+export of `724b11f`, matching the methodology §26/§33.5 established (this is
+the same discipline C-3 exists to enforce: an artifact must be a function of
+the commit, not of whatever else happens to be sitting in the checkout).
+
+```
+git archive 724b11f | tar -x -C <clean-export>
+docker build --no-cache --pull -f <clean-export>/backend/Dockerfile \
+    -t stockassist-rc:ph312-c4-final <clean-export>/backend
+```
+
+| Item | Value |
+|---|---|
+| Committed release SHA | `724b11f3f390cb7a61e40f11e77c30efaee857df` |
+| Production image digest | `sha256:470915f4a09b0b9dcb115368ef80e0275a6f3d4da3e844f9b5b599f8d7d8bc30` |
+| Build | `docker build --no-cache --pull`, `git archive` export, base `python:3.11-slim-bookworm`, `--pull` |
+| Platform | `linux/arm64` |
+
+A second image, `stockassist-rc:ph312-c4-workdir`, was built `--no-cache --pull`
+directly from the (clean) working directory as the reproducibility control —
+see §34.7.
+
+## 34.5 Certification-critical checks, re-run against `724b11f`
+
+| Check | Result | Baseline |
+|---|---|---|
+| Backend regression suite | **2,936 passed**, 0 failed, 4 xfailed (pre-existing, unrelated D-10), 95 deselected | 2,787 + new C-4 suite |
+| Security suite (`-m security`) | **452 passed**, 0 failed | 452 |
+| C-4 regression suite (new) | **20 passed** | new |
+| Dockerignore/C-3 differential suite (real `docker buildx`) | **81 passed** | 81 |
+| Frontend tests | **395 passed**, 22 suites | 395 / 22 |
+| Frontend production build | **exit 0** | exit 0 |
+| Dependency gate (`--ecosystem all`) | **exit 0** — 7 python + 16 npm advisories, all triaged | exit 0 |
+| Dependency gate, falsifiability probe (`--today 2030-01-01`) | **exit 1 EXPIRED** (7 `starlette` entries) — gate still bites | exit 1 |
+| Triage register after the probe | **unmodified** (`git status` clean) | unchanged |
+| Route inventory (introspected from `server.app`, dependency-graph classified) | **202** total (201 HTTP + 1 WebSocket); **97** user-protected / **29** admin / **75** public | 201 / 97-29-75 / 202 |
+
+**Route inventory note.** `tests/_routes.py` — the same dependency-graph
+classifier §20 used — was re-run directly against the committed tree
+(`get_current_user` → protected, `require_admin` → admin, neither → public),
+independent of the pytest suites that also exercise it. Counts match the
+established baseline exactly.
+
+## 34.6 B-1, B-2, C-4, production fail-closed — against the release image
+
+**B-1 — paper-trade input validation.** `tests/test_paper_trade_validation.py`
++ `tests/test_api_authz.py`, hermetic in-process against the exact application
+code in the image (§34.7 proves byte-identity): **439 passed**, including the
+original `quantity=-1000` exploit and 14 other hostile payloads, all rejected
+422, balance unchanged. A live-container HTTP replay (curl against a running
+release image with a real MongoDB, as §26/§32.6 performed) was not repeated in
+this pass — no MongoDB is available in this execution environment — so B-1's
+evidence here is the hermetic suite, not a fresh container-level probe. This
+is disclosed as a methodology narrowing, not silently substituted.
+
+**B-2 — API documentation exposure, both directions**, via the same hermetic
+`TestClient` probe methodology as `tests/_prod_app_probe.py` (built for exactly
+this reason: `APP_ENV` is read at import time, so testing it requires a fresh
+interpreter, which a live container also provides but a real MongoDB was not
+available here to boot one against):
+
+| Probe | `APP_ENV=production` | Same code, `APP_ENV=development` |
+|---|---|---|
+| `/docs` | **404** | **200** |
+| `/redoc` | **404** | **200** |
+| `/openapi.json` | **404** | **200** |
+| `docs_url` / `redoc_url` / `openapi_url` | all `null` | all registered |
+| Schema still generable (`app.openapi()`) | ✅ (unpublished ≠ ungenerable) | ✅ |
+
+Falsifiable: the same application object serves all three when the
+environment is flipped, so the 404s are evidence of the control.
+
+**C-4 — LOG_LEVEL, against the actual release image**, via the entrypoint's
+`sh -c 'true'` override hatch (validation runs unconditionally before the
+hand-off) and one full uvicorn boot:
+
+| Probe | Result |
+|---|---|
+| `LOG_LEVEL=INFO` | **exit 0** — validated, normalized, boots |
+| `LOG_LEVEL=info` | **exit 0** |
+| `LOG_LEVEL=BOGUS` | **exit 1** — `FATAL: LOG_LEVEL='bogus' is not one of: critical, error, warning, info, debug, trace (case-insensitive).` |
+| Full uvicorn boot, `LOG_LEVEL=INFO`, `-p 18334:8000` | container reaches `running`; log line reads `log-level=info` |
+
+**Production configuration fail-closed, against the release image.** Four
+boots, each expected to fail for a specific, distinct reason, plus one control
+expected to succeed only once every requirement is genuinely satisfied:
+
+| Condition | Result |
+|---|---|
+| Unauthenticated `MONGO_URL` (no username:password) | exit 1 — `MONGO_URL carries no username:password …` |
+| No AI provider key | exit 1 — `No AI provider configured …` |
+| Missing `CORS_ALLOWED_ORIGINS` | exit 1 — `CORS_ALLOWED_ORIGINS is required in production …` |
+| **Control** — every requirement satisfied (auth'd Mongo, AI key, CORS, `FRONTEND_URL`) | **exit 0** — `Configuration OK.` |
+
+The control is what makes the first three falsifiable: they fail for the
+condition under test, not because the harness never satisfies anything.
+
+## 34.7 Image cleanliness and reproducibility
+
+**Reproducibility — clean export vs. working directory.** Two images built
+`--no-cache --pull` from the same commit: **A** (`ph312-c4-final`) from a
+`git archive` export, **B** (`ph312-c4-workdir`) from the (clean)
+working directory.
+
+| Comparison | Result |
+|---|---|
+| File count, `/app`, A vs B | **222 = 222** |
+| File list, A vs B | **identical** (`diff` of sorted `find` output — 0 lines) |
+| Full recursive content diff, A vs B (`diff -rq`) | **0 differences** — every one of the 222 files, `.pyc` included, byte-identical |
+
+**Reproducibility — image vs. committed tree.** Every non-`.pyc` file
+extracted from image A was compared against the `git archive` export of
+`724b11f`:
+
+| Check | Result |
+|---|---|
+| Files in image, non-`.pyc` | 115 |
+| Content mismatches vs. the commit | **0** |
+| Unexpected extras (present in image, absent from commit) | **0** |
+| "Missing" from the image (present in commit, correctly `.dockerignore`d) | 84 — `tests/*`, `Dockerfile`, `.dockerignore`, `.env.example`, `requirements-dev.txt`, `services/AI_WORKSPACE.md` |
+
+The 84 "missing" files are the C-1/C-3 exclusion list working as designed —
+`services/AI_WORKSPACE.md` in particular is the exact file C-3 found leaking
+before its fix; it is confirmed absent here.
+
+**Cleanliness sweep, image A:**
+
+| Check | Result |
+|---|---|
+| `.pyc` files | 107, all `cpython-311` (the image's own interpreter) — 0 from a host interpreter |
+| Any `/Users/` (or other host path) anywhere in the image | **0 matches** |
+| `.coverage*`, `junit*.xml`, `htmlcov*`, `test-results/`, `tests/`, `conftest.py` | **0 present** |
+| `.git`, `venv`, `.venv`, `node_modules` | **0 present** |
+| `.env`, `*.key`, `*.pem`, `credentials.json` | **0 present** |
+| `Dockerfile`, `.dockerignore` | **0 present** |
+
+C-3's reproducibility property — the released image is a pure function of the
+commit — holds for this artifact.
+
+## 34.8 C-1 / C-2 / C-3 / B-1 / B-2 / L-1 status — unchanged
+
+No prior control was reopened or modified in this pass.
+
+| Finding | Status | Re-verified how in this pass |
+|---|---|---|
+| C-1 (test artifacts in build context) | **CLOSED** | subsumed by §34.7's 0-mismatch/0-extras result |
+| C-2 (exit 137 on stop) | **WITHDRAWN** (not a defect) | not re-probed; no code path touched it |
+| C-3 (nested `__pycache__`/host bytecode) | **CLOSED** | §34.5 dockerignore differential suite (81/81); §34.7 cleanliness sweep |
+| C-4 (uppercase LOG_LEVEL crash-loop) | **CLOSED** (this pass) | §34.2, §34.6 |
+| B-1 (paper-trade validation) | **CLOSED** | §34.6 |
+| B-2 (production doc exposure) | **CLOSED** | §34.6 |
+| L-1 (reproducibility) | **HOLDS** for this artifact | §34.7 |
+
+## 34.9 New findings
+
+None. No new blocker, defect, or unexplained behavior surfaced during this
+pass. The only pre-existing, unrelated item touched incidentally is the four
+`xfail`s in `test_api_errors.py` (D-10, registration email-format validation)
+— already known, already marked `xfail`, out of scope for C-4.
+
+## 34.10 Final verdict: **GO**
+
+| Gate | Result |
+|---|---|
+| Zero unresolved security findings | ✅ |
+| Zero financial-integrity blockers | ✅ B-1 closed and re-proven |
+| Zero reproducibility blockers | ✅ C-1 and C-3 both closed; A≡B≡commit, byte-for-byte |
+| Zero regression failures | ✅ 2,936 / 452 / 20 / 81 / 395, all passing |
+| Zero known production auth bypasses | ✅ route inventory unchanged: 97/29/75 |
+| Container boots on the documented configuration | ✅ C-4 closed — `LOG_LEVEL=INFO` (the documented value) now boots |
+| Production build succeeds | ✅ exit 0 |
+| Dependency gate passes and is falsifiable | ✅ exit 0; probe exit 1 EXPIRED |
+| Working tree clean at hand-off | ✅ |
+
+All four conditions carried out of the PH3.12/PH3.12R/PH3.12F/PH3.12-C3
+sequence — **C-1, C-2, C-3, C-4** — are now closed or withdrawn. B-1 and B-2
+hold. The committed source at `724b11f` and the image built from it,
+`sha256:470915f4a09b0b9dcb115368ef80e0275a6f3d4da3e844f9b5b599f8d7d8bc30`, are
+certified **GO** for release, unconditionally with respect to the gates this
+report evaluates.
+
+**This verdict does not cover, and never has:** payments, off-host backup, and
+rollback drills remain **NOT OPERATIONALLY VERIFIED** (§23, §27, §28,
+unchanged by this pass — there is no production environment, payment
+provider, or off-host target in this execution context to drill against).
+Those are pre-existing operational prerequisites for go-live, not code defects,
+and are outside a source/artifact certification's scope.
+
+Nothing beyond the four committed files was changed. No application logic was
+modified. PH3.13 was not started. Nothing was deployed.
+
+---
+
+*Final sign-off 2026-08-19 against commit `724b11f`,
+image `sha256:470915f4…8bc30`. GO.*
