@@ -569,13 +569,37 @@ Every new broker also becomes a streaming market data provider for its connected
 
 ---
 
+# Phase D — Market Data Evolution (CURRENT)
+
+Objective
+
+Make live provider feeds possible without destabilizing the platform, by putting every market data provider behind one abstraction.
+
+Authoritative document: MARKET_DATA_ARCHITECTURE.md. Scope decisions: ADR-028.
+
+D1 — Market Gateway Foundation — **COMPLETE (2026-08-19)**
+
+Provider Adapter contract, Provider Registry, Source Manager foundation, and the Yahoo Finance migration behind the abstraction. The Market Engine and the AI Context Builder no longer contain provider-specific logic; adding a provider is one adapter + one normalizer + one registry entry. Three debts carried forward and tracked in TASK.md (DD-1…DD-5), the notable one being the `source: "yahoo_finance"` field still present in the public REST contract.
+
+D2 — Source Manager completion + frontend tier indicator (Live / Delayed); close the D1 debts.
+
+D3 — Zerodha Kite WebSocket adapter: the streaming push surface, per-user resolution, make-before-break switching, failover to Yahoo. This stage delivers the headline feature.
+
+D4 — Remaining broker adapters (Upstox, Angel One, Fyers, Dhan).
+
+D5 — Hardening: latency scoring, flap suppression, probation windows, multi-connection sharding, chaos tests.
+
+D6 — Enterprise/licensed feeds, as entitlements and licensing arrive.
+
+---
+
 # Market Data Provider Expansion
 
 The market data layer is provider-independent (MARKET_DATA_ARCHITECTURE.md). Each stage below is one adapter — no changes to the Market Engine, AI, or Frontend.
 
 Current
 
-Yahoo Finance (polling baseline, free tier)
+Yahoo Finance — polling baseline, free tier. Behind the Provider Adapter contract as of D1 (`providers/yahoo.py`, priority 3, the permanent floor of the priority list).
 
 Next
 

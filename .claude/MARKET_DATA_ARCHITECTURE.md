@@ -1,9 +1,9 @@
 # StockAssist AI
 ## Market Data Architecture
 
-Version: 1.0
+Version: 1.1
 
-Status: Approved Design — Pending Implementation
+Status: Approved Design — Phase 1 Implemented (Sprint D1, 2026-08-19); Phases 2–6 pending
 
 Priority: Critical
 
@@ -270,6 +270,8 @@ Each of these is **one new adapter** implementing the Provider Adapter contract 
 Every provider — current and future — is wrapped in an adapter that implements a single contract. This is the only place provider-specific code is allowed to exist.
 
 **Location convention:** `backend/services/market_engine/providers/<provider_name>.py`
+
+**Implemented in** `backend/services/market_engine/providers/base.py` **as of Sprint D1.** The table below is the target contract; see the Phase 1 note under "Implementation Phasing" for what D1 built and what it deliberately deferred.
 
 **Contract (conceptual interface — not implementation code):**
 
@@ -725,9 +727,31 @@ These are permanent, non-negotiable rules. Violating any of them is grounds for 
 
 This document defines the target architecture. Recommended build order for whoever implements it:
 
-**Phase 1 — Formalize the contract.** Extract the Provider Adapter interface; wrap the existing Yahoo path (`real_market.py` behind `gateway.py`) as `YahooPollingAdapter`. Behavior identical, structure ready.
+**Phase 1 — Formalize the contract.** ✅ **IMPLEMENTED — Sprint D1, 2026-08-19.** Extract the Provider Adapter interface; wrap the existing Yahoo path (`real_market.py` behind `gateway.py`) as `YahooPollingAdapter`. Behavior identical, structure ready.
 
-**Phase 2 — Source Manager.** Introduce the Source Manager with a single provider (Yahoo). Wire `provider.status` events and the frontend tier indicator.
+As built:
+
+```
+backend/services/market_engine/
+    providers/base.py        MarketDataProvider contract, Capability,
+                             ProviderKind, SourceTier, ProviderHealth
+    providers/registry.py    ProviderRegistry — priority-ordered, capability-
+                             and health-filtered candidate resolution
+    providers/yahoo.py       YahooPollingAdapter (priority 3, polling, delayed)
+    source_manager.py        SourceManager — resolution, health, provider.status
+    gateway.py               resolves by capability; normalizes with the
+                             adapter's normalizer_key; stamps source_tier
+```
+
+Three deviations from this document, each recorded with its reasoning in **ADR-028** and each carrying a dated closure sprint:
+
+1. **The adapter contract omits `subscribe`/`unsubscribe`/`on_raw`.** D1 ships one polling provider and no consumer able to receive pushed ticks; the push surface lands in Phase 3 with the adapter and consumer that need it. `ProviderKind` already separates the families.
+2. **Adapters return the provider's raw payload, but `real_market.py` also computes derived analytics** (RSI/MACD/VWAP, breadth, sentiment, mover ranking) that are Market Engine business logic living in the provider module. Relocating them is Phase 2.
+3. **`source_tier` is added; the legacy `source: "yahoo_finance"` field remains in REST payloads** for API compatibility. Removing it is sequenced through Phase 2. This is the one open violation of Developer Rule 4 and it is deliberate, documented, and awaiting approval.
+
+Not every consumer reaches the gateway yet: `server.py` and five service modules still call the provider client directly. That set is frozen in an enforced register (`KNOWN_GATEWAY_BYPASSES`, `backend/tests/test_market_gateway.py`) which may only shrink — a new bypass fails CI, and a stale entry fails once the module is migrated. The Market Engine itself and the AI Context Builder are fully migrated.
+
+**Phase 2 — Source Manager.** Introduce the Source Manager with a single provider (Yahoo). Wire `provider.status` events and the frontend tier indicator. *(D1 delivered the Source Manager's resolution, health and `provider.status` publication; Phase 2 owns the frontend tier indicator and closing the three deviations above.)*
 
 **Phase 3 — First broker adapter.** Zerodha Kite WebSocket adapter + normalizer, per-user resolution, make-before-break switching, failover back to Yahoo. This phase delivers the headline feature.
 

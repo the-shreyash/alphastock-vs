@@ -7,6 +7,14 @@ system, WebSocket layer, and other consumers about market state changes.
 Events:
     market.open / market.close       Market session transitions
     price.updated                    Stock price change
+    provider.status                  Market feed state changed (D1). Payload:
+                                     state ("available"|"unavailable"), tier
+                                     ("streaming"|"delayed"|null),
+                                     previous_tier, capabilities[]. Carries the
+                                     freshness TIER only — never a provider
+                                     name (MARKET_DATA_ARCHITECTURE.md,
+                                     Developer Rule 4). Published by the Source
+                                     Manager, change-gated.
     sector.updated                   Sector performance recalculated
     news.received                    New article classified
     scanner.updated                  Scanner results refreshed (data.source:

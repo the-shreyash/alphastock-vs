@@ -189,6 +189,32 @@ The Market Gateway owns provider connections, authentication, normalization, val
 
 Full design: MARKET_DATA_ARCHITECTURE.md.
 
+Implemented (Sprint D1, 2026-08-19)
+
+`services/market_engine/gateway.py` resolves a provider per request by capability, never by name:
+
+    market_gateway.get_quote(symbol)
+        → source_manager.resolve(Capability.QUOTES)
+        → provider.fetch_quote(symbol)          # raw provider payload
+        → normalize_stock_quote(raw, provider.normalizer_key)
+        → validate_stock_quote(...)
+        → stamp source_tier + ingested_at
+        → event_bus.publish("price.updated", ...)
+
+Adding a provider is one adapter, one normalizer family, and one
+`provider_registry.register()` call — nothing in the Market Engine changes.
+
+Failover needs no switching code: the gateway records every call outcome
+against provider health, a provider that fails consistently stops being
+resolved, and the next priority tier takes over. Recovery is symmetric.
+`provider.status` events carry the freshness tier only — never a provider name.
+
+Two silent defects were closed in D1: normalized quotes had been stamped with
+`provider: "yahoo"` (provider identity leaking downstream), and index
+normalization had never actually run (the provider's index sub-dicts carry no
+`name`, and a nameless index fails validation, so the raw payload passed
+through on every request).
+
 Benefits
 
 Centralized

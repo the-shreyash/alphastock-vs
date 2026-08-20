@@ -2211,20 +2211,55 @@ dedicated Risk Dashboard page and Strategy Builder.
 
 # Market Data Architecture (Provider Independence)
 
-Status: PLANNING
+Status: IN PROGRESS — Phase D (Market Data Evolution)
 
 Priority: Critical
 
-Design approved and documented in MARKET_DATA_ARCHITECTURE.md (2026-07-16); ADR-026 recorded in DECISIONS.md. Documentation system synchronized.
+Design approved and documented in MARKET_DATA_ARCHITECTURE.md (2026-07-16); ADR-026 recorded in DECISIONS.md. D1 scope decisions recorded as ADR-028 (2026-08-19).
 
 Implementation phases (per MARKET_DATA_ARCHITECTURE.md):
 
-- [ ] Phase 1 — Formalize Provider Adapter contract; wrap Yahoo path as YahooPollingAdapter
-- [ ] Phase 2 — Source Manager + provider.status events + frontend tier indicator (Live/Delayed)
-- [ ] Phase 3 — Zerodha Kite WebSocket adapter; per-user switching; failover to Yahoo
-- [ ] Phase 4 — Remaining broker adapters (Upstox, Angel One, Fyers, Dhan)
-- [ ] Phase 5 — Hardening: latency scoring, flap suppression, probation, chaos tests
-- [ ] Phase 6 — Enterprise/licensed feeds (future)
+- [x] **D1 / Phase 1 — Market Gateway Foundation** — **COMPLETE (2026-08-19)** — Provider Adapter contract, Provider Registry, Source Manager foundation, Yahoo migration. Scope decisions in **ADR-028**.
+- [ ] D2 / Phase 2 — Source Manager completion + `provider.status` consumed by the frontend tier indicator (Live/Delayed) + close the D1 debts below
+- [ ] D3 / Phase 3 — Zerodha Kite WebSocket adapter; streaming push surface (`subscribe`/`on_raw`); per-user resolution; make-before-break switching; failover to Yahoo
+- [ ] D4 / Phase 4 — Remaining broker adapters (Upstox, Angel One, Fyers, Dhan)
+- [ ] D5 / Phase 5 — Hardening: latency scoring, flap suppression, probation windows, multi-connection sharding, chaos tests
+- [ ] D6 / Phase 6 — Enterprise/licensed feeds (future)
+
+## D1 — What shipped
+
+**Created**
+
+- `backend/services/market_engine/providers/base.py` — `MarketDataProvider` contract, `Capability`, `ProviderKind`, `SourceTier`, `ProviderState`, `ProviderHealth`, `CapabilityUnavailable`.
+- `backend/services/market_engine/providers/registry.py` — `ProviderRegistry`, priority-ordered, capability- and health-filtered candidate lists.
+- `backend/services/market_engine/providers/yahoo.py` — `YahooPollingAdapter` (priority 3, `kind=polling`, `tier=delayed`), wrapping the hardened `services/real_market.py` client.
+- `backend/services/market_engine/source_manager.py` — `SourceManager`: capability resolution, health-based exclusion and recovery, `provider.status` publication (change-gated, tier-only), `status()` vs `diagnostics()` split.
+- `backend/tests/test_market_gateway.py` — 44 tests.
+
+**Modified**
+
+- `gateway.py` — resolves providers by capability instead of importing the Yahoo client; selects the normalizer from the adapter's `normalizer_key`; records call outcomes against provider health; stamps `source_tier` + `ingested_at`; gained `search()`; `status` gained a tier-only `feed` block; `diagnostics` added.
+- `normalizer.py` — no longer stamps `provider` on any normalized event (all four families).
+- `ai_context_builder.py` — the five direct `real_market.*` calls now go through the gateway; `_render_sectors` reads either sector-name shape.
+- `event_bus.py` — `provider.status` topic documented.
+- `market_engine/__init__.py` — exports the new surface.
+
+**Two silent defects found and closed**
+
+1. Index normalization in the gateway had never run: the provider's index sub-dicts carry no `name`, `validate_index_quote` rejects a nameless index, so the raw payload passed through on every request. The gateway now supplies the name at the boundary and merges normalized fields *over* the raw dict so `available` survives.
+2. Every normalized quote carried `provider: "yahoo"` — provider identity one attribute access away from the AI prompt and the frontend store.
+
+**Validation**
+
+Backend suite **2,964 passed / 15 failed** — the 15 are the pre-existing `test_entrypoint_log_level.py` failures (`python: command not found`; the Docker entrypoint tests need the container's PATH) and are unchanged from the pre-D1 baseline of 2,921 passed / 15 failed. flake8 clean on every touched file (one pre-existing warning removed). **Seven falsification probes run**: each guard was mutated and observed to fail — provider leak restored → 2 red; normalizer key hardcoded → 1 red; index-name fix reverted → 1 red; new bypass module added → 1 red; provider named in a non-adapter engine module → 1 red; gateway re-importing the provider client → 1 red; AI layer reverted to `real_market` → 1 red.
+
+## D1 — Debts carried into D2 (tracked, tested, not hidden)
+
+- **DD-1 — Gateway bypasses.** `server.py` and five service modules still call `services/real_market.py` directly. Frozen in `KNOWN_GATEWAY_BYPASSES` (`tests/test_market_gateway.py`), enforced in both directions: a new bypass fails, and a stale entry fails once migrated. Blocked on a shape reconciliation — `/api/market/sectors` returns the provider's `{"sector": …}` while the gateway returns canonical `{"name": …}` and the frontend reads the former.
+- **DD-2 — `source: "yahoo_finance"` in the public REST contract.** Still returned by `/api/stocks/{symbol}/live` and `/api/stocks/{symbol}/intraday`, and by the advisor as `data_source`; `frontend/src/pages/InvestmentAdvisor.jsx` *branches on it* to choose "Live market data" vs "Fallback data", so a broker feed would render as "Fallback data". Sequenced: D1 added `source_tier`, D2 moves consumers onto it, a later sprint removes `source`. **Needs approval — see ADR-028.**
+- **DD-3 — Derived analytics inside the provider module.** RSI/MACD/VWAP, market breadth, sentiment scoring and gainer/loser ranking live in `real_market.py`. They are Market Engine business logic; relocating them is D2.
+- **DD-4 — Unadapted providers.** FII/DII (NSE India public API), news (RSS), Gift Nifty (its own adapter chain) and the economic calendar are collectors the gateway calls directly. D2 folds them into the registry.
+- **DD-5 — Frontend provider labels.** `FinancialStatements.jsx` and `FundamentalsPanel.jsx` print "live from Yahoo Finance". Copy-only, no logic, but it is provider identity on a live UI surface (Developer Rule 4). Fix with the D2 tier indicator.
 
 ---
 

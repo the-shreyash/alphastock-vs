@@ -13,6 +13,20 @@ Canonical formats:
     SectorData:   name, change_pct, leaders, laggards, breadth
     NewsArticle:  title, summary, source, url, published, sentiment,
                   sentiment_score, companies, sectors, importance
+
+PROVENANCE (D1)
+---------------
+Normalized events deliberately carry NO provider name. Each `_normalize_*`
+function is selected *by* provider — that is the "one normalizer function per
+provider" rule in MARKET_DATA_ARCHITECTURE.md — but the provider identity stops
+at this boundary and does not appear in the output.
+
+Until D1 every normalized quote carried `provider: "yahoo"`, which is precisely
+the leak Developer Rules 4 and 5 forbid: any consumer could branch on it, and
+the first consumer to do so would silently misbehave the day a broker feed
+arrived. The Market Gateway now stamps `source_tier` (`streaming` | `delayed`)
+and `ingested_at` instead — freshness without provenance, which is everything a
+consumer legitimately needs and nothing it can couple to.
 """
 import logging
 from datetime import datetime, timezone
@@ -74,7 +88,6 @@ def _normalize_yahoo_quote(raw: Dict[str, Any]) -> Dict[str, Any]:
         "ema_20": _to_float(raw.get("ema_20")),
         "sma_50": _to_float(raw.get("sma_50")),
         "timestamp": raw.get("timestamp", datetime.now(timezone.utc).isoformat()),
-        "provider": "yahoo",
     }
 
 
@@ -108,7 +121,6 @@ def _normalize_av_quote(raw: Dict[str, Any]) -> Dict[str, Any]:
         "ema_20": None,
         "sma_50": None,
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "provider": "alpha_vantage",
     }
 
 
@@ -141,7 +153,6 @@ def _normalize_broker_quote(raw: Dict[str, Any]) -> Dict[str, Any]:
         "ema_20": None,
         "sma_50": None,
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "provider": "broker",
     }
 
 
@@ -236,7 +247,7 @@ def _apply_defaults(raw: Dict[str, Any]) -> Dict[str, Any]:
         "week_52_high": None, "week_52_low": None, "day_range": "",
         "sector": "", "exchange": "NSE", "rsi": None, "macd": None,
         "vwap": None, "ema_20": None, "sma_50": None,
-        "timestamp": datetime.now(timezone.utc).isoformat(), "provider": "unknown",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }
     result = {**defaults, **raw}
     return result

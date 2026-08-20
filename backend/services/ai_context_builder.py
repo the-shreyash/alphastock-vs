@@ -19,8 +19,16 @@ model memory.
 DESIGN CONTRACT
 ---------------
 * **Compose, never re-implement.** Every section reuses an existing service
-  function (`real_market.*`, `portfolio_engine.*`, `news_service.*`,
+  function (`market_gateway.*`, `portfolio_engine.*`, `news_service.*`,
   `ai_memory.*`, `activity_logger.*`). This module adds *no* new data source.
+* **Never touch a provider.** Every market read goes through the Market
+  Gateway. MARKET_DATA_ARCHITECTURE.md makes the Context Builder the only door
+  between the AI system and market data, and requires that the AI never learn
+  which provider produced a number — context carries `source_tier` and
+  timestamps so the model can say "live price" or "as of 10:42 AM", and nothing
+  more. Before D1 this module called `real_market.*` (Yahoo) directly, which
+  both bypassed the gateway and put a provider name one attribute access away
+  from the prompt.
 * **Best-effort.** Every section is isolated: a failing fetch degrades to an
   omitted section, never a raised exception. A broken news feed must never break
   the chat reply.
@@ -211,13 +219,25 @@ def _render_sectors(sectors: Optional[list]) -> Optional[str]:
         return None
     top = sectors[:3]
     bottom = sectors[-2:] if len(sectors) > 3 else []
-    lead = ", ".join(f"{s['sector']} ({_pct(s.get('change_pct'))})" for s in top)
+    lead = ", ".join(f"{_sector_name(s)} ({_pct(s.get('change_pct'))})" for s in top)
     line = f"- Leading: {lead}"
     out = ["## Sector Performance", line]
     if bottom:
-        lag = ", ".join(f"{s['sector']} ({_pct(s.get('change_pct'))})" for s in bottom)
+        lag = ", ".join(f"{_sector_name(s)} ({_pct(s.get('change_pct'))})" for s in bottom)
         out.append(f"- Lagging: {lag}")
     return "\n".join(out)
+
+
+def _sector_name(sector: dict) -> str:
+    """Sector label from either shape.
+
+    The Market Gateway normalizes sectors to `name`; the raw provider payload
+    this module used before D1 keyed them as `sector`. Reading both keeps the
+    renderer correct for any producer instead of raising a KeyError on the
+    prompt path — a missing sector label must degrade to an omitted word, never
+    to a failed chat reply.
+    """
+    return sector.get("name") or sector.get("sector") or "—"
 
 
 def _render_global(markets: Optional[list]) -> Optional[str]:
@@ -373,8 +393,9 @@ async def build_chat_context(
 async def _assemble(db, user: dict, quotes_map_func: QuotesMapFunc) -> ChatContext:
     """Concurrently fetch every section, then render. Import inside the function
     keeps module import cheap and avoids import cycles at server startup."""
-    from services import real_market, portfolio_engine, news_service, ai_memory
+    from services import portfolio_engine, news_service, ai_memory
     from services.activity_logger import get_recent_activity
+    from services.market_engine import market_gateway
 
     user_id = (user or {}).get("_id")
 
@@ -399,11 +420,11 @@ async def _assemble(db, user: dict, quotes_map_func: QuotesMapFunc) -> ChatConte
         overview, gainers, losers, sectors, global_markets,
         holdings, articles, sentiment, memory, extra_quotes, broker,
     ) = await asyncio.gather(
-        _safe(real_market.fetch_real_market_overview(), "overview"),
-        _safe(real_market.fetch_real_gainers(5), "gainers", default=[]),
-        _safe(real_market.fetch_real_losers(5), "losers", default=[]),
-        _safe(real_market.fetch_real_sectors(), "sectors", default=[]),
-        _safe(real_market.fetch_real_global_markets(), "global", default=[]),
+        _safe(market_gateway.get_indices(), "overview"),
+        _safe(market_gateway.get_gainers(5), "gainers", default=[]),
+        _safe(market_gateway.get_losers(5), "losers", default=[]),
+        _safe(market_gateway.get_sectors(), "sectors", default=[]),
+        _safe(market_gateway.get_global_markets(), "global", default=[]),
         _safe(portfolio_engine.build_holdings(db, user, quotes_map_func), "holdings", default=[]),
         _safe(news_service.fetch_news(), "news", default=[]),
         _safe(news_service.get_market_sentiment(), "sentiment"),
