@@ -84,21 +84,24 @@ class TestZerodha:
 
 # ---------- Alpha Vantage / Live Stock ----------
 class TestStockLiveAndIntraday:
-    def test_stock_live_has_source(self):
+    def test_stock_live_declares_a_freshness_tier_not_a_provider(self):
+        """DD-1: the public contract carries `source_tier`, never a provider
+        name. The old assertion allowed `"simulated"`, which PH3.9 removed —
+        so it had been asserting a value the product can no longer produce."""
         r = requests.get(f"{API}/stocks/RELIANCE/live", timeout=20)
         assert r.status_code == 200, r.text
         d = r.json()
-        assert "source" in d, f"missing source: {d}"
-        assert d["source"] in ("alpha_vantage", "simulated")
-        # In simulated mode also expect price
+        assert d.get("source_tier") in ("delayed", "streaming"), \
+            f"expected a freshness tier, got {d.get('source_tier')}"
+        assert "source" not in d, "provider identity leaked into the public contract"
         assert "price" in d or "symbol" in d
 
-    def test_stock_intraday_has_source(self):
+    def test_stock_intraday_declares_a_freshness_tier_not_a_provider(self):
         r = requests.get(f"{API}/stocks/RELIANCE/intraday", timeout=20)
         assert r.status_code == 200, r.text
         d = r.json()
-        assert "source" in d
-        assert d["source"] in ("alpha_vantage", "simulated")
+        assert d.get("source_tier") in ("delayed", "streaming")
+        assert "source" not in d, "provider identity leaked into the public contract"
         assert "data" in d
 
 

@@ -113,14 +113,84 @@ class Capability(str, Enum):
 class ProviderState(str, Enum):
     """Health state of a single provider connection.
 
+    UNKNOWN   registered but never yet exercised — no evidence either way
     UP        serving normally
     DEGRADED  failing intermittently — still a candidate, ranked lower
     DOWN      failing consistently — filtered out of resolution entirely
+
+    WHY `UNKNOWN` EXISTS (D2)
+    -------------------------
+    D1 started every provider at UP, which asserted health the provider had
+    never demonstrated: a broker adapter registered one millisecond ago and a
+    baseline that has served ten thousand clean requests reported identically,
+    on a diagnostics surface whose entire job is to tell an operator which
+    providers are actually working. UNKNOWN is the honest initial value and it
+    is the state D3's probation window starts from — a recovered provider
+    re-enters probation as UNKNOWN rather than claiming UP on one success.
+
+    For *selection* (D2) UNKNOWN ranks alongside UP, not below it. This is
+    deliberate and load-bearing: ranking it below UP would mean a freshly
+    registered priority-1 broker feed could never overtake a healthy priority-3
+    baseline, because it can only leave UNKNOWN by being called and it can only
+    be called by being selected. See `HEALTH_RANK` in `source_manager.py`.
     """
 
+    UNKNOWN = "unknown"
     UP = "up"
     DEGRADED = "degraded"
     DOWN = "down"
+
+
+@dataclass(frozen=True)
+class ResolutionContext:
+    """Everything the Source Manager is allowed to know about a request.
+
+    WHY THIS REPLACED THE BARE `user_id` PARAMETER (D2)
+    ---------------------------------------------------
+    D1 threaded an `Optional[str] user_id` through every resolution entry point
+    and ignored it, as a seam for per-user selection. D2 makes the seam real,
+    and the moment it is real a bare string stops being enough: entitlement is
+    per user, but coverage is per *instrument* — MARKET_DATA_ARCHITECTURE.md's
+    priority rules are explicit that "a broker feed covering NSE equities does
+    not disqualify Yahoo from serving a US index the broker doesn't carry", and
+    that decision needs the symbol and the exchange, not the user.
+
+    Bundling them into one frozen object now means D3's broker adapter adds a
+    field here instead of adding a fifth keyword argument to eleven gateway
+    methods, eleven Source Manager methods, and every call site of both.
+
+    Every field is optional. A context with nothing set is the honest
+    representation of a platform-wide read with no user attached — a scheduled
+    universe refresh, a scanner sweep, a warm-up job — and resolves to the
+    globally entitled providers, which is exactly right.
+    """
+
+    #: Whose request this is. `None` = a platform-level read with no user.
+    user_id: Optional[str] = None
+
+    #: Instrument being requested, in StockAssist's internal symbol convention.
+    #: Reserved for per-symbol coverage filtering (D3); unused in D2 because no
+    #: registered provider has partial coverage to filter on.
+    symbol: Optional[str] = None
+
+    #: Venue (`NSE`, `BSE`, …). Same status as `symbol`.
+    exchange: Optional[str] = None
+
+    @classmethod
+    def for_user(cls, user_id: Optional[str]) -> "ResolutionContext":
+        """Build a context from a bare user id.
+
+        The compatibility shim for the `user_id=` keyword D1 put on every
+        gateway method and that call sites outside the Market Engine still
+        pass. Keeping it as a named constructor rather than overloading the
+        resolve signature keeps exactly one code path inside the resolver.
+        """
+        return cls(user_id=user_id)
+
+
+#: The context used when a caller supplies none. Module-level and frozen so the
+#: common path allocates nothing.
+GLOBAL_CONTEXT = ResolutionContext()
 
 
 class CapabilityUnavailable(RuntimeError):
@@ -153,7 +223,7 @@ class ProviderHealth:
     failure counts already answer correctly for a polled provider.
     """
 
-    state: ProviderState = ProviderState.UP
+    state: ProviderState = ProviderState.UNKNOWN
     consecutive_failures: int = 0
     total_calls: int = 0
     total_errors: int = 0
@@ -209,7 +279,25 @@ class MarketDataProvider(ABC):
     #:     1 connected broker WebSocket
     #:     2 licensed exchange feed
     #:     3 polled baseline (Yahoo) — the permanent floor
+    #:
+    #: Priority is provider *metadata*, declared here by the adapter that owns
+    #: it, never a branch in application code. That is what keeps the tier
+    #: ordering in one readable place instead of scattered across
+    #: `if yahoo / elif zerodha / else upstox` chains.
     priority: int = 100
+
+    #: Whose entitlement this provider is served under. `None` means a
+    #: platform-wide entitlement — Yahoo, a licensed feed — available to every
+    #: request. A user id binds the adapter to exactly that user.
+    #:
+    #: This is the Category 2 cornerstone of MARKET_DATA_ARCHITECTURE.md made
+    #: enforceable: a broker feed is legally the *user's* data, consumed on
+    #: their behalf with their own session, and must never serve anybody else.
+    #: D3 registers one broker adapter per connected user with this set; D2
+    #: builds the filter so that when it does, cross-user leakage is impossible
+    #: by construction rather than by every future call site remembering to
+    #: check.
+    owner_user_id: Optional[str] = None
 
     def __init__(self) -> None:
         self._health = ProviderHealth()
@@ -300,6 +388,28 @@ class MarketDataProvider(ABC):
     def supports(self, capability: Capability) -> bool:
         return capability in self.capabilities
 
+    # ── Entitlement ──────────────────────────────────────
+
+    def is_eligible_for(self, context: ResolutionContext) -> bool:
+        """Whether this provider may serve `context`.
+
+        Step 1 of the Resolution procedure in MARKET_DATA_ARCHITECTURE.md —
+        "build the candidate list: every provider whose entitlement applies to
+        this user". Capability and health are separate filters applied
+        alongside it (steps 2 and 3).
+
+        The default implements entitlement scope alone, which is all any D2
+        provider has to express. A broker adapter (D3) overrides this to add
+        session liveness — a connected-but-unauthenticated broker is entitled
+        and still not usable — and a partial-coverage feed overrides it to
+        consult `context.symbol`. Overriding is the extension point precisely
+        so that per-provider entitlement rules stay inside the provider module,
+        where Developer Rule 1 requires provider-specific logic to live.
+        """
+        if self.owner_user_id is None:
+            return True
+        return context.user_id == self.owner_user_id
+
     def _unsupported(self, capability: Capability) -> CapabilityUnavailable:
         return CapabilityUnavailable(
             f"provider {self.name!r} does not serve capability {capability.value!r}"
@@ -347,6 +457,7 @@ class MarketDataProvider(ABC):
             "tier": self.tier.value,
             "priority": self.priority,
             "connected": self._connected,
+            "scope": "global" if self.owner_user_id is None else "user",
             "capabilities": sorted(c.value for c in self.capabilities),
             "health": self._health.as_dict(),
         }

@@ -4,12 +4,13 @@ The Market Engine collects, normalizes, validates, processes, ranks, caches,
 and distributes real-time market data throughout the platform.
 
 Architecture:
-    Provider Adapters -> Market Gateway -> Source Manager -> Normalizer
+    Provider Adapters -> Source Manager -> Market Gateway -> Normalizer
     -> Validator -> Cache -> Processing Engine -> Ranking Engine
     -> Scanner Engine -> Event Bus -> AI System -> Frontend
 
-Provider independence (D1): every provider sits behind the Provider Adapter
-contract in `providers/`, the Source Manager decides which one serves a request,
+Provider independence (D1/D2): every provider sits behind the Provider Adapter
+contract in `providers/`, the Source Manager resolves which one serves a request
+— by capability, entitlement and health, returning an ordered failover chain —
 and the Market Gateway is the only code permitted to call one. Everything above
 that line consumes normalized events carrying a `source_tier` and no provider
 identity at all. MARKET_DATA_ARCHITECTURE.md is authoritative for this boundary.
@@ -28,10 +29,16 @@ from services.market_engine.providers import (
     MarketDataProvider,
     ProviderKind,
     ProviderState,
+    ResolutionContext,
     SourceTier,
     provider_registry,
 )
-from services.market_engine.source_manager import SourceManager, source_manager
+from services.market_engine.source_manager import (
+    Resolution,
+    SourceManager,
+    UnavailableReason,
+    source_manager,
+)
 
 __all__ = [
     "Capability",
@@ -39,8 +46,11 @@ __all__ = [
     "MarketGateway",
     "ProviderKind",
     "ProviderState",
+    "Resolution",
+    "ResolutionContext",
     "SourceManager",
     "SourceTier",
+    "UnavailableReason",
     "event_bus",
     "market_gateway",
     "provider_registry",

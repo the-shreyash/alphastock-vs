@@ -898,6 +898,152 @@ MARKET_DATA_ARCHITECTURE.md
 
 ---
 
+# ADR-029
+
+Title
+
+Source Manager Completion — Resolution Semantics for Phase D2
+
+Date
+
+2026-08-20
+
+Status
+
+Accepted
+
+Context
+
+D1 (ADR-028) delivered the Provider Adapter contract, the Provider Registry, a Source Manager with capability-based resolution and health-based exclusion, and the Yahoo migration. D2's brief is to complete the Source Manager: capability resolution, registry integration, provider priority, provider health, capability+health resolution, a user-context foundation, a failover foundation, and verified Market Engine / AI decoupling.
+
+Inspecting D1 against that brief found the foundation sound and four seams that were left deliberately inert, each of which stops being defensible the moment a second provider exists:
+
+• `resolve()` returned a single provider. A request whose preferred provider raised returned nothing, even with a healthy baseline one tier below. The baseline only took over after the provider accumulated `DOWN_AFTER_FAILURES` consecutive failures — eight whole requests, each of which served a user an empty dashboard for an outage the platform could already route around.
+
+• `resolve()` returned `None` with no reason. "Nothing is registered", "this user is entitled to nothing", "no provider serves order-book depth" and "every provider is in outage" reached the gateway as the same silence, and the gateway degraded all four into the caller's empty default — which a caller also could not distinguish from "the provider answered and there was nothing to report".
+
+• `user_id` was accepted and ignored. A D3 broker adapter registered against the global registry would have been resolved for every user, consuming one user's broker entitlement on behalf of another — the exact thing Category 2 of MARKET_DATA_ARCHITECTURE.md forbids.
+
+• Every provider started at `ProviderState.UP`. A provider registered one millisecond ago and one with ten thousand clean requests behind it reported identically on the diagnostics surface whose only job is telling them apart.
+
+Decision
+
+1. **Resolution returns an ordered failover chain, and the gateway walks it inside one request.** `SourceManager.resolve_feed()` returns a `Resolution` carrying the selected provider plus the ordered alternatives; `MarketGateway._serve_with_provider` tries the next eligible provider when one raises. Health counters keep their role — a DOWN provider is dropped from resolution entirely, so later requests never pay for its timeout — but the chain closes the window before they trip. Only an exception advances the chain: an empty result is an answer, and failing over on it would double every provider call on a quiet market to produce the same empty list.
+
+2. **A fourth health state, `UNKNOWN`, is the initial state — and it ranks alongside `UP`, not below it.** The ranking is load-bearing, not cosmetic. Ranking `UNKNOWN` below `UP` deadlocks the Provider Priority Algorithm: a freshly registered priority-1 broker feed leaves `UNKNOWN` only by being called and is called only by being selected, so it would sit behind a healthy priority-3 Yahoo forever and the platform's headline feature would never engage. `DEGRADED` is different in kind — evidence of failure rather than absence of evidence — and continues to demote a provider below a healthy lower tier.
+
+3. **`user_id` is replaced by a `ResolutionContext`, and entitlement is enforced in the provider.** The context carries `user_id`, `symbol` and `exchange`; `MarketDataProvider.owner_user_id` declares whose entitlement a provider is served under and `is_eligible_for(context)` is the filter. A provider bound to a user cannot be resolved for anybody else, and a request with no user attached (a scheduled refresh, a scanner sweep) never reaches one. The gateway supplies the symbol at every call site that has one, so MARKET_DATA_ARCHITECTURE.md's per-symbol rule — "a broker feed covering NSE equities does not disqualify Yahoo from serving a US index the broker doesn't carry" — becomes implementable in D3 entirely inside a provider's `is_eligible_for`, with no call-site change.
+
+   A bare `user_id` string was rejected: entitlement is per user but coverage is per instrument, and threading a fifth keyword argument through eleven gateway methods later is a wide, merge-conflict-heavy change. `user_id=` remains accepted everywhere as a shorthand, so no existing caller changed.
+
+4. **Unavailability is explicit.** `UnavailableReason` names the four cases (`no_providers_registered`, `not_entitled`, `capability_unsupported`, `all_providers_down`). It travels on `provider.status` and on `MarketGateway.status["last_unavailable"]`, and it describes the *feed*, never the providers behind it, so it does not breach Developer Rule 4.
+
+5. **Public API shapes are unchanged.** Gateway methods still return their empty defaults when the feed is genuinely unavailable, and still re-raise when a call fails — the difference is that they now re-raise only after every eligible provider has been tried. No route contract, no frontend payload, and no existing call site changed.
+
+Alternatives Considered
+
+• **Add probation windows and periodic re-probing now** — rejected. MARKET_DATA_ARCHITECTURE.md assigns them to Phase 5, the D2 brief scopes out "sophisticated automatic failover policies", and a re-probe needs a clock source and a background sweeper D2 has no other use for. The consequence is recorded below rather than hidden.
+
+• **Cache resolution per user session** — rejected for D2. The cache would need invalidating on broker connect, broker disconnect, token refresh, every health transition and every registry mutation: five invalidation paths guarding a sorted traversal of a one-element list. It becomes worth its invalidation surface in D3, when a per-user session actually exists to hang it on.
+
+• **Fail over on an empty result as well as on an exception** — rejected. An empty gainers list at 3am is correct, and the policy would double every provider call on a quiet market.
+
+Consequences
+
+• A user whose preferred provider dies mid-session keeps their feed within the same request, at a lower freshness tier. D1 recovered only after eight failed requests.
+
+• Cross-user entitlement leakage is impossible by construction rather than by every future call site remembering to check.
+
+• An operator reading a log line can tell a startup registration bug from an expired broker token from an unimplemented capability from a total outage.
+
+• **A demoted provider has no self-recovery path in D2.** It is last in the chain, the chain stops at the first provider that answers, and health only improves on a successful call — so a provider that blips past `DEGRADED` stays on the lower tier until an external `record_success`, a process restart, or the Phase 5 re-probe. D3's broker adapter is the natural first caller: a reconnected WebSocket knows it recovered without anyone polling it. Pinned by `test_a_demoted_provider_has_no_self_recovery_path_in_d2` so it cannot regress silently and so D5 has a red-to-green target.
+
+• DD-5 (provider names on two live UI surfaces) is closed. DD-1, DD-2, DD-3 and DD-4 are **not** closed by D2 and are re-sequenced in TASK.md; DD-2 in particular remains blocked on the ADR-028 approval item below.
+
+Requires Approval
+
+ADR-028's open approval item is unchanged and now overdue: `source: "yahoo_finance"` remains in the public REST contract, and `InvestmentAdvisor.jsx` and `Markets.jsx` still branch on it, so a broker feed would render as "Fallback data". D2 did not move those consumers onto `source_tier` because the endpoints that serve them bypass the gateway (DD-1) and therefore do not emit `source_tier` yet; closing DD-2 requires closing DD-1's shape reconciliation first. This needs an explicit accept-or-accelerate decision before D3 makes a streaming feed visible to users.
+
+Review Date
+
+At D3 (first broker WebSocket adapter).
+
+Authoritative document
+
+MARKET_DATA_ARCHITECTURE.md
+
+---
+
+# ADR-030
+
+Title
+
+Public REST Contract Reconciliation — Retiring Provider Identity from Market Data Responses (DD-1 / DD-2)
+
+Date
+
+2026-08-20
+
+Status
+
+Accepted — supersedes the open approval item in ADR-028
+
+Context
+
+ADR-028 (D1) retained `source: "yahoo_finance"` in the public REST contract for API compatibility and flagged it as the one deliberate violation of Developer Rule 4 needing an explicit accept-or-accelerate decision. ADR-029 (D2) recorded it as overdue. It was accelerated.
+
+Two debts were entangled and had to be resolved together:
+
+• **DD-1** — the public market routes bypassed the Market Gateway, blocked on a shape reconciliation: `/api/market/sectors` returned the provider's `{"sector": …}` while the gateway returns the canonical `{"name": …}`, and the frontend read the provider's key. Routing the endpoint at the gateway without reconciling that would have silently blanked every sector label in the UI.
+
+• **DD-2** — `source: "yahoo_finance"` (and the advisor's `data_source`) named a provider on a public surface. Consumers could not be moved onto `source_tier` while the endpoints serving them bypassed the gateway and therefore never emitted it. DD-2 could not close before DD-1.
+
+Decision
+
+1. **Provider identity is removed from the market-data contract, not retained behind a deprecation window.** Every market-data response now carries `source_tier` (`"delayed"` / `"streaming"`) and no provider name. `services/real_market.py` no longer writes a provider name into its own payloads.
+
+   Retention was rejected because it was not actually backward compatible. `source` was a hardcoded literal, so the day a broker feed serves a quote the field keeps reporting `"yahoo_finance"` — it would not merely leak provenance, it would report the *wrong* provenance. `InvestmentAdvisor.jsx` branched on precisely that value to choose between "Live market data" and "Fallback data", so D3's headline feature would have rendered a live streaming feed to the user as "Fallback data". A field that is about to start lying is worse than a field that is removed.
+
+2. **The value comes from the Source Manager, never from a literal.** `MarketGateway.source_tier(capability)` reads the active tier, so the contract tracks reality without any route learning who serves it.
+
+3. **The sector shape is reconciled by emitting both keys.** The route returns the canonical `name` and keeps `sector` as a deprecated alias of the same value. The alias lives in the route rather than in `normalizer.py`, so the canonical model does not acquire a legacy key that every future provider's normalizer would inherit. `Dashboard.jsx` and `Markets.jsx` read `name`; the alias is removable once no consumer reads `sector`.
+
+4. **Compatibility is preserved where it is meaningful:** every other field, every payload shape, every status code, and the sector alias. What changed is one field name on one family of endpoints, plus the two frontend branches that read it — both migrated in the same change.
+
+5. **Diagnostics surfaces keep provider detail.** `/api/data-sources`, `Settings.jsx` and `AdminAPIs.jsx` still name providers, which MARKET_DATA_ARCHITECTURE.md explicitly permits for settings and diagnostics surfaces and forbids only on live data surfaces.
+
+Alternatives Considered
+
+• **Keep `source` and add `source_tier` alongside it** — rejected per Decision 1: the retained field becomes actively wrong under D3 rather than merely redundant.
+
+• **Keep `source` but derive its value from the resolved provider** — rejected. It would be honest but still publishes a provider name, which is the rule being enforced.
+
+• **Migrate every gateway bypass in the same change** — rejected as unrelated scope. The remaining bypasses (`heartbeat_engine`, `scheduler`, `paper_trade`, `portfolio_stream`, `portfolio_engine`, `stock_details`, `morning_report`) do not emit provider identity to any public surface; they are Developer Rule 2 debt and stay in the enforced register.
+
+• **Route `/api/stocks/{symbol}/live` through the gateway too** — rejected for now (DD-1b). The canonical StockQuote drops `currency`, `market_state` and the `historical_*` series that endpoint returns, so it would be a silent breaking change dressed as a refactor.
+
+Consequences
+
+• No provider name reaches any market-data client. Guarded by `TestPublicContractCarriesNoProviderIdentity`, which sweeps every public market endpoint's response and includes a control proving the sweep can actually observe a leak — planted on a passthrough endpoint, because a leak planted on the sectors route is stripped by the normalizer and would prove nothing.
+
+• The frontend tier indicator now has real data behind it: `Markets.jsx` renders Live/Delayed from `source_tier`, which is DD-7's groundwork.
+
+• **A latent 500 was found and fixed.** `MarketGateway.get_sectors` iterated whatever the provider returned; a provider answering with a dict where a list belongs was iterated into its *keys*, and `normalize_sector_data("some_key")` raised `AttributeError`. It surfaced only because the route migration made the path reachable. Malformed payloads are now logged and dropped, as MARKET_DATA_ARCHITECTURE.md requires.
+
+• Three pieces of residue are recorded rather than hidden: DD-1a (Alpha Vantage selected in a route handler), DD-1b (the live-quote endpoint's richer shape), DD-1c (`backtest_engine`'s `data_source: "yfinance"`, deliberately untouched because it is a PH3.9 anti-fabrication control on a different surface).
+
+• ADR-028's open approval item is closed. No decision remains pending on the market-data contract.
+
+Review Date
+
+At D3 (first broker WebSocket adapter), when `source_tier` first takes the value `"streaming"` in production.
+
+Authoritative document
+
+MARKET_DATA_ARCHITECTURE.md
+
+---
+
 # Pending Decisions
 
 Future decisions to document.

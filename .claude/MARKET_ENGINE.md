@@ -209,6 +209,30 @@ against provider health, a provider that fails consistently stops being
 resolved, and the next priority tier takes over. Recovery is symmetric.
 `provider.status` events carry the freshness tier only — never a provider name.
 
+Extended (Sprint D2, 2026-08-20)
+
+The Source Manager now returns an ordered failover *chain*, not a single
+provider, and the gateway walks it inside one request:
+
+    market_gateway.get_quote(symbol, user_id=...)
+        → source_manager.resolve_feed(
+              Capability.QUOTES,
+              ResolutionContext(user_id=..., symbol=symbol))
+        → Resolution(provider, chain, reason)
+        → try chain[0]; on exception try chain[1]; …
+        → normalize with the provider that actually answered
+
+D1 called the head of the chain alone, so the baseline only took over after a
+provider had failed eight consecutive *requests*. Selection now also honours
+per-user entitlement (`MarketDataProvider.is_eligible_for`), reports a fourth
+health state `unknown` for a provider never yet exercised, and returns an
+explicit `UnavailableReason` instead of a bare `None`. See ADR-029.
+
+One limitation D2 leaves open: a demoted provider is never called again, so it
+cannot recover on its own until Phase 5 adds probation windows and periodic
+re-probing. D3's broker adapter is the natural first caller, because a
+reconnected WebSocket knows it recovered without anyone polling it.
+
 Two silent defects were closed in D1: normalized quotes had been stamped with
 `provider: "yahoo"` (provider identity leaking downstream), and index
 normalization had never actually run (the provider's index sub-dicts carry no

@@ -3,7 +3,7 @@
 
 Version: 1.1
 
-Status: Approved Design — Phase 1 Implemented (Sprint D1, 2026-08-19); Phases 2–6 pending
+Status: Approved Design — Phase 1 Implemented (Sprint D1, 2026-08-19); Phase 2 Implemented in backend (Sprint D2, 2026-08-20, frontend tier indicator outstanding); Phases 3–6 pending
 
 Priority: Critical
 
@@ -371,6 +371,8 @@ The Source Manager is a dedicated service that decides, for every user and every
 
 **Location convention:** `backend/services/market_engine/source_manager.py`
 
+**Implemented in Sprints D1–D2.** D1 built capability-based resolution over the registry, health-based exclusion and `provider.status` publication. D2 completed the resolution semantics: an ordered failover chain instead of a single pick, an explicit `UnavailableReason` instead of a bare `None`, a `ResolutionContext` (user, symbol, exchange) honoured through `MarketDataProvider.is_eligible_for()`, and a fourth health state `unknown`. See ADR-029 for the reasoning and for the one limitation D2 leaves open (a demoted provider cannot recover on its own until Phase 5's re-probe).
+
 ## Responsibilities
 
 **1. Detect connected brokers**
@@ -452,6 +454,18 @@ Priority 3   Yahoo Finance
 3. Filter out candidates that lack the required capability for the request context (e.g. a symbol not covered by the broker feed falls through to the next provider **for that symbol**).
 4. Pick the highest-priority survivor.
 5. If two candidates share a priority tier (user has two brokers connected), pick the one with the better health score; break ties by most recently used (stability over churn).
+
+**As implemented (D2).** Steps 1–3 are `ProviderRegistry.candidates_for(capability, context)`; steps 4–5 are `SourceManager.resolve_feed()`, which returns the winner *and the ordered remainder as a failover chain*. Health ranks in two bands rather than as a continuous score — full latency scoring is Phase 5:
+
+| Band | States | Meaning |
+|---|---|---|
+| 0 | `up`, `unknown` | not known to be failing |
+| 1 | `degraded` | demonstrated intermittent failure |
+| — | `down` | filtered out at step 2 |
+
+Ranking is a *stable* sort over the already priority-ordered candidate list, so priority order survives inside each band — which is exactly rules 4 and 5.
+
+`unknown` sharing band 0 with `up` is load-bearing, not a rounding-off. A newly registered priority-1 broker feed leaves `unknown` only by being called and is called only by being selected; ranking it below `up` would pin it behind a healthy Yahoo permanently and this document's Category 2 would never engage. See ADR-029.
 
 **Rules:**
 
@@ -747,11 +761,37 @@ Three deviations from this document, each recorded with its reasoning in **ADR-0
 
 1. **The adapter contract omits `subscribe`/`unsubscribe`/`on_raw`.** D1 ships one polling provider and no consumer able to receive pushed ticks; the push surface lands in Phase 3 with the adapter and consumer that need it. `ProviderKind` already separates the families.
 2. **Adapters return the provider's raw payload, but `real_market.py` also computes derived analytics** (RSI/MACD/VWAP, breadth, sentiment, mover ranking) that are Market Engine business logic living in the provider module. Relocating them is Phase 2.
-3. **`source_tier` is added; the legacy `source: "yahoo_finance"` field remains in REST payloads** for API compatibility. Removing it is sequenced through Phase 2. This is the one open violation of Developer Rule 4 and it is deliberate, documented, and awaiting approval.
+3. **`source_tier` is added; the legacy `source: "yahoo_finance"` field remains in REST payloads** for API compatibility. ✅ **CLOSED 2026-08-20 (DD-1/DD-2, ADR-030).** The provider name is gone from every market-data response; `source_tier` replaces it, read from the Source Manager rather than written as a literal. No open violation of Developer Rule 4 remains on the public contract.
 
-Not every consumer reaches the gateway yet: `server.py` and five service modules still call the provider client directly. That set is frozen in an enforced register (`KNOWN_GATEWAY_BYPASSES`, `backend/tests/test_market_gateway.py`) which may only shrink — a new bypass fails CI, and a stale entry fails once the module is migrated. The Market Engine itself and the AI Context Builder are fully migrated.
+Not every consumer reaches the gateway yet, though the public market routes now do (DD-1, 2026-08-20): `server.py` and five service modules still call the provider client directly on non-contract paths. That set is frozen in an enforced register (`KNOWN_GATEWAY_BYPASSES`, `backend/tests/test_market_gateway.py`) which may only shrink — a new bypass fails CI, and a stale entry fails once the module is migrated. The Market Engine itself and the AI Context Builder are fully migrated.
 
-**Phase 2 — Source Manager.** Introduce the Source Manager with a single provider (Yahoo). Wire `provider.status` events and the frontend tier indicator. *(D1 delivered the Source Manager's resolution, health and `provider.status` publication; Phase 2 owns the frontend tier indicator and closing the three deviations above.)*
+**Phase 2 — Source Manager.** ✅ **BACKEND IMPLEMENTED — Sprint D2, 2026-08-20.** Introduce the Source Manager with a single provider (Yahoo). Wire `provider.status` events and the frontend tier indicator.
+
+As built (D2, on top of D1):
+
+```
+providers/base.py        ProviderState.UNKNOWN (4th state, initial);
+                         ResolutionContext (user_id, symbol, exchange);
+                         owner_user_id + is_eligible_for() entitlement filter
+providers/registry.py    candidates_for(capability, context) — entitlement,
+                         capability and health filtering; entitled_for(context)
+source_manager.py        Resolution (provider + ordered failover chain + reason),
+                         UnavailableReason, resolve_feed(), failover_chain(),
+                         HEALTH_RANK
+gateway.py               walks the failover chain inside one request; records an
+                         explicit unavailable state; supplies the symbol to the
+                         resolution context at every call site that has one
+```
+
+Still outstanding for Phase 2:
+
+• **The frontend tier indicator.** The backend publishes everything it needs — `provider.status` carries `state`, `tier`, `reason` and `previous_tier`, and `MarketGateway.status["feed"]` exposes the same — but no component renders it yet.
+• **One of the three D1 deviations.** The push surface still lands in Phase 3 (unchanged). Derived analytics still live in `real_market.py` (DD-3).
+
+Closed alongside D2:
+
+• **DD-5** — no live UI surface names a provider any more.
+• **DD-1 / DD-2 (2026-08-20, ADR-030)** — the public market routes read through the gateway, the sector shape is reconciled (canonical `name` plus a deprecated `sector` alias), and `source: "yahoo_finance"` is replaced everywhere by `source_tier` sourced from the Source Manager. ADR-028's open approval item is closed. `Markets.jsx` already renders Live/Delayed from `source_tier`, which is most of the tier indicator's groundwork.
 
 **Phase 3 — First broker adapter.** Zerodha Kite WebSocket adapter + normalizer, per-user resolution, make-before-break switching, failover back to Yahoo. This phase delivers the headline feature.
 

@@ -179,7 +179,11 @@ async def fetch_yahoo_quote(symbol: str, range_str: str = "2d"):
                 "market_state": meta.get("marketState", "CLOSED"),
                 "exchange": meta.get("exchangeName", "NSE"),
                 "currency": meta.get("currency", "INR"),
-                "source": "yahoo_finance",
+                # No `source` field. An adapter returns the provider's raw
+                # payload; naming the provider *inside* that payload is how the
+                # name reached the public REST contract in the first place
+                # (DD-1). The Market Gateway stamps `source_tier` at the
+                # normalization boundary — freshness, never provenance.
                 "historical_closes": [c for c in raw_closes if c is not None],
                 "historical_close_timestamps": close_timestamps,
                 "historical_volumes": volumes,
@@ -331,7 +335,8 @@ async def fetch_real_market_overview():
             "market_sentiment": compute_market_sentiment(breadth, nifty_chg),
             "advance_decline": breadth,
             "market_status": "OPEN" if (isinstance(nifty, dict) and nifty.get("market_state") == "REGULAR") else "CLOSED",
-            "source": "yahoo_finance",
+            # See the note in `fetch_yahoo_quote`: no provider name in a payload.
+            # `/api/market/overview` stamps `source_tier` from the Source Manager.
         }
         await cache_set(cache_key, overview, 30)
         return overview

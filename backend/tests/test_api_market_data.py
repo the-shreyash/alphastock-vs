@@ -356,6 +356,10 @@ class TestFailureContainmentLivesInTheServiceLayer:
         """
         from services.real_market import fetch_all_universe_quotes
 
+        # `source` is deliberately still here: this is a *raw provider* payload,
+        # and DD-1 removed the field from `fetch_yahoo_quote`'s output, not from
+        # what a hypothetical provider might send. Keeping it proves the
+        # normalization boundary strips whatever provenance a provider invents.
         healthy = {"price": 100.0, "change_pct": 1.0, "prev_close": 99.0,
                    "change": 1.0, "source": "yahoo_finance"}
         calls = {"n": 0}

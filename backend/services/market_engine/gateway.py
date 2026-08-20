@@ -26,6 +26,23 @@ could not be added without editing it. It now:
 Yahoo Finance did not change role: it is still the baseline feed serving every
 request. It simply sits behind the contract now.
 
+WHAT D2 CHANGED HERE
+--------------------
+The gateway now asks the Source Manager for a *failover chain* rather than a
+single provider, and walks it: if the preferred provider raises, the next
+eligible one is tried inside the same request. D1 failed over only across
+requests, once health counters had escalated, which left a window where the
+platform returned nothing to users whose baseline feed was healthy throughout.
+
+It also records an explicit unavailable state (`status["last_unavailable"]`,
+carrying an `UnavailableReason` and no provider name) instead of returning a
+bare empty default that a caller could not distinguish from "the provider
+answered, there was nothing to report".
+
+Resolution is now context-aware: methods that know an instrument supply it, so
+per-user entitlement and per-symbol coverage are decided inside the Source
+Manager and the provider adapters — never at a call site.
+
 WHAT THIS GATEWAY IS NOT
 ------------------------
 Not a cache (Redis and the Market Engine own caching — the provider client
@@ -51,6 +68,7 @@ from services.market_engine.normalizer import (
 from services.market_engine.providers import (
     Capability,
     MarketDataProvider,
+    ResolutionContext,
     YahooPollingAdapter,
     provider_registry,
 )
@@ -101,6 +119,11 @@ class MarketGateway:
     def __init__(self) -> None:
         self._initialized = False
         self._start_time: Optional[str] = None
+        #: The most recent unresolvable request, or None while the feed is
+        #: being served. Provider-free by construction — it carries a capability
+        #: and an `UnavailableReason`, never a provider name — so it is safe on
+        #: the `status` property, which status endpoints reach.
+        self._last_unavailable: Optional[Dict[str, Any]] = None
 
     async def initialize(self) -> None:
         """Start the gateway and publish readiness + initial feed status."""
@@ -132,12 +155,49 @@ class MarketGateway:
             # Tier and feed state only — this property is reachable from status
             # endpoints, so it may not carry provider identity.
             "feed": source_manager.status(),
+            "last_unavailable": self._last_unavailable,
         }
 
     @property
     def diagnostics(self) -> Dict[str, Any]:
         """Provider-level detail, including provider names. Admin surfaces only."""
         return source_manager.diagnostics()
+
+    # ── Public-contract provenance ───────────────────────
+
+    def source_tier(
+        self,
+        capability: Capability = Capability.QUOTES,
+        *,
+        user_id: Optional[str] = None,
+    ) -> Optional[str]:
+        """Freshness tier currently serving `capability` — `"streaming"`,
+        `"delayed"`, or None when nothing is.
+
+        The ONLY provenance a REST response may carry (MARKET_DATA_ARCHITECTURE.md,
+        Developer Rule 4). Route handlers stamp `source_tier` with this instead of
+        a literal.
+
+        WHY THIS EXISTS ON THE GATEWAY (D2/DD-1)
+        ----------------------------------------
+        Until DD-1 the public contract carried `source: "yahoo_finance"` — a
+        hardcoded literal, written by hand at each route. Two things were wrong
+        with it. It named a provider on a public surface, which Rule 4 forbids
+        outright. And it was a *constant*: the day a broker feed serves a quote,
+        a literal still says "yahoo_finance", so the field does not merely leak
+        provenance, it reports the wrong provenance. `InvestmentAdvisor.jsx`
+        branched on exactly that string to decide whether to render "Live market
+        data" or "Fallback data", so a streaming broker quote would have been
+        labelled "Fallback data" to the user.
+
+        Reading it from the Source Manager makes the field track reality with no
+        route ever learning who is serving. Routes that already go through a
+        gateway *read* get the tier stamped on the payload and do not need this;
+        it is for composite payloads (the market overview) and for the routes
+        still on their own data path (DD-1 residue, recorded in TASK.md).
+        """
+        tier = source_manager.active_tier(capability, user_id=user_id)
+        return tier.value if tier else None
 
     # ── Provider invocation ──────────────────────────────
 
@@ -149,28 +209,54 @@ class MarketGateway:
         default: T,
         *,
         user_id: Optional[str] = None,
+        context: Optional[ResolutionContext] = None,
         subsystem: str = "market_data",
     ) -> "tuple[Optional[MarketDataProvider], T]":
-        """Resolve a provider for `capability`, call it, and record the outcome.
+        """Resolve providers for `capability`, call them in order, record outcomes.
 
-        Returns `(provider, payload)`. The provider comes back with the payload
-        because the caller needs it to pick a normalizer and stamp a tier, and
-        resolving a second time at the call site could pick a *different*
-        provider than the one that actually answered — normalizing a Yahoo
-        payload with a broker's normalizer is exactly the class of bug this
-        boundary exists to prevent.
+        Returns `(provider, payload)` for whichever provider actually answered.
+        The provider comes back with the payload because the caller needs it to
+        pick a normalizer and stamp a tier, and resolving a second time at the
+        call site could pick a *different* provider than the one that answered —
+        normalizing a Yahoo payload with a broker's normalizer is exactly the
+        class of bug this boundary exists to prevent. With the failover chain
+        below that is no longer a hypothetical: the answering provider is
+        routinely not the preferred one.
 
-        Provider exceptions are re-raised untouched. That is deliberate: the
-        public methods below differ in whether they contain their own failures,
-        and several of them are called by routes whose error handling depends on
-        seeing the exception. Instrumentation and health bookkeeping observe
-        control flow here; they never alter it.
+        FAILOVER WITHIN THE REQUEST (D2)
+        --------------------------------
+        The Source Manager returns an ordered chain, not a single pick, and this
+        method walks it: preferred provider, and on failure the next eligible
+        one, until something answers. MARKET_DATA_ARCHITECTURE.md's failover
+        diagram, executed.
 
-        `default` is returned only when there is no provider at all to ask —
-        the feed is genuinely unavailable. It is the caller's own empty value
-        (None, [], {}), never a substitute for real market data: fabricating a
-        price to fill a gap is forbidden by CLAUDE.md and by
-        MARKET_DATA_ARCHITECTURE.md's failover rules alike.
+        D1 called the head of the chain alone and re-raised. Failover was real
+        but only *between* requests — a provider had to accumulate
+        `DOWN_AFTER_FAILURES` consecutive failures before the registry stopped
+        offering it, and every request in between returned nothing to a user
+        whose baseline feed was healthy the whole time. The health counters
+        still do their job (a DOWN provider is dropped from resolution entirely,
+        so later requests do not pay for its timeout first); the chain closes the
+        window before they trip.
+
+        Only an *exception* advances the chain. An empty result does not: an
+        empty gainers list at 3am is the correct answer, and failing over on it
+        would double every provider call on a quiet market while producing the
+        same empty list. Emptiness is recorded against health, where a provider
+        answering 200-with-no-data forever is already visible.
+
+        When the chain is exhausted the last exception is re-raised untouched,
+        which preserves D1's contract exactly: the public methods below differ
+        in whether they contain their own failures, and several are called by
+        routes whose error handling depends on seeing the exception.
+        Instrumentation and health bookkeeping observe control flow; they never
+        alter it.
+
+        `default` is returned only when there is no provider at all to ask — the
+        feed is genuinely unavailable. It is the caller's own empty value (None,
+        [], {}), never a substitute for real market data: fabricating a price to
+        fill a gap is forbidden by CLAUDE.md and by MARKET_DATA_ARCHITECTURE.md's
+        failover rules alike.
 
         `subsystem` labels the metric. Note the provider *label* stays
         "market_data" rather than becoming the adapter's name: one time series
@@ -178,29 +264,66 @@ class MarketGateway:
         set, and `observability/instruments.py` keeps that vocabulary frozen on
         purpose.
         """
-        provider = source_manager.resolve(capability, user_id=user_id)
-        if provider is None:
+        resolution = source_manager.resolve_feed(capability, context, user_id=user_id)
+
+        if not resolution.available:
+            # The explicit unavailable state. `reason` distinguishes "nothing is
+            # registered" from "this user is entitled to nothing" from "no
+            # provider serves depth" from "everything is in outage" — four
+            # incidents that D1 logged identically.
+            self._last_unavailable = {
+                "capability": capability.value,
+                "operation": operation,
+                "reason": resolution.reason.value if resolution.reason else None,
+                "at": datetime.now(timezone.utc).isoformat(),
+            }
             logger.warning(
-                "Gateway: no provider available for capability %s (%s)",
+                "Gateway: feed unavailable for capability=%s (%s) reason=%s",
                 capability.value, operation,
+                resolution.reason.value if resolution.reason else "unknown",
             )
             await source_manager.publish_status()
             return None, default
 
-        try:
-            with instruments.track_provider(subsystem, operation) as call:
-                result = await invoke(provider)
-                empty = not result
-                if empty:
-                    call.empty()
-        except Exception as exc:
-            if source_manager.record_failure(provider, exc):
-                await source_manager.publish_status()
-            raise
+        self._last_unavailable = None
+        last_error: Optional[BaseException] = None
 
-        if source_manager.record_success(provider, empty=empty):
-            await source_manager.publish_status()
-        return provider, result
+        for attempt, provider in enumerate(resolution.chain):
+            try:
+                with instruments.track_provider(subsystem, operation) as call:
+                    result = await invoke(provider)
+                    empty = not result
+                    if empty:
+                        call.empty()
+            except Exception as exc:
+                last_error = exc
+                if source_manager.record_failure(provider, exc):
+                    await source_manager.publish_status()
+                remaining = len(resolution.chain) - attempt - 1
+                logger.warning(
+                    "Gateway: provider call failed for %s (%s): %s — %d alternative(s) left",
+                    capability.value, operation, exc, remaining,
+                )
+                continue
+
+            if source_manager.record_success(provider, empty=empty):
+                await source_manager.publish_status()
+            return provider, result
+
+        # Chain exhausted: every eligible provider raised. Re-raise the last
+        # error rather than degrading to `default`, because this is a failure to
+        # serve, not an absence of providers, and the callers below deliberately
+        # differ on how they handle each.
+        #
+        # `last_error` cannot be None here — the loop body either returns or
+        # sets it, and an empty chain was handled above — but this is a raise
+        # statement, so the fallback is spelled out rather than asserted: a bare
+        # `assert` vanishes under `python -O` and would turn an unreachable
+        # branch into `TypeError: exceptions must derive from BaseException`,
+        # replacing the provider's real error with a confusing one.
+        if last_error is None:  # pragma: no cover - unreachable
+            return None, default
+        raise last_error
 
     async def _serve(
         self,
@@ -210,13 +333,28 @@ class MarketGateway:
         default: T,
         *,
         user_id: Optional[str] = None,
+        context: Optional[ResolutionContext] = None,
     ) -> T:
         """`_serve_with_provider` for callers that return the provider's payload
         unchanged and so have no use for the provider itself."""
         _provider, result = await self._serve_with_provider(
-            capability, operation, invoke, default, user_id=user_id,
+            capability, operation, invoke, default,
+            user_id=user_id, context=context,
         )
         return result
+
+    @staticmethod
+    def _context_for(symbol: Optional[str], user_id: Optional[str]) -> ResolutionContext:
+        """Build the resolution context for an instrument-scoped request.
+
+        The gateway already knows the symbol at every call site that has one, so
+        it supplies it rather than making callers thread it through. That is
+        what lets MARKET_DATA_ARCHITECTURE.md's per-symbol rule — "a broker feed
+        covering NSE equities does not disqualify Yahoo from serving a US index
+        the broker doesn't carry" — be implemented in D3 purely inside a
+        provider's `is_eligible_for`, with no change to any call site.
+        """
+        return ResolutionContext(user_id=user_id, symbol=symbol)
 
     # ── Single stock quote ───────────────────────────────
 
@@ -225,7 +363,8 @@ class MarketGateway:
         try:
             provider, raw = await self._serve_with_provider(
                 Capability.QUOTES, "get_quote",
-                lambda p: p.fetch_quote(symbol), None, user_id=user_id,
+                lambda p: p.fetch_quote(symbol), None,
+                context=self._context_for(symbol, user_id),
             )
         except Exception as exc:
             logger.warning(f"Gateway: quote fetch failed for {symbol}: {exc}")
@@ -335,8 +474,27 @@ class MarketGateway:
         if not raw_sectors:
             return []
 
+        # Drop anything that is not a row before normalizing.
+        # MARKET_DATA_ARCHITECTURE.md: "Unknown or malformed payloads are logged
+        # and dropped — they never propagate." A provider answering with a dict
+        # where a list belongs would otherwise be iterated into its *keys*, and
+        # `normalize_sector_data("some_key")` raises `AttributeError` — an
+        # unhandled 500 on a dashboard route, from a provider that merely
+        # returned the wrong shape. Found by the DD-1 route migration: this path
+        # became reachable the moment `/api/market/sectors` started reading
+        # through the gateway instead of returning the provider payload raw.
+        if not isinstance(raw_sectors, (list, tuple)):
+            logger.warning(
+                "Gateway: sector payload was %s, expected a list — dropped",
+                type(raw_sectors).__name__,
+            )
+            return []
+
         normalized = []
         for raw in raw_sectors:
+            if not isinstance(raw, dict):
+                logger.debug("Gateway: dropped non-dict sector row (%s)", type(raw).__name__)
+                continue
             norm = normalize_sector_data(raw)
             if norm:
                 normalized.append(norm)
@@ -463,7 +621,8 @@ class MarketGateway:
                         *, user_id: Optional[str] = None) -> List[Dict[str, Any]]:
         return await self._serve(
             Capability.OHLC, "get_chart",
-            lambda p: p.fetch_chart(symbol, period), [], user_id=user_id,
+            lambda p: p.fetch_chart(symbol, period), [],
+            context=self._context_for(symbol, user_id),
         )
 
     # ── Instrument search ────────────────────────────────

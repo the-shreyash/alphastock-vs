@@ -664,8 +664,8 @@ function SectorPerformance({ sectors }) {
         {sectors.map(s => {
           const isPos = s.change_pct >= 0;
           return (
-            <div key={s.sector} className="heatmap-cell" style={{ background: isPos ? "var(--gain-bg)" : "var(--loss-bg)" }}>
-              <div className="text-[10px] font-medium truncate" style={{ color: "var(--text-secondary)" }}>{s.sector}</div>
+            <div key={s.name || s.sector} className="heatmap-cell" style={{ background: isPos ? "var(--gain-bg)" : "var(--loss-bg)" }}>
+              <div className="text-[10px] font-medium truncate" style={{ color: "var(--text-secondary)" }}>{s.name || s.sector}</div>
               <div className="text-[13px] font-mono font-bold mt-0.5" style={{ color: isPos ? "var(--gain)" : "var(--loss)" }}>
                 {isPos ? "+" : ""}{s.change_pct?.toFixed(2)}%
               </div>

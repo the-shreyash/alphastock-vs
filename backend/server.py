@@ -83,6 +83,13 @@ from services.brokers.base import BrokerAuthError, BrokerError
 from services.brokers.stream import stream_manager
 from services.scheduler import setup_scheduler
 
+# Market data enters the application through exactly one door
+# (MARKET_DATA_ARCHITECTURE.md, Developer Rule 2). Imported at module scope
+# rather than per-route because the market routes below are one-liners whose
+# whole body is the gateway call, and a function-local import in each would be
+# more import machinery than route.
+from services.market_engine import Capability, SourceTier, market_gateway
+
 # Centralized authentication-cookie policy (PH1.3). Every auth cookie is set or
 # cleared through this module so the Secure/HttpOnly/SameSite/Path/Max-Age
 # posture stays consistent across login, register, refresh, logout and OAuth.
@@ -931,7 +938,11 @@ async def build_advisor_recommendations(
         detect_chart_patterns, fetch_real_sectors,
     )
 
-    data_source = "yahoo_finance"
+    # `source_tier`, not a provider name: this value is rendered by
+    # `InvestmentAdvisor.jsx`, which branched on `data_source == "yahoo_finance"`
+    # to choose "Live market data" vs "Fallback data" — so a broker feed would
+    # have been labelled "Fallback data" to the user (DD-2).
+    source_tier = market_gateway.source_tier(Capability.UNIVERSE_QUOTES)
     try:
         universe = await fetch_all_universe_quotes()
     except Exception as e:
@@ -946,7 +957,7 @@ async def build_advisor_recommendations(
             "risk_appetite": risk_appetite,
             "count": 0,
             "ai_powered": False,
-            "data_source": "unavailable",
+            "source_tier": None,
             "available": False,
             "note": "Live market data is temporarily unavailable — recommendations cannot be generated right now.",
             "recommendations": [],
@@ -1107,7 +1118,7 @@ async def build_advisor_recommendations(
         "risk_appetite": risk_appetite,
         "count": len(recommendations),
         "ai_powered": ai_powered,
-        "data_source": data_source,
+        "source_tier": source_tier,
         "available": True,
         "recommendations": recommendations,
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -1587,46 +1598,70 @@ async def _apply_password_change(user: dict, new_password: str) -> None:
 
 # ============ MARKET ROUTES ============
 
+# The market routes below read through `market_gateway`, never through a
+# provider client (MARKET_DATA_ARCHITECTURE.md, Developer Rule 2). Each returns
+# `source_tier` — `"delayed"` or `"streaming"` — which is the only provenance a
+# public response may carry (Rule 4). Before DD-1 several of them returned
+# `source: "yahoo_finance"`, a hardcoded literal that both named a provider and
+# would have kept saying "yahoo_finance" the day a broker feed served the data.
+
 @market_router.get("/overview")
 async def market_overview():
-    """Get market overview — live Yahoo Finance indices. Explicitly unavailable on failure."""
-    overview = await real_overview()
+    """Market overview — live indices, VIX, breadth. Explicitly unavailable on failure."""
+    overview = await market_gateway.get_indices()
     if not overview:
         return {
             "available": False,
             "note": "Live market data is temporarily unavailable. Please retry shortly.",
         }
-    return {**overview, "available": True}
+    return {
+        **overview,
+        "available": True,
+        "source_tier": market_gateway.source_tier(Capability.INDICES),
+    }
 
 @market_router.get("/gainers")
 async def top_gainers():
-    from services.real_market import fetch_real_gainers
-    return await fetch_real_gainers()
+    return await market_gateway.get_gainers()
 
 @market_router.get("/losers")
 async def top_losers():
-    from services.real_market import fetch_real_losers
-    return await fetch_real_losers()
+    return await market_gateway.get_losers()
 
 @market_router.get("/sectors")
 async def sector_performance():
-    from services.real_market import fetch_real_sectors
-    return await fetch_real_sectors()
+    """Sector performance.
+
+    THE DD-1 SHAPE RECONCILIATION
+    -----------------------------
+    This route is why DD-1 stayed open through D1 and D2. The provider payload
+    keys each row `{"sector": ...}`; the Market Gateway normalizes it to the
+    canonical `{"name": ...}` (normalizer.py's SectorData), and the frontend read
+    the provider's key. Routing the endpoint at the gateway without reconciling
+    that would have silently blanked every sector label in the UI — the reason
+    ADR-028 recorded it as "real work, not a rename".
+
+    Reconciled by emitting the canonical `name` *and* keeping `sector` as a
+    deprecated alias of the same value, so unmigrated consumers keep working
+    while the frontend moves to `name`. The alias lives here rather than in
+    `normalizer.py` on purpose: the canonical model must not carry a legacy key,
+    or every future provider's normalizer inherits it. Remove the alias once no
+    consumer reads it.
+    """
+    sectors = await market_gateway.get_sectors()
+    return [{**row, "sector": row.get("name", "")} for row in sectors]
 
 @market_router.get("/global")
 async def global_markets():
-    from services.real_market import fetch_real_global_markets
-    return await fetch_real_global_markets()
+    return await market_gateway.get_global_markets()
 
 @market_router.get("/commodities")
 async def commodities():
-    from services.real_market import fetch_real_commodities
-    return await fetch_real_commodities()
+    return await market_gateway.get_commodities()
 
 @market_router.get("/fii-dii")
 async def fii_dii():
-    from services.real_market import fetch_real_fii_dii
-    return await fetch_real_fii_dii()
+    return await market_gateway.get_fii_dii()
 
 @market_router.get("/summary")
 async def market_summary():
@@ -4487,32 +4522,46 @@ async def zerodha_emergency_stop(user: dict = Depends(get_current_user)):
 
 # ============ ENHANCED STOCK ENDPOINT ============
 
+# Both routes below previously returned `source: "yahoo_finance"` (or
+# `"alpha_vantage"`). They now return `source_tier`, which is what a consumer
+# legitimately needs — how fresh the data is — and nothing it can couple to.
+#
+# KNOWN RESIDUE (DD-1a, TASK.md): the Alpha Vantage branch is provider selection
+# inside a route handler, which Developer Rule 3 forbids. Closing it properly
+# means giving Alpha Vantage a `MarketDataProvider` adapter and a registry entry
+# so the Source Manager resolves it like any other provider; that is one adapter
+# of work and belongs with the sprint that adds it, not smuggled into a contract
+# fix. What DD-1 removes here is the *observable* breach — no provider name
+# reaches the client either way — and the branch is recorded rather than hidden.
+# Alpha Vantage is a polled REST API, so both branches are the delayed tier.
+
 @stocks_router.get("/{symbol}/live")
 async def stock_live_quote(symbol: str):
-    """Get live quote - Alpha Vantage if configured, else real Yahoo Finance."""
+    """Live quote for a symbol. 404 when the symbol is unknown, 503 during an outage."""
     if av_configured():
         av_quote = await av_get_quote(symbol)
         if av_quote:
-            av_quote["source"] = "alpha_vantage"
+            av_quote["source_tier"] = SourceTier.DELAYED.value
             return av_quote
     quote = await real_quote(symbol)
     if not quote:
         if not get_stock_meta(symbol):
             raise HTTPException(status_code=404, detail="Stock not found")
         raise HTTPException(status_code=503, detail="Live market data temporarily unavailable for this stock")
-    quote["source"] = "yahoo_finance"
+    quote["source_tier"] = market_gateway.source_tier(Capability.QUOTES)
     return quote
 
 @stocks_router.get("/{symbol}/intraday")
 async def stock_intraday(symbol: str, interval: str = "5min"):
-    """Get intraday data - Alpha Vantage if configured, else real Yahoo Finance."""
+    """Intraday series for a symbol."""
     if av_configured():
         av_data = await av_intraday(symbol, interval)
         if av_data:
-            return {"data": av_data, "source": "alpha_vantage"}
-    from services.real_market import fetch_real_chart_data
-    chart = await fetch_real_chart_data(symbol, "1D")
-    return {"data": chart, "source": "yahoo_finance", "available": bool(chart)}
+            return {"data": av_data, "source_tier": SourceTier.DELAYED.value,
+                    "available": bool(av_data)}
+    chart = await market_gateway.get_chart(symbol, "1D")
+    return {"data": chart, "available": bool(chart),
+            "source_tier": market_gateway.source_tier(Capability.OHLC)}
 
 
 # ============ DATA SOURCE STATUS ============

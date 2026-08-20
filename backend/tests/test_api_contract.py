@@ -70,20 +70,30 @@ TEST_PICKS = [
 
 @pytest.fixture
 def stub_market(monkeypatch):
-    """Replace the two market-data entry points `server` calls directly.
+    """Feed both market-data entry points a known payload.
 
-    Patched on the `server` module rather than on `services.real_market`
-    because `server.py` binds `real_quote`/`real_overview` at import time — a
-    patch applied to the service module would not be seen by the route.
+    `real_quote` is patched on the `server` module because `server.py` binds it
+    at import time, so a patch on the service module would not be seen by the
+    route.
+
+    The overview is patched on `services.real_market` instead, because since
+    DD-1 `/api/market/overview` reads through `market_gateway`, which reaches
+    the provider client through the Yahoo adapter's *function-local* import —
+    looked up on the module object at call time, so a service-module patch is
+    exactly what the route sees and a `server` patch is what it no longer does.
+    Patching the wrong one here would leave the route hitting the real network
+    and the test passing or failing for reasons unrelated to its subject.
     """
-    monkeypatch.setattr(server, "real_overview", AsyncMock(return_value=dict(TEST_OVERVIEW)))
+    monkeypatch.setattr("services.real_market.fetch_real_market_overview",
+                        AsyncMock(return_value=dict(TEST_OVERVIEW)))
     monkeypatch.setattr(server, "real_quote", AsyncMock(return_value=dict(TEST_QUOTE)))
 
 
 @pytest.fixture
 def market_unavailable(monkeypatch):
     """Both market-data entry points report an outage (return falsy)."""
-    monkeypatch.setattr(server, "real_overview", AsyncMock(return_value=None))
+    monkeypatch.setattr("services.real_market.fetch_real_market_overview",
+                        AsyncMock(return_value=None))
     monkeypatch.setattr(server, "real_quote", AsyncMock(return_value=None))
 
 

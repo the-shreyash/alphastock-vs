@@ -35,7 +35,7 @@ Deliberately left live, with the question only a deployment can answer:
 
 | Live test | What it really asserts |
 |---|---|
-| `test_stock_live_has_source` | Yahoo Finance actually responded (`source == "yahoo_finance"`) |
+| `test_stock_live_declares_a_freshness_tier_not_a_provider` | A provider actually responded (`source_tier` is set, and no provider name leaked) |
 | `TestZerodhaAccount` (phase6) | A real broker session returns real funds/holdings |
 | `TestWebSocket` (phase2) | A socket survives a real network hop and proxy |
 | `TestWhatsAppLive` (phase7) | Twilio actually delivered a billable message |

@@ -16,18 +16,21 @@ See `base.py` for the contract and why the streaming push surface is not part
 of D1.
 """
 from services.market_engine.providers.base import (
+    GLOBAL_CONTEXT,
     Capability,
     CapabilityUnavailable,
     MarketDataProvider,
     ProviderHealth,
     ProviderKind,
     ProviderState,
+    ResolutionContext,
     SourceTier,
 )
 from services.market_engine.providers.registry import ProviderRegistry, provider_registry
 from services.market_engine.providers.yahoo import YahooPollingAdapter
 
 __all__ = [
+    "GLOBAL_CONTEXT",
     "Capability",
     "CapabilityUnavailable",
     "MarketDataProvider",
@@ -35,6 +38,7 @@ __all__ = [
     "ProviderKind",
     "ProviderRegistry",
     "ProviderState",
+    "ResolutionContext",
     "SourceTier",
     "YahooPollingAdapter",
     "provider_registry",

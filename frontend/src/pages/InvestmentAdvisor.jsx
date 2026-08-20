@@ -388,7 +388,12 @@ export default function InvestmentAdvisor() {
                 ) : (
                   <Chip icon={Gauge}>Rule-based narrative</Chip>
                 )}
-                <Chip>{meta?.data_source === "yahoo_finance" ? "Live market data" : "Fallback data"}</Chip>
+                {/* Reads the freshness tier, not a provider name. The old
+                    `data_source === "yahoo_finance"` test would have rendered
+                    "Fallback data" over a live broker feed (DD-2). */}
+                <Chip>{meta?.source_tier === "streaming" ? "Live market data"
+                     : meta?.source_tier === "delayed" ? "Delayed market data"
+                     : "Market data unavailable"}</Chip>
               </div>
             </div>
           </Reveal>

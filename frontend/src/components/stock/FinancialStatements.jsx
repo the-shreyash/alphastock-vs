@@ -115,7 +115,7 @@ export default function FinancialStatements({ symbol, enabled = true }) {
           </div>
         )}
         <p className="text-[10px] mt-3 text-right" style={{ color: "var(--text-muted)" }}>
-          All figures in {data?.unit || "₹ Cr"} · live from Yahoo Finance
+          All figures in {data?.unit || "₹ Cr"} · live market data
         </p>
       </SectionState>
     </motion.div>

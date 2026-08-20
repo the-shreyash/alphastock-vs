@@ -305,6 +305,20 @@ All endpoints return live market data.
 
 Market data endpoints are provider-agnostic: data is served from the Market Engine's normalized cache, fed by the Market Gateway (broker WebSocket, licensed feed, or Yahoo Finance — selected automatically per user by the Source Manager). Responses never expose the underlying provider; freshness is indicated by the source tier (streaming / delayed) and timestamps. See MARKET_DATA_ARCHITECTURE.md.
 
+**Provenance field (enforced since 2026-08-20, ADR-030).**
+
+`source_tier` — `"streaming"` | `"delayed"` | `null`
+
+It is the only provenance any market-data response carries, and its value is read from the Source Manager at request time rather than written as a constant, so it tracks whichever provider is actually serving. `null` means the feed is unavailable and the response says so explicitly (`available: false`).
+
+Returned by `/market/overview`, `/stocks/{symbol}/live`, `/stocks/{symbol}/intraday` and `/advisor/recommend`.
+
+Removed in the same change: `source: "yahoo_finance"` and the advisor's `data_source`. Both named a provider, and because both were literals they would have reported Yahoo for a broker-served quote. Clients must read `source_tier`; branching on a provider name is not supported and never was correct.
+
+`/market/sectors` returns rows keyed by the canonical `name`. A duplicate `sector` key carries the same value as a deprecated alias for unmigrated clients and will be removed — read `name`.
+
+Provider names remain visible on `/api/data-sources`, which is a diagnostics surface and is exempt by design.
+
 ---
 
 # Stock APIs

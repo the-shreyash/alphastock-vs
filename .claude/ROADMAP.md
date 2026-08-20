@@ -581,7 +581,13 @@ D1 — Market Gateway Foundation — **COMPLETE (2026-08-19)**
 
 Provider Adapter contract, Provider Registry, Source Manager foundation, and the Yahoo Finance migration behind the abstraction. The Market Engine and the AI Context Builder no longer contain provider-specific logic; adding a provider is one adapter + one normalizer + one registry entry. Three debts carried forward and tracked in TASK.md (DD-1…DD-5), the notable one being the `source: "yahoo_finance"` field still present in the public REST contract.
 
-D2 — Source Manager completion + frontend tier indicator (Live / Delayed); close the D1 debts.
+D2 — Source Manager completion — **BACKEND COMPLETE (2026-08-20)**
+
+Capability + entitlement + health resolution returning an ordered failover chain, walked inside a single request; a fourth health state (`unknown`); an explicit `UnavailableReason` in place of a silent `None`; a `ResolutionContext` (user, symbol, exchange) that makes per-user and per-symbol provider selection implementable in D3 without touching a call site. Market Engine and AI decoupling re-verified by structural tests. Scope decisions: ADR-029.
+
+DD-1 and DD-2 closed in a follow-up pass on 2026-08-20 (ADR-030): the public market routes read through the Market Gateway, the sector shape mismatch that blocked them is reconciled, and `source: "yahoo_finance"` is replaced across the public contract by `source_tier` read from the Source Manager. ADR-028's outstanding approval item is closed with it. DD-5 closed in D2.
+
+Carried forward: the reactive frontend tier indicator (DD-7) — `Markets.jsx` renders Live/Delayed from the REST `source_tier`, but nothing subscribes to `provider.status`, so a mid-session tier flip is not reflected until the next fetch. DD-3, DD-4, DD-6 and the DD-1a/b/c residue are tracked in TASK.md.
 
 D3 — Zerodha Kite WebSocket adapter: the streaming push surface, per-user resolution, make-before-break switching, failover to Yahoo. This stage delivers the headline feature.
 

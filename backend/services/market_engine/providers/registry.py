@@ -24,9 +24,11 @@ import logging
 from typing import Dict, List, Optional
 
 from services.market_engine.providers.base import (
+    GLOBAL_CONTEXT,
     Capability,
     MarketDataProvider,
     ProviderState,
+    ResolutionContext,
 )
 
 logger = logging.getLogger(__name__)
@@ -106,25 +108,52 @@ class ProviderRegistry:
             key=lambda p: (p.priority, _registration_index(self._providers, p)),
         )
 
-    def candidates_for(self, capability: Capability) -> List[MarketDataProvider]:
-        """Providers able to serve `capability`, in priority order, excluding
-        any that are currently DOWN.
+    def candidates_for(
+        self,
+        capability: Capability,
+        context: Optional[ResolutionContext] = None,
+    ) -> List[MarketDataProvider]:
+        """Providers able to serve `capability` for `context`, in priority
+        order, excluding any that are currently DOWN.
 
-        This is step 1–3 of the Resolution procedure in
-        MARKET_DATA_ARCHITECTURE.md: build the candidate list, filter out
-        unhealthy providers, filter out providers lacking the capability. Step
-        4 (pick the survivor) belongs to the Source Manager.
+        This is steps 1–3 of the Resolution procedure in
+        MARKET_DATA_ARCHITECTURE.md: build the candidate list from providers
+        whose entitlement applies to the request, drop the ones lacking the
+        capability, drop the ones that are unhealthy. Step 4 — picking among
+        the survivors, and ordering the rest as a failover chain — belongs to
+        the Source Manager. The registry stores and filters; it does not
+        choose, and keeping that line sharp is what stops selection policy from
+        settling into a data structure.
+
+        `context` defaults to the global context, so a caller with no user
+        attached (a scheduled refresh, a scanner sweep) sees exactly the
+        platform-wide providers.
 
         DEGRADED providers are deliberately kept: a provider failing
         intermittently still beats no data at all, and the tier below it may be
-        materially worse. Only DOWN is disqualifying.
+        materially worse. UNKNOWN providers are kept for a different reason —
+        they have never been tried, and filtering them out would make being
+        tried impossible. Only DOWN is disqualifying.
         """
+        ctx = context if context is not None else GLOBAL_CONTEXT
         return [
             provider
             for provider in self.all()
             if provider.supports(capability)
+            and provider.is_eligible_for(ctx)
             and provider.health().state is not ProviderState.DOWN
         ]
+
+    def entitled_for(self, context: ResolutionContext) -> List[MarketDataProvider]:
+        """Every provider whose entitlement applies to `context`, in priority
+        order, regardless of capability or health.
+
+        Used by diagnostics and by the Source Manager to tell "this user has no
+        provider at all" apart from "this user's providers cannot serve *this*
+        capability" — two situations with the same empty candidate list and
+        completely different meanings to an operator reading a log line.
+        """
+        return [p for p in self.all() if p.is_eligible_for(context)]
 
     def describe(self) -> List[dict]:
         """Diagnostic snapshot of every provider, in priority order.

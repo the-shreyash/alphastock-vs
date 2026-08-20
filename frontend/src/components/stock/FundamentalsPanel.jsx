@@ -5,7 +5,7 @@ import SectionState from "./SectionState";
 import { formatNumber } from "../../utils/formatters";
 
 // Group → field definitions matching the backend /fundamentals contract.
-// Missing Yahoo values arrive as null and render as "—" (never invented).
+// Missing provider values arrive as null and render as "—" (never invented).
 const GROUPS = [
   {
     key: "valuation",
@@ -122,7 +122,7 @@ export default function FundamentalsPanel({ symbol, enabled = true }) {
           })}
         </div>
         <p className="text-[10px] mt-3 text-right" style={{ color: "var(--text-muted)" }}>
-          Live from Yahoo Finance · missing fields shown as —
+          Live market data · missing fields shown as —
         </p>
       </SectionState>
     </motion.div>

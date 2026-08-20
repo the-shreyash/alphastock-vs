@@ -15,13 +15,20 @@ def session():
     return s
 
 
-# ---- Real Market Data (Yahoo Finance) ----
+# ---- Real Market Data ----
+#
+# These assert on `source_tier`, never on a provider name. Before DD-1 they
+# asserted `source == "yahoo_finance"`, which pinned the public contract to one
+# provider: connecting a broker feed would have turned this suite red for
+# working exactly as designed. The tier is the contract; who serves it is not.
 class TestRealMarketOverview:
-    def test_overview_returns_real_yahoo_data(self, session):
+    def test_overview_returns_real_market_data(self, session):
         r = session.get(f"{BASE_URL}/api/market/overview", timeout=20)
         assert r.status_code == 200
         d = r.json()
-        assert d.get("source") == "yahoo_finance", f"expected source=yahoo_finance, got {d.get('source')}"
+        assert d.get("source_tier") in ("delayed", "streaming"), \
+            f"expected a freshness tier, got {d.get('source_tier')}"
+        assert "source" not in d, "provider identity leaked into the public contract"
         for idx_key in ("nifty", "bank_nifty", "sensex"):
             assert idx_key in d, f"missing {idx_key}"
             assert "value" in d[idx_key]
@@ -59,7 +66,8 @@ class TestRealStockQuote:
         r = session.get(f"{BASE_URL}/api/stocks/RELIANCE", timeout=20)
         assert r.status_code == 200
         d = r.json()
-        assert d.get("source") == "yahoo_finance", f"expected yahoo_finance source, got {d.get('source')}"
+        assert d.get("source_tier") in ("delayed", "streaming"), \
+            f"expected a freshness tier, got {d.get('source_tier')}"
         assert d["symbol"] == "RELIANCE"
         price = d.get("price", 0)
         # Reliance has been between INR 1000-3500 historically; loose
@@ -72,7 +80,7 @@ class TestRealStockQuote:
         r = session.get(f"{BASE_URL}/api/stocks/TCS", timeout=20)
         assert r.status_code == 200
         d = r.json()
-        assert d.get("source") == "yahoo_finance"
+        assert d.get("source_tier") in ("delayed", "streaming")
         assert d["symbol"] == "TCS"
         price = d.get("price", 0)
         assert 1000 < price < 6000, f"TCS price {price} out of realistic range"

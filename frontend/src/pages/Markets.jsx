@@ -270,8 +270,18 @@ export default function Markets() {
                 Market {overview.market_status === "OPEN" ? "Open" : "Closed"}
               </span>
             )}
-            {overview?.source === "yahoo_finance" && (
-              <span className="badge-status" style={{ background: "var(--gain-bg)", color: "var(--gain)" }}>NSE</span>
+            {/* Feed freshness, never the provider. `source_tier` is the only
+                provenance the backend sends (MARKET_DATA_ARCHITECTURE.md,
+                Developer Rule 4); this used to branch on
+                `source === "yahoo_finance"`, which would have gone dark the day
+                a broker feed served the overview. */}
+            {overview?.source_tier && (
+              <span className="badge-status" style={{
+                background: overview.source_tier === "streaming" ? "var(--gain-bg)" : "var(--hover)",
+                color: overview.source_tier === "streaming" ? "var(--gain)" : "var(--text-muted)",
+              }}>
+                {overview.source_tier === "streaming" ? "Live" : "Delayed"}
+              </span>
             )}
           </div>
         </div>
@@ -326,8 +336,8 @@ export default function Markets() {
                     const isPos = s.change_pct >= 0;
                     const barWidth = Math.min(Math.abs(s.change_pct || 0) * 15, 100);
                     return (
-                      <div key={s.sector} className="flex items-center gap-3">
-                        <span className="text-[11px] font-medium w-20 shrink-0 truncate" style={{ color: "var(--text-secondary)" }}>{s.sector}</span>
+                      <div key={s.name || s.sector} className="flex items-center gap-3">
+                        <span className="text-[11px] font-medium w-20 shrink-0 truncate" style={{ color: "var(--text-secondary)" }}>{s.name || s.sector}</span>
                         <div className="flex-1 h-5 rounded-md overflow-hidden relative" style={{ background: "var(--hover)" }}>
                           <div className="h-full rounded-md transition-all duration-500" style={{
                             width: `${barWidth}%`,
