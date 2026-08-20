@@ -589,9 +589,15 @@ DD-1 and DD-2 closed in a follow-up pass on 2026-08-20 (ADR-030): the public mar
 
 Carried forward: the reactive frontend tier indicator (DD-7) — `Markets.jsx` renders Live/Delayed from the REST `source_tier`, but nothing subscribes to `provider.status`, so a mid-session tier flip is not reflected until the next fetch. DD-3, DD-4, DD-6 and the DD-1a/b/c residue are tracked in TASK.md.
 
-D3 — Zerodha Kite WebSocket adapter: the streaming push surface, per-user resolution, make-before-break switching, failover to Yahoo. This stage delivers the headline feature.
+D3 — Broker Provider Framework — **COMPLETE (2026-08-20)**
 
-D4 — Remaining broker adapters (Upstox, Angel One, Fyers, Dhan).
+**Re-scoped from the original plan.** D3 was written here as "the Zerodha Kite WebSocket adapter". Building that first would have hung the platform's headline feature off a broker layer that was still Zerodha-and-Upstox-shaped: a hardcoded broker dict rather than a registry, no capability model, no gateway, canonical shapes that existed only in a docstring, and broker names branched on inside `server.py`, `broker_engine.py` and `stream.py`. Every one of those would have had to be unpicked later, with a live streaming feature sitting on top of them. The framework comes first; the streaming feed is D4. Scope decisions and the full reasoning: ADR-031.
+
+Delivered: the Broker Capability Model, Broker Registry (with registration-time verification), Broker Gateway (the single choke point), canonical broker-data contracts, a broker health model separate from per-user session state, one broker error vocabulary with retry/recovery semantics, the authentication/configuration boundary, the canonical user → broker association, and Zerodha as the first adapter fully expressed in those terms. Adding a broker is now one adapter plus one registry entry, proven by a fictional broker built inside the test suite.
+
+Source Manager integration: the Broker Gateway now publishes `broker.connected` / `broker.disconnected`, and the Source Manager subscribes — MARKET_DATA_ARCHITECTURE.md's Source Manager responsibility 1, unimplementable before D3 because both topics were documented and never published.
+
+D4 — Broker market-data streaming + remaining brokers: the Zerodha Kite ticker as a registered priority-1 market provider, per-user resolution, make-before-break switching, failover to Yahoo — then Upstox, Angel One, Fyers, Dhan, each one adapter. This stage delivers the headline feature.
 
 D5 — Hardening: latency scoring, flap suppression, probation windows, multi-connection sharding, chaos tests.
 

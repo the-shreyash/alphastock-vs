@@ -1044,6 +1044,86 @@ MARKET_DATA_ARCHITECTURE.md
 
 ---
 
+# ADR-031
+
+Title
+
+Broker Provider Framework — Capability-Based, Provider-Independent Broker Integration (Sprint D3)
+
+Date
+
+2026-08-20
+
+Status
+
+Accepted — implemented
+
+Context
+
+Phase D's plan (ROADMAP.md, ADR-028) listed D3 as "the Zerodha Kite WebSocket adapter — the streaming push surface, make-before-break switching, failover to Yahoo", the market-data headline feature. Inspection before starting found a broker layer that already existed and was already load-bearing — `services/brokers/` with a `BrokerAdapter` ABC, Zerodha and Upstox adapters, encrypted per-user sessions, portfolio sync, live order streaming — and that was nonetheless not a framework:
+
+• **No registry.** The broker set was a module literal, `SUPPORTED_BROKERS = {"zerodha": …, "upstox": …}`, and `create_adapter()` built a fresh instance per call. Nothing could accumulate a broker's API health across requests, which is why BROKER_INTEGRATION.md's Admin Portal health monitoring had no data source.
+
+• **No capability model.** Every account-data and order method was `@abstractmethod`, so a broker missing an endpoint could only be integrated by writing stub methods that lie — raising from a method that claims to exist, or returning `[]` from one that claims to have looked.
+
+• **No gateway.** `BrokerEngine` held adapters and called them directly, so capability enforcement, response shape, error normalization and health had no single place to live.
+
+• **Canonical shapes in a docstring.** The normalized Holding/Position/Order/Trade/Funds shapes were documented at the top of `base.py` and enforced nowhere. Zerodha's `get_funds` returned Kite's whole `equity`/`commodity` margin tree under a `raw` key, straight through to core services.
+
+• **Broker names in core code.** `server.py` chose an order product with `"CNC" if broker == "zerodha" else "D"` (twice) and branched on the broker name to parse its OAuth callback; `BrokerEngine.start_stream` branched on `if broker == "zerodha":` and read `KITE_API_KEY` by name; `stream.py` dispatched its run loop on the broker name.
+
+Building the streaming feed first would have hung the platform's headline feature on all of that, and every item would have had to be unpicked afterwards with a live feature sitting on top.
+
+Decision
+
+**D3 is re-scoped from "first WebSocket adapter" to "Broker Provider Framework". Broker market-data streaming moves to D4.**
+
+The framework, all under `services/brokers/`:
+
+1. **`capabilities.py`** — `BrokerCapability`, and `CAPABILITY_METHODS` binding each capability to the adapter method that serves it, which is what makes the model *verifiable* rather than decorative.
+
+2. **`registry.py`** — `BrokerRegistry`, one long-lived adapter per broker, with registration-time validation: an adapter declaring a capability it has not implemented fails at import, not at 09:15 on a Monday. A `@capability_stub` mark distinguishes a default that only raises (declaring it is a defect) from one that genuinely works — `get_margins` delegating to `get_funds` — which identity comparison against the base class could not.
+
+3. **`gateway.py`** — `BrokerGateway`, the single choke point. Four guarantees on every call: capability enforcement before the adapter is reached, canonical shapes, one error family, health bookkeeping.
+
+4. **`contracts.py`** — the canonical shapes as dataclasses that know how to build themselves from an adapter payload. Coercion is lenient (a missing optional field becomes its zero value) and validation is narrow (an order with no id is rejected, because an untrackable order in the order book is worse than an error). `BrokerOrderAck` is deliberately separate from `BrokerOrder`: `place_order` persists `{**request, **ack}`, so a full-order ack would overwrite the request's real quantity and price with default zeros.
+
+5. **`errors.py`** — one error vocabulary. The existing wire codes are adopted verbatim rather than tidied, because they are already on the public contract; what is added is that retry policy and recovery hints are *derived* from the code instead of re-decided per call site, and `normalize_broker_error` guarantees no `httpx`, `KeyError` or `struct.error` crosses the gateway.
+
+6. **`health.py`** — broker API health, distinct from a user's session. **An auth failure never counts against it.** Kite invalidates every access token daily at 06:00 IST, so at 06:01 every connected user's next call raises `BrokerAuthError`; counting those would drive Zerodha to DOWN every morning while its API was perfectly available.
+
+7. **`credentials.py`** — the authentication/configuration boundary. Adapters *declare* which environment variables carry their credentials and never read them, which is what lets `BrokerEngine` open a broker stream without naming a single secret.
+
+8. **`BrokerConnection`** — the canonical user → broker association, carrying no token material so it is safe on events, in logs and in AI context.
+
+Consequences
+
+• **Adding a broker is one adapter plus one registry entry.** Proven, not asserted: `tests/test_broker_framework.py` defines `AcmeBrokerAdapter` — a fictional, deliberately *partial* broker with its own product code ("DELIVERY", neither Zerodha's nor Upstox's) — built from nothing but the public contract, and exercises it end to end with no core module changed. Structural tests assert that the Trading Engine, Portfolio Engine, portfolio/trade streams, AI Context Builder, paper trading and the Broker Engine name no broker in executable code.
+
+• **Three broker-name leaks in core are closed.** The order-product default now comes from the adapter (the old `else` branch silently handed Upstox's product code to every future broker); OAuth callback parsing moved to the adapter (the old `else` assumed every future broker speaks Upstox's dialect); the stream transport dispatches on a declared `stream_protocol`, so two brokers on one vendor API share a transport and a new protocol adds a table entry rather than a branch.
+
+• **Two defects were found and fixed on the way.** `_request` logged the full broker URL on 401/403, and Kite's logout endpoint carries the access token *in the query string* — so a rejected logout, which is exactly what an already-dead token produces, wrote a live broker access token into the application log. URLs are now stripped of their query before logging. Separately, `BROKER_FORCE_IPV4` was evaluated once at import, so a deployment setting it after the process read its environment silently kept the import-time answer.
+
+• **Kite's `raw` margin tree no longer reaches core services.** Nothing read it; any consumer that had started to would have been reading a shape only one broker produces.
+
+• **The Source Manager can finally do its job.** `broker.connected` / `broker.disconnected` were documented in BROKER_INTEGRATION.md and published by nothing, so MARKET_DATA_ARCHITECTURE.md's Source Manager responsibility 1 was unimplementable. The Broker Gateway publishes them with the broker's capabilities attached; the Source Manager subscribes and maintains the per-user connected-broker registry. The two subsystems meet only on the Event Bus — the Market Engine imports no broker module and the broker layer imports no Market Engine module.
+
+• **D3 deliberately does NOT register a broker as a market-data provider.** Doing so would have meant either a fabricated `streaming` tier (forbidden outright by CLAUDE.md's data rules) or a REST-polled provider silently taking a connected user's quotes away from the Yahoo baseline with none of the make-before-break machinery that makes such a switch safe. Pinned by `test_d3_does_not_register_a_broker_as_a_market_data_provider` so D4 has a red-to-green target.
+
+• `SUPPORTED_BROKERS` and `create_adapter()` survive as deprecated views *derived from* the registry, so they cannot drift from what is actually registered.
+
+• Nothing user-visible changed. 3064 backend tests pass (3015 before D3 plus 49 new); the 15 failures in `test_entrypoint_log_level.py` are the documented pre-existing Docker-daemon baseline.
+
+Review Date
+
+At D4, when the first broker feed is registered as a market-data provider and `source_tier` first takes the value `"streaming"` in production.
+
+Authoritative documents
+
+BROKER_INTEGRATION.md (broker behavior), MARKET_DATA_ARCHITECTURE.md (market data behavior)
+
+---
+
 # Pending Decisions
 
 Future decisions to document.

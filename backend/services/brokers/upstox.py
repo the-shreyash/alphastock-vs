@@ -12,13 +12,14 @@ instrument keys from the user's own holdings/positions; callers may also pass
 `instrument_token` explicitly.
 """
 import logging
-import os
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode
 
 from services.brokers.base import (
     IST, BrokerAdapter, BrokerAuthError, BrokerError, normalize_status,
 )
+from services.brokers.capabilities import BrokerCapability
+from services.brokers.credentials import BrokerCredentialSpec
 
 logger = logging.getLogger(__name__)
 
@@ -30,16 +31,46 @@ class UpstoxAdapter(BrokerAdapter):
     name = "upstox"
     display_name = "Upstox"
 
-    def _credentials(self):
-        return (
-            os.environ.get("UPSTOX_API_KEY", "").strip(),
-            os.environ.get("UPSTOX_API_SECRET", "").strip(),
-            os.environ.get("UPSTOX_REDIRECT_URL", "").strip(),
-        )
+    #: Upstox v2 covers the account, order and order-stream surface. TICK_STREAM
+    #: is absent because the Upstox market feed is a separate protobuf endpoint
+    #: this adapter does not speak — the portfolio stream carries order updates
+    #: only. Declaring the absence is what lets the engine open an order-only
+    #: stream for Upstox and a tick-carrying stream for Zerodha from the same
+    #: broker-agnostic code path.
+    capabilities = frozenset({
+        BrokerCapability.PROFILE,
+        BrokerCapability.HOLDINGS,
+        BrokerCapability.POSITIONS,
+        BrokerCapability.FUNDS,
+        BrokerCapability.MARGINS,
+        BrokerCapability.ORDERS,
+        BrokerCapability.TRADES,
+        BrokerCapability.PLACE_ORDER,
+        BrokerCapability.MODIFY_ORDER,
+        BrokerCapability.CANCEL_ORDER,
+        BrokerCapability.SESSION_INVALIDATE,
+        BrokerCapability.ORDER_STREAM,
+    })
 
-    def is_configured(self) -> bool:
-        api_key, api_secret, redirect = self._credentials()
-        return bool(api_key and api_secret and redirect)
+    credential_spec = BrokerCredentialSpec(
+        api_key_env="UPSTOX_API_KEY",
+        api_secret_env="UPSTOX_API_SECRET",
+        redirect_url_env="UPSTOX_REDIRECT_URL",
+        #: Upstox will not issue a token without a registered redirect URL, so
+        #: it is required for this broker where it is optional for Zerodha.
+        required=("api_key", "api_secret", "redirect_url"),
+    )
+
+    #: Upstox's delivery product code.
+    default_product = "D"
+
+    #: Upstox v2 portfolio stream (JSON order updates).
+    stream_protocol = "upstox_portfolio"
+
+    def _credentials(self):
+        """(api_key, api_secret, redirect_url) — via the credentials boundary."""
+        creds = self.credentials
+        return creds.api_key, creds.api_secret, creds.redirect_url
 
     def _headers(self, session: dict) -> dict:
         token = (session or {}).get("access_token")
@@ -208,6 +239,10 @@ class UpstoxAdapter(BrokerAdapter):
             "product": t.get("product"),
             "executed_at": t.get("exchange_timestamp") or t.get("order_timestamp"),
         } for t in rows or []]
+
+    def normalize_stream_order(self, payload: dict) -> dict:
+        """Canonicalize an Upstox portfolio-stream order frame."""
+        return self._normalize_order(payload or {})
 
     @staticmethod
     def _normalize_order(o: dict) -> dict:

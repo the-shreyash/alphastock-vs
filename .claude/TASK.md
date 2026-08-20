@@ -2220,9 +2220,9 @@ Design approved and documented in MARKET_DATA_ARCHITECTURE.md (2026-07-16); ADR-
 Implementation phases (per MARKET_DATA_ARCHITECTURE.md):
 
 - [x] **D1 / Phase 1 — Market Gateway Foundation** — **COMPLETE (2026-08-19)** — Provider Adapter contract, Provider Registry, Source Manager foundation, Yahoo migration. Scope decisions in **ADR-028**.
-- [ ] D2 / Phase 2 — Source Manager completion + `provider.status` consumed by the frontend tier indicator (Live/Delayed) + close the D1 debts below
-- [ ] D3 / Phase 3 — Zerodha Kite WebSocket adapter; streaming push surface (`subscribe`/`on_raw`); per-user resolution; make-before-break switching; failover to Yahoo
-- [ ] D4 / Phase 4 — Remaining broker adapters (Upstox, Angel One, Fyers, Dhan)
+- [x] **D2 / Phase 2 — Source Manager completion** — **BACKEND COMPLETE (2026-08-20)** — failover chain, `UnavailableReason`, `ResolutionContext`, `unknown` health. Scope decisions in **ADR-029**; public-contract reconciliation in **ADR-030**. Frontend reactive tier indicator outstanding (DD-7).
+- [x] **D3 / Phase 3 — Broker Provider Framework** — **COMPLETE (2026-08-20)** — re-scoped from "Zerodha Kite WebSocket adapter"; scope decisions in **ADR-031**. See "D3 — What shipped" below.
+- [ ] D4 / Phase 4 — Broker market-data streaming (Zerodha Kite ticker as a registered priority-1 provider, streaming push surface `subscribe`/`on_raw`, tick normalization, per-user resolution, make-before-break switching, failover to Yahoo) + remaining broker adapters (Upstox, Angel One, Fyers, Dhan)
 - [ ] D5 / Phase 5 — Hardening: latency scoring, flap suppression, probation windows, multi-connection sharding, chaos tests
 - [ ] D6 / Phase 6 — Enterprise/licensed feeds (future)
 
@@ -2252,6 +2252,61 @@ Implementation phases (per MARKET_DATA_ARCHITECTURE.md):
 **Validation**
 
 Backend suite **2,964 passed / 15 failed** — the 15 are the pre-existing `test_entrypoint_log_level.py` failures (`python: command not found`; the Docker entrypoint tests need the container's PATH) and are unchanged from the pre-D1 baseline of 2,921 passed / 15 failed. flake8 clean on every touched file (one pre-existing warning removed). **Seven falsification probes run**: each guard was mutated and observed to fail — provider leak restored → 2 red; normalizer key hardcoded → 1 red; index-name fix reverted → 1 red; new bypass module added → 1 red; provider named in a non-adapter engine module → 1 red; gateway re-importing the provider client → 1 red; AI layer reverted to `real_market` → 1 red.
+
+## D3 — What shipped
+
+**Re-scoped before starting.** D3 was planned as the Zerodha Kite WebSocket market-data adapter. The broker layer underneath it was not yet a framework — a hardcoded broker dict rather than a registry, no capability model, no broker gateway, canonical shapes documented only in a docstring, and broker names branched on inside `server.py`, `broker_engine.py` and `stream.py`. Building the headline streaming feature on top of that would have meant unpicking all of it later with a live feature sitting on it. Framework first; streaming feed is D4. Full reasoning: **ADR-031**.
+
+**Created** (all under `backend/services/brokers/`)
+
+- `capabilities.py` — `BrokerCapability` (14 capabilities) + `CAPABILITY_METHODS` binding each to the adapter method that serves it, which is what makes the model verifiable rather than decorative.
+- `registry.py` — `BrokerRegistry`, one long-lived adapter per broker, with registration-time validation. A `@capability_stub` mark distinguishes a base default that only raises (declaring it is a defect) from one that genuinely works (`get_margins` → `get_funds`), which identity comparison against the base class could not.
+- `gateway.py` — `BrokerGateway`, the single choke point: capability enforcement before the adapter is reached, canonical coercion, error normalization, health bookkeeping.
+- `contracts.py` — `BrokerProfile`, `BrokerHolding`, `BrokerPosition`, `BrokerOrder`, `BrokerOrderAck`, `BrokerTrade`, `BrokerFunds`, `BrokerConnection`.
+- `errors.py` — `BrokerErrorCode` (11 codes, existing wire values preserved), `CapabilityUnsupported`, `UnknownBrokerError`, `BrokerContractError`, `normalize_broker_error`; retry and recovery derived from the code.
+- `health.py` — `BrokerConnectionState` + `BrokerHealth`, with auth failures counted separately and excluded from the state machine.
+- `credentials.py` — `BrokerCredentialSpec` / `BrokerCredentials` / `resolve_credentials`: the authentication and configuration boundary.
+- `backend/tests/test_broker_framework.py` — 49 tests, including `AcmeBrokerAdapter`, a fictional partial broker that proves adding a broker touches no core module.
+
+**Modified**
+
+- `brokers/base.py` — capability-gated fetch surface replacing nine `@abstractmethod`s; `capabilities`, `credential_spec`, `default_product`, `default_variety`, `stream_protocol`; `parse_callback_params`, `stream_credentials`, `stream_instruments`, `normalize_stream_order`, `describe`.
+- `brokers/zerodha.py`, `brokers/upstox.py` — capability declarations, credential specs, stream protocols; no `os.environ` remains in either.
+- `brokers/stream.py` — dispatch by `stream_protocol` through `PROTOCOL_RUNNERS` instead of `if self.broker == "zerodha"`; frame normalization via the adapter instead of importing adapter classes by name; `credentials` dict replacing a Kite-specific `api_key`.
+- `brokers/__init__.py` — registry wiring; `SUPPORTED_BROKERS` and `create_adapter` retained as deprecated views *derived from* the registry so they cannot drift.
+- `broker_engine.py` — every broker call routed through the gateway; publishes `broker.connected` / `broker.disconnected`; `get_status` built from `BrokerConnection`; the `if broker == "zerodha"` stream branch and the `KITE_API_KEY` read are gone.
+- `server.py` — `_require_broker` and `preferred_broker` validate against the registry; the two `"CNC" if broker == "zerodha" else "D"` product defaults removed; the OAuth callback's broker-name branch replaced by `parse_callback_params`.
+- `market_engine/source_manager.py` — subscribes to broker lifecycle events; `connected_brokers()`, `streaming_brokers()`, `has_broker_connected()`.
+- `market_engine/gateway.py` — subscribes the Source Manager to broker events at initialisation.
+
+**Three broker-name leaks in core closed**
+
+1. Order product default — the old `else` branch silently handed Upstox's product code to every broker added after it.
+2. OAuth callback parsing — the old `else` assumed every future broker speaks Upstox's dialect.
+3. Stream dispatch — a broker-name chain that grew by one branch per broker in a module no broker owns.
+
+**Two defects found and closed on the way**
+
+1. **A live broker access token could be written to the application log.** `_request` logged the full broker URL on 401/403, and Kite's logout endpoint carries the access token *in the query string* — so a rejected logout (exactly what an already-dead token produces) leaked it. URLs are now stripped of their query before logging. Violated SECURITY.md's no-credentials-in-logs rule.
+2. **`BROKER_FORCE_IPV4` was evaluated once at import**, so a deployment setting it after the process read its environment silently kept the import-time answer. Read at call time now.
+
+**Validation**
+
+Backend suite **3,064 passed** (3,015 before D3 + 49 new), 4 xfailed, 0 failed. `test_entrypoint_log_level.py` remains at its documented pre-existing baseline of 15 failures (needs a Docker daemon) — unchanged by D3. flake8 clean repo-wide on the blocking selection and fully clean on all eight new files; `black` and `isort` clean on all eight (CI's blocking format check applies to added files). No secrets; no mock or simulated data introduced.
+
+**Deliberately NOT done in D3** (each deferred to D4, each pinned by a test)
+
+- No broker registered as a *market data* provider. That requires either a fabricated `streaming` tier (forbidden by CLAUDE.md's data rules) or a REST-polled provider silently displacing the Yahoo baseline without make-before-break. Pinned by `test_d3_does_not_register_a_broker_as_a_market_data_provider`.
+- No broker WebSocket market feed, no `subscribe`/`on_raw` push surface on `MarketDataProvider`.
+- No DD-6 provider recovery / re-probe.
+- No Upstox, Angel One, Groww, INDmoney, Dhan or Fyers *new* adapters (Upstox was already present and was brought onto the framework).
+
+## D3 — Debts carried into D4
+
+- **DB-1 — Broker health is process-local.** `BrokerHealth` lives on the registry's adapter instance, so a multi-worker deployment has one health view per worker and the Admin Portal sees whichever worker answers. Acceptable while health is diagnostic; it needs a shared store (Redis, as `infrastructure/` already provides) before it drives any automatic behaviour.
+- **DB-2 — The per-user connected-broker registry is process-local and not restored at startup.** `SourceManager._connected_brokers` is populated only by live lifecycle events, so a restart forgets who is connected until each user's session is exercised. `BrokerEngine.load_sessions()` is the natural place to re-publish `broker.connected` for restored sessions; deferred because nothing consumes the registry yet. Closing this is a prerequisite for D4's feed switch.
+- **DB-3 — Stream transports still live in `stream.py` rather than in the adapters.** Dispatch is by protocol and no broker-name branch remains, so adding a broker no longer edits a branch — but a broker with a genuinely new protocol still adds its transport to a shared module. Moving each transport into its owning adapter is the cleaner end state and belongs with D4's streaming work, not before it.
+- **DB-4 — `/api/zerodha/*` legacy routes remain.** A deprecated public surface with its own URL prefix (not a framework leak); they delegate to the Broker Engine. Retire with a deprecation window.
 
 ## D1 — Debts carried into D2 (tracked, tested, not hidden)
 

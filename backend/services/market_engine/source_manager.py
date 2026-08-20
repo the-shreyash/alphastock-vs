@@ -43,9 +43,33 @@ D2 makes real because each one is load-bearing before a second provider exists:
   * **`UNKNOWN` health.** A provider registered a millisecond ago no longer
     reports the same state as one that has served ten thousand clean requests.
 
-Still deferred, with the sprint that owns each: the streaming push surface and
-per-user broker detection (D3); probation windows, latency scoring and flap
-suppression (D5 / Phase 5 in MARKET_DATA_ARCHITECTURE.md).
+WHAT D3 ADDED
+-------------
+Responsibility 1 of this service in MARKET_DATA_ARCHITECTURE.md — "subscribes to
+broker connection lifecycle events ... maintains a per-user registry: which
+brokers are connected, authenticated, and streaming-capable right now" — was
+unimplementable before D3 for a mundane reason: `broker.connected` and
+`broker.disconnected` were documented in BROKER_INTEGRATION.md and never
+published by anything. D3's Broker Gateway publishes them, and this service now
+subscribes: :meth:`connected_brokers` answers who is connected, and
+:meth:`streaming_brokers` answers which of those connections could carry a
+market feed, read from the capabilities the event carries rather than by
+importing a broker module.
+
+What D3 deliberately does NOT do is register a broker as a *market data
+provider*. MARKET_DATA_ARCHITECTURE.md's Category 2 upgrade is a streaming
+feed — the broker WebSocket, make-before-break switching, tick normalization —
+and D3's brief defers broker streaming to D4. Registering a provider now would
+mean either a fabricated streaming tier (forbidden outright by CLAUDE.md's data
+rules) or a REST-polled provider silently taking a connected user's quotes away
+from the baseline without any of the switching machinery that makes that safe.
+The registry this class now keeps is exactly the record D4 attaches that
+registration to.
+
+Still deferred, with the sprint that owns each: the streaming push surface,
+per-user provider registration and make-before-break switching (D4); probation
+windows, latency scoring and flap suppression (D5 / Phase 5 in
+MARKET_DATA_ARCHITECTURE.md).
 
 WHY RESOLUTION IS STILL NOT CACHED
 -----------------------------------
@@ -87,6 +111,20 @@ FEED_UNAVAILABLE = "unavailable"
 #: Topic on the existing Event Bus. Payload carries `tier`, `state` and an
 #: unavailability `reason` — never a provider name (Developer Rule 4).
 PROVIDER_STATUS_TOPIC = "provider.status"
+
+#: Broker lifecycle topics published by the Broker Gateway (D3). Subscribed
+#: rather than called, so the Market Engine never imports a broker module and
+#: the broker layer never imports the Market Engine — the two subsystems meet
+#: only on the Event Bus.
+BROKER_CONNECTED_TOPIC = "broker.connected"
+BROKER_DISCONNECTED_TOPIC = "broker.disconnected"
+
+#: The broker capability that makes a connection a candidate market feed. A
+#: string, not an import: comparing to `BrokerCapability.TICK_STREAM.value`
+#: would mean the Market Engine importing the broker package, which is the
+#: coupling the Event Bus boundary exists to avoid. The value is part of the
+#: published event contract.
+TICK_STREAM_CAPABILITY = "tick_stream"
 
 #: Selection order among providers that survived filtering. Lower wins.
 #:
@@ -164,6 +202,11 @@ class SourceManager:
     def __init__(self, registry: Optional[ProviderRegistry] = None) -> None:
         self._registry = registry if registry is not None else provider_registry
         self._last_status: Optional[Dict[str, Any]] = None
+        #: user_id -> {broker_name: (capabilities,)}. Populated from Event Bus
+        #: broker lifecycle events; never written by anything that imports a
+        #: broker module.
+        self._connected_brokers: Dict[str, Dict[str, Tuple[str, ...]]] = {}
+        self._broker_events_subscribed = False
 
     @property
     def registry(self) -> ProviderRegistry:
@@ -367,6 +410,92 @@ class SourceManager:
         )
         return current
 
+    # ── Broker connection tracking (D3) ──────────────────
+
+    def subscribe_broker_events(self) -> None:
+        """Listen for broker connect/disconnect on the Event Bus.
+
+        Idempotent: the Event Bus appends handlers without de-duplicating, so a
+        second subscription would double-handle every event, and startup paths
+        in this codebase demonstrably run more than once (reload, test
+        re-import, worker fork). Guarding here rather than asking every caller
+        to remember is the same choice the provider registry makes about
+        duplicate registration.
+        """
+        if self._broker_events_subscribed:
+            return
+        event_bus.subscribe(BROKER_CONNECTED_TOPIC, self._on_broker_connected)
+        event_bus.subscribe(BROKER_DISCONNECTED_TOPIC, self._on_broker_disconnected)
+        self._broker_events_subscribed = True
+        logger.info("SourceManager subscribed to broker lifecycle events")
+
+    async def _on_broker_connected(self, event: Dict[str, Any]) -> None:
+        data = event.get("data") or {}
+        self.record_broker_connected(
+            data.get("user_id"), data.get("broker"), data.get("capabilities") or [])
+
+    async def _on_broker_disconnected(self, event: Dict[str, Any]) -> None:
+        data = event.get("data") or {}
+        self.record_broker_disconnected(data.get("user_id"), data.get("broker"))
+
+    def record_broker_connected(self, user_id: Optional[str], broker: Optional[str],
+                                capabilities: Any = ()) -> None:
+        """Record that `user_id` has `broker` connected, with `capabilities`.
+
+        Separate from the event handler so the state transition is callable and
+        assertable without constructing an event envelope — and so a future
+        caller with the information in hand does not have to publish an event to
+        itself.
+        """
+        if not user_id or not broker:
+            logger.warning("Ignoring broker.connected with no user or broker: %r/%r",
+                           user_id, broker)
+            return
+        self._connected_brokers.setdefault(str(user_id), {})[broker] = tuple(capabilities)
+        logger.info("Source Manager: broker %s connected for user %s (capabilities=%s)",
+                    broker, user_id, ",".join(capabilities) or "none")
+
+    def record_broker_disconnected(self, user_id: Optional[str],
+                                   broker: Optional[str]) -> None:
+        """Record that `user_id` no longer has `broker` connected."""
+        if not user_id or not broker:
+            return
+        brokers = self._connected_brokers.get(str(user_id))
+        if not brokers:
+            return
+        brokers.pop(broker, None)
+        if not brokers:
+            # Drop the empty user entry rather than keeping it. This map is
+            # per-process and unbounded otherwise: one residual key per user who
+            # has ever connected a broker, for the life of the process.
+            self._connected_brokers.pop(str(user_id), None)
+        logger.info("Source Manager: broker %s disconnected for user %s", broker, user_id)
+
+    def connected_brokers(self, user_id: Optional[str]) -> List[str]:
+        """Brokers this user currently has connected, in connection order."""
+        if not user_id:
+            return []
+        return list(self._connected_brokers.get(str(user_id), {}))
+
+    def streaming_brokers(self, user_id: Optional[str]) -> List[str]:
+        """Connected brokers whose feed could serve streaming market data.
+
+        The question MARKET_DATA_ARCHITECTURE.md's priority algorithm asks first,
+        answered from the capabilities carried on the lifecycle event rather than
+        by importing a broker module. D4 turns a non-empty answer here into a
+        registered priority-1 provider; D3 stops at being able to ask.
+        """
+        if not user_id:
+            return []
+        return [
+            broker
+            for broker, capabilities in self._connected_brokers.get(str(user_id), {}).items()
+            if TICK_STREAM_CAPABILITY in capabilities
+        ]
+
+    def has_broker_connected(self, user_id: Optional[str]) -> bool:
+        return bool(self.connected_brokers(user_id))
+
     # ── Health bookkeeping (called by the gateway) ───────
 
     def record_success(self, provider: MarketDataProvider, *, empty: bool = False) -> bool:
@@ -397,8 +526,10 @@ class SourceManager:
         return provider.record_failure(exc) is not None
 
     def reset(self) -> None:
-        """Drop cached status and every provider's health. Startup and tests only."""
+        """Drop cached status, broker tracking and every provider's health.
+        Startup and tests only."""
         self._last_status = None
+        self._connected_brokers.clear()
         for provider in self._registry.all():
             provider.reset_health()
 

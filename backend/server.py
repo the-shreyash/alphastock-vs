@@ -2113,7 +2113,9 @@ async def create_trade(data: TradeCreate, user: dict = Depends(get_current_user)
                 "transaction_type": data.type, "quantity": data.quantity,
                 "order_type": data.order_type,
                 "price": data.entry_price if data.order_type == "LIMIT" else None,
-                "product": data.product or ("CNC" if broker == "zerodha" else "D"),
+                # No product default here: the Broker Gateway fills the
+                # adapter's own product code when the caller does not choose one.
+                "product": data.product,
                 "tag": "engine-entry",
             })
             broker_order_id = placed.get("order_id")
@@ -3159,9 +3161,9 @@ async def update_settings(data: UserSettingsUpdate, user: dict = Depends(get_cur
     if data.preferred_broker is not None:
         # The user's chosen trading platform. "" clears the choice — there is
         # never an implicit default broker.
-        from services.brokers import SUPPORTED_BROKERS
+        from services.brokers import broker_registry
         choice = data.preferred_broker.strip().lower()
-        if choice and choice not in SUPPORTED_BROKERS:
+        if choice and choice not in broker_registry:
             raise HTTPException(status_code=422, detail=f"Unsupported broker: {choice}")
         update["preferred_broker"] = choice or None
     if data.notification_prefs is not None:
@@ -4046,9 +4048,14 @@ brokers_router = APIRouter(prefix="/api/brokers", tags=["Brokers"])
 
 
 def _require_broker(broker: str) -> str:
-    from services.brokers import SUPPORTED_BROKERS
+    """Validate a broker path parameter against the Broker Registry.
+
+    Asks the registry rather than a hardcoded set, so a broker becomes routable
+    by being registered — no route changes when D4 adds one.
+    """
+    from services.brokers import broker_registry
     broker = (broker or "").lower()
-    if broker not in SUPPORTED_BROKERS:
+    if broker not in broker_registry:
         raise HTTPException(status_code=404, detail=f"Unsupported broker: {broker}")
     return broker
 
@@ -4103,15 +4110,13 @@ async def broker_oauth_callback(broker: str, request: Request):
     if not uid and state.startswith("uid="):
         uid = state[4:]
 
-    auth_payload = {}
-    if broker == "zerodha":
-        if params.get("status") != "success" or not params.get("request_token"):
-            return RedirectResponse(url=f"{frontend}/settings?broker=zerodha&status=cancelled")
-        auth_payload = {"request_token": params.get("request_token")}
-    else:  # upstox
-        if params.get("error") or not params.get("code"):
-            return RedirectResponse(url=f"{frontend}/settings?broker={broker}&status=cancelled")
-        auth_payload = {"code": params.get("code")}
+    # The adapter parses its own redirect shape (Kite sends request_token +
+    # status; standard OAuth2 brokers send code + error). This route used to
+    # branch on the broker name, with an `else` that assumed every future broker
+    # speaks Upstox's dialect.
+    auth_payload = broker_engine.parse_callback_params(broker, dict(params))
+    if not auth_payload:
+        return RedirectResponse(url=f"{frontend}/settings?broker={broker}&status=cancelled")
 
     try:
         await broker_engine.complete_auth(broker, uid, auth_payload)
@@ -4173,7 +4178,11 @@ async def broker_place_order(broker: str, order: BrokerOrderCreate, user: dict =
     """Place a LIVE order via the official broker API (no simulation)."""
     broker = _require_broker(broker)
     payload = order.model_dump(exclude_none=True)
-    payload.setdefault("product", "CNC" if broker == "zerodha" else "D")
+    # The product default comes from the adapter (`BrokerGateway.place_order`),
+    # not from a broker name in this route. The expression here used to be
+    # `"CNC" if broker == "zerodha" else "D"`, which named a broker in a core
+    # route AND silently handed Upstox's product code to every broker added
+    # after it.
     return await broker_engine.place_order(str(user["_id"]), broker, payload)
 
 @brokers_router.patch("/{broker}/orders/{order_id}")

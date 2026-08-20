@@ -2210,37 +2210,48 @@ Positions
 
 Trade History
 
-The Broker Engine should expose one unified interface.
+The Broker Engine exposes one unified interface.
 
 Other services never interact with brokers directly.
 
 ---
 
-Broker Adapter Pattern
+Broker Provider Framework (implemented Sprint D3, ADR-031)
 
 ```
 
-Trading Engine
+Trading Engine / Portfolio Engine / Routes / AI
 
 ↓
 
-Broker Interface
+Broker Engine        sessions · encryption · persistence · sync · audit · events
 
 ↓
 
-Zerodha Adapter
+Broker Gateway       capability enforcement · canonical contracts
+                     error normalization · health           ← the choke point
 
 ↓
 
-Upstox Adapter
+Broker Registry      the brokers this deployment knows
 
 ↓
 
-Future Broker Adapter
+Broker Adapter       Zerodha · Upstox · future brokers
+
+↓
+
+Broker API
 
 ```
 
-Every broker implements the same interface.
+**Nothing above the Broker Gateway may hold a broker adapter.** The broker-side counterpart of the Market Gateway rule, and the reason capability enforcement, response shape, error vocabulary and health can be guaranteed once instead of per call site.
+
+Every broker declares a **capability set** rather than implementing every method. Do not assume every broker supports every capability: Kite Connect has no refresh grant, Upstox exposes no market-tick feed on its portfolio stream. The gateway refuses an undeclared capability before the adapter is reached, and the registry verifies at startup that every declared capability is actually implemented.
+
+Adding a broker is one adapter plus one registry entry — no change to the Trading Engine, the Portfolio Engine, the AI, any route, or the frontend. Authoritative document: BROKER_INTEGRATION.md.
+
+Market data and broker providers are separate concepts. A broker may also be a *market data* provider (MARKET_DATA_ARCHITECTURE.md, priority 1), and that registration is D4's work; the Broker Gateway publishes `broker.connected` / `broker.disconnected` with the broker's capabilities so the Source Manager can track who is connected without importing a broker module.
 
 ---
 

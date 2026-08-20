@@ -3,7 +3,7 @@
 
 Version: 1.1
 
-Status: Approved Design — Phase 1 Implemented (Sprint D1, 2026-08-19); Phase 2 Implemented in backend (Sprint D2, 2026-08-20, frontend tier indicator outstanding); Phases 3–6 pending
+Status: Approved Design — Phase 1 Implemented (Sprint D1, 2026-08-19); Phase 2 Implemented in backend (Sprint D2, 2026-08-20, frontend tier indicator outstanding); Phase 3 re-scoped to the Broker Provider Framework and Implemented (Sprint D3, 2026-08-20, ADR-031); Phases 4–6 pending
 
 Priority: Critical
 
@@ -793,9 +793,28 @@ Closed alongside D2:
 • **DD-5** — no live UI surface names a provider any more.
 • **DD-1 / DD-2 (2026-08-20, ADR-030)** — the public market routes read through the gateway, the sector shape is reconciled (canonical `name` plus a deprecated `sector` alias), and `source: "yahoo_finance"` is replaced everywhere by `source_tier` sourced from the Source Manager. ADR-028's open approval item is closed. `Markets.jsx` already renders Live/Delayed from `source_tier`, which is most of the tier indicator's groundwork.
 
-**Phase 3 — First broker adapter.** Zerodha Kite WebSocket adapter + normalizer, per-user resolution, make-before-break switching, failover back to Yahoo. This phase delivers the headline feature.
+**Phase 3 — Broker Provider Framework.** ⚠️ **RE-SCOPED, then IMPLEMENTED — Sprint D3, 2026-08-20 (ADR-031).**
 
-**Phase 4 — Remaining brokers.** Upstox, Angel One, Fyers, Dhan — each is Phase 3's pattern repeated.
+Phase 3 was specified here as "the Zerodha Kite WebSocket adapter". Inspection before D3 found that the broker layer underneath it was not yet a framework — a hardcoded broker dict rather than a registry, no capability model, no broker gateway, canonical shapes documented only in a docstring, and broker names branched on inside `server.py`, `broker_engine.py` and `stream.py`. Building the streaming feed first would have hung the headline feature on all of that. D3 built the framework; the streaming feed moved to Phase 4.
+
+What D3 delivered that this document depends on:
+
+```
+services/brokers/
+    capabilities.py  BrokerCapability + registration-time verification
+    registry.py      BrokerRegistry — one long-lived adapter per broker
+    gateway.py       BrokerGateway — the broker-side choke point
+    contracts.py     canonical broker data, enforced at the boundary
+    errors.py        one broker error vocabulary
+    health.py        broker API health (auth failures excluded)
+    credentials.py   the authentication / configuration boundary
+```
+
+**Source Manager responsibility 1 is now implementable and implemented.** This document has always specified that the Source Manager "subscribes to broker connection lifecycle events" and "maintains a per-user registry: which brokers are connected, authenticated, and streaming-capable right now". It could not, for a mundane reason: `broker.connected` and `broker.disconnected` were documented in BROKER_INTEGRATION.md and published by nothing. D3's Broker Gateway publishes both, carrying the broker's *capabilities*, and `SourceManager.connected_brokers()` / `streaming_brokers()` maintain the registry. The two subsystems meet only on the Event Bus: the Market Engine imports no broker module and the broker layer imports no Market Engine module.
+
+**What D3 deliberately did NOT do** is register a broker as a market-data provider. Doing so would have meant either a fabricated `streaming` tier — forbidden by this document's normalization rules and by CLAUDE.md's data rules — or a REST-polled broker provider silently taking a connected user's quotes away from the Yahoo baseline with none of the make-before-break machinery that makes such a switch safe. Pinned by `test_d3_does_not_register_a_broker_as_a_market_data_provider`.
+
+**Phase 4 — Broker market-data streaming, then remaining brokers.** The Zerodha Kite WebSocket adapter as a registered priority-1 market provider (`owner_user_id` set to the connected user), the streaming push surface on `MarketDataProvider`, tick normalization, per-user resolution, make-before-break switching, failover back to Yahoo — then Upstox, Angel One, Fyers, Dhan, each one adapter. This phase delivers the headline feature. The entitlement filter (`is_eligible_for`, D2) and the per-user connected-broker registry (D3) are already in place for it.
 
 **Phase 5 — Hardening.** Latency scoring, flap suppression, probation windows, multi-connection sharding, chaos tests (kill connections in staging, verify silent failover).
 

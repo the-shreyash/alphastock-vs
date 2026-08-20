@@ -2,7 +2,27 @@
 
 Single entry point for everything broker-related:
 
-    UI / Trading Engine  →  BrokerEngine  →  BrokerAdapter (Zerodha / Upstox)
+    UI / Trading Engine  →  BrokerEngine  →  BrokerGateway  →  Broker Adapter
+
+WHAT D3 CHANGED HERE
+--------------------
+The engine used to hold adapters itself and call them directly, which made it
+the place broker-specific knowledge accumulated: it read `KITE_API_KEY` by name
+to open a stream, it branched on `if broker == "zerodha"` to decide what to
+subscribe to, and it assembled the per-user connection status inline. Every one
+of those is a reason a new broker could not be added without editing this file.
+
+It now calls the Broker Gateway, which enforces capabilities, coerces responses
+into the canonical contracts, normalizes errors and records broker health. The
+engine keeps the responsibilities that are genuinely its own and that the
+gateway deliberately does not want — the database, encryption at rest, session
+lifecycle, audit logging, portfolio persistence and event publication.
+
+It also publishes `broker.connected` / `broker.disconnected` on the Event Bus.
+Both topics were documented in BROKER_INTEGRATION.md and neither was ever
+published, which is why MARKET_DATA_ARCHITECTURE.md's Source Manager
+responsibility 1 — "subscribes to broker connection lifecycle events" — had
+nothing to subscribe to.
 
 Responsibilities:
   • OAuth session lifecycle (exchange, encrypted storage, expiry, refresh,
@@ -22,9 +42,10 @@ import logging
 from datetime import datetime, timezone
 from typing import Optional
 
-from services.brokers import SUPPORTED_BROKERS, create_adapter
-from services.brokers.base import BrokerAdapter, BrokerAuthError, BrokerError
+from services.brokers import BrokerCapability, broker_gateway, broker_registry
+from services.brokers.base import BrokerAdapter
 from services.brokers.crypto import decrypt_token, encrypt_token, is_encrypted
+from services.brokers.errors import BrokerAuthError, BrokerError
 from services.brokers.stream import stream_manager
 
 logger = logging.getLogger(__name__)
@@ -36,11 +57,22 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def adapter_display(broker: str) -> str:
+    """Human-readable broker name for activity and notification copy.
+
+    A one-line lookup rather than `self.adapter(broker).display_name` scattered
+    through the engine: the display name is the only adapter attribute this
+    module legitimately needs, and routing it through a named function keeps the
+    deprecated `adapter()` accessor out of the engine's own code paths.
+    """
+    adapter = broker_registry.get(broker)
+    return adapter.display_name if adapter else (broker or "Broker")
+
+
 class BrokerEngine:
     def __init__(self):
         self.db = None
         self.ws_push = None            # async (user_id, message) -> None
-        self._adapters: dict[str, BrokerAdapter] = {}
         self._sessions: dict = {}      # (user_id, broker) -> decrypted session dict
 
     # -- wiring -----------------------------------------------------------------
@@ -49,17 +81,24 @@ class BrokerEngine:
         self.ws_push = ws_push
 
     def adapter(self, broker: str) -> BrokerAdapter:
-        broker = (broker or "").lower()
-        if broker not in self._adapters:
-            self._adapters[broker] = create_adapter(broker)
-        return self._adapters[broker]
+        """DEPRECATED — the registered adapter for `broker`.
+
+        Kept for `zerodha_service.py` (the legacy single-session shim) and for
+        tests that patch adapter methods directly. The engine itself no longer
+        calls broker methods through it; it goes through `broker_gateway`, which
+        is what guarantees capability enforcement, canonical shapes and error
+        normalization. New code must not reach for an adapter.
+
+        It used to build and cache its own adapter instances, which meant the
+        engine's adapters and anything else's were different objects with
+        different health counters. There is now exactly one instance per broker,
+        owned by the registry.
+        """
+        return broker_registry.require(broker)
 
     def list_brokers(self) -> list:
-        return [{
-            "name": name,
-            "display_name": cls.display_name,
-            "configured": self.adapter(name).is_configured(),
-        } for name, cls in SUPPORTED_BROKERS.items()]
+        """Supported brokers with their capabilities and configuration state."""
+        return broker_gateway.list_brokers()
 
     # -- audit / events ------------------------------------------------------------
     async def _audit(self, user_id: str, action: str, details: dict = None):
@@ -126,11 +165,10 @@ class BrokerEngine:
         session.pop("_id", None)
         if needs_migration and session.get("access_token"):
             # Legacy plaintext token (pre-Sprint 7) — re-save encrypted.
-            adapter = self.adapter(broker)
             if not session.get("expires_at") and session.get("connected_at"):
                 try:
                     connected = datetime.fromisoformat(session["connected_at"])
-                    session["expires_at"] = adapter.session_expiry(connected).isoformat()
+                    session["expires_at"] = broker_gateway.session_expiry(broker, connected).isoformat()
                 except Exception:
                     pass
             await self.db.broker_accounts.update_one(
@@ -144,15 +182,18 @@ class BrokerEngine:
         """Return a live (fresh) decrypted session or raise BrokerAuthError.
         Attempts a token refresh first where the broker supports it."""
         key = (user_id, broker)
+        adapter = broker_registry.require(broker)
         session = self._sessions.get(key) or await self._load_account(user_id, broker)
         if not session or not session.get("access_token"):
-            raise BrokerAuthError(f"{self.adapter(broker).display_name} is not connected. "
+            raise BrokerAuthError(f"{adapter.display_name} is not connected. "
                                   "Connect your account in Settings.")
-        adapter = self.adapter(broker)
-        if adapter.session_is_fresh(session):
+        if broker_gateway.session_is_fresh(broker, session):
             self._sessions[key] = session
             return session
-        refreshed = await adapter.refresh_session(session)
+        # The gateway answers None both for "this broker has no refresh grant"
+        # and for "the refresh failed"; the engine's response is the same either
+        # way, which is why it does not need to tell them apart.
+        refreshed = await broker_gateway.refresh_session(broker, session)
         if refreshed and refreshed.get("access_token"):
             await self._save_account(user_id, broker, {**session, **refreshed})
             await self._audit(user_id, "broker.token.refreshed", {"broker": broker})
@@ -161,20 +202,26 @@ class BrokerEngine:
         raise BrokerAuthError(f"{adapter.display_name} session expired. Please reconnect from Settings.")
 
     # -- authentication flows -----------------------------------------------------------
+    def parse_callback_params(self, broker: str, params: dict) -> Optional[dict]:
+        """The `exchange_token` payload for a broker's OAuth redirect, or None
+        when the user cancelled."""
+        return broker_gateway.parse_callback_params(broker, params)
+
     def get_login_url(self, broker: str, user_id: str) -> dict:
-        return self.adapter(broker).get_login_url(user_id=user_id)
+        return broker_gateway.login_url(broker, user_id=user_id)
 
     async def complete_auth(self, broker: str, user_id: str, auth_payload: dict) -> dict:
         """Exchange the OAuth callback payload, store the encrypted session,
         start the realtime stream and run an initial portfolio sync."""
-        adapter = self.adapter(broker)
-        session = await adapter.exchange_token(auth_payload)
+        adapter = broker_registry.require(broker)
+        session = await broker_gateway.exchange_token(broker, auth_payload)
         await self._save_account(user_id, broker, session)
         await self._audit(user_id, "broker.connected", {
             "broker": broker, "account_id": session.get("account_id")})
         self._activity(f"{adapter.display_name} account connected — live broker session active")
         await self._push(user_id, {"type": "broker_status", "data": {
             "broker": broker, "connected": True}})
+        await self._publish_connection(user_id, broker, connected=True)
         # Initial sync + stream are best-effort: connection succeeds even if
         # the first sync hits a transient broker error.
         sync_result = None
@@ -190,14 +237,17 @@ class BrokerEngine:
                 "profile": session.get("profile", {}), "sync": sync_result}
 
     async def disconnect(self, broker: str, user_id: str) -> dict:
-        adapter = self.adapter(broker)
+        adapter = broker_registry.require(broker)
         await stream_manager.stop_stream(user_id, broker)
-        try:
-            session = self._sessions.get((user_id, broker)) or await self._load_account(user_id, broker)
-            if session and session.get("access_token") and hasattr(adapter, "invalidate_session"):
-                await adapter.invalidate_session(session)
-        except Exception as e:
-            logger.warning(f"{broker} token invalidation on disconnect failed: {e}")
+        session = self._sessions.get((user_id, broker)) or await self._load_account(user_id, broker)
+        if session and session.get("access_token"):
+            # Capability-gated and best-effort inside the gateway: a broker with
+            # no logout endpoint is not an error, and a broker that refuses to
+            # log out an already-dead token must not fail the user's disconnect.
+            # This replaced a `hasattr(adapter, "invalidate_session")` probe —
+            # a duck-typing check that could not distinguish "this broker cannot
+            # revoke tokens" from "someone renamed the method".
+            await broker_gateway.invalidate_session(broker, session)
         self._sessions.pop((user_id, broker), None)
         await self.db.broker_accounts.update_one(
             {"user_id": user_id, "broker": broker},
@@ -207,69 +257,110 @@ class BrokerEngine:
         self._activity(f"{adapter.display_name} account disconnected")
         await self._push(user_id, {"type": "broker_status", "data": {
             "broker": broker, "connected": False}})
+        await self._publish_connection(user_id, broker, connected=False)
         return {"success": True, "broker": broker}
 
+    async def _publish_connection(self, user_id: str, broker: str, *, connected: bool):
+        """Publish `broker.connected` / `broker.disconnected` on the Event Bus.
+
+        BROKER_INTEGRATION.md lists both topics and nothing published either,
+        which left MARKET_DATA_ARCHITECTURE.md's Source Manager responsibility 1
+        ("subscribes to broker connection lifecycle events") with nothing to
+        subscribe to. The Source Manager now consumes these to maintain its
+        per-user connected-broker registry — the record D4's market-data feed
+        switch attaches a provider registration to.
+
+        The payload carries the broker's *capabilities*, not just its name, so a
+        consumer can decide what a connection makes possible without importing a
+        broker module: the Source Manager reads `tick_stream` to know whether
+        this connection could ever become a streaming market feed.
+
+        Best-effort. A market-data listener failing must never fail a user's
+        broker connection — the connection is the thing that succeeded.
+        """
+        try:
+            from services.market_engine.event_bus import event_bus
+            adapter = broker_registry.require(broker)
+            await event_bus.publish(
+                "broker.connected" if connected else "broker.disconnected",
+                {
+                    "user_id": str(user_id),
+                    "broker": broker,
+                    "capabilities": sorted(c.value for c in adapter.capabilities),
+                },
+            )
+        except Exception as e:
+            logger.warning(f"broker lifecycle event publish failed for {broker}: {e}")
+
     async def get_status(self, user_id: str) -> dict:
-        """Connection status for every supported broker for this user."""
+        """Connection status for every registered broker for this user.
+
+        The per-broker record is built by the gateway as a
+        :class:`~services.brokers.contracts.BrokerConnection` — the canonical
+        user -> broker association — and this method adds only what needs the
+        database or the stream manager: the broker profile and whether a stream
+        is live. It used to assemble the whole dict inline, which is why no
+        other code could construct or assert against the shape.
+
+        Iterates the registry rather than a hardcoded broker list, so a new
+        broker appears here by being registered.
+        """
         statuses = {}
-        for broker in SUPPORTED_BROKERS:
-            adapter = self.adapter(broker)
-            configured = adapter.is_configured()
+        for broker in broker_registry.names():
             doc = await self.db.broker_accounts.find_one(
                 {"user_id": user_id, "broker": broker}) if self.db is not None else None
             session = self._decrypt_doc(doc) if doc else None
-            has_token = bool(session and session.get("access_token"))
-            fresh = bool(has_token and adapter.session_is_fresh(session))
-            expired = has_token and not fresh
-            if fresh:
-                message = f"Connected to {adapter.display_name}"
-                account = (session.get("profile") or {}).get("user_id") or session.get("account_id")
-                if account:
-                    message += f" ({account})"
-            elif expired:
-                message = f"{adapter.display_name} session expired. Please login again."
-            elif configured:
-                message = "API keys configured. Login required."
-            else:
-                message = f"{adapter.display_name} API keys not configured."
+            streaming = any(s["running"] for s in stream_manager.status()
+                            if s["user_id"] == user_id and s["broker"] == broker)
+            connection = broker_gateway.connection(
+                user_id=user_id, broker=broker, session=session, streaming=streaming)
             statuses[broker] = {
-                "broker": broker,
-                "display_name": adapter.display_name,
-                "configured": configured,
-                "connected": fresh,
-                "session_expired": expired,
-                "profile": (session.get("profile") or {}) if fresh else {},
-                "connected_at": session.get("connected_at") if fresh else None,
-                "expires_at": session.get("expires_at") if fresh else None,
-                "last_sync": (session or {}).get("last_sync"),
-                "mode": "live" if fresh else ("ready" if configured else "disconnected"),
-                "message": message,
-                "streaming": any(s["running"] for s in stream_manager.status()
-                                 if s["user_id"] == user_id and s["broker"] == broker),
+                **connection.as_dict(),
+                "profile": (session.get("profile") or {}) if connection.connected else {},
+                "message": self._connection_message(connection),
             }
         return statuses
 
+    @staticmethod
+    def _connection_message(connection) -> str:
+        """The user-facing sentence for a connection state.
+
+        Presentation, kept out of the contract on purpose: `BrokerConnection`
+        travels to events, logs and AI context, and a display string has no
+        business in any of those. Four states, four sentences, no broker name
+        hardcoded — `display_name` comes from the adapter.
+        """
+        name = connection.display_name or connection.broker
+        if connection.connected:
+            account = f" ({connection.account_id})" if connection.account_id else ""
+            return f"Connected to {name}{account}"
+        if connection.session_expired:
+            return f"{name} session expired. Please login again."
+        if connection.configured:
+            return "API keys configured. Login required."
+        return f"{name} API keys not configured."
+
     # -- data access (unified across brokers) ---------------------------------------------
     async def get_profile(self, user_id: str, broker: str) -> dict:
-        return await self.adapter(broker).get_profile(await self.get_session(user_id, broker))
+        return await broker_gateway.get_profile(broker, await self.get_session(user_id, broker))
 
     async def get_holdings(self, user_id: str, broker: str) -> list:
-        return await self.adapter(broker).get_holdings(await self.get_session(user_id, broker))
+        return await broker_gateway.get_holdings(broker, await self.get_session(user_id, broker))
 
     async def get_positions(self, user_id: str, broker: str) -> list:
-        return await self.adapter(broker).get_positions(await self.get_session(user_id, broker))
+        return await broker_gateway.get_positions(broker, await self.get_session(user_id, broker))
 
     async def get_funds(self, user_id: str, broker: str) -> dict:
-        return await self.adapter(broker).get_funds(await self.get_session(user_id, broker))
+        return await broker_gateway.get_funds(broker, await self.get_session(user_id, broker))
 
     async def get_margins(self, user_id: str, broker: str) -> dict:
-        return await self.adapter(broker).get_margins(await self.get_session(user_id, broker))
+        return await broker_gateway.get_margins(broker, await self.get_session(user_id, broker))
 
     async def get_orders(self, user_id: str, broker: str) -> list:
-        return await self.adapter(broker).get_orders(await self.get_session(user_id, broker))
+        return await broker_gateway.get_orders(broker, await self.get_session(user_id, broker))
 
     async def get_trades(self, user_id: str, broker: str) -> list:
-        return await self.adapter(broker).get_trades(await self.get_session(user_id, broker))
+        return await broker_gateway.get_trades(broker, await self.get_session(user_id, broker))
 
     # -- portfolio sync ---------------------------------------------------------------------
     async def sync_portfolio(self, user_id: str, broker: str) -> dict:
@@ -277,12 +368,16 @@ class BrokerEngine:
         broadcast a portfolio.synced event. Restarts the realtime stream so
         tick subscriptions cover the current holdings."""
         session = await self.get_session(user_id, broker)
-        adapter = self.adapter(broker)
-        holdings = await adapter.get_holdings(session)
-        positions = await adapter.get_positions(session)
+        adapter = broker_registry.require(broker)
+        holdings = await broker_gateway.get_holdings(broker, session)
+        positions = await broker_gateway.get_positions(broker, session)
         try:
-            funds = await adapter.get_funds(session)
+            funds = await broker_gateway.get_funds(broker, session)
         except BrokerError as e:
+            # Includes CapabilityUnsupported for a broker with no funds
+            # endpoint: a portfolio without a cash balance is still a portfolio,
+            # and refusing to sync one would make an optional capability
+            # mandatory in practice.
             logger.warning(f"{broker} funds fetch failed during sync: {e}")
             funds = None
 
@@ -347,26 +442,26 @@ class BrokerEngine:
     # -- orders ---------------------------------------------------------------------------------
     async def place_order(self, user_id: str, broker: str, order: dict) -> dict:
         session = await self.get_session(user_id, broker)
-        result = await self.adapter(broker).place_order(session, order)
+        result = await broker_gateway.place_order(broker, session, order)
         await self._record_order(user_id, broker, {**order, **result})
         await self._audit(user_id, "broker.order.placed", {
             "broker": broker, "order_id": result.get("order_id"),
             "symbol": order.get("symbol"), "transaction_type": order.get("transaction_type"),
             "quantity": order.get("quantity"), "order_type": order.get("order_type")})
-        self._activity(f"Order placed on {self.adapter(broker).display_name}: "
+        self._activity(f"Order placed on {adapter_display(broker)}: "
                        f"{order.get('transaction_type', 'BUY')} {order.get('quantity')} {order.get('symbol')}")
         return result
 
     async def modify_order(self, user_id: str, broker: str, order_id: str, changes: dict) -> dict:
         session = await self.get_session(user_id, broker)
-        result = await self.adapter(broker).modify_order(session, order_id, changes)
+        result = await broker_gateway.modify_order(broker, session, order_id, changes)
         await self._audit(user_id, "broker.order.modified", {
             "broker": broker, "order_id": order_id, "changes": changes})
         return result
 
     async def cancel_order(self, user_id: str, broker: str, order_id: str) -> dict:
         session = await self.get_session(user_id, broker)
-        result = await self.adapter(broker).cancel_order(session, order_id)
+        result = await broker_gateway.cancel_order(broker, session, order_id)
         await self._audit(user_id, "broker.order.cancelled", {
             "broker": broker, "order_id": order_id})
         return result
@@ -393,29 +488,46 @@ class BrokerEngine:
     # -- realtime streaming -------------------------------------------------------------------------
     async def start_stream(self, user_id: str, broker: str,
                            holdings: list = None, positions: list = None):
-        """Open the official broker WebSocket for this account. Zerodha also
-        subscribes to LTP ticks for every instrument in the portfolio."""
+        """Open the broker's official WebSocket for this account.
+
+        Fully broker-agnostic as of D3. What used to be here was an `if broker
+        == "zerodha":` block that fetched the portfolio, extracted Kite
+        instrument tokens, and an `os.environ["KITE_API_KEY"]` read to
+        authenticate the socket — a broker name and a broker's secret name,
+        both inside the engine. Every broker-specific answer now comes from the
+        adapter through the gateway:
+
+          * whether this broker has a stream worth opening at all
+          * which instruments (if any) its tick feed subscribes to
+          * what credential material its transport needs
+
+        A broker with neither an order stream nor a tick stream opens no
+        connection, rather than opening one that will immediately fail.
+        """
+        streams = broker_gateway.stream_capabilities(broker)
+        if not (streams["orders"] or streams["ticks"]):
+            logger.debug("Broker %s offers no realtime stream — skipping", broker)
+            return
+
         session = await self.get_session(user_id, broker)
         instrument_tokens = []
-        if broker == "zerodha":
+        if streams["ticks"]:
             if holdings is None:
                 try:
-                    holdings = await self.adapter(broker).get_holdings(session)
+                    holdings = await broker_gateway.get_holdings(broker, session)
                 except BrokerError:
                     holdings = []
             if positions is None:
                 try:
-                    positions = await self.adapter(broker).get_positions(session)
+                    positions = await broker_gateway.get_positions(broker, session)
                 except BrokerError:
                     positions = []
-            tokens = {row.get("instrument_token")
-                      for row in (holdings or []) + (positions or [])
-                      if isinstance(row.get("instrument_token"), int)}
-            instrument_tokens = sorted(tokens)
-        import os
+            instrument_tokens = broker_gateway.stream_instruments(
+                broker, holdings=holdings, positions=positions)
+
         await stream_manager.start_stream(
             user_id, broker, session,
-            api_key=os.environ.get("KITE_API_KEY", "").strip(),
+            credentials=broker_gateway.stream_credentials(broker),
             instrument_tokens=instrument_tokens,
             on_order_update=self._on_stream_order,
             on_tick=self._on_stream_tick,
@@ -449,7 +561,7 @@ class BrokerEngine:
                     type=f"ORDER_{status}",
                     title=f"Order {verb}",
                     message=f"{order.get('transaction_type', '')} {order.get('quantity', '')} "
-                            f"{order.get('symbol', '')} — {verb} on {self.adapter(broker).display_name}."
+                            f"{order.get('symbol', '')} — {verb} on {adapter_display(broker)}."
                             + (f" Reason: {order.get('status_message')}" if status == "REJECTED" and order.get("status_message") else ""),
                     severity="critical" if status == "REJECTED" else "info",
                     symbol=order.get("symbol"),
@@ -502,13 +614,13 @@ class BrokerEngine:
             docs = await self.db.broker_accounts.find({"connected": {"$ne": False}}).to_list(1000)
             for doc in docs:
                 user_id, broker = doc.get("user_id"), doc.get("broker")
-                if not user_id or broker not in SUPPORTED_BROKERS:
+                if not user_id or broker not in broker_registry:
                     continue
                 try:
                     session = await self._load_account(user_id, broker)
                     if not session or not session.get("access_token"):
                         continue
-                    if not self.adapter(broker).session_is_fresh(session):
+                    if not broker_gateway.session_is_fresh(broker, session):
                         logger.info(f"Saved {broker} session for user {user_id} has expired; reconnect required.")
                         continue
                     self._sessions[(user_id, broker)] = session

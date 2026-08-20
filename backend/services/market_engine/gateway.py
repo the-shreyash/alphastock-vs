@@ -128,6 +128,11 @@ class MarketGateway:
     async def initialize(self) -> None:
         """Start the gateway and publish readiness + initial feed status."""
         register_default_providers()
+        # Broker lifecycle events (D3). Subscribing at gateway initialisation
+        # rather than at import keeps the Source Manager's subscription tied to
+        # the same lifecycle as everything else it needs, and makes it absent in
+        # tests that never initialise the gateway.
+        source_manager.subscribe_broker_events()
         for provider in provider_registry.all():
             await provider.connect()
 

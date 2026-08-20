@@ -1,7 +1,7 @@
 # StockAssist AI
 ## API Reference
 
-Version: 1.1
+Version: 1.2
 
 Status: Active Development
 
@@ -667,45 +667,97 @@ order book from all connected brokers; ?broker= filters.
 
 # Broker APIs
 
+All broker endpoints are provider-independent: every broker returns the SAME canonical shapes, and no response shape depends on which broker served it. Routes resolve the broker through the Broker Registry, so a broker becomes routable by being registered — no route changes when one is added. See BROKER_INTEGRATION.md.
+
 GET
 
 /brokers
+
+Registered brokers with `{name, display_name, configured, capabilities}`, plus this user's connection status for each.
+
+**`capabilities` (D3)** — the list a client may branch on to decide what to render. Clients must branch on capabilities, never on a broker name: a broker without `place_order` is read-only, a broker without `funds` has no cash balance to show. Values are documented in BROKER_INTEGRATION.md.
 
 GET
 
 /brokers/status
 
-POST
-
-/brokers/connect
-
-POST
-
-/brokers/disconnect
-
-POST
-
-/brokers/sync
+Per-broker connection status for this user (the canonical `BrokerConnection`): `{broker, display_name, configured, connected, session_expired, account_id, connected_at, expires_at, last_sync, streaming, capabilities, mode, message, profile}`. `mode` is `live | ready | disconnected`. Never contains token material.
 
 GET
 
-/brokers/orders
-
-GET
-
-/brokers/positions
+/brokers/{broker}/login-url
 
 POST
 
-/brokers/orders
+/brokers/{broker}/session
+
+Exchange the OAuth callback payload. Tokens are never returned to the browser.
+
+GET
+
+/brokers/{broker}/callback
+
+Public browser redirect target. Each adapter parses its own redirect shape.
+
+POST
+
+/brokers/{broker}/disconnect
+
+POST
+
+/brokers/{broker}/sync
+
+GET
+
+/brokers/{broker}/profile
+
+GET
+
+/brokers/{broker}/holdings
+
+GET
+
+/brokers/{broker}/positions
+
+GET
+
+/brokers/{broker}/funds
+
+GET
+
+/brokers/{broker}/margins
+
+GET
+
+/brokers/{broker}/orders
+
+GET
+
+/brokers/{broker}/trades
+
+POST
+
+/brokers/{broker}/orders
+
+Place a LIVE order. `product` is optional — when omitted the broker's own default product code is used (Zerodha `CNC`, Upstox `D`, and whatever a future broker's is). Clients must not compute a product from a broker name.
 
 PATCH
 
-/brokers/orders/{id}
+/brokers/{broker}/orders/{id}
 
 DELETE
 
-/brokers/orders/{id}
+/brokers/{broker}/orders/{id}
+
+---
+
+## Broker error responses
+
+Every broker failure returns one of the canonical codes below. Only the message field is safe to render; it never contains a stack trace, a URL, a token or a broker's internal error type.
+
+`BROKER_AUTH` · `BROKER_REJECTED` · `RATE_LIMIT` · `BROKER_TIMEOUT` · `BROKER_NETWORK` · `BROKER_UNSUPPORTED` · `BROKER_NOT_CONFIGURED` · `BROKER_UNKNOWN` · `BROKER_INVALID_REQUEST` · `BROKER_CONTRACT` · `BROKER_ERROR`
+
+`BROKER_UNSUPPORTED` means the broker does not offer the capability — a permanent, honest "no", never a transient failure, and never worth retrying. `BROKER_AUTH` answers 409 (the user can fix it by reconnecting), not 502. Retry semantics per code are tabulated in BROKER_INTEGRATION.md.
 
 ---
 
@@ -1059,7 +1111,7 @@ INVALID_TOKEN
 
 VALIDATION_ERROR
 
-BROKER_ERROR
+BROKER_ERROR (and the full broker code set — see Broker APIs above)
 
 MARKET_CLOSED
 
