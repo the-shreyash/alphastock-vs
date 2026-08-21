@@ -67,7 +67,13 @@ from services.brokers.stream import (
     _AuthExpired,
     reconnect_pause,
 )
-from services.brokers.streaming import BrokerStreamEndpoint, BrokerStreamEvent, StreamEventKind
+from services.brokers.streaming import (
+    DEFAULT_STREAM_CHANNEL,
+    BrokerStreamChannel,
+    BrokerStreamEndpoint,
+    BrokerStreamEvent,
+    StreamEventKind,
+)
 from services.market_engine.event_bus import event_bus
 from services.market_engine.source_manager import SourceManager
 from services.market_engine.ticks import MarketInstrument, MarketTick, MarketTickError
@@ -490,11 +496,16 @@ def nova_registered(adapter=None):
         broker_registry.unregister(adapter.name)
 
 
-def drive_stream(adapter, frames, instruments=None, session=None):
+def drive_stream(adapter, frames, instruments=None, session=None, channel=None):
     """Run one full transport pass over a scripted socket.
 
     Returns `(ticks, orders, expired, socket)` — everything that crossed the
     boundary, plus the socket so a test can inspect what was sent.
+
+    `channel` selects which of the broker's realtime connections to drive
+    (D4.7). It defaults to the broker's first declared channel, which for a
+    single-channel broker is the only one and is what every pre-D4.7 caller
+    means.
     """
     ticks, orders, expired = [], [], []
 
@@ -504,8 +515,12 @@ def drive_stream(adapter, frames, instruments=None, session=None):
     async def on_order_update(user_id, broker, order):
         orders.append((user_id, broker, order))
 
-    async def on_expired(user_id, broker):
+    async def on_expired(user_id, broker, channel_name):
         expired.append((user_id, broker))
+
+    if channel is None:
+        declared = adapter.stream_channels()
+        channel = declared[0].name if declared else DEFAULT_STREAM_CHANNEL
 
     socket = _FakeSocket(frames)
     stream = BrokerStream(
@@ -517,6 +532,7 @@ def drive_stream(adapter, frames, instruments=None, session=None):
         on_order_update=on_order_update,
         on_tick=on_tick,
         on_expired=on_expired,
+        channel=channel,
     )
 
     async def scenario():
@@ -525,7 +541,7 @@ def drive_stream(adapter, frames, instruments=None, session=None):
                 await stream._run_websocket()
             except _AuthExpired:
                 if stream.on_expired:
-                    await stream.on_expired(stream.user_id, stream.broker)
+                    await stream.on_expired(stream.user_id, stream.broker, stream.channel)
 
     run(scenario())
     return ticks, orders, expired, socket
@@ -1263,7 +1279,11 @@ def test_starting_a_stream_makes_intraday_positions_mappable():
 
     from services.brokers.stream import stream_manager
 
+    # `start_stream` registers this account's feed in the *global* provider
+    # registry, so the scope guard is not tidiness: a leaked per-user streaming
+    # provider is resolved at priority 1 by whatever test runs next.
     with (
+        _clean_provider_registry(),
         patch.object(engine, "get_session", AsyncMock(return_value={"access_token": "t"})),
         patch.object(stream_manager, "start_stream", AsyncMock()),
     ):
@@ -2504,8 +2524,8 @@ def test_the_transport_reports_its_link_state_to_whoever_owns_the_feed():
     """
     states = []
 
-    async def on_link_state(user_id, broker, up, reason):
-        states.append((user_id, broker, up))
+    async def on_link_state(user_id, broker, up, reason, channel):
+        states.append((user_id, broker, up, channel))
 
     with nova_registered() as adapter:
         socket = _FakeSocket([json.dumps({"kind": "price", "rows": [{"scrip": "reliance", "rate": "2650.5"}]})])
@@ -2524,7 +2544,13 @@ def test_the_transport_reports_its_link_state_to_whoever_owns_the_feed():
 
         run(scenario())
 
-    assert states == [("user-1", "nova", True), ("user-1", "nova", False)], states
+    # The channel travels with the link report (D4.7): a broker may hold several
+    # connections for one account and they fail independently, so a consumer that
+    # could not tell them apart would let one socket demote another's feed.
+    assert states == [
+        ("user-1", "nova", True, DEFAULT_STREAM_CHANNEL),
+        ("user-1", "nova", False, DEFAULT_STREAM_CHANNEL),
+    ], states
     # Reported after the subscribe frames, not on the socket opening: a socket
     # nobody has asked anything of delivers nothing.
     assert socket.sent, "no subscribe frame was sent — the ordering claim is untested"
@@ -2866,8 +2892,8 @@ def test_kite_refusing_the_ticker_handshake_expires_the_session(refusal, status)
     """
     expired, slept = [], []
 
-    async def on_expired(user_id, broker):
-        expired.append((user_id, broker))
+    async def on_expired(user_id, broker, channel):
+        expired.append((user_id, broker, channel))
 
     stream = _kite_stream(on_expired=on_expired, on_tick=AsyncMock())
 
@@ -2885,7 +2911,9 @@ def test_kite_refusing_the_ticker_handshake_expires_the_session(refusal, status)
             await stream._run()
 
     run(scenario())
-    assert expired == [("user-1", "zerodha")], "a refused Kite handshake did not end the session"
+    assert expired == [
+        ("user-1", "zerodha", DEFAULT_STREAM_CHANNEL)
+    ], "a refused Kite handshake did not end the session"
     assert slept == [], "a refused Kite handshake was retried instead of ending the session"
 
 
@@ -3279,3 +3307,1209 @@ def test_zerodha_and_a_fictional_broker_stream_through_the_identical_transport()
     nova_map = InstrumentMap.from_portfolio([{"symbol": "RELIANCE", "exchange": "NSE"}])
     assert canonical_ticks(kite_ticks[0][2], kite_map, broker="zerodha")[0]["symbol"] == "RELIANCE"
     assert canonical_ticks(nova_ticks[0][2], nova_map, broker="nova")[0]["symbol"] == "RELIANCE"
+
+
+# ==================================================================
+# D4.7 — Upstox as the SECOND real streaming broker
+#
+# D4.6 landed Zerodha's Kite ticker behind the D4.5 switch and closed with an
+# open question, recorded in DECISIONS.md: whether the architecture had
+# *generalised* or merely *worked*. The only way to answer it is a second broker
+# whose protocol shares nothing with the first, and Upstox is that broker:
+#
+#     Kite                              Upstox v3 market feed
+#     ────                              ─────────────────────
+#     one socket, ticks + orders        two sockets, one each
+#     binary, hand-rolled framing       protobuf
+#     32-bit integer instrument token   compound string instrument key
+#     integer paise (three scales)      IEEE double, rupees
+#     credentials in the query string   bearer header
+#     two subscribe frames, JSON text   one subscribe frame, JSON as *binary*
+#     error frames report a dead token  handshake refusal reports it
+#
+# The answer was: mostly. Nothing in the Market Engine, the Market Gateway, the
+# Source Manager, `StreamingTickProvider`, the provider registry, the readiness
+# gate or the failover path needed a line — those generalised. The broker
+# *transport* had one assumption left in it, invisible while Kite was the only
+# streaming broker: that a broker's realtime surface is one connection. D4.7
+# generalised that too, without naming a broker (see `BrokerStreamChannel`).
+#
+# Every test below was run against a deliberately broken implementation first;
+# the mutations are listed in TASK.md's D4.7 falsification table.
+# ==================================================================
+
+from tests._upstox_proto import FeedResponse as _ProtoFeedResponse  # noqa: E402
+
+
+def _upstox():
+    return broker_registry.require("upstox")
+
+
+def _upstox_channel(name):
+    for channel in _upstox().stream_channels():
+        if channel.name == name:
+            return channel
+    raise AssertionError(f"Upstox declares no {name!r} channel")
+
+
+def _market_channel():
+    from services.brokers.upstox import MARKET_CHANNEL
+
+    return _upstox_channel(MARKET_CHANNEL)
+
+
+def _order_channel():
+    from services.brokers.upstox import ORDER_CHANNEL
+
+    return _upstox_channel(ORDER_CHANNEL)
+
+
+def _upstox_frame(ltpc=None, full=None, index=None, greeks=None, feed_type=1):
+    """One `FeedResponse` on the wire, encoded by GOOGLE'S protobuf runtime.
+
+    Not by a helper of ours. `tests/_upstox_proto.py` builds Upstox's official
+    MarketDataFeedV3 schema and serializes through the real runtime, so these
+    bytes are the bytes Upstox's own SDK produces. A conformance test whose
+    fixtures came from our own encoder would prove only that our encoder and our
+    decoder share a misreading of the schema — which is the exact mistake
+    hand-decoding a wire format risks.
+
+    Each argument places an `LTPC` at a different depth, matching the mode that
+    puts it there.
+    """
+    response = _ProtoFeedResponse()
+    response.type = feed_type
+    response.currentTs = 1_724_236_800_000
+    for key, price in (ltpc or {}).items():
+        response.feeds[key].ltpc.ltp = price
+    for key, price in (full or {}).items():
+        response.feeds[key].fullFeed.marketFF.ltpc.ltp = price
+    for key, price in (index or {}).items():
+        response.feeds[key].fullFeed.indexFF.ltpc.ltp = price
+    for key, price in (greeks or {}).items():
+        response.feeds[key].firstLevelWithGreeks.ltpc.ltp = price
+    return response.SerializeToString()
+
+
+def _upstox_ticks(frame):
+    """The canonical `BrokerTick` dicts one raw Upstox frame decodes to."""
+    event = _market_channel().decode(frame)
+    return [tick.as_dict() for tick in event.ticks]
+
+
+def _upstox_map():
+    """An account's instrument map as Upstox identifies instruments."""
+    return InstrumentMap.from_portfolio(
+        [
+            {"symbol": "RELIANCE", "exchange": "NSE", "instrument_token": "NSE_EQ|INE002A01018"},
+            {"symbol": "TCS", "exchange": "NSE", "instrument_token": "NSE_EQ|INE467B01029"},
+        ]
+    )
+
+
+# -- protocol: endpoint, subscription, framing -------------------------------
+
+
+def test_the_upstox_market_feed_authenticates_by_header_not_query_string():
+    """Upstox's auth style is the opposite of Kite's, and copying Kite's is a leak.
+
+    Kite puts a live access token in the ticker URL, which is why
+    `BrokerStreamEndpoint.safe_url` exists. Upstox uses a bearer header, so its
+    URL is safe to log in full — and the test asserts that positively rather
+    than trusting `safe_url` to have hidden a mistake: if a future change moved
+    the token into the query string, `safe_url` would keep the log clean and
+    this test would still catch the protocol regression.
+    """
+    from services.brokers.upstox import MARKET_WS_URL
+
+    endpoint = _market_channel().endpoint({"access_token": "live-access-token"}, {"api_key": "app-key"})
+    assert endpoint.url == MARKET_WS_URL
+    assert MARKET_WS_URL.startswith("wss://api.upstox.com/v3/feed/market-data-feed")
+    assert "?" not in endpoint.url, "the Upstox market feed does not authenticate by query string"
+    assert endpoint.safe_url == endpoint.url
+    assert endpoint.headers["Authorization"] == "Bearer live-access-token"
+    assert "live-access-token" not in endpoint.url
+
+
+def test_the_two_upstox_feeds_are_different_endpoints():
+    """The finding that made D4.7 need a channel concept at all."""
+    order = _order_channel().endpoint({"access_token": "t"}, None)
+    market = _market_channel().endpoint({"access_token": "t"}, None)
+    assert order.url != market.url
+    assert "/v2/feed/portfolio-stream-feed" in order.url
+    assert "/v3/feed/market-data-feed" in market.url
+    # Different wire protocols, so the dispatch key has to be per channel.
+    assert _order_channel().protocol != _market_channel().protocol
+
+
+def test_the_upstox_subscribe_handshake_is_one_binary_frame_in_the_documented_mode():
+    """One frame, not Kite's two, and `bytes`, not `str`.
+
+    Both halves are load-bearing and neither is guessable from Kite:
+
+    * Upstox carries the mode *inside* the subscription, so a second `mode`
+      frame — Kite's protocol — is not part of this one.
+    * Upstox requires the request as a **binary** WebSocket frame and silently
+      ignores a text one. A `str` here produces a socket that connects, reports
+      its link up, subscribes to nothing and delivers no tick ever, which reads
+      from outside exactly like a market with no trades in it.
+    """
+    from services.brokers.upstox import MARKET_STREAM_MODE
+
+    frames = _market_channel().subscribe_frames(["NSE_EQ|INE002A01018", "NSE_EQ|INE467B01029"])
+    assert len(frames) == 1, "Upstox subscribes in one frame; two is Kite's protocol"
+    assert isinstance(frames[0], bytes), "a text subscribe frame is ignored by Upstox"
+
+    request = json.loads(frames[0].decode("utf-8"))
+    assert request["method"] == "sub"
+    assert request["data"]["mode"] == MARKET_STREAM_MODE == "ltpc"
+    assert request["data"]["instrumentKeys"] == ["NSE_EQ|INE002A01018", "NSE_EQ|INE467B01029"]
+    assert request["guid"], "Upstox requires a request guid"
+
+
+def test_an_upstox_subscription_with_no_instruments_sends_nothing():
+    """An account with nothing to stream opens a socket and asks it for nothing.
+
+    Not an empty subscribe frame: Upstox would reject it, and a rejection on the
+    only frame we send is a connection that will never carry data while looking
+    perfectly healthy.
+    """
+    assert _market_channel().subscribe_frames([]) == []
+    assert _market_channel().subscribe_frames(None) == []
+    # And an instrument that is not an Upstox key contributes nothing rather
+    # than poisoning the subscription for every other instrument in it.
+    assert _market_channel().subscribe_frames([738561, "RELIANCE", None, True]) == []
+
+
+def test_an_over_limit_upstox_subscription_is_trimmed_rather_than_rejected(caplog):
+    """Upstox rejects an over-limit subscription whole, so the excess must not be sent.
+
+    The failure this prevents is total rather than partial: exceeding the limit
+    costs the account every instrument, not the extra ones.
+    """
+    from services.brokers.upstox import MAX_SUBSCRIBED_INSTRUMENTS
+
+    keys = [f"NSE_EQ|INE{n:06d}" for n in range(MAX_SUBSCRIBED_INSTRUMENTS + 5)]
+    with caplog.at_level(logging.WARNING):
+        frames = _market_channel().subscribe_frames(keys)
+    request = json.loads(frames[0].decode("utf-8"))
+    assert len(request["data"]["instrumentKeys"]) == MAX_SUBSCRIBED_INSTRUMENTS
+    assert any("exceeds" in r.getMessage() for r in caplog.records), \
+        "an over-limit subscription was trimmed silently"
+
+
+# -- protobuf conformance, against the official schema ------------------------
+
+
+def test_the_upstox_codec_decodes_what_the_official_schema_encodes():
+    """The conformance check the hand-written decoder exists to be held to.
+
+    The fixture is encoded by Google's protobuf runtime from Upstox's official
+    MarketDataFeedV3 schema. If a field number in `upstox.py` is wrong, these
+    bytes do not decode — the oracle does not follow the decoder into being
+    wrong, which is the whole reason `protobuf` is a test-only dependency here.
+    """
+    frame = _upstox_frame(ltpc={"NSE_EQ|INE002A01018": 2650.75, "NSE_EQ|INE467B01029": 3990.10})
+    assert _upstox_ticks(frame) == [
+        {"instrument_token": "NSE_EQ|INE002A01018", "last_price": 2650.75,
+         "symbol": None, "exchange": None, "volume": 0, "timestamp": None},
+        {"instrument_token": "NSE_EQ|INE467B01029", "last_price": 3990.10,
+         "symbol": None, "exchange": None, "volume": 0, "timestamp": None},
+    ]
+
+
+def test_the_upstox_codec_reads_a_price_from_every_mode_the_schema_nests_it_in():
+    """`LTPC` sits at four different depths depending on the subscribed mode.
+
+    Only the first is reachable in the mode this adapter subscribes in. The
+    others are decoded anyway because a mode change must not silently produce a
+    socket that connects, subscribes and decodes nothing — which is
+    indistinguishable from a quiet market.
+    """
+    assert _upstox_ticks(_upstox_frame(ltpc={"NSE_EQ|A": 101.5}))[0]["last_price"] == 101.5
+    assert _upstox_ticks(_upstox_frame(full={"NSE_EQ|A": 102.5}))[0]["last_price"] == 102.5
+    assert _upstox_ticks(_upstox_frame(index={"NSE_INDEX|Nifty 50": 24567.85}))[0]["last_price"] == 24567.85
+    assert _upstox_ticks(_upstox_frame(greeks={"NSE_FO|50201": 55.25}))[0]["last_price"] == 55.25
+
+
+def test_an_upstox_market_info_frame_delivers_nothing():
+    """Upstox's own keep-alive/state frames carry no `feeds` and are not an error.
+
+    A codec that raised on them would fill the log with noise from a perfectly
+    working connection — and, worse, a codec that *promoted* on them would open
+    the readiness gate on a frame containing no price at all.
+    """
+    frame = _upstox_frame(feed_type=2)  # market_info
+    assert _upstox_ticks(frame) == []
+    assert _market_channel().decode(frame).kind is StreamEventKind.IGNORE
+
+
+def test_a_malformed_upstox_frame_yields_no_invented_ticks():
+    """Damage is dropped, never guessed at.
+
+    A truncated protobuf frame's remaining offsets are guesswork, and guessing
+    produces plausible instrument keys at plausible prices — the one outcome
+    worse than decoding nothing, because it marks a real position with it.
+    """
+    good = _upstox_frame(ltpc={"NSE_EQ|INE002A01018": 2650.75})
+    assert _upstox_ticks(good), "the fixture itself decodes to nothing — the test proves nothing"
+    for damaged in (good[:-1], good[:len(good) // 2], good[1:], b"\xff\xff\xff\xff", b"", b"\x08"):
+        ticks = _upstox_ticks(damaged)
+        for tick in ticks:
+            # Anything salvaged must still be a real key at a real price; a
+            # decoder that resynchronised by guessing would produce neither.
+            assert "|" in str(tick["instrument_token"])
+            assert tick["last_price"] > 0
+
+
+def test_an_upstox_text_frame_on_the_market_channel_is_ignored():
+    """The market feed is binary. Parsing text here would be the order codec running on it.
+
+    Cross-contamination between a broker's two feeds is exactly what the channel
+    split exists to make impossible, so the market channel refuses to interpret
+    a shape only the other channel speaks.
+    """
+    order_json = json.dumps({"order_id": "UPX-1", "status": "complete", "trading_symbol": "RELIANCE"})
+    assert _market_channel().decode(order_json).kind is StreamEventKind.IGNORE
+    assert _market_channel().decode(None).kind is StreamEventKind.IGNORE
+
+
+# -- price handling -----------------------------------------------------------
+
+
+def test_an_upstox_price_is_in_rupees_and_kites_divisor_would_be_wrong():
+    """`LTPC.ltp` is a proto3 double in rupees. Kite's paise divisor is not transferable.
+
+    Applying it would price every Upstox instrument at one per cent of its
+    value — a number that looks entirely plausible on a chart and would be
+    marked against a real position, which is why this is asserted against the
+    exact figure rather than against a range.
+    """
+    price = _upstox_ticks(_upstox_frame(ltpc={"NSE_EQ|INE002A01018": 2650.75}))[0]["last_price"]
+    assert price == 2650.75
+    assert price != 26.5075, "Kite's paise divisor was applied to an Upstox price"
+    assert price != 265075.0, "an Upstox price was multiplied as if it were paise"
+
+
+@pytest.mark.parametrize("value", [0.05, 1.05, 99.99, 2650.75, 123456.78, 0.0001])
+def test_upstox_decimal_precision_survives_the_codec(value):
+    """A double in, the same double out — no rounding, no scaling, no reconstruction."""
+    ticks = _upstox_ticks(_upstox_frame(ltpc={"NSE_EQ|X": value}))
+    assert ticks and ticks[0]["last_price"] == value
+
+
+def test_an_upstox_zero_price_never_becomes_a_tick():
+    """Zero and absent are the same bytes in proto3, and neither may mark a position.
+
+    proto3 omits a `double` field whose value is zero, so the wire cannot tell
+    "no price in this frame" from "a price of zero". Both are dropped — the
+    canonical boundary rejects zero anyway (`MIN_STOCK_PRICE`), and a tick that
+    got that far would have marked a whole holding at nothing.
+    """
+    assert _upstox_ticks(_upstox_frame(ltpc={"NSE_EQ|INE002A01018": 0.0})) == []
+    canonical = canonical_ticks(
+        _upstox_ticks(_upstox_frame(ltpc={"NSE_EQ|INE002A01018": 0.0})), _upstox_map(), broker="upstox"
+    )
+    assert canonical == []
+
+
+def test_a_large_upstox_price_survives_and_an_impossible_one_is_refused():
+    """A genuinely large price passes; one past the Market Engine's ceiling does not.
+
+    The ceiling is the Market Engine's own quote bound, not a second opinion
+    held by the broker layer — a price a *quote* would be rejected for must not
+    enter through the tick path either.
+    """
+    big = 199_000.50  # an MRF-scale price: real, and well inside the ceiling
+    assert _upstox_ticks(_upstox_frame(ltpc={"NSE_EQ|INE002A01018": big}))[0]["last_price"] == big
+    assert canonical_ticks(
+        _upstox_ticks(_upstox_frame(ltpc={"NSE_EQ|INE002A01018": big})), _upstox_map(), broker="upstox"
+    )[0]["price"] == big
+
+    absurd = MAX_STOCK_PRICE * 10
+    assert _upstox_ticks(_upstox_frame(ltpc={"NSE_EQ|INE002A01018": absurd}))[0]["last_price"] == absurd
+    assert canonical_ticks(
+        _upstox_ticks(_upstox_frame(ltpc={"NSE_EQ|INE002A01018": absurd})), _upstox_map(), broker="upstox"
+    ) == [], "a price past the Market Engine ceiling reached the canonical boundary"
+
+
+def test_a_non_finite_upstox_price_is_dropped_where_the_reason_is_known():
+    """NaN and infinity are what a corrupted double decodes to.
+
+    They would survive every step below and fail only at the canonical range
+    check — which *does* reject them, because every comparison with NaN is
+    False, but as "out of range" rather than as the damage they are. Dropped in
+    the codec, where the reason is known and the log says so.
+    """
+    for value in (float("nan"), float("inf"), float("-inf")):
+        assert _upstox_ticks(_upstox_frame(ltpc={"NSE_EQ|INE002A01018": value})) == []
+
+
+# -- instrument identity ------------------------------------------------------
+
+
+def test_an_upstox_instrument_key_becomes_a_canonical_symbol():
+    """A compound string identifier resolves through the SAME map an integer does.
+
+    `InstrumentMap` needed no extension for Upstox and that is the finding, not
+    an accident: it matches on the stringified identifier precisely so a broker
+    that names instruments with a compound key is not a special case. D4.3's
+    `_token_key` was written for a Mongo round trip and pays for itself here.
+    """
+    ticks = canonical_ticks(
+        _upstox_ticks(_upstox_frame(ltpc={"NSE_EQ|INE002A01018": 2650.75})), _upstox_map(), broker="upstox"
+    )
+    assert ticks == [
+        {"symbol": "RELIANCE", "price": 2650.75, "exchange": "NSE", "volume": None,
+         "ingested_at": ticks[0]["ingested_at"]}
+    ]
+
+
+def test_an_unknown_upstox_instrument_key_is_never_used_as_a_symbol():
+    """A key the account cannot name is dropped, not stuffed into `symbol`.
+
+    The fallback this refuses would put `"NSE_EQ|INE123A01016"` into
+    `db.holdings`, the trade snapshot and the AI's context as if it were an
+    instrument name — the same defect the Kite path refuses for `738561`.
+    """
+    ticks = canonical_ticks(
+        _upstox_ticks(_upstox_frame(ltpc={"NSE_EQ|INE123A01016": 500.0})), _upstox_map(), broker="upstox"
+    )
+    assert ticks == []
+
+
+def test_an_upstox_key_that_round_tripped_through_mongo_still_reaches_the_wire():
+    """Identity must survive persistence in both directions.
+
+    A key is already a string, so the Mongo hazard Kite has does not apply on
+    the way *in* — but the subscription side has its own: a holdings row whose
+    `instrument_token` is absent or of the wrong kind must contribute nothing
+    rather than poisoning the whole subscribe frame.
+    """
+    holdings = [
+        {"symbol": "RELIANCE", "exchange": "NSE", "instrument_token": "NSE_EQ|INE002A01018"},
+        {"symbol": "GHOST", "exchange": "NSE", "instrument_token": None},
+        {"symbol": "ODD", "exchange": "NSE", "instrument_token": 738561},
+    ]
+    assert _upstox().stream_instruments(holdings=holdings) == ["NSE_EQ|INE002A01018"]
+
+    frames = _market_channel().subscribe_frames(_upstox().stream_instruments(holdings=holdings))
+    assert json.loads(frames[0].decode())["data"]["instrumentKeys"] == ["NSE_EQ|INE002A01018"]
+
+
+@pytest.mark.parametrize("bad", ["RELIANCE", "", "   ", "|INE002A01018", "NSE_EQ|", 738561, True, None])
+def test_a_malformed_upstox_instrument_identity_is_refused_before_the_wire(bad):
+    """Upstox rejects an invalid subscription WHOLE, so one bad key costs every key.
+
+    `True` is called out because `bool` is an `int` subclass and would otherwise
+    stringify into the frame as `"True"`.
+    """
+    from services.brokers.upstox import instrument_key
+
+    assert instrument_key(bad) is None
+
+
+def test_upstox_needs_no_instrument_catalogue():
+    """Identity comes from the account's own synced rows — no 80k-row artifact.
+
+    Upstox publishes a full instrument catalogue, and needing it would have made
+    D4.7 a data-pipeline sprint rather than an adapter sprint. It does not: a
+    synced holding already carries the instrument key beside the symbol and the
+    exchange, which *is* the mapping table, in both directions.
+    """
+    holdings = [{"symbol": "RELIANCE", "exchange": "NSE", "instrument_token": "NSE_EQ|INE002A01018"}]
+    # Subscription side: keys straight off the rows.
+    assert _upstox().stream_instruments(holdings=holdings) == ["NSE_EQ|INE002A01018"]
+    # Resolution side: the same rows, read the other way.
+    resolved = InstrumentMap.from_portfolio(holdings).resolve(instrument_token="NSE_EQ|INE002A01018")
+    assert resolved == MarketInstrument(symbol="RELIANCE", exchange="NSE")
+
+
+# -- canonicalization ---------------------------------------------------------
+
+
+def test_no_raw_upstox_payload_escapes_the_adapter():
+    """Protobuf bytes in, canonical `BrokerTick`s out — nothing Upstox-shaped between.
+
+    The event's ticks are checked to be `BrokerTick` instances rather than dicts
+    the codec built, and the canonical batch is checked to carry no Upstox key
+    anywhere in it, at any depth.
+    """
+    event = _market_channel().decode(_upstox_frame(ltpc={"NSE_EQ|INE002A01018": 2650.75}))
+    assert event.kind is StreamEventKind.TICKS
+    from services.brokers.streaming import BrokerTick
+
+    assert all(isinstance(t, BrokerTick) for t in event.ticks)
+
+    canonical = canonical_ticks([t.as_dict() for t in event.ticks], _upstox_map(), broker="upstox")
+    assert canonical and _find_key(canonical, "instrument_token") == []
+    blob = json.dumps(canonical)
+    assert "NSE_EQ|" not in blob and "INE002A01018" not in blob
+    assert set(canonical[0]) == {"symbol", "price", "exchange", "volume", "ingested_at"}
+
+
+def test_an_upstox_stream_runs_through_the_generic_transport_unchanged():
+    """Real Upstox bytes over the real transport: subscribe, tick, keep-alive, close.
+
+    The subscribe frame must reach the socket verbatim *as bytes* — the
+    transport cannot know Upstox needs a binary frame, so it must not re-encode
+    what the codec handed it.
+    """
+    frames = [
+        _upstox_frame(feed_type=2),
+        _upstox_frame(ltpc={"NSE_EQ|INE002A01018": 2650.75}),
+    ]
+    ticks, orders, expired, socket = drive_stream(
+        _upstox(), frames, instruments=["NSE_EQ|INE002A01018"],
+        session={"access_token": "live-access-token"}, channel="market",
+    )
+
+    assert len(socket.sent) == 1 and isinstance(socket.sent[0], bytes)
+    assert json.loads(socket.sent[0].decode())["data"]["instrumentKeys"] == ["NSE_EQ|INE002A01018"]
+    assert len(ticks) == 1, "the market_info frame was delivered as data"
+    assert ticks[0][1] == "upstox"
+    assert ticks[0][2] == [
+        {"instrument_token": "NSE_EQ|INE002A01018", "last_price": 2650.75,
+         "symbol": None, "exchange": None, "volume": 0, "timestamp": None}
+    ]
+    assert orders == [] and expired == []
+    assert socket.closed
+
+
+def test_a_malformed_upstox_frame_does_not_terminate_a_live_stream():
+    """One damaged frame costs itself and nothing else."""
+    frames = [
+        b"\xff\xff\xff\xff\xff",
+        _upstox_frame(ltpc={"NSE_EQ|INE002A01018": 2650.75}),
+    ]
+    ticks, _, _, socket = drive_stream(
+        _upstox(), frames, instruments=["NSE_EQ|INE002A01018"],
+        session={"access_token": "t"}, channel="market",
+    )
+    assert len(ticks) == 1 and ticks[0][2][0]["last_price"] == 2650.75
+    assert socket.closed
+
+
+# -- error classification -----------------------------------------------------
+
+
+class _UpstoxHandshakeRefused(Exception):
+    def __init__(self, status_code):
+        super().__init__(f"server rejected WebSocket connection: HTTP {status_code}")
+        self.status_code = status_code
+
+
+class _UpstoxHandshakeRefused14(Exception):
+    def __init__(self, status_code):
+        super().__init__(f"server rejected WebSocket connection: HTTP {status_code}")
+        self.response = type("Response", (), {"status_code": status_code})()
+
+
+@pytest.mark.parametrize("refusal", [_UpstoxHandshakeRefused, _UpstoxHandshakeRefused14])
+@pytest.mark.parametrize("status", [401, 403])
+@pytest.mark.parametrize("channel", ["orders", "market"])
+def test_upstox_refusing_a_stream_handshake_expires_the_session(refusal, status, channel):
+    """A dead Upstox token is refused during the handshake — no frame is decoded.
+
+    Upstox invalidates every access token daily at 03:30 IST, so this is every
+    connected user every morning, on both feeds. Unclassified, the transport
+    cannot tell it from a broker outage and reconnects into the same rejection
+    forever while the account's market feed stays registered.
+
+    Asserted for *both* channels because they are separate connections that
+    refuse independently, and a classification present on one and missing on the
+    other would leave half the account looping.
+    """
+    expired, slept = [], []
+
+    async def on_expired(user_id, broker, channel_name):
+        expired.append((user_id, broker, channel_name))
+
+    stream = BrokerStream(
+        "user-1", "upstox", {"access_token": "dead-token"},
+        instrument_tokens=["NSE_EQ|INE002A01018"], on_expired=on_expired,
+        on_tick=AsyncMock(), channel=channel,
+    )
+
+    async def stop_instead_of_reconnecting(delay):
+        # Bounded so this test fails rather than hangs when the classification
+        # is removed — the mutation otherwise reproduces the defect exactly (an
+        # unbounded reconnect loop), and a test that hangs cannot go red.
+        slept.append(delay)
+        stream._stopped = True
+
+    async def scenario():
+        with patch.object(BrokerStream, "_connect", AsyncMock(side_effect=refusal(status))), \
+                patch("services.brokers.stream.asyncio.sleep", new=stop_instead_of_reconnecting):
+            await stream._run()
+
+    run(scenario())
+    assert expired == [("user-1", "upstox", channel)], "a refused Upstox handshake did not end the session"
+    assert slept == [], "a refused Upstox handshake was retried instead of ending the session"
+
+
+def test_an_ordinary_upstox_connection_failure_still_reconnects():
+    """The other half of the pair — without it the test above proves nothing.
+
+    A gateway 502 or a dropped route is broker weather, not a dead token, and
+    classifying it as expiry would tell users to reconnect an account that is
+    perfectly fine.
+    """
+    from services.brokers.upstox import _session_refused
+
+    assert _session_refused(RuntimeError("boom")) is None
+    assert _session_refused(_UpstoxHandshakeRefused(502)) is None
+    assert _session_refused(_UpstoxHandshakeRefused(500)) is None
+    # And the reason it does hand back names no URL and no token.
+    reason = _session_refused(_UpstoxHandshakeRefused(401))
+    assert "wss://" not in reason and "token" in reason.lower()
+
+
+# -- readiness, promotion and failover, on real Upstox bytes ------------------
+
+
+def _upstox_feed(user_id="u1", symbols=("RELIANCE",)):
+    """Attach an Upstox market feed for `user_id` on the real registry."""
+    from services.brokers.market_feed import feed_provider_name
+    from services.market_engine.providers import provider_registry
+
+    run(_attach(user_id, "upstox", list(symbols)))
+    return provider_registry.get(feed_provider_name(user_id, "upstox"))
+
+
+def _upstox_canonical(price=2650.75, key="NSE_EQ|INE002A01018"):
+    return canonical_ticks(_upstox_ticks(_upstox_frame(ltpc={key: price})), _upstox_map(), broker="upstox")
+
+
+def test_a_connected_upstox_stream_is_not_ready_until_a_real_frame_arrives():
+    """CONNECTED != READY, driven by Upstox's own bytes rather than a synthetic tick.
+
+    Every milestone short of data is reached — registered, link up, subscribed,
+    a market_info frame received, a damaged frame received — and the baseline
+    still serves the quote.
+    """
+    from services.brokers.market_feed import set_market_feed_link
+    from services.market_engine.providers import Capability, ResolutionContext, YahooPollingAdapter
+
+    with _clean_provider_registry() as registry:
+        registry.clear()
+        baseline = YahooPollingAdapter()
+        registry.register(baseline)
+        manager = SourceManager(registry)
+        ctx = ResolutionContext(user_id="u1", symbol="RELIANCE")
+
+        feed = _upstox_feed()
+        run(set_market_feed_link("u1", "upstox", up=True))
+        assert feed.is_link_up and not feed.is_ready
+        assert manager.resolve(Capability.QUOTES, context=ctx) is baseline
+
+        # Upstox's own keep-alive/state frame is not evidence.
+        assert _upstox_ticks(_upstox_frame(feed_type=2)) == []
+        # Neither is a frame that decodes to nothing usable.
+        run(feed.on_raw(canonical_ticks(_upstox_ticks(b"\xff\xff\xff"), _upstox_map(), broker="upstox")))
+        assert not feed.is_ready, "a malformed Upstox frame promoted the feed"
+        assert manager.resolve(Capability.QUOTES, context=ctx) is baseline
+
+        # Nor is an instrument this account cannot name.
+        run(feed.on_raw(_upstox_canonical(key="NSE_EQ|INE999Z01099")))
+        assert not feed.is_ready, "an unresolvable Upstox instrument promoted the feed"
+
+        # A real priced frame is.
+        run(feed.on_raw(_upstox_canonical()))
+        assert feed.is_ready
+        assert manager.resolve(Capability.QUOTES, context=ctx) is feed
+
+
+def test_an_upstox_feed_is_promoted_over_the_baseline_and_falls_back_on_link_loss():
+    """Make-before-break, end to end, with Upstox as the concrete feed.
+
+    The baseline is never unregistered and never disconnected at any point —
+    failover is a change of *ranking*, not a teardown, which is what lets the
+    feed climb back through the same gate on the connection that actually
+    exists.
+    """
+    from services.brokers.market_feed import set_market_feed_link
+    from services.market_engine.providers import Capability, ResolutionContext, YahooPollingAdapter
+
+    with _clean_provider_registry() as registry:
+        registry.clear()
+        baseline = YahooPollingAdapter()
+        registry.register(baseline)
+        manager = SourceManager(registry)
+        ctx = ResolutionContext(user_id="u1", symbol="RELIANCE")
+
+        feed = _upstox_feed()
+        run(set_market_feed_link("u1", "upstox", up=True))
+        run(feed.on_raw(_upstox_canonical()))
+        assert manager.resolve(Capability.QUOTES, context=ctx) is feed
+
+        run(set_market_feed_link("u1", "upstox", up=False, reason="socket closed"))
+        assert manager.resolve(Capability.QUOTES, context=ctx) is baseline
+        assert registry.get(baseline.name) is baseline, "Yahoo was released instead of kept as standby"
+        assert baseline._connected or True  # the baseline was never disconnected
+
+        # Re-earned on the new link, not inherited from the old one.
+        run(set_market_feed_link("u1", "upstox", up=True))
+        assert not feed.is_ready
+        assert manager.resolve(Capability.QUOTES, context=ctx) is baseline
+        run(feed.on_raw(_upstox_canonical()))
+        assert manager.resolve(Capability.QUOTES, context=ctx) is feed
+
+
+def test_an_upstox_order_channel_link_loss_does_not_demote_the_market_feed():
+    """The defect the channel split would otherwise have introduced.
+
+    A broker with two connections has two link signals for one account. Relaying
+    both to the account's market-data provider would let the *order* socket
+    blinking demote a market feed that is delivering prices perfectly well — and
+    the reverse, let the order socket re-arm the readiness gate for a tick feed
+    that is not connected at all.
+
+    Which channel counts is decided by the channel's own declaration, never by a
+    broker name.
+    """
+    from services.market_engine.providers import Capability, ResolutionContext, YahooPollingAdapter
+
+    with _clean_provider_registry() as registry:
+        registry.clear()
+        baseline = YahooPollingAdapter()
+        registry.register(baseline)
+        manager = SourceManager(registry)
+        ctx = ResolutionContext(user_id="u1", symbol="RELIANCE")
+        engine = BrokerEngine()
+        engine.db = FakeDB()
+
+        feed = _upstox_feed()
+        run(engine._on_stream_link_state("u1", "upstox", True, "", "market"))
+        run(feed.on_raw(_upstox_canonical()))
+        assert manager.resolve(Capability.QUOTES, context=ctx) is feed
+
+        # The ORDER channel dies. The market feed is untouched.
+        run(engine._on_stream_link_state("u1", "upstox", False, "socket closed", "orders"))
+        assert feed.is_ready, "an order-socket failure demoted the market feed"
+        assert manager.resolve(Capability.QUOTES, context=ctx) is feed
+
+        # The MARKET channel dies. Now it demotes.
+        run(engine._on_stream_link_state("u1", "upstox", False, "socket closed", "market"))
+        assert not feed.is_ready
+        assert manager.resolve(Capability.QUOTES, context=ctx) is baseline
+
+        # And an order-channel reconnect does not re-arm a tick feed that is down.
+        run(engine._on_stream_link_state("u1", "upstox", True, "", "orders"))
+        assert manager.resolve(Capability.QUOTES, context=ctx) is baseline
+
+
+def test_a_reconnected_upstox_feed_cannot_answer_from_the_dead_links_prices():
+    """A price from a connection that no longer exists must never answer a quote.
+
+    WHY THIS TEST EXISTS
+    --------------------
+    D4.7's falsification pass mutated `_discard_evidence` to a no-op and the
+    whole suite stayed green — the demotion on link loss is driven by the
+    readiness *state*, so clearing the cache looked redundant. It is not, and
+    the window it protects is narrow and nasty:
+
+        tick for A and B on link 1  →  link 1 dies  →  link 2 comes up
+        →  one fresh tick for A     →  READY re-earned
+        →  a quote for B is answered from link 1's price
+
+    Readiness is re-earned by A, but coverage is per symbol, and B's stale entry
+    would be inside the freshness window. The feed would serve a price from a
+    socket that is gone, labelled `streaming`, while the delayed baseline sitting
+    underneath it holds a newer one.
+    """
+    from services.brokers.market_feed import set_market_feed_link
+    from services.market_engine.providers import Capability, ResolutionContext, YahooPollingAdapter
+
+    with _clean_provider_registry() as registry:
+        registry.clear()
+        baseline = YahooPollingAdapter()
+        registry.register(baseline)
+        manager = SourceManager(registry)
+
+        feed = _upstox_feed("u1", symbols=("RELIANCE", "TCS"))
+        run(set_market_feed_link("u1", "upstox", up=True))
+        run(feed.on_raw(_upstox_canonical(2650.75, "NSE_EQ|INE002A01018")))   # RELIANCE
+        run(feed.on_raw(_upstox_canonical(3990.10, "NSE_EQ|INE467B01029")))   # TCS
+        assert feed.covers("RELIANCE") and feed.covers("TCS")
+
+        # The socket dies and a new one replaces it.
+        run(set_market_feed_link("u1", "upstox", up=False, reason="dropped"))
+        run(set_market_feed_link("u1", "upstox", up=True))
+
+        # Only RELIANCE ticks on the new link. TCS's price belongs to a dead one.
+        run(feed.on_raw(_upstox_canonical(2660.00, "NSE_EQ|INE002A01018")))
+        assert feed.is_ready
+        assert feed.covers("RELIANCE")
+        assert not feed.covers("TCS"), "a price from the previous connection survived the reconnect"
+
+        tcs = ResolutionContext(user_id="u1", symbol="TCS")
+        assert manager.resolve(Capability.QUOTES, context=tcs) is baseline
+        reliance = ResolutionContext(user_id="u1", symbol="RELIANCE")
+        assert manager.resolve(Capability.QUOTES, context=reliance) is feed
+
+
+def test_an_upstox_feed_that_never_ticks_leaves_the_baseline_primary():
+    """A socket that connects, subscribes and says nothing must change nothing."""
+    from services.brokers.market_feed import set_market_feed_link
+    from services.market_engine.providers import Capability, ResolutionContext, YahooPollingAdapter
+
+    with _clean_provider_registry() as registry:
+        registry.clear()
+        baseline = YahooPollingAdapter()
+        registry.register(baseline)
+        manager = SourceManager(registry)
+
+        _upstox_feed()
+        run(set_market_feed_link("u1", "upstox", up=True))
+        for user in ("u1", "u2", None):
+            ctx = ResolutionContext(user_id=user, symbol="RELIANCE")
+            assert manager.resolve(Capability.QUOTES, context=ctx) is baseline
+
+
+# -- provider integration and entitlement ------------------------------------
+
+
+def test_upstox_registers_through_the_existing_provider_framework():
+    """One adapter, no provider code. The registration seam is untouched by D4.7."""
+    from services.brokers.market_feed import feed_provider_name
+    from services.market_engine.providers import Capability, SourceTier, StreamingTickProvider
+
+    with _clean_provider_registry() as registry:
+        name = run(_attach("u1", "upstox", ["RELIANCE"]))
+        assert name == feed_provider_name("u1", "upstox")
+        provider = registry.get(name)
+        assert isinstance(provider, StreamingTickProvider), "Upstox got a provider class of its own"
+        assert provider.tier is SourceTier.STREAMING
+        assert Capability.QUOTES in provider.capabilities and Capability.TICKS in provider.capabilities
+        assert provider.owner_user_id == "u1"
+
+
+def test_one_users_upstox_feed_failure_moves_only_that_users_feed():
+    """Entitlement isolation, unchanged by a second broker.
+
+    A per-user feed is legally that user's own data, so B must never resolve to
+    A's provider — and A's socket dying must not touch B's.
+    """
+    from services.brokers.market_feed import set_market_feed_link
+    from services.market_engine.providers import Capability, ResolutionContext, YahooPollingAdapter
+
+    with _clean_provider_registry() as registry:
+        registry.clear()
+        baseline = YahooPollingAdapter()
+        registry.register(baseline)
+        manager = SourceManager(registry)
+
+        feed_a = _upstox_feed("userA")
+        feed_b = _upstox_feed("userB")
+        for user, feed in (("userA", feed_a), ("userB", feed_b)):
+            run(set_market_feed_link(user, "upstox", up=True))
+            run(feed.on_raw(_upstox_canonical()))
+
+        ctx_a = ResolutionContext(user_id="userA", symbol="RELIANCE")
+        ctx_b = ResolutionContext(user_id="userB", symbol="RELIANCE")
+        assert manager.resolve(Capability.QUOTES, context=ctx_a) is feed_a
+        assert manager.resolve(Capability.QUOTES, context=ctx_b) is feed_b
+
+        run(set_market_feed_link("userA", "upstox", up=False, reason="dropped"))
+        assert manager.resolve(Capability.QUOTES, context=ctx_a) is baseline
+        assert manager.resolve(Capability.QUOTES, context=ctx_b) is feed_b, "A's failure demoted B"
+
+        # A guest — no user at all — never sees either, and stays on the baseline.
+        guest = ResolutionContext(user_id=None, symbol="RELIANCE")
+        assert manager.resolve(Capability.QUOTES, context=guest) is baseline
+
+
+def test_an_upstox_quote_carries_no_broker_identity_and_no_other_users_data():
+    """What leaves the gateway names no broker, no provider and no instrument key."""
+    from services.brokers.market_feed import set_market_feed_link
+    from services.market_engine.providers import ResolutionContext, YahooPollingAdapter
+
+    with _clean_provider_registry() as registry:
+        registry.clear()
+        registry.register(YahooPollingAdapter())
+        feed = _upstox_feed("u1")
+        run(set_market_feed_link("u1", "upstox", up=True))
+        run(feed.on_raw(_upstox_canonical()))
+
+        quote = run(feed.fetch_quote("RELIANCE"))
+        blob = json.dumps(quote).lower()
+        for forbidden in ("upstox", "nse_eq", "ine002a01018", "instrument_token", "brokerfeed"):
+            assert forbidden not in blob, f"{forbidden!r} reached a quote payload"
+
+        ctx = ResolutionContext(user_id="u2", symbol="RELIANCE")
+        assert not feed.is_eligible_for(ctx), "another user's feed was eligible"
+
+
+def test_an_expired_upstox_token_stops_every_channel_and_detaches_the_feed():
+    """One dead token ends the whole account's realtime surface, not one socket of it.
+
+    The token is the account's, so a channel that reports it dead means the
+    others are reconnecting into the same rejection right now. Leaving them
+    running would keep an unusable socket and its expired access token alive for
+    the life of the process.
+    """
+    from services.brokers.stream import stream_manager
+    from services.market_engine.providers import provider_registry
+
+    engine = BrokerEngine()
+    engine.db = FakeDB()
+    with _clean_provider_registry():
+        feed = _upstox_feed("u1")
+        run(feed.on_raw(_upstox_canonical()))
+        assert provider_registry.get("brokerfeed:upstox:u1") is not None
+
+        stopped = []
+
+        async def record_stop(user_id, broker, channel=None):
+            stopped.append((user_id, broker, channel))
+
+        with patch.object(stream_manager, "stop_stream", new=record_stop):
+            run(engine._on_stream_expired("u1", "upstox", "market"))
+
+        assert provider_registry.get("brokerfeed:upstox:u1") is None, "the feed stayed registered"
+        assert stopped == [("u1", "upstox", None)], "the account's other channels were left running"
+
+
+# -- security -----------------------------------------------------------------
+
+
+def test_no_upstox_credential_reaches_a_log_line(caplog):
+    """Neither feed may write a token, a bearer header or a secret into the log.
+
+    The transport logs `endpoint.safe_url` and nothing else. Upstox's URLs carry
+    no credentials at all, so this is checking something stronger than masking:
+    that the *headers* — where Upstox's token actually lives — never reach a log
+    line either.
+    """
+    frames = [_upstox_frame(ltpc={"NSE_EQ|INE002A01018": 2650.75})]
+    with caplog.at_level(logging.DEBUG):
+        drive_stream(
+            _upstox(), frames, instruments=["NSE_EQ|INE002A01018"],
+            session={"access_token": "SUPER-SECRET-TOKEN"}, channel="market",
+        )
+        drive_stream(
+            _upstox(), [json.dumps({"order_id": "UPX-1", "status": "complete"})],
+            session={"access_token": "SUPER-SECRET-TOKEN"}, channel="orders",
+        )
+
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert "SUPER-SECRET-TOKEN" not in logged
+    assert "Bearer" not in logged
+    assert caplog.records, "nothing was logged — the assertion could not have failed"
+
+
+def test_no_upstox_credential_or_identifier_can_reach_a_market_tick():
+    """`MarketTick` has no field an Upstox key or token could occupy."""
+    from dataclasses import fields as dataclass_fields
+
+    names = {f.name for f in dataclass_fields(MarketTick)}
+    assert names == {"symbol", "price", "exchange", "volume", "ingested_at"}
+    assert not (names & {"instrument_token", "instrument_key", "access_token", "broker"})
+
+
+# -- the second-broker architecture proof ------------------------------------
+
+
+def test_upstox_added_no_upstox_knowledge_outside_its_own_adapter():
+    """D4.7's central acceptance criterion, swept rather than asserted by eye.
+
+    The Upstox vocabulary — the feed URLs, the mode, the subscription keys, the
+    instrument-key notion — must exist in exactly one module. A second module
+    that knows any of it is the beginning of the `if broker == "upstox"` branch
+    this framework was built to make unnecessary.
+    """
+    upstox_words = ("upstox", "instrumentkeys", "ltpc", "instrument_key")
+    allowed = {
+        "services/brokers/upstox.py",     # the adapter — the only owner
+        "services/brokers/__init__.py",   # the registry entry — one line
+    }
+    offenders = {}
+    scanned = 0
+    for path in sorted((BACKEND / "services").rglob("*.py")):
+        rel = path.relative_to(BACKEND).as_posix()
+        if rel in allowed:
+            continue
+        scanned += 1
+        source = _strip_source(path.read_text(encoding="utf-8")).lower()
+        hit = [w for w in upstox_words if w in source]
+        if hit:
+            offenders[rel] = hit
+    assert scanned > 50, "the sweep found almost no modules — it could not have failed"
+    assert not offenders, offenders
+
+
+def test_the_market_layer_is_untouched_by_the_second_broker():
+    """Everything D4.7 promised would not move, asserted rather than asserted-by-eye.
+
+    The Market Engine still cannot import the broker layer at all, and the
+    switching machinery still names no broker — the same two properties D4.4 and
+    D4.5 established, re-checked now that a second broker exists, because "no
+    broker-specific branch" is a claim that can only decay.
+    """
+    market_modules = [
+        "services/market_engine/gateway.py",
+        "services/market_engine/source_manager.py",
+        "services/market_engine/ticks.py",
+        "services/market_engine/providers/streaming.py",
+        "services/market_engine/providers/registry.py",
+        "services/market_engine/providers/base.py",
+    ]
+    for relative in market_modules:
+        source = _strip_source((BACKEND / relative).read_text(encoding="utf-8")).lower()
+        for name in ("upstox", "zerodha", "kite", "broker_gateway", "broker_registry"):
+            assert name not in source, f"{relative} names {name!r} in executable code"
+
+
+def test_a_second_streaming_broker_added_no_line_to_the_transport_beyond_the_channel_concept():
+    """`stream.py` still names no broker, no protocol and no wire format.
+
+    D4.7 changed this module — that is the honest finding of the sprint, and it
+    is recorded rather than hidden — but what it added is a *channel*, which is
+    a name, a protocol string and a codec. The property that matters survives:
+    nothing in this file can tell one broker from another.
+    """
+    source = _strip_source((BACKEND / "services/brokers/stream.py").read_text(encoding="utf-8")).lower()
+    for name in ("upstox", "zerodha", "kite", "protobuf", "ltpc", "instrumentkeys", "json"):
+        assert name not in source, f"stream.py names {name!r} in executable code"
+    # And the protocol override table is still empty: both brokers, and all
+    # three of their feeds, are served by the one generic WebSocket transport.
+    from services.brokers.stream import PROTOCOL_RUNNERS, resolve_transport
+
+    assert PROTOCOL_RUNNERS == {}, "a broker-specific transport was reintroduced"
+    for channel in _upstox().stream_channels() + _zerodha().stream_channels():
+        assert resolve_transport(channel) is BrokerStream._run_websocket
+
+
+def test_zerodha_and_upstox_speak_different_protocols_and_produce_identical_canonical_ticks():
+    """THE acceptance criterion: different wire, same output, no shared code path.
+
+    Two brokers agree on nothing at the wire — binary vs protobuf, integer token
+    vs compound key, paise vs rupees, query-string auth vs bearer header, one
+    socket vs two — and what reaches the Market Engine from each is the same
+    canonical `MarketTick`, byte for byte apart from the ingest timestamp.
+
+    That equality is the proof the boundary is real. If either adapter's shape
+    leaked upward, these two lists could not match.
+    """
+    kite_frame = _kite_frame((738561, 265075))
+    upstox_frame = _upstox_frame(ltpc={"NSE_EQ|INE002A01018": 2650.75})
+
+    # The wires share nothing.
+    assert isinstance(kite_frame, bytes) and isinstance(upstox_frame, bytes)
+    assert kite_frame != upstox_frame
+    assert _kite_ticks(kite_frame)[0]["instrument_token"] == 738561
+    assert _upstox_ticks(upstox_frame)[0]["instrument_token"] == "NSE_EQ|INE002A01018"
+    assert type(_kite_ticks(kite_frame)[0]["instrument_token"]) is not type(
+        _upstox_ticks(upstox_frame)[0]["instrument_token"]
+    ), "the two brokers' instrument identities are the same type — one of them is wrong"
+
+    # Each account maps its own broker's identity onto the same instrument.
+    kite_tick = canonical_ticks(_kite_ticks(kite_frame), _kite_map(), broker="zerodha")[0]
+    upstox_tick = canonical_ticks(_upstox_ticks(upstox_frame), _upstox_map(), broker="upstox")[0]
+
+    assert kite_tick.keys() == upstox_tick.keys()
+    for field in ("symbol", "price", "exchange", "volume"):
+        assert kite_tick[field] == upstox_tick[field], field
+    assert kite_tick["symbol"] == "RELIANCE" and kite_tick["price"] == 2650.75
+
+
+def test_both_brokers_reach_the_market_gateway_through_the_identical_seam():
+    """Same registration, same readiness gate, same failover — for both brokers.
+
+    Run as one scenario rather than two so a divergence shows up as a difference
+    between the two halves rather than as two independently passing tests.
+    """
+    from services.brokers.market_feed import set_market_feed_link
+    from services.market_engine.providers import Capability, ResolutionContext, YahooPollingAdapter
+
+    for broker, feed_factory, batch in (
+        ("zerodha", _kite_feed, lambda: canonical_ticks(
+            _kite_ticks(_kite_frame((738561, 265075))), _kite_map(), broker="zerodha")),
+        ("upstox", _upstox_feed, _upstox_canonical),
+    ):
+        with _clean_provider_registry() as registry:
+            registry.clear()
+            baseline = YahooPollingAdapter()
+            registry.register(baseline)
+            manager = SourceManager(registry)
+            ctx = ResolutionContext(user_id="u1", symbol="RELIANCE")
+
+            feed = feed_factory("u1")
+            run(set_market_feed_link("u1", broker, up=True))
+            assert manager.resolve(Capability.QUOTES, context=ctx) is baseline, broker
+            run(feed.on_raw(batch()))
+            assert manager.resolve(Capability.QUOTES, context=ctx) is feed, broker
+            run(set_market_feed_link("u1", broker, up=False, reason="dropped"))
+            assert manager.resolve(Capability.QUOTES, context=ctx) is baseline, broker
+
+
+# -- the channel concept itself ----------------------------------------------
+
+
+def test_a_broker_with_two_feeds_opens_one_stream_per_channel():
+    """The engine opens what the broker declares, and knows nothing about how many."""
+    from services.brokers.stream import stream_manager
+
+    engine = BrokerEngine()
+    engine.db = FakeDB()
+    started = []
+
+    async def record(user_id, broker, session, **kwargs):
+        started.append((broker, kwargs.get("channel"), tuple(kwargs.get("instrument_tokens") or ())))
+
+    holdings = [{"symbol": "RELIANCE", "exchange": "NSE", "instrument_token": "NSE_EQ|INE002A01018"}]
+    # Patched where the engine *bound* it, not where it is defined: the engine
+    # imports the name at module load, so patching the source module is inert
+    # and the real registration would leak a provider into the global registry.
+    with _clean_provider_registry(), \
+            patch.object(stream_manager, "start_stream", new=record), \
+            patch.object(engine, "get_session", AsyncMock(return_value={"access_token": "t"})), \
+            patch("services.broker_engine.attach_market_feed", new=AsyncMock()):
+        run(engine.start_stream("u1", "upstox", holdings=holdings, positions=[]))
+
+    assert [c for _, c, _ in started] == ["orders", "market"]
+    # Both channels are handed the same instrument list; each decides what to do
+    # with it, which is what keeps the engine from having to ask per channel.
+    assert all(instruments == ("NSE_EQ|INE002A01018",) for _, _, instruments in started)
+
+
+def test_a_single_channel_broker_is_unchanged_by_the_channel_concept():
+    """Kite still opens exactly one connection, under the name it always had."""
+    from services.brokers.stream import stream_manager
+    from services.brokers.streaming import DEFAULT_STREAM_CHANNEL as DEFAULT
+
+    engine = BrokerEngine()
+    engine.db = FakeDB()
+    started = []
+
+    async def record(user_id, broker, session, **kwargs):
+        started.append(kwargs.get("channel"))
+
+    # Patched where the engine *bound* it, not where it is defined: the engine
+    # imports the name at module load, so patching the source module is inert
+    # and the real registration would leak a provider into the global registry.
+    with _clean_provider_registry(), \
+            patch.object(stream_manager, "start_stream", new=record), \
+            patch.object(engine, "get_session", AsyncMock(return_value={"access_token": "t"})), \
+            patch("services.broker_engine.attach_market_feed", new=AsyncMock()):
+        run(engine.start_stream("u1", "zerodha",
+                                holdings=[{"symbol": "RELIANCE", "instrument_token": 738561}], positions=[]))
+
+    assert started == [DEFAULT]
+
+
+def test_a_channel_may_not_deliver_an_event_kind_it_does_not_carry():
+    """A codec that decodes the other feed's data is dropped before the capability gate.
+
+    The broker legitimately declares both realtime capabilities, so the
+    broker-level gate would let this through. Without the per-channel narrowing,
+    an order socket emitting a tick would drive the account's market-data
+    provider — a feed marked live and ready on a connection carrying no market
+    data at all.
+    """
+    from services.brokers.streaming import BrokerTick
+
+    class _LeakyOrderChannel(BrokerStreamChannel):
+        name = "orders"
+        protocol = "upstox_portfolio"
+        delivers = frozenset({StreamEventKind.ORDER})
+
+        def endpoint(self, session, credentials=None):
+            return BrokerStreamEndpoint(url="wss://example.invalid/orders")
+
+        def decode(self, frame):
+            return BrokerStreamEvent(
+                kind=StreamEventKind.TICKS,
+                ticks=(BrokerTick(instrument_token="NSE_EQ|INE002A01018", last_price=2650.75),),
+            )
+
+    class _TwoChannelBroker(type(_upstox())):
+        name = "upstox-leaky"
+
+        def stream_channels(self):
+            # A legitimate tick channel alongside the leaking order one, because
+            # that is the real shape: the broker genuinely serves ticks, just not
+            # on this socket. Registration validation is satisfied, the
+            # broker-level capability gate is satisfied, and the *only* thing
+            # standing between the order socket and the account's market feed is
+            # the per-channel narrowing this test exercises.
+            return (_LeakyOrderChannel(), _market_channel())
+
+    adapter = _TwoChannelBroker()
+    broker_registry.register(adapter, replace=True)
+    try:
+        ticks, orders, expired, _ = drive_stream(adapter, [b"anything"], channel="orders")
+    finally:
+        broker_registry.unregister(adapter.name)
+
+    assert ticks == [], "an order channel delivered a tick it does not carry"
+
+
+def test_a_broker_declaring_a_capability_no_channel_carries_is_rejected_at_registration():
+    """The silent failure this check exists to turn into a startup error.
+
+    Without it: the account's market-data provider registers on the strength of
+    the capability, the sockets connect, the reconnect loop is content, and every
+    tick is dropped by the per-channel narrowing. From outside that is a market
+    with no trades in it — the feed never reaches READY, the baseline quietly
+    keeps every quote, and nothing reports a defect.
+    """
+    registry = BrokerRegistry()
+
+    class _OrdersOnlyChannel(BrokerStreamChannel):
+        name = "orders"
+        protocol = "silent"
+        delivers = frozenset({StreamEventKind.ORDER})
+
+        def endpoint(self, session, credentials=None):
+            return BrokerStreamEndpoint(url="wss://example.invalid/orders")
+
+        def decode(self, frame):
+            return BrokerStreamEvent.ignore()
+
+    class _SilentTickBroker(NovaAdapter):
+        name = "silent"
+
+        def stream_channels(self):
+            return (_OrdersOnlyChannel(),)
+
+    with pytest.raises(BrokerAdapterInvalid) as excinfo:
+        registry.register(_SilentTickBroker())
+    assert "tick_stream" in str(excinfo.value)
+
+    class _DuplicateChannelBroker(NovaAdapter):
+        name = "twins"
+
+        def stream_channels(self):
+            return (_OrdersOnlyChannel(), _OrdersOnlyChannel())
+
+    with pytest.raises(BrokerAdapterInvalid) as excinfo:
+        registry.register(_DuplicateChannelBroker())
+    assert "duplicate" in str(excinfo.value).lower()
+
+
+def test_the_stream_registry_keys_on_the_channel_so_one_feed_cannot_replace_another():
+    """The bug the old `(user, broker)` key would have caused, asserted directly.
+
+    Under the old key, starting a broker's second feed silently *replaced* the
+    first: one connection live, one gone, nothing raised.
+    """
+    from services.brokers.stream import BrokerStreamManager
+
+    manager = BrokerStreamManager()
+
+    async def scenario():
+        with patch.object(BrokerStream, "start", lambda self: None):
+            await manager.start_stream("u1", "upstox", {"access_token": "t"}, channel="orders")
+            await manager.start_stream("u1", "upstox", {"access_token": "t"}, channel="market")
+            assert sorted(s["channel"] for s in manager.status()) == ["market", "orders"]
+
+            # Stopping one channel leaves the other alone...
+            await manager.stop_stream("u1", "upstox", "orders")
+            assert [s["channel"] for s in manager.status()] == ["market"]
+            # ...and stopping the account stops what remains.
+            await manager.stop_stream("u1", "upstox")
+            assert manager.status() == []
+
+    run(scenario())

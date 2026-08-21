@@ -44,7 +44,8 @@ Two properties follow, and both are asserted rather than hoped for:
   * **A raw broker payload cannot pass through.** The decoded value is
     type-checked; only canonical `BrokerTick` / `BrokerOrder` shapes continue up.
 
-Adding a WebSocket broker therefore changes nothing here at all.
+Adding a WebSocket broker therefore changed nothing here at all — until a
+broker turned out to need two of them. See the D4.7 note below.
 
 What this module forwards is still a `BrokerTick` — broker-identified. D4.3 put
 the canonical boundary immediately above it, in `BrokerEngine._on_stream_tick`,
@@ -76,8 +77,44 @@ same `_AuthExpired` a frame-reported expiry raises, so one expiry path serves
 both. The default answer is `None`, so no other adapter is affected and this
 file still names no broker.
 
+WHAT D4.7 CHANGED — THE ASSUMPTION KITE HID
+--------------------------------------------
+D4.2 claimed that "adding a WebSocket broker changes nothing here at all". That
+was true of every broker whose realtime surface is one socket, and it stopped
+being true at the second streaming broker, so it is corrected rather than
+quietly left standing.
+
+One assumption survived every previous sprint because Kite could not expose it:
+that a broker has *one* connection. `BrokerStream` held one endpoint, one codec
+and one protocol, and `BrokerStreamManager` keyed its registry on
+`(user, broker)`. Upstox serves order updates on its v2 portfolio stream and
+market ticks on a separate v3 feed — different host, different encoding,
+different subscription model — and under the old key its second `start_stream`
+would have silently *replaced* the first: one feed live, one feed gone, nothing
+raised anywhere.
+
+The generalisation is :class:`~services.brokers.streaming.BrokerStreamChannel`:
+a name, a protocol and a codec. This module opens one connection per channel and
+still cannot tell one broker from another — a channel is as opaque to it as an
+adapter was. A broker that has never heard of channels gets exactly one, backed
+by the same five adapter methods it always implemented, so Kite is unchanged
+byte for byte.
+
+Two things moved with it, both because a broker's connections fail
+*independently*:
+
+  * the link-state callback carries the channel, so a consumer can tell which
+    connection came back — without it, a broker's order socket blinking would
+    demote a market feed that is delivering prices perfectly well;
+  * a decoded event is checked against the *channel's* declared `delivers`
+    before the broker-level capability gate, because a broker that declares
+    TICK_STREAM on one channel would otherwise let its other channel deliver
+    ticks it has no prices on.
+
 Still out of scope, deliberately (D5+): probation windows, latency scoring,
-flap suppression, and sharding a subscription across several connections.
+flap suppression, and sharding one subscription across several connections —
+which is a different thing from a broker needing several connections, and is
+still not done here.
 """
 
 import asyncio
@@ -85,7 +122,12 @@ import logging
 import random
 
 from services.brokers.errors import BrokerContractError
-from services.brokers.streaming import BrokerStreamEndpoint, BrokerStreamEvent, StreamEventKind
+from services.brokers.streaming import (
+    DEFAULT_STREAM_CHANNEL,
+    BrokerStreamEndpoint,
+    BrokerStreamEvent,
+    StreamEventKind,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -129,9 +171,16 @@ class BrokerStream:
         on_tick=None,
         on_expired=None,
         on_link_state=None,
+        channel: str = DEFAULT_STREAM_CHANNEL,
     ):
         self.user_id = user_id
         self.broker = broker
+        #: Which of this broker's realtime channels this connection serves
+        #: (D4.7). A string rather than the channel object because the object is
+        #: resolved from the registry at use time, exactly as `_adapter` is:
+        #: a long-lived stream holding a codec instance would keep serving a
+        #: replaced adapter's wire format after a re-registration.
+        self.channel = (channel or DEFAULT_STREAM_CHANNEL).strip() or DEFAULT_STREAM_CHANNEL
         self.session = session
         #: Credential material supplied by the adapter through the gateway. A
         #: dict rather than a bare `api_key` because what a transport needs is
@@ -183,9 +232,9 @@ class BrokerStream:
         if not self.on_link_state:
             return
         try:
-            await self.on_link_state(self.user_id, self.broker, up, reason)
+            await self.on_link_state(self.user_id, self.broker, up, reason, self.channel)
         except Exception as e:  # pragma: no cover - defensive
-            logger.warning("%s stream link-state callback failed: %s", self.broker, e)
+            logger.warning("%s %s stream link-state callback failed: %s", self.broker, self.channel, e)
 
     async def stop(self):
         self._stopped = True
@@ -209,14 +258,36 @@ class BrokerStream:
 
         return broker_registry.require(self.broker)
 
+    @property
+    def _codec(self):
+        """The channel object this connection speaks through, or None.
+
+        Resolved by name from the adapter every time rather than held, for the
+        same reason `_adapter` is: a stream that cached the codec would keep
+        decoding with a replaced adapter's wire format after a re-registration.
+
+        `None` means the broker no longer declares a channel by this name, which
+        is a configuration change rather than a runtime error — the run loop
+        stops instead of reconnecting into a channel that does not exist.
+        """
+        for channel in self._adapter.stream_channels() or ():
+            if channel.name == self.channel:
+                return channel
+        return None
+
     async def _run(self):
         delay = RECONNECT_BASE_DELAY
         while not self._stopped:
             try:
-                runner = resolve_transport(self._adapter)
+                codec = self._codec
+                if codec is None:
+                    logger.warning("Broker %s declares no stream channel %r", self.broker, self.channel)
+                    return
+                runner = resolve_transport(codec)
                 if runner is None:
                     logger.warning(
-                        "No stream transport for protocol %r (broker %s)", self._adapter.stream_protocol, self.broker
+                        "No stream transport for protocol %r (broker %s channel %s)",
+                        codec.protocol, self.broker, self.channel,
                     )
                     return
                 try:
@@ -232,15 +303,18 @@ class BrokerStream:
             except asyncio.CancelledError:
                 raise
             except _AuthExpired:
-                logger.info(f"{self.broker} stream token expired for user {self.user_id}; stopping stream.")
+                logger.info(
+                    "%s %s stream token expired for user %s; stopping stream.",
+                    self.broker, self.channel, self.user_id,
+                )
                 if self.on_expired:
                     try:
-                        await self.on_expired(self.user_id, self.broker)
+                        await self.on_expired(self.user_id, self.broker, self.channel)
                     except Exception:
                         pass
                 return
             except Exception as e:
-                logger.warning(f"{self.broker} stream error for user {self.user_id}: {e}")
+                logger.warning("%s %s stream error for user %s: %s", self.broker, self.channel, self.user_id, e)
             if self._stopped:
                 return
             await asyncio.sleep(reconnect_pause(delay))
@@ -271,8 +345,8 @@ class BrokerStream:
         the auth material, the subscribe frames, the meaning of a frame — comes
         from the adapter, so this body does not change when a broker is added.
         """
-        adapter = self._adapter
-        endpoint = adapter.stream_endpoint(self.session, self.credentials)
+        codec = self._codec
+        endpoint = codec.endpoint(self.session, self.credentials)
         try:
             ws = await self._connect(endpoint)
         except asyncio.CancelledError:
@@ -284,16 +358,19 @@ class BrokerStream:
             # broker's rejection means; a `None` answer — the default — leaves
             # the exception to the normal backoff, unchanged. See
             # `BrokerAdapter.stream_connect_error`.
-            expired = adapter.stream_connect_error(exc)
+            expired = codec.connect_error(exc)
             if expired:
                 raise _AuthExpired(expired) from exc
             raise
         # `safe_url`, never `url`: a broker that authenticates by query string
         # puts a live access token in it, and SECURITY.md forbids credentials in
         # logs. See BrokerStreamEndpoint.safe_url.
-        logger.info("%s stream connected for user %s (%s)", self.broker, self.user_id, endpoint.safe_url)
+        logger.info(
+            "%s %s stream connected for user %s (%s)",
+            self.broker, self.channel, self.user_id, endpoint.safe_url,
+        )
         try:
-            for frame in adapter.stream_subscribe_frames(self.instrument_tokens) or ():
+            for frame in codec.subscribe_frames(self.instrument_tokens) or ():
                 await ws.send(frame)
             # Announced after the subscribe frames are away, not on the socket
             # opening: an open socket nobody has asked anything of delivers
@@ -325,18 +402,20 @@ class BrokerStream:
         exactly like a quiet market from the outside, and that is precisely the
         failure this whole boundary exists to make visible.
         """
+        codec = self._codec
         try:
-            event = self._adapter.decode_stream_frame(message)
+            event = codec.decode(message)
         except BrokerContractError as e:
-            logger.warning("%s stream frame rejected by the contract: %s", self.broker, e)
+            logger.warning("%s %s stream frame rejected by the contract: %s", self.broker, self.channel, e)
             return BrokerStreamEvent.ignore()
         except Exception as e:
-            logger.warning("%s stream frame could not be decoded: %s", self.broker, e)
+            logger.warning("%s %s stream frame could not be decoded: %s", self.broker, self.channel, e)
             return BrokerStreamEvent.ignore()
         if not isinstance(event, BrokerStreamEvent):
             logger.error(
-                "%s codec returned %s instead of BrokerStreamEvent — frame dropped",
+                "%s %s codec returned %s instead of BrokerStreamEvent — frame dropped",
                 self.broker,
+                self.channel,
                 type(event).__name__,
             )
             return BrokerStreamEvent.ignore()
@@ -352,6 +431,22 @@ class BrokerStream:
 
         if event.kind is StreamEventKind.ERROR:
             logger.warning("%s stream reported an error: %s", self.broker, event.message)
+            return
+
+        codec = self._codec
+        if codec is not None and event.kind not in codec.delivers:
+            # The channel decoded something it does not carry (D4.7). Dropped
+            # ahead of the broker-level gate because the broker may legitimately
+            # declare the capability on a *different* channel, so the capability
+            # check would let this through: a broker whose order channel emitted
+            # a tick would drive that account's market-data provider from a
+            # socket carrying no market data, and mark a live portfolio with it.
+            logger.warning(
+                "%s channel %s decoded a %s event it does not carry — dropped",
+                self.broker,
+                self.channel,
+                event.kind.value,
+            )
             return
 
         from services.brokers.gateway import broker_gateway
@@ -392,15 +487,20 @@ class BrokerStream:
 PROTOCOL_RUNNERS = {}
 
 
-def resolve_transport(adapter):
-    """The transport coroutine for an adapter, or None if it declares no stream.
+def resolve_transport(source):
+    """The transport coroutine for a stream channel, or None if it has no protocol.
 
     Protocol-specific override first, generic WebSocket transport otherwise.
-    A broker with no `stream_protocol` gets None and never connects — checked
-    here rather than at the call site so "does this broker stream" has one
-    answer.
+    A channel with no protocol gets None and never connects — checked here
+    rather than at the call site so "does this stream" has one answer.
+
+    Accepts a :class:`~services.brokers.streaming.BrokerStreamChannel` or, for
+    the "does this broker stream at all" question, an adapter — whose answer is
+    its default channel's protocol. Both are asked by name (`protocol` /
+    `stream_protocol`) and neither is a broker: this function still cannot tell
+    Kite from Upstox.
     """
-    protocol = (getattr(adapter, "stream_protocol", "") or "").strip()
+    protocol = (getattr(source, "protocol", None) or getattr(source, "stream_protocol", "") or "").strip()
     if not protocol:
         return None
     return PROTOCOL_RUNNERS.get(protocol, BrokerStream._run_websocket)
@@ -411,10 +511,18 @@ class _AuthExpired(Exception):
 
 
 class BrokerStreamManager:
-    """Owns every live broker stream: start/stop/replace per (user, broker)."""
+    """Owns every live broker stream: start/stop/replace per (user, broker, channel).
+
+    Keyed on the channel as well as the account since D4.7. The key used to be
+    `(user, broker)`, which was not a simplification but an assumption — that a
+    broker's realtime surface is one socket — and it held only because Kite
+    multiplexes ticks and order updates onto one connection. A broker that needs
+    two would have had its second `start_stream` silently *replace* the first,
+    leaving one feed live, one feed gone, and nothing raised.
+    """
 
     def __init__(self):
-        self._streams: dict = {}  # (user_id, broker) -> BrokerStream
+        self._streams: dict = {}  # (user_id, broker, channel) -> BrokerStream
 
     async def start_stream(
         self,
@@ -427,8 +535,10 @@ class BrokerStreamManager:
         on_tick=None,
         on_expired=None,
         on_link_state=None,
+        channel: str = DEFAULT_STREAM_CHANNEL,
     ):
-        await self.stop_stream(user_id, broker)
+        channel = (channel or DEFAULT_STREAM_CHANNEL).strip() or DEFAULT_STREAM_CHANNEL
+        await self.stop_stream(user_id, broker, channel)
         stream = BrokerStream(
             user_id,
             broker,
@@ -439,17 +549,35 @@ class BrokerStreamManager:
             on_tick=on_tick,
             on_expired=on_expired,
             on_link_state=on_link_state,
+            channel=channel,
         )
-        self._streams[(user_id, broker)] = stream
+        self._streams[(user_id, broker, channel)] = stream
         stream.start()
         return stream
 
-    async def stop_stream(self, user_id: str, broker: str):
-        stream = self._streams.pop((user_id, broker), None)
-        if stream:
-            await stream.stop()
+    def _keys(self, user_id: str, broker: str, channel: str = None) -> list:
+        """Every registry key for an account, or just the one channel's.
 
-    def discard(self, user_id: str, broker: str) -> bool:
+        `channel=None` means "every channel of this account", which is what the
+        account-level callers want — disconnect, shutdown, session expiry. They
+        pass no channel and must not have to enumerate a broker's channels
+        themselves; asking a broker how many sockets it has is exactly the
+        knowledge this module does not hold.
+        """
+        return [
+            key
+            for key in list(self._streams)
+            if key[0] == user_id and key[1] == broker and (channel is None or key[2] == channel)
+        ]
+
+    async def stop_stream(self, user_id: str, broker: str, channel: str = None):
+        """Stop one channel, or every channel of an account when `channel` is None."""
+        for key in self._keys(user_id, broker, channel):
+            stream = self._streams.pop(key, None)
+            if stream:
+                await stream.stop()
+
+    def discard(self, user_id: str, broker: str, channel: str = None) -> bool:
         """Forget a stream that has already ended on its own (PH3.6).
 
         Deliberately NOT `stop_stream`. The one caller is the broker's
@@ -463,8 +591,15 @@ class BrokerStreamManager:
         its `session` dict — that is, an expired broker **access token** — and
         its callbacks, and each still listed by `status()` as a stream that
         exists but is not running.
+
+        Scoped to the calling channel since D4.7. Discarding an account's other
+        channels here would drop live streams from the registry without
+        stopping them, leaking exactly the task `stop_stream` exists to cancel.
         """
-        return self._streams.pop((user_id, broker), None) is not None
+        discarded = False
+        for key in self._keys(user_id, broker, channel):
+            discarded = self._streams.pop(key, None) is not None or discarded
+        return discarded
 
     async def stop_all(self):
         for key in list(self._streams):
@@ -475,10 +610,11 @@ class BrokerStreamManager:
             {
                 "user_id": user_id,
                 "broker": broker,
+                "channel": channel,
                 "running": stream.running,
                 "subscribed_instruments": len(stream.instrument_tokens),
             }
-            for (user_id, broker), stream in self._streams.items()
+            for (user_id, broker, channel), stream in self._streams.items()
         ]
 
 

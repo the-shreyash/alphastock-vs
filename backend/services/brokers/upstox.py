@@ -10,41 +10,486 @@ Note on instruments: Upstox order APIs address instruments by instrument key
 ("NSE_EQ|<ISIN>"), not by trading symbol. The adapter resolves symbols to
 instrument keys from the user's own holdings/positions; callers may also pass
 `instrument_token` explicitly.
+
+TWO FEEDS, TWO CHANNELS (D4.7)
+------------------------------
+Upstox does not multiplex its realtime surface the way Kite does. Order updates
+arrive on the v2 **portfolio stream** as JSON; market ticks arrive on the v3
+**market-data feed**, a different host path, a different encoding (protobuf) and
+a different subscription model. Both are declared through
+:meth:`UpstoxAdapter.stream_channels` and opened by the same generic transport,
+which learns nothing about Upstox in the process — see
+:class:`~services.brokers.streaming.BrokerStreamChannel` for why the transport
+grew the concept rather than this module growing a socket.
+
+Everything Upstox-specific below terminates in this file. What leaves it is a
+:class:`~services.brokers.streaming.BrokerTick` carrying the account's own
+instrument key, which `InstrumentMap` turns into a canonical symbol exactly as
+it does for Kite's integer token.
 """
 import json
 import logging
+import math
+import struct
+import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import urlencode
 
 from services.brokers.base import (
-    IST, BrokerAdapter, BrokerAuthError, BrokerError, normalize_status,
+    IST, AdapterStreamChannel, BrokerAdapter, BrokerAuthError, BrokerError, normalize_status,
 )
 from services.brokers.capabilities import BrokerCapability
 from services.brokers.credentials import BrokerCredentialSpec
-from services.brokers.streaming import BrokerStreamEndpoint, BrokerStreamEvent
+from services.brokers.streaming import (
+    BrokerStreamChannel,
+    BrokerStreamEndpoint,
+    BrokerStreamEvent,
+    StreamEventKind,
+)
 
 logger = logging.getLogger(__name__)
 
-#: Upstox v2 portfolio stream. Order updates only — Upstox's market ticks are a
-#: separate protobuf feed and remain out of scope. Moved here from `stream.py`
-#: in D4.2 with the rest of this broker's wire knowledge.
+#: Upstox v2 portfolio stream. Order updates only — market ticks arrive on the
+#: separate v3 feed below. Moved here from `stream.py` in D4.2 with the rest of
+#: this broker's wire knowledge.
 WS_URL = "wss://api.upstox.com/v2/feed/portfolio-stream-feed?update_types=order"
+
+#: Upstox v3 market-data feed (D4.7).
+#:
+#: Verified against Upstox's own Python SDK (`upstox_client/feeder/
+#: market_data_feeder_v3.py`), not inferred from Kite and not inferred from the
+#: portfolio stream. Two properties matter here and neither is shared with
+#: Zerodha:
+#:
+#: * **Authentication is a bearer header, not a query string.** Nothing
+#:   credential-bearing is in this URL, so `BrokerStreamEndpoint.safe_url` has
+#:   nothing to strip — the opposite of Kite's ticker, whose URL carries a live
+#:   access token. No second masking mechanism was needed for it.
+#: * **Upstox answers the handshake with a 307 redirect** to a short-lived
+#:   signed socket URL. `websockets` follows it, so there is no separate
+#:   `/authorize` call to make; that REST endpoint exists and returns the same
+#:   destination, and is deliberately not used — an extra authenticated request
+#:   whose response would be a credential-bearing URL we would then have to keep
+#:   out of every log line.
+MARKET_WS_URL = "wss://api.upstox.com/v3/feed/market-data-feed"
 
 BASE_URL = "https://api.upstox.com/v2"
 AUTH_URL = f"{BASE_URL}/login/authorization/dialog"
+
+#: Channel names for this broker's two realtime connections (D4.7).
+ORDER_CHANNEL = "orders"
+MARKET_CHANNEL = "market"
+
+#: The market-feed mode this adapter subscribes in.
+#:
+#: `ltpc` deliberately, and — as with Kite's `STREAM_MODE` — the choice is
+#: recorded here rather than inline because it is the one protocol decision with
+#: a product consequence. It is NOT copied from Kite: Upstox's modes are its own
+#: (`ltpc`, `option_greeks`, `full`, `full_d30`) and the reasoning was made
+#: against what each of them actually carries.
+#:
+#: The tick feed marks portfolio holdings and open trades and answers streamed
+#: quotes; all three need a last traded price. `full` adds five depth levels,
+#: 1-minute/30-minute/daily candles, option greeks and open interest — a
+#: multiple of the bandwidth for fields no consumer reads — and `full_d30` is an
+#: Upstox Plus entitlement this platform does not require its users to hold.
+#:
+#: What it costs, stated plainly: an Upstox-derived `MarketTick` carries no
+#: volume. `LTPC` has `ltq` — the *last traded* quantity — and that is one
+#: trade's size, not the day's cumulative volume; mapping it to the canonical
+#: `volume` field would put a number there that means something else entirely.
+#: Cumulative volume (`vtt`) exists only in the `full` modes. This is the same
+#: limitation Kite's LTP mode has, reached independently, and it is recorded in
+#: TASK.md rather than papered over.
+MARKET_STREAM_MODE = "ltpc"
+
+#: Instrument keys one Upstox socket may carry in `ltpc` mode.
+#:
+#: Enforced here because Upstox rejects an over-limit *subscription request* as
+#: a whole rather than trimming it, so exceeding it silently costs the account
+#: every instrument rather than the excess ones. A retail holdings-and-positions
+#: universe is nowhere near this; an account that somehow is gets a warning and
+#: a deterministic prefix, which is strictly better than a feed with nothing on
+#: it.
+MAX_SUBSCRIBED_INSTRUMENTS = 5000
+
+
+# ── Upstox v3 market-data feed: the protobuf codec ──────────────────────────
+#
+# The v3 feed is Protocol Buffers, and this decodes exactly the fields the
+# canonical contract can hold. Field numbers are transcribed from Upstox's
+# official schema (`MarketDataFeedV3.proto`, upstox/upstox-python):
+#
+#     FeedResponse { Type type = 1; map<string, Feed> feeds = 2;
+#                    int64 currentTs = 3; MarketInfo marketInfo = 4; }
+#     Feed         { oneof { LTPC ltpc = 1; FullFeed fullFeed = 2;
+#                            FirstLevelWithGreeks firstLevelWithGreeks = 3; } }
+#     FullFeed     { oneof { MarketFullFeed marketFF = 1; IndexFullFeed indexFF = 2; } }
+#     LTPC         { double ltp = 1; int64 ltt = 2; int64 ltq = 3; double cp = 4; }
+#
+# WHY A DECODER RATHER THAN THE PROTOBUF RUNTIME
+# ----------------------------------------------
+# `protobuf` is not a dependency of this platform, and its absence is a decision
+# rather than an oversight: PH2.8 removed it (with grpcio and the old Google AI
+# SDK) from the production runtime after PH2.1 measured ~220 MB of image that no
+# application module imports. Re-adding a C-extension runtime dependency, plus a
+# generated `_pb2` build artifact that must be regenerated whenever the schema
+# moves, to read one `double` out of a map is a poor trade.
+#
+# The proto3 wire format is small, published and stable, and what is read here
+# is four field numbers deep. The risk in hand-decoding is getting the schema
+# wrong, so the tests do not take this module's word for it: fixtures are
+# encoded by Google's own protobuf runtime from the official schema and must
+# decode identically through the code below (`tests/test_broker_streaming.py`,
+# the Upstox protobuf conformance tests). That runtime is a **test-only**
+# dependency — see requirements-dev.txt — so the oracle cannot pass by agreeing
+# with the implementation it is checking.
+
+WIRE_VARINT = 0
+WIRE_64BIT = 1
+WIRE_LENGTH = 2
+WIRE_32BIT = 5
+
+#: `FeedResponse.feeds`.
+FEEDS_FIELD = 2
+#: proto3 map entries are messages of {key = 1, value = 2}.
+MAP_KEY_FIELD = 1
+MAP_VALUE_FIELD = 2
+#: `LTPC.ltp`.
+LTP_FIELD = 1
+
+#: Every place an `LTPC` message can sit inside a `Feed`, as field-number paths.
+#:
+#: Only the first is reachable in the mode this adapter subscribes in. The other
+#: three are here because a mode change must not produce a socket that connects,
+#: subscribes and decodes nothing — which is indistinguishable from a quiet
+#: market and is precisely how a feed goes silently narrow.
+LTPC_PATHS = (
+    (1,),        # Feed.ltpc                                    — ltpc mode
+    (2, 1, 1),   # Feed.fullFeed.marketFF.ltpc                  — full mode, tradable
+    (2, 2, 1),   # Feed.fullFeed.indexFF.ltpc                   — full mode, index
+    (3, 1),      # Feed.firstLevelWithGreeks.ltpc               — option_greeks mode
+)
+
+
+class UpstoxProtocolError(ValueError):
+    """A market-feed frame that is not decodable proto3.
+
+    Raised inside this module and caught at :meth:`UpstoxMarketFeedChannel.decode`,
+    never propagated: a malformed frame must cost itself and nothing else, least
+    of all a socket that is otherwise delivering good prices.
+    """
+
+
+def _read_varint(buf: bytes, pos: int) -> Tuple[int, int]:
+    """One base-128 varint at `pos`; returns (value, next position)."""
+    result = 0
+    shift = 0
+    while True:
+        if pos >= len(buf):
+            raise UpstoxProtocolError("varint runs past the end of the frame")
+        byte = buf[pos]
+        pos += 1
+        result |= (byte & 0x7F) << shift
+        if not byte & 0x80:
+            return result, pos
+        shift += 7
+        if shift > 63:
+            raise UpstoxProtocolError("varint is longer than 64 bits")
+
+
+def _fields(buf: bytes):
+    """Yield `(field_number, wire_type, value)` for one protobuf message.
+
+    `value` is an `int` for varints and a `bytes` slice for everything else.
+    Unknown fields are yielded rather than skipped silently — the caller filters
+    by field number, which is what makes this forward-compatible with a schema
+    that grows fields we do not read.
+
+    A length that runs past the buffer stops the parse by raising rather than
+    truncating: every subsequent offset in a damaged frame is guesswork, and
+    guessing produces plausible instrument keys at plausible prices, which is
+    the one outcome worse than decoding nothing. (The same reasoning as the Kite
+    binary parser's truncation check, arrived at from the same failure mode.)
+    """
+    pos = 0
+    end = len(buf)
+    while pos < end:
+        key, pos = _read_varint(buf, pos)
+        number, wire = key >> 3, key & 0x07
+        if number == 0:
+            raise UpstoxProtocolError("field number 0 is not valid")
+        if wire == WIRE_VARINT:
+            value, pos = _read_varint(buf, pos)
+        elif wire == WIRE_64BIT:
+            if pos + 8 > end:
+                raise UpstoxProtocolError("64-bit field runs past the end of the frame")
+            value, pos = buf[pos:pos + 8], pos + 8
+        elif wire == WIRE_LENGTH:
+            length, pos = _read_varint(buf, pos)
+            if pos + length > end:
+                raise UpstoxProtocolError("length-delimited field runs past the end of the frame")
+            value, pos = buf[pos:pos + length], pos + length
+        elif wire == WIRE_32BIT:
+            if pos + 4 > end:
+                raise UpstoxProtocolError("32-bit field runs past the end of the frame")
+            value, pos = buf[pos:pos + 4], pos + 4
+        else:
+            # Wire types 3 and 4 are proto2 groups, removed in proto3, and 6/7
+            # are not assigned. Any of them means this is not the frame we think
+            # it is, so the parse stops rather than resynchronising by guess.
+            raise UpstoxProtocolError(f"unsupported protobuf wire type {wire}")
+        yield number, wire, value
+
+
+def _submessage(buf: bytes, *path: int) -> Optional[bytes]:
+    """Follow a path of field numbers down through nested messages."""
+    for number in path:
+        found = None
+        for field_number, wire, value in _fields(buf):
+            if field_number == number and wire == WIRE_LENGTH:
+                found = value
+                break
+        if found is None:
+            return None
+        buf = found
+    return buf
+
+
+def _last_price(feed: bytes) -> Optional[float]:
+    """`LTPC.ltp` from a `Feed`, in rupees, or None when it carries no price.
+
+    RUPEES, NOT PAISE — AND THE SCHEMA IS THE EVIDENCE
+    ---------------------------------------------------
+    `LTPC.ltp` is a proto3 `double`. Kite quotes in paise (and in two other
+    scales for the currency segments) because its packets carry unsigned
+    integers, which have to be scaled to express a fraction; a `double` does
+    not. Applying Kite's divisor of 100 here would price every Upstox
+    instrument at one per cent of its value — a number that looks entirely
+    plausible on a chart and would be marked against a real position.
+
+    `None` rather than `0.0` when the field is absent, and the distinction is
+    load-bearing: proto3 omits a `double` whose value is zero, so "no price in
+    this frame" and "a price of zero" are the same bytes. Neither may become a
+    tick — `MIN_STOCK_PRICE` rejects zero at the canonical boundary for exactly
+    this reason — so returning None drops it here instead of manufacturing a
+    tick that marks a position at nothing.
+    """
+    for path in LTPC_PATHS:
+        ltpc = _submessage(feed, *path)
+        if ltpc is None:
+            continue
+        for number, wire, value in _fields(ltpc):
+            if number == LTP_FIELD and wire == WIRE_64BIT:
+                price = struct.unpack("<d", value)[0]
+                # NaN and ±inf are what a corrupted double decodes to. They
+                # would survive every arithmetic step below and fail only at the
+                # canonical range check — which compares NaN with `<=` and gets
+                # False, so it *is* caught, but as "out of range" rather than as
+                # the damage it is. Dropped here, where the reason is known.
+                return price if math.isfinite(price) else None
+    return None
+
+
+def decode_market_feed(payload: bytes) -> List[Dict[str, Any]]:
+    """One `FeedResponse` frame → `[{instrument_token, last_price}]`.
+
+    The instrument identifier is the map key — Upstox's own instrument key,
+    `"NSE_EQ|INE002A01018"` — carried through verbatim as
+    :attr:`BrokerTick.instrument_token`, which is typed `Any` precisely so a
+    broker that identifies instruments by a compound string needs no special
+    case. `InstrumentMap` matches it against the account's synced holdings and
+    positions, whose `instrument_token` is the same key, and the platform never
+    sees it again.
+
+    Nothing raises. A frame is a batch of instruments and one undecodable entry
+    must not cost the others their prices; a frame that yields nothing usable
+    returns `[]`, which the caller turns into an IGNORE event. `market_info`
+    frames and Upstox's periodic keep-alives carry no `feeds` and land here
+    naturally as empty rather than as errors.
+    """
+    ticks: List[Dict[str, Any]] = []
+    try:
+        entries = [value for number, wire, value in _fields(payload)
+                   if number == FEEDS_FIELD and wire == WIRE_LENGTH]
+    except UpstoxProtocolError as exc:
+        logger.debug("Upstox market frame skipped: %s", exc)
+        return ticks
+
+    for entry in entries:
+        try:
+            key = None
+            feed = None
+            for number, wire, value in _fields(entry):
+                if number == MAP_KEY_FIELD and wire == WIRE_LENGTH:
+                    key = value.decode("utf-8", errors="ignore").strip()
+                elif number == MAP_VALUE_FIELD and wire == WIRE_LENGTH:
+                    feed = value
+            if not key or feed is None:
+                continue
+            price = _last_price(feed)
+            if price is None:
+                continue
+            ticks.append({"instrument_token": key, "last_price": price})
+        except (UpstoxProtocolError, struct.error) as exc:
+            logger.debug("Upstox market feed entry skipped: %s", exc)
+            continue
+    return ticks
+
+
+def instrument_key(value: Any) -> Optional[str]:
+    """Coerce a stored instrument identifier into an Upstox instrument key, or None.
+
+    Upstox identifies instruments by a compound string — `"NSE_EQ|INE002A01018"`,
+    `"NSE_INDEX|Nifty 50"` — so unlike Kite's numeric token there is nothing to
+    parse; what this rejects is a value that is not one. The separator is the
+    check: a bare symbol or an integer would be accepted by the subscribe frame
+    and then silently rejected by Upstox for the *whole* subscription, leaving
+    the account with a connected socket and no instruments on it.
+
+    `bool` is excluded explicitly for the same reason the Kite coercion excludes
+    it — it is an `int` subclass and would stringify into the frame as "True".
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    key = str(value).strip()
+    if "|" not in key:
+        return None
+    segment, _, identifier = key.partition("|")
+    if not segment.strip() or not identifier.strip():
+        return None
+    return key
+
+
+class UpstoxMarketFeedChannel(BrokerStreamChannel):
+    """The v3 market-data feed — Upstox's tick channel.
+
+    A sibling of the portfolio stream rather than a mode of it: different host
+    path, different encoding, different subscription model, and it fails
+    independently. Everything below is Upstox wire knowledge and none of it
+    leaves this class; what the transport gets back is a
+    :class:`BrokerStreamEvent` built from canonical `BrokerTick`s.
+
+    :attr:`delivers` is TICKS alone. That narrowing is what stops this channel
+    ever being credited with an order update, and — the direction that actually
+    bites — stops the *order* channel being mistaken for this one when the
+    account's market-data provider is deciding whether its feed is live.
+    """
+
+    name = MARKET_CHANNEL
+    #: A protocol of its own, not the adapter's. Two feeds of one broker need
+    #: not speak the same wire format, and these two do not.
+    protocol = "upstox_market_feed_v3"
+    delivers = frozenset({StreamEventKind.TICKS})
+
+    def endpoint(self, session: dict, credentials: Dict[str, str] = None) -> BrokerStreamEndpoint:
+        """The v3 feed, authenticated by bearer header.
+
+        `credentials` is unused: this feed authenticates with the user's own
+        session token and needs none of the app-level material Kite's ticker
+        puts in its query string. The parameter stays because it is the
+        channel contract, and a channel that dropped it would be a channel the
+        transport calls differently.
+        """
+        token = (session or {}).get("access_token") or ""
+        return BrokerStreamEndpoint(
+            url=MARKET_WS_URL,
+            headers={"Authorization": f"Bearer {token}", "Accept": "*/*"},
+        )
+
+    def subscribe_frames(self, instruments: Sequence[Any] = None) -> List[Any]:
+        """Upstox's single subscribe frame — JSON, sent as **binary**.
+
+        Two Upstox specifics that a Kite-shaped assumption gets wrong:
+
+        * one frame, not two. Kite subscribes and then narrows the mode with a
+          second frame; Upstox carries the mode inside the subscription.
+        * `bytes`, not `str`. Upstox requires the request as a binary frame, and
+          a text frame is ignored — which produces a socket that connects,
+          reports its link up, and never delivers a tick. Returning `bytes` is
+          what makes the transport send a binary frame, since it forwards
+          exactly what this returns without re-encoding it (D4.2).
+
+        The keys are re-coerced here as well as in `stream_instruments` because
+        this method is part of the channel's contract and the transport hands
+        back whatever it was given at stream start.
+        """
+        keys = [k for k in (instrument_key(i) for i in (instruments or [])) if k is not None]
+        if not keys:
+            return []
+        if len(keys) > MAX_SUBSCRIBED_INSTRUMENTS:
+            logger.warning(
+                "Upstox market feed: %d instruments exceeds the %d-key limit for %s mode — "
+                "subscribing to the first %d",
+                len(keys), MAX_SUBSCRIBED_INSTRUMENTS, MARKET_STREAM_MODE, MAX_SUBSCRIBED_INSTRUMENTS,
+            )
+            keys = keys[:MAX_SUBSCRIBED_INSTRUMENTS]
+        request = {
+            "guid": str(uuid.uuid4()),
+            "method": "sub",
+            "data": {"mode": MARKET_STREAM_MODE, "instrumentKeys": keys},
+        }
+        return [json.dumps(request).encode("utf-8")]
+
+    def connect_error(self, error: BaseException) -> Optional[str]:
+        """Whether a refused handshake means this session is dead."""
+        return _session_refused(error)
+
+    def decode(self, frame: Any) -> BrokerStreamEvent:
+        """Decode one v3 market-feed frame.
+
+        Binary only. A text frame on this socket is not a tick under any Upstox
+        mode, so it is ignored rather than JSON-parsed — parsing it would be the
+        portfolio stream's codec running on the market feed, which is the
+        cross-contamination this channel split exists to make impossible.
+        """
+        if not isinstance(frame, (bytes, bytearray)):
+            return BrokerStreamEvent.ignore()
+        return BrokerStreamEvent.tick_event(decode_market_feed(bytes(frame)))
+
+
+def _session_refused(error: BaseException) -> Optional[str]:
+    """Reason string when Upstox refused a stream handshake for a dead token.
+
+    Upstox invalidates every access token daily at 03:30 IST and then refuses
+    both feeds' handshakes with **HTTP 401** — before a frame is exchanged, so
+    neither codec ever sees it. Left unclassified the generic transport cannot
+    tell it from a broker outage: it reconnects on the backoff schedule
+    indefinitely, the account's market feed stays registered, and the user is
+    never asked to reconnect. That is not an edge case; it is every connected
+    Upstox user, every morning.
+
+    Shared by both channels because it is one token and one rejection, and
+    written as a function rather than duplicated so the two cannot drift into
+    disagreeing about what a dead Upstox session looks like.
+
+    403 is included alongside 401 because Upstox uses it for a token whose app
+    authorisation has been withdrawn — also unrecoverable by reconnecting, and
+    also fixed by the user reconnecting the account.
+    """
+    status = getattr(error, "status_code", None)
+    if status is None:
+        # websockets >= 14 wraps the handshake response instead.
+        status = getattr(getattr(error, "response", None), "status_code", None)
+    if status in (401, 403):
+        return (
+            f"Upstox refused the stream handshake (HTTP {status}) — the access token is no "
+            "longer valid. Upstox tokens reset daily at 3:30 AM IST; please reconnect."
+        )
+    return None
 
 
 class UpstoxAdapter(BrokerAdapter):
     name = "upstox"
     display_name = "Upstox"
 
-    #: Upstox v2 covers the account, order and order-stream surface. TICK_STREAM
-    #: is absent because the Upstox market feed is a separate protobuf endpoint
-    #: this adapter does not speak — the portfolio stream carries order updates
-    #: only. Declaring the absence is what lets the engine open an order-only
-    #: stream for Upstox and a tick-carrying stream for Zerodha from the same
-    #: broker-agnostic code path.
+    #: Upstox v2 covers the account and order surface; the realtime surface is
+    #: two feeds and both are declared here (D4.7). TICK_STREAM used to be
+    #: absent because the market feed is a separate protobuf endpoint this
+    #: adapter did not speak — it speaks it now, on its own channel, and the
+    #: capability is what makes the account's feed a registered market-data
+    #: provider through the same broker-agnostic path Zerodha uses.
     capabilities = frozenset({
         BrokerCapability.PROFILE,
         BrokerCapability.HOLDINGS,
@@ -58,6 +503,7 @@ class UpstoxAdapter(BrokerAdapter):
         BrokerCapability.CANCEL_ORDER,
         BrokerCapability.SESSION_INVALIDATE,
         BrokerCapability.ORDER_STREAM,
+        BrokerCapability.TICK_STREAM,
     })
 
     credential_spec = BrokerCredentialSpec(
@@ -252,6 +698,56 @@ class UpstoxAdapter(BrokerAdapter):
     def normalize_stream_order(self, payload: dict) -> dict:
         """Canonicalize an Upstox portfolio-stream order frame."""
         return self._normalize_order(payload or {})
+
+    # -- realtime: channels (D4.7) ---------------------------------------------
+    def stream_channels(self) -> Tuple[BrokerStreamChannel, ...]:
+        """Upstox's two realtime connections.
+
+        The order channel is this adapter itself, wrapped — its endpoint,
+        subscribe frames and codec are the `stream_*` / `decode_stream_frame`
+        methods below, unchanged from D4.2 — narrowed to ORDER so it can never
+        be credited with a tick it did not carry. The market channel is a
+        separate codec for a separate feed.
+
+        Naming both explicitly rather than leaving one on the default channel
+        name is deliberate: the stream registry keys on `(user, broker,
+        channel)` and appears in diagnostics, and "default" would say nothing
+        about which of two feeds an entry is.
+        """
+        return (
+            AdapterStreamChannel(self, name=ORDER_CHANNEL, delivers=frozenset({StreamEventKind.ORDER})),
+            UpstoxMarketFeedChannel(),
+        )
+
+    def stream_instruments(self, holdings: list = None, positions: list = None) -> List[Any]:
+        """Upstox instrument keys for every instrument in the user's portfolio.
+
+        The same two lists Kite's adapter reads, producing an entirely different
+        kind of identifier: a compound string the user's own holdings and
+        positions already carry as `instrument_token`. Nothing has to be fetched
+        and no instrument catalogue is involved — which is why D4.7 needed no
+        catalogue sprint. The cost is that the feed covers what the account
+        holds and nothing else, which is exactly the scope D4.5 subscribes and
+        grants coverage for.
+
+        Sorted and de-duplicated so a resubscribe after a portfolio sync
+        produces a stable subscription list.
+        """
+        keys = set()
+        for row in list(holdings or []) + list(positions or []):
+            if not isinstance(row, dict):
+                continue
+            key = instrument_key(row.get("instrument_token"))
+            if key is not None:
+                keys.add(key)
+        return sorted(keys)
+
+    def stream_connect_error(self, error: BaseException) -> Optional[str]:
+        """Whether a refused portfolio-stream handshake means this session is dead.
+
+        Same classification as the market feed's — see :func:`_session_refused`.
+        """
+        return _session_refused(error)
 
     # -- realtime: the portfolio-stream codec (D4.2) ---------------------------
     def stream_endpoint(self, session: dict, credentials: dict = None) -> BrokerStreamEndpoint:

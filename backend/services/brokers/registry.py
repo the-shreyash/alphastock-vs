@@ -42,7 +42,7 @@ from __future__ import annotations
 import logging
 from typing import Dict, List, Optional
 
-from services.brokers.base import BrokerAdapter
+from services.brokers.base import CAPABILITY_EVENTS, BrokerAdapter
 from services.brokers.capabilities import (
     CAPABILITY_METHODS,
     IMPLEMENTABLE_CAPABILITIES,
@@ -190,10 +190,68 @@ class BrokerRegistry:
                     f"broker {adapter.name!r} declares a realtime stream it cannot decode: missing "
                     + ", ".join(f"{m}()" for m in sorted(unimplemented))
                 )
+            BrokerRegistry._validate_stream_channels(adapter, streaming)
         elif (adapter.stream_protocol or "").strip():
             raise BrokerAdapterInvalid(
                 f"broker {adapter.name!r} declares stream_protocol "
                 f"{adapter.stream_protocol!r} but no streaming capability to use it"
+            )
+
+    @staticmethod
+    def _validate_stream_channels(adapter: BrokerAdapter, streaming: frozenset) -> None:
+        """Every declared realtime capability must be carried by some channel (D4.7).
+
+        The method check above verifies the adapter *can* decode a frame. It
+        cannot verify that anything ever will, and for a single-channel broker
+        it did not need to: one channel carried whatever the broker declared.
+        A broker whose realtime surface is several connections can now declare
+        TICK_STREAM while no channel says it delivers ticks — and the failure is
+        silent in the worst way. The account's market-data provider is
+        registered on the strength of the capability, the sockets connect, the
+        reconnect loop is content, and every tick the transport does see is
+        dropped by the per-channel narrowing in `stream.py`. From the outside
+        that is indistinguishable from a market with no trades in it: the feed
+        never reaches READY, the baseline quietly keeps every quote, and nothing
+        anywhere reports a defect.
+
+        Checked at registration, so the cost of the mistake is a startup error
+        rather than a trading session spent on delayed prices.
+        """
+        channels = tuple(adapter.stream_channels() or ())
+        if not channels:
+            raise BrokerAdapterInvalid(
+                f"broker {adapter.name!r} declares "
+                + ", ".join(sorted(c.value for c in streaming))
+                + " but no stream channel to carry it"
+            )
+
+        names = [channel.name for channel in channels]
+        duplicates = sorted({name for name in names if names.count(name) > 1})
+        if duplicates:
+            # Two channels with one name are one channel as far as the stream
+            # registry is concerned: `(user, broker, channel)` collides, the
+            # second `start_stream` replaces the first, and one of the broker's
+            # feeds is silently never opened.
+            raise BrokerAdapterInvalid(
+                f"broker {adapter.name!r} declares duplicate stream channel name(s): " + ", ".join(duplicates)
+            )
+
+        carried = set()
+        for channel in channels:
+            if not (channel.protocol or "").strip():
+                raise BrokerAdapterInvalid(
+                    f"broker {adapter.name!r} stream channel {channel.name!r} declares no protocol to dispatch on"
+                )
+            carried |= set(channel.delivers or ())
+
+        uncarried = sorted(
+            capability.value
+            for capability in streaming
+            if CAPABILITY_EVENTS.get(capability) not in carried
+        )
+        if uncarried:
+            raise BrokerAdapterInvalid(
+                f"broker {adapter.name!r} declares " + ", ".join(uncarried) + " but no stream channel delivers it"
             )
 
     def unregister(self, name: str) -> Optional[BrokerAdapter]:

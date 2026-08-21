@@ -54,6 +54,7 @@ from services.brokers.market_feed import (
     set_market_feed_link,
 )
 from services.brokers.stream import stream_manager
+from services.brokers.streaming import StreamEventKind
 
 logger = logging.getLogger(__name__)
 
@@ -557,15 +558,23 @@ class BrokerEngine:
                 user_id, broker, holdings=holdings, positions=positions)
             feed_symbols = instrument_map.symbols
 
-        await stream_manager.start_stream(
-            user_id, broker, session,
-            credentials=broker_gateway.stream_credentials(broker),
-            instrument_tokens=instrument_tokens,
-            on_order_update=self._on_stream_order,
-            on_tick=self._on_stream_tick,
-            on_expired=self._on_stream_expired,
-            on_link_state=self._on_stream_link_state,
-        )
+        # D4.7: one connection per channel the broker declares. A broker whose
+        # realtime surface is one socket declares one channel and this loop runs
+        # once, which is what it has always done; a broker that serves order
+        # updates and market ticks on separate feeds gets both, from the same
+        # transport, with no name of its own anywhere in this method.
+        credentials = broker_gateway.stream_credentials(broker)
+        for channel in broker_gateway.stream_channels(broker):
+            await stream_manager.start_stream(
+                user_id, broker, session,
+                credentials=credentials,
+                instrument_tokens=instrument_tokens,
+                on_order_update=self._on_stream_order,
+                on_tick=self._on_stream_tick,
+                on_expired=self._on_stream_expired,
+                on_link_state=self._on_stream_link_state,
+                channel=channel.name,
+            )
         if streams["ticks"]:
             # D4.4: this account's tick stream becomes a registered market-data
             # provider. Best-effort on purpose — the stream itself is already
@@ -707,25 +716,70 @@ class BrokerEngine:
         except Exception as e:
             logger.warning(f"Live trade recompute from {broker} ticks failed: {e}")
 
-    async def _on_stream_link_state(self, user_id: str, broker: str, up: bool, reason: str = ""):
+    async def _on_stream_link_state(self, user_id: str, broker: str, up: bool, reason: str = "",
+                                    channel: str = None):
         """The broker transport's connection came up or went down (D4.5).
 
-        Relayed straight through to this account's market-data provider, which
-        is where the make-before-break gate lives. Nothing is decided here: a
-        lost link demotes the feed below the baseline on the very next
-        resolution, and a restored one puts it back at the start of the gate to
-        re-earn readiness from a fresh tick.
+        Relayed to this account's market-data provider, which is where the
+        make-before-break gate lives. Nothing is decided here: a lost link
+        demotes the feed below the baseline on the very next resolution, and a
+        restored one puts it back at the start of the gate to re-earn readiness
+        from a fresh tick.
+
+        ONLY THE TICK-CARRYING CHANNEL DRIVES THE FEED (D4.7)
+        ------------------------------------------------------
+        A broker may now hold several connections for one account, and they fail
+        independently. Relaying every channel's link state to the market feed
+        would let a broker's *order* socket demote a market feed that is
+        delivering prices perfectly well — a promoted feed dropped to the
+        delayed baseline because an unrelated connection blinked — and, worse,
+        let that same order socket re-arm the readiness gate for a tick feed
+        that is not connected at all.
+
+        Which channel that is comes from the channel's own declaration, not from
+        a broker name: whichever one says it delivers ticks. A single-channel
+        broker's one channel carries them, so this is a no-op for it.
 
         Best-effort, like every other market-feed call on this path — the stream
         itself is driving live portfolio and trade P&L, and a provider
         bookkeeping error must never cost the user that.
         """
+        if not self._channel_carries_ticks(broker, channel):
+            return
         try:
             await set_market_feed_link(user_id, broker, up=up, reason=reason)
         except Exception as e:
             logger.warning(f"Market feed link update from {broker} failed: {e}")
 
-    async def _on_stream_expired(self, user_id: str, broker: str):
+    def _channel_carries_ticks(self, broker: str, channel: str = None) -> bool:
+        """Whether `channel` is the one this broker's market ticks arrive on.
+
+        `None` means the caller did not say — a stream started before channels
+        existed, or a test double. Treated as "yes", which preserves the
+        pre-D4.7 behaviour for anything that has not been told about channels
+        and keeps the failure direction safe: an unknown channel that is in fact
+        the tick feed still demotes on link loss.
+        """
+        if channel is None:
+            return True
+        try:
+            for declared in broker_gateway.stream_channels(broker):
+                if declared.name == channel:
+                    return StreamEventKind.TICKS in declared.delivers
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning(f"Could not resolve {broker} stream channel {channel}: {e}")
+            return True
+        return False
+
+    async def _on_stream_expired(self, user_id: str, broker: str, channel: str = None):
+        """A broker reported this account's token dead on one of its channels.
+
+        The token is the account's, not the channel's, so every channel of this
+        broker is finished — the others are reconnecting into the same rejection
+        right now. The one that reported it is `discard`ed (we are inside its
+        task; see `BrokerStreamManager.discard`) and the rest are stopped
+        properly, which cancels their tasks rather than merely forgetting them.
+        """
         self._sessions.pop((user_id, broker), None)
         # A dead token means the feed cannot deliver another tick. Unregistering
         # it is what stops the Source Manager resolving a priority-1 streaming
@@ -737,7 +791,11 @@ class BrokerEngine:
         # BrokerStream — and the expired access token inside its `session` — for
         # the life of the process. `discard` rather than `stop_stream` because we
         # are running inside that task; see BrokerStreamManager.discard.
-        stream_manager.discard(user_id, broker)
+        stream_manager.discard(user_id, broker, channel)
+        # The remaining channels are separate tasks, so stopping them here is
+        # safe — the calling channel has just been removed from the registry, so
+        # this cannot await the task it is running inside.
+        await stream_manager.stop_stream(user_id, broker)
         await self._audit(user_id, "broker.session.expired", {"broker": broker})
         await self._push(user_id, {"type": "broker_status", "data": {
             "broker": broker, "connected": False, "session_expired": True}})

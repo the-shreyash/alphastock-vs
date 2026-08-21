@@ -87,7 +87,7 @@ Conclusion: StockAssist AI must never depend on a single provider. It must suppo
                      │            PROVIDER ADAPTERS             │
                      │                                          │
    Zerodha WS ──────▶│ BrokerAdapter(zerodha)                   │
-   Upstox WS ───────▶│ BrokerAdapter(upstox)                    │
+   Upstox WS ×2 ────▶│ BrokerAdapter(upstox)  orders + ticks    │
    Angel One WS ────▶│ BrokerAdapter(angelone)                  │
    Fyers WS ────────▶│ BrokerAdapter(fyers)                     │
    Dhan WS ─────────▶│ BrokerAdapter(dhan)                      │
@@ -859,7 +859,15 @@ Nothing changed in the Market Engine, the Market Gateway, the Source Manager, `S
 
 **Live validation has not been performed.** A Kite ticker connection needs a per-user `access_token` obtainable only through an interactive browser login, and no connected Zerodha session exists in the development environment. Every claim above rests on deterministic validation against fixtures built from the published binary specification. This document does not describe StockAssist as Zerodha-dependent, and the platform is not: Yahoo remains the permanent baseline beneath every feed, and a user with no broker is unaffected by any of it.
 
-**Phase 4.7 — the remaining broker adapters.** Upstox, Angel One, Fyers, Dhan — each one adapter and nothing else, per Developer Rule 9.
+**Phase 4.7 (shipped) — Upstox, the second streaming broker.** The real test of whether 4.1–4.6 generalised, because Upstox agrees with Kite about almost nothing at the wire: protobuf rather than bespoke binary, a compound string instrument key rather than a 32-bit integer, an IEEE double in rupees rather than integer paise on three scales, a bearer header rather than credentials in the query string, one binary subscribe frame rather than two text ones — and **two separate WebSockets** (orders, ticks) where Kite multiplexes one.
+
+**The market side needed nothing.** No change to the Market Gateway, the Source Manager, `StreamingTickProvider`, the provider registry, the canonical `MarketTick`, the readiness gate or the failover path — and none to `InstrumentMap`, which matches on the stringified identifier and so resolves a compound key through the same table an integer uses. Developer Rule 9 held: one adapter, and nothing else on this side of the line.
+
+**The broker transport needed one generic change, and it is reported rather than hidden.** It had assumed a broker's realtime surface is one socket — an assumption Kite could not expose. `BrokerStreamChannel` removes it: a channel is a name, a protocol and a codec, a broker declares one or more, and the default is one, so Zerodha is unchanged. The transport still cannot tell one broker from another. See BROKER_INTEGRATION.md §"Stream channels" and **ADR-037**.
+
+**An Upstox-derived tick carries no volume**, for the same shape of reason a Kite one does not: `ltpc` mode carries `ltq` — the *last traded* quantity, one trade's size — and not the day's cumulative volume, which lives in the bandwidth-heavy `full` modes. Populating `volume` from `ltq` would put a number there that means something else. **Live validation has not been performed for Upstox either**, and for the same reason: the feed needs a per-user token obtainable only through an interactive browser login.
+
+**Phase 4.8 — the remaining broker adapters.** Angel One, Fyers, Dhan — each one adapter and nothing else, per Developer Rule 9.
 
 **Phase 5 — Hardening.** Latency scoring, flap suppression, probation windows, multi-connection sharding, chaos tests (kill connections in staging, verify silent failover).
 

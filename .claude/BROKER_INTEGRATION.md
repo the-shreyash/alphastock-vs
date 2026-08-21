@@ -193,7 +193,7 @@ Every broker declares what it actually offers. The Broker Gateway refuses anythi
 | Session lifecycle | `session_refresh` `session_invalidate` |
 | Realtime | `order_stream` `tick_stream` |
 
-**Do not assume every broker supports every capability.** BROKER_INTEGRATION.md's original interface list (below, retained as the target surface) is aspirational: Kite Connect has no refresh grant, Upstox exposes no market-tick feed on its portfolio stream, and brokers added later will be missing pieces neither of them is.
+**Do not assume every broker supports every capability.** BROKER_INTEGRATION.md's original interface list (below, retained as the target surface) is aspirational: Kite Connect has no refresh grant, neither broker can refresh a daily token, and brokers added later will be missing pieces neither of them is.
 
 Declared capabilities are verified at registration. An adapter claiming `trades` without implementing `get_trades` fails at import — the cheapest possible moment — rather than returning an error to a user mid-session.
 
@@ -206,9 +206,31 @@ Declared capabilities are verified at registration. An adapter claiming `trades`
 | session_invalidate | ✅ | ✅ |
 | session_refresh | ❌ (daily tokens, no refresh grant) | ❌ (same) |
 | order_stream | ✅ | ✅ |
-| tick_stream | ✅ | ❌ (separate protobuf feed) |
+| tick_stream | ✅ (same socket) | ✅ (separate v3 protobuf feed) |
 
-The absences are the point. `session_refresh` being unset is what tells the engine to prompt a reconnect instead of attempting a refresh that cannot succeed; `tick_stream` being unset for Upstox is what makes its stream order-only, from the same broker-agnostic code path that gives Zerodha a tick-carrying one.
+The absences are the point. `session_refresh` being unset is what tells the engine to prompt a reconnect instead of attempting a refresh that cannot succeed, rather than attempting one that cannot.
+
+## Stream channels (D4.7)
+
+A capability says *what* a broker serves. A **channel** says *over which connection*, and the two are deliberately separate: every consumer above the transport asks "does this broker stream ticks" and gets one answer whichever topology the broker has.
+
+| | Zerodha | Upstox |
+|---|---|---|
+| channels | 1 — `default` | 2 — `orders`, `market` |
+| protocol(s) | `kite_ticker` | `upstox_portfolio`, `upstox_market_feed_v3` |
+| ticks and orders | multiplexed on one socket | one feed each |
+
+An adapter declares its channels through `stream_channels()`. **The default is one channel**, backed by the same `stream_endpoint` / `stream_subscribe_frames` / `stream_connect_error` / `decode_stream_frame` methods every adapter already implements — so a broker that has never heard of channels *is* a single-channel broker and needs no override. Override it only when a broker's realtime surface is genuinely more than one connection.
+
+Each channel declares:
+
+- `name` — unique within the broker; it is part of the stream registry key `(user, broker, channel)` and appears in diagnostics, so name it after what it carries rather than leaving it `default`;
+- `protocol` — the transport dispatch key, per channel because a broker's two feeds need not speak the same wire format;
+- `delivers` — which `StreamEventKind`s this channel may produce. **This is a narrowing of the broker's capabilities, never a widening.** A multi-channel broker must set it explicitly: an order channel that inherited TICKS from the adapter would claim to carry a market feed it has no prices on, and the account's market-data provider would take its link state for the tick feed's.
+
+Verified at registration: every declared realtime capability must be carried by some channel, names must be unique, and every channel must declare a protocol. A broker that declares `tick_stream` no channel delivers would otherwise register a market-data provider, connect its sockets, and have every tick dropped by the narrowing — which from outside is indistinguishable from a market with no trades in it.
+
+Connection lifecycle, reconnect, backoff, link-state reporting, capability enforcement and readiness all remain in `stream.py`, once, for every channel of every broker. **A channel that opened a socket, or retried one, would be a transport, and there is only one of those.**
 
 ---
 

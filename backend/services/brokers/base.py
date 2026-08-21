@@ -47,7 +47,7 @@ import logging
 import os
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
@@ -65,7 +65,13 @@ from services.brokers.errors import (
     CapabilityUnsupported,
 )
 from services.brokers.health import BrokerHealth
-from services.brokers.streaming import BrokerStreamEndpoint, BrokerStreamEvent
+from services.brokers.streaming import (
+    DEFAULT_STREAM_CHANNEL,
+    BrokerStreamChannel,
+    BrokerStreamEndpoint,
+    BrokerStreamEvent,
+    StreamEventKind,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -150,6 +156,75 @@ def _safe_url(url: str) -> str:
     exactly the case that returns 403 there.
     """
     return (url or "").split("?", 1)[0]
+
+
+#: Which realtime capability entitles a channel to deliver which event kind.
+#:
+#: The inverse of `streaming.EVENT_CAPABILITY`, and derived from it rather than
+#: written out a second time: the two disagreeing would mean a channel that
+#: declares it delivers ticks while the gateway drops every one of them, which
+#: reads in the logs exactly like a quiet market.
+CAPABILITY_EVENTS = {
+    BrokerCapability.TICK_STREAM: StreamEventKind.TICKS,
+    BrokerCapability.ORDER_STREAM: StreamEventKind.ORDER,
+}
+
+
+class AdapterStreamChannel(BrokerStreamChannel):
+    """The channel a broker whose realtime surface is ONE connection gets for free.
+
+    Every adapter written before D4.7 declared its stream as five methods on
+    itself — `stream_endpoint`, `stream_subscribe_frames`, `stream_connect_error`,
+    `decode_stream_frame` — with no notion that there might be two of anything.
+    This channel *is* that adapter, wrapped: it delegates each call straight
+    back, so the one-socket contract those adapters were written against is
+    preserved exactly rather than reimplemented beside it.
+
+    That matters more than the line count suggests. The alternative — adding a
+    `channel` argument to the five adapter methods — would have changed the
+    signature every existing adapter and every test double implements, so a
+    broker that had not been updated would fail at the first frame rather than
+    at import, and the compatibility break would be discovered on a live socket.
+    Here, a broker that knows nothing about channels *is* a single-channel
+    broker, which is what it always was.
+
+    :attr:`delivers` is read off the adapter's own capability declaration, so
+    the free channel can deliver exactly what the broker says it serves and the
+    per-channel narrowing is a no-op for a single-channel broker.
+    """
+
+    def __init__(
+        self,
+        adapter: "BrokerAdapter",
+        name: str = DEFAULT_STREAM_CHANNEL,
+        delivers: Optional[frozenset] = None,
+    ) -> None:
+        self._adapter = adapter
+        self.name = name
+        self.protocol = (getattr(adapter, "stream_protocol", "") or "").strip()
+        # Derived from the broker's capabilities when not stated, which is right
+        # for a single-channel broker: its one channel carries everything the
+        # broker serves. A multi-channel broker must narrow explicitly — an
+        # order channel that inherited TICKS from the adapter would claim to
+        # carry a market feed it has no prices on, and the account's provider
+        # would take its link state for the tick feed's.
+        self.delivers = (
+            frozenset(delivers)
+            if delivers is not None
+            else frozenset(event for capability, event in CAPABILITY_EVENTS.items() if adapter.supports(capability))
+        )
+
+    def endpoint(self, session: dict, credentials: Dict[str, str] = None) -> BrokerStreamEndpoint:
+        return self._adapter.stream_endpoint(session, credentials)
+
+    def subscribe_frames(self, instruments: List[Any] = None) -> List[Any]:
+        return self._adapter.stream_subscribe_frames(instruments)
+
+    def connect_error(self, error: BaseException) -> Optional[str]:
+        return self._adapter.stream_connect_error(error)
+
+    def decode(self, frame: Any) -> BrokerStreamEvent:
+        return self._adapter.decode_stream_frame(frame)
 
 
 class BrokerAdapter(ABC):
@@ -401,6 +476,31 @@ class BrokerAdapter(ABC):
     # adapter to decode. What comes back is a `BrokerStreamEvent` built from
     # canonical types, which is what stops a raw broker payload from continuing
     # up into the engine.
+
+    def stream_channels(self) -> Tuple[BrokerStreamChannel, ...]:
+        """Every connection this broker's realtime surface needs (D4.7).
+
+        The default is the one this adapter has always described: a single
+        channel backed by :meth:`stream_endpoint`, :meth:`stream_subscribe_frames`,
+        :meth:`stream_connect_error` and :meth:`decode_stream_frame`. A broker
+        that has never heard of channels therefore keeps working unchanged, and
+        Kite — whose ticker multiplexes binary ticks and JSON order updates onto
+        one socket — needs no override at all.
+
+        A broker overrides this when its realtime surface is genuinely more than
+        one connection. Upstox is the case that forced the concept to exist: its
+        order updates arrive on the v2 portfolio stream and its market ticks on
+        a separate v3 feed with a different host, a different encoding and a
+        different subscription model. Overriding here is how it says so; nothing
+        in the transport, the Market Gateway, the Source Manager or the provider
+        registry learns that a broker did.
+
+        Returns `()` for a broker with no stream at all, which is what stops the
+        engine opening a connection that could only fail.
+        """
+        if not (self.stream_protocol or "").strip():
+            return ()
+        return (AdapterStreamChannel(self),)
 
     @capability_stub
     def stream_endpoint(self, session: dict, credentials: dict = None) -> BrokerStreamEndpoint:

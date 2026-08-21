@@ -1479,6 +1479,100 @@ When the first live Zerodha session is available, to close the live-validation g
 
 ---
 
+# ADR-037
+
+Title
+
+Upstox as the Second Concrete Stream Adapter, and the Multi-Channel Stream Transport It Required (Sprint D4.7)
+
+Date
+
+2026-08-21
+
+Status
+
+Accepted — implemented; **live validation not performed** (see Consequences)
+
+Context
+
+ADR-036 closed with an explicit open question: whether D4.1–D4.6 had *generalised* or had merely *worked* for the one broker they were built against. Its own Review Date named the test — "at the second streaming broker (Upstox), which is the real test of whether D4.6 generalised or merely worked." D4.7 is that test.
+
+Upstox was chosen because it agrees with Kite about almost nothing at the wire. Its market feed is Protocol Buffers rather than bespoke binary; it identifies instruments by a compound string (`NSE_EQ|INE002A01018`) rather than a 32-bit integer; it quotes an IEEE `double` in rupees rather than integer paise on three segment-dependent scales; it authenticates by bearer header rather than by query string; it subscribes with one JSON frame sent as **binary** rather than two sent as text. Most consequentially, **it serves order updates and market ticks on two entirely separate WebSockets**, where Kite multiplexes both onto one.
+
+The protocol was taken from Upstox's own published SDK (`upstox/upstox-python`, `upstox_client/feeder/`) and its official `MarketDataFeedV3.proto`, not inferred from Kite and not inferred from the Upstox portfolio stream this platform already spoke. ADR-036's general lesson — that a test asserting moved code against what the removed code produced proves the move and not the protocol — applies with more force to a second broker, where the temptation to reason "like the first one, but…" is the whole risk.
+
+Decision
+
+**The market side generalised completely, and that is reported as the finding it is.** Nothing changed in the Market Engine, the Market Gateway, the Source Manager, `StreamingTickProvider`, the provider registry, the canonical `MarketTick`, the readiness gate, the failover path, the Portfolio Engine, the Trading Engine or the frontend. `InstrumentMap` needed no extension either: it matches on the *stringified* identifier — a detail D4.3 introduced for a MongoDB round trip — so a compound string key resolves through the same table an integer token does, with no second identity model and no per-broker branch.
+
+**One assumption did not generalise, and it is in the broker transport.** `BrokerStream` held one endpoint, one codec and one protocol, and `BrokerStreamManager` keyed its registry on `(user, broker)`. Nothing had ever said "a broker has one connection"; Kite simply could not expose the assumption, because it multiplexes. Under the old key, Upstox's second `start_stream` for an account would have silently **replaced** the first — one feed live, one feed gone, no exception, no log line.
+
+The generalisation is `BrokerStreamChannel`: a name, a protocol and a codec. Three properties were required of it and all three hold:
+
+• **It names no broker.** The transport opens one connection per channel and still cannot tell Kite from Upstox; a channel is as opaque to it as an adapter was.
+
+• **It is free for a single-channel broker.** `BrokerAdapter.stream_channels()` defaults to one channel backed by the same five `stream_*` methods every adapter already implements, so a broker that has never heard of channels *is* a single-channel broker. Zerodha is unchanged byte for byte, and so is every test double written before D4.7.
+
+• **It carries no market-side change.** The channel concept stops at the broker package boundary. Nothing above it — no provider, no gateway, no resolver — learns that a broker may hold more than one socket.
+
+Two consequences of channels had to be handled deliberately, because a broker's connections **fail independently**:
+
+  1. **Link state is per channel, and only the tick-carrying channel drives the market feed.** Relaying every channel's link state would let a broker's order socket blinking demote a market feed delivering prices perfectly well, and — the sharper direction — let that order socket *re-arm the readiness gate* for a tick feed that is not connected at all. Which channel counts comes from the channel's own `delivers` declaration, never from a broker name.
+
+  2. **A decoded event is narrowed by the channel before the broker capability gate.** The broker legitimately declares both realtime capabilities, so the existing gate would pass a tick decoded on the order channel. Without the narrowing, that account's market-data provider would be driven — marked live, marked ready — by a socket carrying no market data.
+
+`BrokerRegistry` gained the matching startup validation: every declared realtime capability must be carried by some channel, channel names must be unique within a broker, and every channel must declare a protocol. The failure it converts into a startup error is otherwise entirely silent — the provider registers on the strength of the capability, the sockets connect, the reconnect loop is content, and every tick is dropped by the narrowing, which from outside is indistinguishable from a market with no trades in it.
+
+**A dependency-free protobuf reader, checked against an independent oracle.** The v3 feed is Protocol Buffers. `protobuf` is absent from `requirements.txt` by a documented decision (PH2.8 removed it with grpcio after PH2.1 measured the runtime-image cost of packages no application module imports), and `protoc` is not a build dependency here, so a generated `_pb2` stub would have had to be hand-built as a descriptor and then kept from going stale. Re-adding a C-extension runtime dependency plus a build artifact to read one `double` out of a map is a poor trade.
+
+The adapter therefore carries a ~90-line proto3 reader that decodes only the fields the canonical contract can hold. The risk of hand-decoding a wire format is getting the *schema* wrong, and a test written by the same hand as the decoder cannot catch that — so the fixtures are not ours. `tests/_upstox_proto.py` transcribes Upstox's official `MarketDataFeedV3.proto` and serializes through **Google's** protobuf runtime; the bytes the tests feed the adapter are the bytes Upstox's own SDK produces. `protobuf` is pinned in **requirements-dev.txt only**.
+
+Alternatives considered
+
+**Let the Upstox adapter open its own second socket.** Rejected outright. It would have duplicated the reconnect loop, the jittered backoff, the link-state reporting, the auth-expiry path and the capability checks inside a broker module — the exact duplication ADR-032 rejected DB-3 for, and the exact code where a per-broker copy diverges and one broker quietly stops reconnecting.
+
+**Add a `channel` argument to the five existing adapter methods.** Rejected. It changes the signature every existing adapter and every test double implements, so a broker not yet updated would fail at the first frame rather than at import — a compatibility break discovered on a live socket. Wrapping the adapter as its own default channel preserves the old contract exactly instead of reimplementing it beside a new one.
+
+**Drop the Upstox portfolio stream and use the one socket for ticks.** Rejected: it silently removes live Upstox order updates that ship today. A regression, not a simplification.
+
+**Add `protobuf` to the production runtime with a vendored `.proto` and generated `_pb2`.** Rejected, above.
+
+**Subscribe in `full` mode so the tick can carry volume.** Rejected, for the same shape of reason ADR-036 rejected Kite's quote mode, but re-derived against what Upstox's modes actually carry rather than copied. `full` adds five depth levels, 1-minute/30-minute/daily candles, greeks and open interest — a multiple of the bandwidth per frame for one field one consumer would use. `full_d30` additionally requires an Upstox Plus entitlement this platform must not require of its users. The absent volume is recorded as a limitation.
+
+**Map `LTPC.ltq` to the canonical `volume` field.** Rejected, and worth naming because it is the plausible mistake. `ltq` is the *last traded* quantity — one trade's size — not the day's cumulative volume, which lives in the `full` modes as `vtt`. Putting it in `volume` would populate a canonical field with a number that means something else, which is worse than leaving it unset.
+
+**Fetch Upstox's instrument catalogue.** Rejected as unnecessary rather than merely out of scope: a synced holding or position already carries the Upstox instrument key beside the symbol and the exchange, which *is* the mapping table in both directions. Requiring the catalogue would have turned an adapter sprint into a data-pipeline sprint for no gain — a tick for an instrument the account does not hold has nothing to be joined to.
+
+**Use the `/v3/feed/market-data-feed/authorize` REST step.** Rejected. Upstox answers the handshake with a 307 to a signed socket URL and the client follows it, so the extra call buys nothing — and what it returns is a credential-bearing URL that would then have to be kept out of every log line. Connecting directly with a bearer header means **nothing credential-bearing is in the URL at all**, which is strictly stronger than masking it.
+
+Consequences
+
+• A user with a connected Upstox account and a synced portfolio gets a streaming feed for the instruments they hold, promoted over the Yahoo baseline only after a valid canonical `MarketTick` has arrived on the current link, and demoted the instant that link drops — the unchanged D4.5 machinery, reached by a second broker that shares no wire format with the first.
+
+• **The second-broker architecture proof holds where it matters and is stated honestly where it does not.** No core *market* module changed. The broker *transport* did, generically, and that change is the sprint's real finding rather than an embarrassment to be buried: an assumption that only a second broker could expose was exposed, and removed, by the second broker.
+
+• **A pre-existing Upstox lifecycle defect was closed on the way.** The Upstox portfolio stream had no handshake-refusal classification, so a token dead at 03:30 IST reconnected on the backoff schedule indefinitely — the same defect ADR-036 found in Kite, present in Upstox since before D4.6 and never noticed because Upstox had no market feed to lose. One classifier now serves both Upstox channels.
+
+• **An Upstox-derived `MarketTick` carries no volume**, for the `ltq`/`vtt` reason above. The D4.5 limitation stands unchanged alongside it: a tick-derived quote still carries no `change` / `change_pct` and no OHLC, and D4.7 deliberately does not solve that by stitching two providers together.
+
+• **A latent staleness window in `StreamingTickProvider` was found by falsification and closed.** Neutralising `_discard_evidence` left the suite green, because demotion on link loss is driven by the readiness state. But the cache it clears is per symbol while readiness is re-earned by *any* symbol: a feed that ticked A and B on link 1, lost it, reconnected, and received one fresh tick for A would have answered a quote for **B from the dead link's price** — inside the freshness window, labelled `streaming`, with a newer price sitting in the baseline underneath. This predates D4.7 and affects Zerodha equally. A test now pins it.
+
+• Upstox's 5,000-key `ltpc` limit is enforced by trimming with a warning, not by sharding across connections. D5 owns sharding; a retail portfolio is nowhere near the limit. Note that "a broker needs several connections" (D4.7) and "one subscription is sharded across several connections" (D5) are different problems, and only the first is solved here.
+
+• **LIVE VALIDATION WAS NOT PERFORMED.** An Upstox market-feed connection needs a per-user `access_token` obtainable only through an interactive browser OAuth login, and no connected Upstox session exists in this environment. Every claim rests on deterministic validation against fixtures encoded from Upstox's official schema by Google's protobuf runtime, plus 12 source mutations observed red. A live smoke test remains outstanding for **both** streaming brokers, and neither is production-verified until it is run.
+
+• The frontend is untouched and shows generic source status. No Upstox detail, no instrument key, no broker label on any market-data surface.
+
+Authoritative documents
+
+MARKET_DATA_ARCHITECTURE.md, BROKER_INTEGRATION.md
+
+Review Date
+
+When the first live Upstox or Zerodha session is available, to close the live-validation gap that now spans both streaming brokers; and at the third streaming broker, which is where the channel model itself gets its first independent test.
+
+---
+
 Future decisions to document.
 
 International Markets

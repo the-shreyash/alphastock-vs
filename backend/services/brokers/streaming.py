@@ -60,8 +60,13 @@ reconnect, the auth-expiry handling and the capability checks — the exact code
 where a per-broker copy diverges and one broker quietly stops reconnecting.
 
 So the split is: **transport generic, codec broker-owned.** Adding a WebSocket
-broker now adds *zero* lines to any shared module — `PROTOCOL_RUNNERS` remains
-only for a broker whose protocol is not a WebSocket at all.
+broker adds *zero* lines to any shared module — `PROTOCOL_RUNNERS` remains only
+for a broker whose protocol is not a WebSocket at all.
+
+D4.7 kept that split and widened one thing it had quietly assumed: that a broker
+has one connection. See :class:`BrokerStreamChannel` at the end of this module
+for what the second streaming broker revealed and why the answer names no
+broker.
 """
 
 from __future__ import annotations
@@ -303,3 +308,98 @@ class BrokerStreamEvent:
     @classmethod
     def ignore(cls) -> "BrokerStreamEvent":
         return cls(kind=StreamEventKind.IGNORE)
+
+
+# ── Stream channels (D4.7) ──────────────────────────────────────────────
+
+#: The channel name a broker whose realtime surface is one connection uses.
+#:
+#: Named rather than empty so that every stream in the platform — single- or
+#: multi-channel — is addressed the same way: `(user, broker, channel)`. A
+#: registry keyed on a value that is sometimes absent is a registry with two
+#: key shapes, and the second one is always the one that gets missed.
+DEFAULT_STREAM_CHANNEL = "default"
+
+
+class BrokerStreamChannel:
+    """One named connection within a broker's realtime surface.
+
+    WHY THIS EXISTS — THE D4.7 FINDING
+    -----------------------------------
+    D4.2 split the streaming path into *transport generic, codec broker-owned*
+    and that split still holds. What it also assumed, silently and without ever
+    saying so, is that a broker's realtime surface is **one socket**: the
+    adapter had one `stream_protocol`, one `stream_endpoint`, one
+    `decode_stream_frame`, and `BrokerStreamManager` keyed its registry on
+    `(user, broker)`.
+
+    That assumption was Kite-shaped. Kite multiplexes binary ticks and JSON
+    order updates onto a single ticker connection, so one adapter, one socket
+    and one codec were indistinguishable from each other and nothing forced the
+    question. The second streaming broker is where they come apart: Upstox
+    serves order updates on its v2 portfolio stream and market ticks on an
+    entirely separate v3 market-data feed, with different hosts, different
+    encodings and different subscription models. Under the one-socket
+    assumption, supporting both was impossible without the adapter opening a
+    connection of its own — which would have duplicated the reconnect, the
+    backoff, the link-state reporting and the auth-expiry handling inside a
+    broker module, the precise duplication D4.2 exists to prevent.
+
+    So the transport generalised instead, and it generalised *without naming a
+    broker*: a channel is a name, a protocol and a codec, and how many of them a
+    broker has is the broker's business. Kite declares one and is byte-for-byte
+    unaffected; Upstox declares two.
+
+    WHAT A CHANNEL OWNS AND WHAT IT DOES NOT
+    -----------------------------------------
+    A channel owns exactly what D4.2 made broker-owned — the endpoint, the
+    subscribe frames, the frame codec, the connection-failure interpretation —
+    and nothing else. Connection lifecycle, reconnect, backoff, link-state
+    reporting, capability enforcement and readiness all stay in `stream.py`,
+    once, for every channel of every broker. A channel that opened a socket, or
+    retried one, would be a transport, and there is only one of those.
+
+    :attr:`delivers` is the channel's own declaration of which event kinds it
+    may produce. It is a *narrowing* of the broker's capabilities, never a
+    widening: the Broker Gateway's capability gate still runs, and this is
+    checked first. Upstox's order channel decoding a tick is a codec defect, and
+    without this it would be indistinguishable from a working tick feed — the
+    order channel would drive the account's market-data provider, and a socket
+    with no market data on it would mark the user's portfolio.
+    """
+
+    #: Stable channel name, unique within one broker.
+    name: str = DEFAULT_STREAM_CHANNEL
+
+    #: Wire protocol, for `PROTOCOL_RUNNERS` dispatch. Per channel rather than
+    #: per broker because a broker's two feeds need not speak the same protocol
+    #: — Upstox's are a JSON WebSocket and a protobuf WebSocket.
+    protocol: str = ""
+
+    #: Which `StreamEventKind`s this channel may deliver.
+    delivers: frozenset = frozenset()
+
+    def endpoint(self, session: dict, credentials: Dict[str, str] = None) -> BrokerStreamEndpoint:
+        """Where to connect for this channel, and how to authenticate."""
+        raise NotImplementedError
+
+    def subscribe_frames(self, instruments: Sequence[Any] = None) -> List[Any]:
+        """Frames to send immediately after connecting, in order. May be none."""
+        return []
+
+    def connect_error(self, error: BaseException) -> Optional[str]:
+        """Reason string when a failed *handshake* means the session is dead.
+
+        `None` — the default — leaves the failure to the transport's ordinary
+        backoff. See :meth:`services.brokers.base.BrokerAdapter.stream_connect_error`
+        for the full reasoning; it is per channel because two feeds of one
+        broker can refuse a dead token in two different ways.
+        """
+        return None
+
+    def decode(self, frame: Any) -> BrokerStreamEvent:
+        """Decode ONE raw frame into a canonical :class:`BrokerStreamEvent`."""
+        raise NotImplementedError
+
+    def __repr__(self) -> str:  # pragma: no cover - diagnostics only
+        return f"<{type(self).__name__} name={self.name!r} protocol={self.protocol!r}>"

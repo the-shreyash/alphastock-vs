@@ -44,7 +44,7 @@ module.
 from __future__ import annotations
 
 import logging
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from services.brokers.base import BrokerAdapter
 from services.brokers.capabilities import BrokerCapability
@@ -319,6 +319,17 @@ class BrokerGateway:
             "orders": adapter.supports(BrokerCapability.ORDER_STREAM),
             "ticks": adapter.supports(BrokerCapability.TICK_STREAM),
         }
+
+    def stream_channels(self, broker: str) -> Tuple[Any, ...]:
+        """Every connection this broker's realtime surface needs (D4.7).
+
+        Asked by `BrokerEngine.start_stream`, which opens one stream per
+        channel. Routed through the gateway rather than read off the registry
+        for the same reason every other adapter question is: the engine talks to
+        one object, and "how many sockets does this broker need" is a broker
+        question the engine must not answer for itself.
+        """
+        return tuple(self.resolve(broker).stream_channels() or ())
 
     def stream_credentials(self, broker: str) -> Dict[str, str]:
         return self.resolve(broker).stream_credentials()

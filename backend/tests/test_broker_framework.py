@@ -353,32 +353,64 @@ def test_zerodha_does_not_declare_session_refresh():
     assert run(broker_gateway.refresh_session("zerodha", {"access_token": "t"})) is None
 
 
-def test_upstox_does_not_declare_tick_stream():
-    """Two brokers, genuinely different capabilities — the model is not cosmetic.
+def test_two_brokers_serve_one_capability_over_different_channel_topologies():
+    """Same declared capabilities, genuinely different shape — the model is not cosmetic.
 
-    Upstox's portfolio stream carries order updates only; its market feed is a
-    separate protobuf endpoint this adapter does not speak. Zerodha's ticker
-    carries both.
+    Until D4.7 this test asserted the opposite fact: Upstox declared no
+    TICK_STREAM, because its market feed is a separate endpoint the adapter did
+    not speak. It speaks it now, and the interesting difference moved rather
+    than disappeared — Zerodha multiplexes ticks and order updates onto one
+    Kite ticker connection, Upstox needs two entirely separate feeds.
+
+    That difference is expressed in channels, not in capabilities, and that is
+    the point: every consumer above the transport asks "does this broker stream
+    ticks" and gets one answer whichever topology the broker has.
     """
     upstox = broker_registry.require("upstox")
     zerodha = broker_registry.require("zerodha")
-    assert upstox.supports(BrokerCapability.ORDER_STREAM)
-    assert not upstox.supports(BrokerCapability.TICK_STREAM)
-    assert zerodha.supports(BrokerCapability.TICK_STREAM)
-    assert broker_gateway.stream_capabilities("upstox") == {"orders": True, "ticks": False}
+    for adapter in (upstox, zerodha):
+        assert adapter.supports(BrokerCapability.ORDER_STREAM)
+        assert adapter.supports(BrokerCapability.TICK_STREAM)
+        assert broker_gateway.stream_capabilities(adapter.name) == {"orders": True, "ticks": True}
+
+    zerodha_channels = zerodha.stream_channels()
+    upstox_channels = upstox.stream_channels()
+    assert len(zerodha_channels) == 1, "Kite multiplexes its realtime surface onto one socket"
+    assert len(upstox_channels) == 2, "Upstox serves orders and ticks on separate feeds"
+    # The two Upstox feeds do not even speak the same wire protocol, which is
+    # why the protocol is declared per channel rather than per broker.
+    assert len({channel.protocol for channel in upstox_channels}) == 2
 
 
-def test_stream_instruments_is_empty_for_a_broker_without_a_tick_feed():
+def test_stream_instruments_is_empty_for_a_broker_without_a_tick_feed(acme_gateway):
     """Asked in capability terms, answered without a broker-name branch.
 
     `BrokerEngine.start_stream` used to decide what to subscribe to with
     `if broker == "zerodha":`. It now asks the gateway, and a broker with no
     tick feed answers with nothing rather than with an error the caller must
     handle.
+
+    Asked of Acme rather than of Upstox since D4.7 — Upstox has a tick feed now,
+    and a test whose "broker without a tick feed" acquires one is a test that
+    stops checking anything.
     """
+    gateway, _ = acme_gateway
     holdings = [{"instrument_token": 42}]
-    assert broker_gateway.stream_instruments("upstox", holdings=holdings) == []
+    assert gateway.stream_instruments("acme", holdings=holdings) == []
     assert broker_gateway.stream_instruments("zerodha", holdings=holdings) == [42]
+
+
+def test_each_broker_subscribes_in_its_own_instrument_vocabulary():
+    """One question, two entirely different kinds of answer, no name branch.
+
+    Kite subscribes by 32-bit integer token; Upstox by a compound instrument
+    key. Both come from the same synced holdings rows through the same gateway
+    call, which is what lets `BrokerEngine.start_stream` ask once.
+    """
+    holdings = [{"symbol": "RELIANCE", "exchange": "NSE", "instrument_token": 738561},
+                {"symbol": "RELIANCE", "exchange": "NSE", "instrument_token": "NSE_EQ|INE002A01018"}]
+    assert broker_gateway.stream_instruments("zerodha", holdings=holdings) == [738561]
+    assert broker_gateway.stream_instruments("upstox", holdings=holdings) == ["NSE_EQ|INE002A01018"]
 
 
 def test_the_gateway_refuses_before_the_adapter_even_when_the_method_exists():

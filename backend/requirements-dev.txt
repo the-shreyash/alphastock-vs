@@ -53,3 +53,19 @@ mypy_extensions==1.1.0  # black / mypy dep
 # shrink the runtime image. Without it, uvicorn's reloader falls back to stat
 # polling; installing it here restores the fast file-watch reload locally.
 watchfiles==1.2.0
+
+# Protobuf runtime — TEST ORACLE ONLY (D4.7)
+#
+# NOT a production dependency, and its absence there is a decision rather than
+# an oversight: PH2.8 removed protobuf/grpcio from requirements.txt after PH2.1
+# measured the image cost of packages no application module imports. Nothing in
+# `backend/services/` imports this; `services/brokers/upstox.py` decodes the
+# Upstox v3 market feed with a small proto3 reader of its own precisely so the
+# runtime does not grow a C extension to read one `double`.
+#
+# It is here so the tests can check that reader against an INDEPENDENT encoder:
+# tests/_upstox_proto.py builds Upstox's official MarketDataFeedV3 schema and
+# serializes fixtures with Google's runtime, which the adapter must then decode
+# identically. Without it the conformance test could only compare our decoder
+# with our own encoder — a test that passes by agreeing with itself.
+protobuf==5.29.6
