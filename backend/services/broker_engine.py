@@ -46,6 +46,8 @@ from services.brokers import BrokerCapability, broker_gateway, broker_registry
 from services.brokers.base import BrokerAdapter
 from services.brokers.crypto import decrypt_token, encrypt_token, is_encrypted
 from services.brokers.errors import BrokerAuthError, BrokerError
+from services.brokers.instruments import InstrumentMap, canonical_ticks
+from services.brokers.market_feed import attach_market_feed, detach_market_feed, publish_market_ticks
 from services.brokers.stream import stream_manager
 
 logger = logging.getLogger(__name__)
@@ -74,6 +76,13 @@ class BrokerEngine:
         self.db = None
         self.ws_push = None            # async (user_id, message) -> None
         self._sessions: dict = {}      # (user_id, broker) -> decrypted session dict
+        #: (user_id, broker) -> InstrumentMap. The account's broker-identifier →
+        #: canonical-symbol table (D4.3), rebuilt whenever the account's portfolio
+        #: is re-synced rather than expired on a timer: holdings only change
+        #: through `sync_portfolio`, so invalidation there is exact, and a TTL
+        #: would only add a window in which a correct map is thrown away and
+        #: rebuilt from a narrower source.
+        self._instrument_maps: dict = {}
 
     # -- wiring -----------------------------------------------------------------
     def configure(self, db, ws_push=None):
@@ -249,6 +258,11 @@ class BrokerEngine:
             # revoke tokens" from "someone renamed the method".
             await broker_gateway.invalidate_session(broker, session)
         self._sessions.pop((user_id, broker), None)
+        self._forget_instrument_map(user_id, broker)
+        # The entitlement has ended, so the feed must stop being resolvable now
+        # rather than at the next health transition — a broker feed is legally
+        # this user's own data (MARKET_DATA_ARCHITECTURE.md, Category 2).
+        await detach_market_feed(user_id, broker)
         await self.db.broker_accounts.update_one(
             {"user_id": user_id, "broker": broker},
             {"$set": {"connected": False, "access_token": "", "refresh_token": "",
@@ -403,6 +417,11 @@ class BrokerEngine:
             await self.db.holdings.insert_many([
                 {**h, "user_id": user_id, "broker": broker, "updated_at": now}
                 for h in holdings])
+        # D4.3: the instrument map is derived from exactly these rows, so a sync
+        # is the moment — and the only moment — it can go stale. Rebuilt from
+        # the fetched rows rather than dropped, so the very next tick resolves
+        # against the new portfolio instead of triggering a re-read.
+        self._remember_instrument_map(user_id, broker, holdings=holdings, positions=positions)
         await self.db.broker_accounts.update_one(
             {"user_id": user_id, "broker": broker}, {"$set": {"last_sync": now}})
         session["last_sync"] = now
@@ -524,6 +543,11 @@ class BrokerEngine:
                     positions = []
             instrument_tokens = broker_gateway.stream_instruments(
                 broker, holdings=holdings, positions=positions)
+            # D4.3: the same two lists that decide what to subscribe to also
+            # decide what an arriving tick can be named — seed the map from them
+            # so the first tick after a reconnect is already resolvable, and so
+            # intraday positions (never persisted) are mappable at all.
+            self._remember_instrument_map(user_id, broker, holdings=holdings, positions=positions)
 
         await stream_manager.start_stream(
             user_id, broker, session,
@@ -533,6 +557,16 @@ class BrokerEngine:
             on_tick=self._on_stream_tick,
             on_expired=self._on_stream_expired,
         )
+        if streams["ticks"]:
+            # D4.4: this account's tick stream becomes a registered market-data
+            # provider. Best-effort on purpose — the stream itself is already
+            # up and driving portfolio and trade P&L, and a provider-registry
+            # problem must not take that away. The Market Engine simply does not
+            # see the feed until the next stream start.
+            try:
+                await attach_market_feed(user_id, broker)
+            except Exception as e:
+                logger.warning(f"Registering the {broker} market feed failed: {e}")
 
     async def _on_stream_order(self, user_id: str, broker: str, order: dict):
         """Order update from the broker's realtime feed."""
@@ -570,13 +604,80 @@ class BrokerEngine:
             except Exception:
                 pass
 
+    # -- instrument identity (D4.3) ------------------------------------------
+    async def _instrument_map(self, user_id: str, broker: str) -> InstrumentMap:
+        """The account's broker-identifier → canonical-symbol table.
+
+        Built from the rows this engine already syncs, so it costs no broker
+        call: a canonical holding carries the broker's `instrument_token`, the
+        trading symbol and the exchange side by side, which *is* the mapping.
+
+        Cached per account and invalidated on sync/disconnect. An account with
+        nothing synced yet gets an empty map, which resolves nothing by token
+        and everything a symbol-identified broker sends by symbol — the correct
+        answer for both, rather than a guess for either.
+        """
+        key = (str(user_id), broker)
+        cached = self._instrument_maps.get(key)
+        if cached is not None:
+            return cached
+        holdings = []
+        if self.db is not None:
+            try:
+                holdings = await self.db.holdings.find(
+                    {"user_id": user_id, "broker": broker}).to_list(1000)
+            except Exception as e:
+                logger.warning(f"Instrument map load failed for {broker}: {e}")
+                holdings = []
+        return self._remember_instrument_map(user_id, broker, holdings=holdings)
+
+    def _remember_instrument_map(self, user_id: str, broker: str,
+                                 holdings: list = None, positions: list = None) -> InstrumentMap:
+        """Rebuild and cache the account's map from rows already in hand.
+
+        `start_stream` and `sync_portfolio` both hold freshly fetched holdings
+        *and* positions, and positions are not persisted — so seeding from them
+        is the only way an intraday position's ticks are ever mappable. Rebuilt
+        wholesale rather than mutated: a stream reading the map must never
+        observe a half-updated table.
+        """
+        instrument_map = InstrumentMap.from_portfolio(holdings, positions)
+        self._instrument_maps[(str(user_id), broker)] = instrument_map
+        return instrument_map
+
+    def _forget_instrument_map(self, user_id: str, broker: str) -> None:
+        self._instrument_maps.pop((str(user_id), broker), None)
+
     async def _on_stream_tick(self, user_id: str, broker: str, ticks: list):
+        """Broker ticks arrive here as `BrokerTick` dicts and leave canonical.
+
+        This is the D4.3 boundary. Everything below it — the app WebSocket, the
+        live portfolio recompute, the open-trade recompute — receives
+        `MarketTick` dicts keyed by canonical symbol and never sees the broker's
+        instrument identifier. A tick whose instrument this account cannot name
+        is dropped inside `canonical_ticks`; a batch that yields nothing stops
+        here rather than waking two recomputes that would find nothing to do.
+        """
+        instrument_map = await self._instrument_map(user_id, broker)
+        ticks = canonical_ticks(ticks, instrument_map, broker=broker)
+        if not ticks:
+            return
+        # D4.4: the same canonical batch enters the Market Gateway through this
+        # account's registered provider, which is what makes it *market* data
+        # rather than portfolio input — the gateway stamps the tier, the Source
+        # Manager learns the feed is live, and the Event Bus fans it out. No
+        # conversion happens here: it is the identical list, and a second
+        # conversion path is a second place for two shapes to drift.
+        try:
+            await publish_market_ticks(user_id, broker, ticks)
+        except Exception as e:
+            logger.warning(f"Market feed publish from {broker} ticks failed: {e}")
         await self._push(user_id, {"type": "broker_price_tick", "data": {
             "broker": broker, "ticks": ticks}})
         # Sprint R5: broker ticks drive the live portfolio — recompute this
         # user's P&L/allocation server-side and stream `portfolio.updated`
         # (throttled inside; best-effort so a recompute error never breaks
-        # the raw tick forward above).
+        # the tick forward above).
         try:
             from services import portfolio_stream
             await portfolio_stream.apply_broker_ticks(self.db, user_id, broker, ticks)
@@ -593,6 +694,11 @@ class BrokerEngine:
 
     async def _on_stream_expired(self, user_id: str, broker: str):
         self._sessions.pop((user_id, broker), None)
+        # A dead token means the feed cannot deliver another tick. Unregistering
+        # it is what stops the Source Manager resolving a priority-1 streaming
+        # provider that can only answer with silence; the baseline below it then
+        # serves the TICKS capability's absence honestly.
+        await detach_market_feed(user_id, broker)
         # The stream task is about to return on its own; drop the registry entry
         # with it (PH3.6). Without this the manager retained a finished
         # BrokerStream — and the expired access token inside its `session` — for
@@ -625,6 +731,24 @@ class BrokerEngine:
                         continue
                     self._sessions[(user_id, broker)] = session
                     restored += 1
+                    # DB-2 (D4.1). A restored session IS a live broker
+                    # connection and must produce the same lifecycle event a
+                    # fresh connect does. The Source Manager's per-user
+                    # connected-broker registry is built only from these events,
+                    # so without this a restart left it empty while a broker
+                    # socket was running underneath — and every restored user
+                    # silently stayed on the baseline feed until some other
+                    # traffic happened to exercise their session.
+                    #
+                    # Published before the stream starts, deliberately: the
+                    # connection is a fact about the session, not about whether
+                    # a socket opened. A broker with no stream at all still has
+                    # a connection worth recording.
+                    #
+                    # Best-effort — `_publish_connection` contains its own
+                    # try/except, because a market-data listener failing must
+                    # never fail a session restore.
+                    await self._publish_connection(user_id, broker, connected=True)
                     try:
                         await self.start_stream(user_id, broker)
                     except Exception as e:

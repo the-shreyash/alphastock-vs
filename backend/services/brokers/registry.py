@@ -46,6 +46,8 @@ from services.brokers.base import BrokerAdapter
 from services.brokers.capabilities import (
     CAPABILITY_METHODS,
     IMPLEMENTABLE_CAPABILITIES,
+    STREAM_TRANSPORT_METHODS,
+    STREAMING_CAPABILITIES,
     BrokerCapability,
 )
 from services.brokers.errors import UnknownBrokerError
@@ -109,7 +111,7 @@ class BrokerRegistry:
         """Reject an adapter whose declaration and implementation disagree.
 
         This is what makes the capability model trustworthy rather than
-        decorative. Three checks, each closing a way a capability set can lie:
+        decorative. Four checks, each closing a way a capability set can lie:
 
         1. The adapter has a real name — an unnamed adapter would register under
            `"base"` and shadow nothing usefully.
@@ -121,6 +123,9 @@ class BrokerRegistry:
            not have, and the only way to find out without this check is for a
            user to hit it. Inheriting a default that genuinely works
            (`get_margins` delegating to `get_funds`) is reuse, and is allowed.
+        4. The realtime declaration is coherent — see :meth:`_validate_streaming`,
+           which is separate because streaming is the one capability family whose
+           implementation is more than a single method.
         """
         if not adapter.name or adapter.name == "base":
             raise BrokerAdapterInvalid(f"{type(adapter).__name__} must set a unique `name`")
@@ -132,7 +137,7 @@ class BrokerRegistry:
         missing = []
         for capability in adapter.capabilities:
             if capability not in IMPLEMENTABLE_CAPABILITIES:
-                continue  # streaming capabilities are declarative, not methods
+                continue  # capability with no bound method — nothing to verify here
             method = CAPABILITY_METHODS[capability]
             implementation = getattr(type(adapter), method, None)
             if implementation is None or getattr(implementation, "_capability_stub", False):
@@ -140,6 +145,55 @@ class BrokerRegistry:
         if missing:
             raise BrokerAdapterInvalid(
                 f"broker {adapter.name!r} declares capabilities it does not implement: " + ", ".join(sorted(missing))
+            )
+
+        BrokerRegistry._validate_streaming(adapter)
+
+    @staticmethod
+    def _validate_streaming(adapter: BrokerAdapter) -> None:
+        """Reject a broker whose realtime declaration cannot be honoured (D4.2).
+
+        Streaming is the one capability family the one-capability-one-method
+        check above cannot verify on its own, because a stream is a *connection
+        plus a codec*: ORDER_STREAM and TICK_STREAM each also require
+        `stream_endpoint` and `decode_stream_frame`, and a `stream_protocol` to
+        dispatch on.
+
+        Both directions are checked, because both are silent in production:
+
+        * A broker declaring a realtime capability without the codec would open
+          a live socket whose every frame decodes to nothing. In the logs that
+          is indistinguishable from a quiet market — the connection is up, the
+          reconnect loop is happy, and the user simply never sees a price move.
+        * A broker declaring a `stream_protocol` while offering no realtime
+          capability has a transport nothing may deliver through, since the
+          Broker Gateway gates every decoded event on a capability. That is
+          always a declaration mistake, and catching it at startup costs
+          nothing while finding it at 09:15 costs a trading session.
+        """
+        streaming = adapter.capabilities & STREAMING_CAPABILITIES
+        if streaming:
+            if not (adapter.stream_protocol or "").strip():
+                raise BrokerAdapterInvalid(
+                    f"broker {adapter.name!r} declares "
+                    + ", ".join(sorted(c.value for c in streaming))
+                    + " but no `stream_protocol` to dispatch on"
+                )
+            unimplemented = [
+                method
+                for method in STREAM_TRANSPORT_METHODS
+                if getattr(getattr(type(adapter), method, None), "_capability_stub", False)
+                or getattr(type(adapter), method, None) is None
+            ]
+            if unimplemented:
+                raise BrokerAdapterInvalid(
+                    f"broker {adapter.name!r} declares a realtime stream it cannot decode: missing "
+                    + ", ".join(f"{m}()" for m in sorted(unimplemented))
+                )
+        elif (adapter.stream_protocol or "").strip():
+            raise BrokerAdapterInvalid(
+                f"broker {adapter.name!r} declares stream_protocol "
+                f"{adapter.stream_protocol!r} but no streaming capability to use it"
             )
 
     def unregister(self, name: str) -> Optional[BrokerAdapter]:

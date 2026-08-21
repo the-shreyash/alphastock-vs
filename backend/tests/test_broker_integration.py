@@ -22,7 +22,9 @@ from tests._fakedb import FakeDB
 
 from services.brokers.base import IST, BrokerAuthError, BrokerError, normalize_status
 from services.brokers.crypto import decrypt_token, encrypt_token, is_encrypted
-from services.brokers.stream import parse_kite_binary
+# D4.2 moved Kite's binary framing out of the shared transport and into the
+# adapter that owns the protocol. Same parser, same expectations, new home.
+from services.brokers.zerodha import parse_kite_binary
 from services.brokers.upstox import UpstoxAdapter
 from services.brokers.zerodha import ZerodhaAdapter
 from services.broker_engine import BrokerEngine

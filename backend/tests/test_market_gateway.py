@@ -103,12 +103,24 @@ class FakeStreamingProvider(MarketDataProvider):
         self._quote = quote if quote is not None else dict(RAW_BROKER_QUOTE)
         self._raises = raises
         self.calls = 0
+        self.pushed = []
 
     async def fetch_quote(self, symbol):
         self.calls += 1
         if self._raises:
             raise self._raises
         return self._quote
+
+    async def on_raw(self, payload):
+        """The push entry point every streaming provider must have (D4.4).
+
+        A double for a broker feed that could not be pushed into would not be a
+        double for a broker feed. Registration refuses one, which is what makes
+        this three-line method a fixture correction rather than a workaround.
+        """
+        self.pushed.append(payload)
+        await self._emit(payload)
+        return 1
 
 
 class FakePollingProvider(MarketDataProvider):
@@ -991,12 +1003,18 @@ class UserScopedProvider(MarketDataProvider):
         self._quote = quote if quote is not None else dict(RAW_BROKER_QUOTE)
         self._raises = raises
         self.calls = 0
+        self.pushed = []
 
     async def fetch_quote(self, symbol):
         self.calls += 1
         if self._raises:
             raise self._raises
         return self._quote
+
+    async def on_raw(self, payload):
+        self.pushed.append(payload)
+        await self._emit(payload)
+        return 1
 
 
 class SymbolScopedProvider(FakeStreamingProvider):

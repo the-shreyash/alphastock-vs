@@ -5,9 +5,10 @@ Covers the live portfolio stream layer (services/portfolio_stream.py):
     flat fields (total_pnl / total_unrealized_pnl / open_positions)
   • publish_snapshot: publishes portfolio.updated with user_id; silent (None,
     no event) for users with no holdings; price_override supersedes the quote
-  • apply_broker_ticks: token→symbol mapping, fresh marks persisted to
-    db.holdings, throttle (second burst suppressed, reset_state re-arms),
-    unmatched/empty ticks emit nothing
+  • apply_broker_ticks: canonical MarketTick dicts (symbol-keyed since D4.3 —
+    the broker's instrument identifier is resolved at the broker boundary and
+    never arrives here), fresh marks persisted to db.holdings, throttle (second
+    burst suppressed, reset_state re-arms), unmatched/empty ticks emit nothing
   • heartbeat task_monitor_portfolio contract: one portfolio.updated per user
     covering BOTH broker-holdings users and manual-trade users, reason
     "monitor"
@@ -193,7 +194,7 @@ def test_broker_ticks_map_persist_and_publish():
         try:
             payload = await portfolio_stream.apply_broker_ticks(
                 db, "u1", "zerodha",
-                [{"instrument_token": 738561, "last_price": 2650.0}],
+                [{"symbol": "RELIANCE", "price": 2650.0, "exchange": "NSE"}],
                 quotes_map_func=_quotes)
         finally:
             spy.close()
@@ -214,7 +215,7 @@ def test_broker_ticks_throttled_then_rearmed():
     async def run():
         db = FakeDB()
         db.holdings.docs = [_broker_holding(token=738561)]
-        ticks = [{"instrument_token": 738561, "last_price": 2650.0}]
+        ticks = [{"symbol": "RELIANCE", "price": 2650.0, "exchange": "NSE"}]
         spy = _BusSpy("portfolio.updated")
         try:
             first = await portfolio_stream.apply_broker_ticks(
@@ -235,7 +236,7 @@ def test_broker_ticks_throttled_then_rearmed():
     assert len(events) == 2
 
 
-def test_broker_ticks_ignore_unmatched_tokens():
+def test_broker_ticks_ignore_symbols_the_user_does_not_hold():
     async def run():
         db = FakeDB()
         db.holdings.docs = [_broker_holding(token=738561)]
@@ -243,7 +244,7 @@ def test_broker_ticks_ignore_unmatched_tokens():
         try:
             payload = await portfolio_stream.apply_broker_ticks(
                 db, "u1", "zerodha",
-                [{"instrument_token": 999999, "last_price": 100.0}],
+                [{"symbol": "INFY", "price": 100.0, "exchange": "NSE"}],
                 quotes_map_func=_quotes)
         finally:
             spy.close()

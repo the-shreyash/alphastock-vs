@@ -1,0 +1,147 @@
+"""Broker stream → market-data provider: the registration seam (D4.4).
+
+WHERE THIS SITS
+---------------
+This is the last link in a chain the previous three sprints built one segment at
+a time::
+
+    broker wire frame
+          ↓  broker-owned codec                        (D4.2, streaming.py)
+    BrokerTick
+          ↓  instrument identity mapping                (D4.3, instruments.py)
+    MarketTick                                          canonical
+          ↓  THIS MODULE
+    StreamingTickProvider                               a registered provider
+          ↓
+    Market Gateway → Source Manager → Event Bus → Market Engine
+
+Before D4.4 a broker's ticks reached `portfolio_stream`, `trade_stream` and the
+user's socket and stopped there. They drove P&L and nothing else: the Market
+Engine had no idea a live feed existed, `source_manager.status()` reported the
+delayed baseline to a user watching tick-by-tick prices, and the TICKS
+capability resolved to nothing for everybody. A broker feed was real data that
+was not market data. This module is what makes it market data.
+
+WHY THE CONSTRUCTION LIVES HERE AND NOT IN THE MARKET ENGINE
+-------------------------------------------------------------
+The Market Engine may not import the broker layer — pinned by
+`test_the_market_engine_never_imports_a_broker_module`, and load-bearing rather
+than stylistic: it is what lets a broker WebSocket and a licensed exchange feed
+be indistinguishable to the Source Manager, so priority stays provider metadata
+instead of becoming `if broker == …`. broker → market is the permitted
+direction, so the broker side constructs the provider, names it, and injects it
+through the Market Gateway. `StreamingTickProvider` itself is entirely generic
+and names no broker.
+
+Adding a second streaming broker therefore adds nothing here, nothing in the
+Market Engine, and nothing in any core service. It adds one adapter, exactly as
+Developer Rule 9 of MARKET_DATA_ARCHITECTURE.md requires.
+
+WHAT THIS MODULE DELIBERATELY DOES NOT DO
+------------------------------------------
+It does not switch the feed. The registered provider declares `TICKS` and not
+`QUOTES`, so it serves a capability nothing has ever served and takes nothing
+away from Yahoo, which continues to answer every quote for every user. Promoting
+a broker feed to primary for quotes is the make-before-break switch —
+"connect the new provider, confirm first valid data, then release the old one"
+— and MARKET_DATA_ARCHITECTURE.md is explicit that the switch has a gate. That
+gate is separately testable work and is deliberately not smuggled in here. See
+`StreamingTickProvider` for the full reasoning and ADR-034.
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any, Optional, Sequence
+
+from services.brokers.capabilities import BrokerCapability
+from services.brokers.gateway import broker_gateway
+from services.market_engine.gateway import market_gateway
+from services.market_engine.providers import StreamingTickProvider, provider_registry
+
+logger = logging.getLogger(__name__)
+
+#: Prefix for provider names minted here. Namespaced so a broker-fed provider
+#: can never collide with a platform-wide one — `"zerodha"` as a bare provider
+#: name would be ambiguous the day a licensed feed is sourced through the same
+#: broker's institutional API.
+FEED_NAME_PREFIX = "brokerfeed"
+
+
+def feed_provider_name(user_id: Any, broker: str) -> str:
+    """The stable registry name for one account's market feed.
+
+    Carries the broker name and the user id. Both are legitimate *here*: a
+    provider name reaches the registry, the gateway's logs and the admin
+    diagnostics surface and nowhere else — `source_manager.status()`, every
+    normalized event and every API response carry a `source_tier` and no
+    identity at all (Developer Rule 4).
+    """
+    return f"{FEED_NAME_PREFIX}:{broker}:{user_id}"
+
+
+async def attach_market_feed(user_id: Any, broker: str) -> Optional[str]:
+    """Register this account's broker stream as a market-data provider.
+
+    Returns the provider name, or None when the broker is not a candidate. The
+    single gate is the broker's own capability declaration: a broker that does
+    not declare `TICK_STREAM` has no tick feed to register, and registering one
+    anyway would produce a priority-1 streaming provider that can only ever
+    deliver silence — which the Source Manager would rank *above* the working
+    baseline. The capability model is the authority on what a broker serves;
+    this module does not second-guess it and does not probe for methods.
+
+    Idempotent. A reconnecting stream re-registers under the same name and
+    replaces the provider bound to the socket that died.
+    """
+    if not user_id or not broker:
+        return None
+    if not broker_gateway.supports(broker, BrokerCapability.TICK_STREAM):
+        logger.debug(
+            "Broker %s does not declare %s — not registering it as a market-data provider",
+            broker,
+            BrokerCapability.TICK_STREAM.value,
+        )
+        return None
+
+    name = feed_provider_name(user_id, broker)
+    provider = StreamingTickProvider(name, owner_user_id=str(user_id))
+    await market_gateway.register_streaming_provider(provider)
+    return name
+
+
+async def detach_market_feed(user_id: Any, broker: str) -> bool:
+    """Unregister this account's market feed. True when one was removed.
+
+    Called when the entitlement ends — disconnect, revoked token, expired
+    session. A broker feed is legally the user's own data, so an ended
+    entitlement must stop being resolvable immediately rather than at the next
+    health transition.
+    """
+    if not user_id or not broker:
+        return False
+    return await market_gateway.unregister_streaming_provider(feed_provider_name(user_id, broker))
+
+
+async def publish_market_ticks(user_id: Any, broker: str, ticks: Sequence[Any]) -> int:
+    """Push a batch of canonical ticks into this account's provider.
+
+    `ticks` are `MarketTick` dicts, exactly as `instruments.canonical_ticks`
+    produces them — this module performs no conversion of its own, because a
+    second conversion path is a second place for the two to drift.
+
+    Returns how many records the provider accepted. Zero when no provider is
+    registered for the account, which is the normal state for a broker with no
+    tick stream and is not an error.
+
+    The account's provider is looked up in the *existing* provider registry
+    rather than in a map kept here. A second registry would have to be kept in
+    step with the first across register, unregister, replace and process
+    restart, and would answer differently the moment one of those was missed.
+    """
+    if not ticks:
+        return 0
+    provider = provider_registry.get(feed_provider_name(user_id, broker))
+    if provider is None:
+        return 0
+    return await provider.on_raw(list(ticks))

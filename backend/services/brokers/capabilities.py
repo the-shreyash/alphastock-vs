@@ -75,10 +75,12 @@ class BrokerCapability(str, Enum):
     #: Live order-status updates over the broker's WebSocket.
     ORDER_STREAM = "order_stream"
     #: Live price ticks over the broker's WebSocket. Declaring this is what
-    #: makes a broker a candidate market-data provider — see the D4 note in
-    #: `services/market_engine/source_manager.py`. It is NOT implemented as a
-    #: market feed in D3: the broker's ticks currently drive portfolio and trade
-    #: P&L only, and routing them into the Market Gateway is D4's work.
+    #: makes a broker a market-data provider: since D4.4 it is the single gate
+    #: `services/brokers/market_feed.py` checks before registering the account's
+    #: stream with the Market Gateway. A broker that omits it opens no market
+    #: feed — which is why the gate is the capability and not a method probe: a
+    #: priority-1 streaming provider that can only deliver silence would be
+    #: ranked above the working baseline.
     TICK_STREAM = "tick_stream"
 
 
@@ -135,3 +137,27 @@ TRADING_CAPABILITIES = frozenset(
         BrokerCapability.CANCEL_ORDER,
     }
 )
+
+
+#: The realtime capability family. Grouped because streaming is the one family
+#: whose implementation is *more than one method*: a stream is a connection plus
+#: a codec, and a broker that declares either realtime capability needs both.
+STREAMING_CAPABILITIES = frozenset(
+    {
+        BrokerCapability.ORDER_STREAM,
+        BrokerCapability.TICK_STREAM,
+    }
+)
+
+#: Methods every streaming broker must implement, whichever realtime capability
+#: it declares (D4.2).
+#:
+#: `CAPABILITY_METHODS` above binds one capability to one method, which is the
+#: right model for the fetch surface and cannot express this: `stream_endpoint`
+#: and `decode_stream_frame` are required by ORDER_STREAM and TICK_STREAM alike,
+#: and neither is meaningful without the other. Verified by
+#: :meth:`BrokerRegistry.validate` for exactly the reason every other capability
+#: is verified there — an adapter that declares a stream it cannot decode opens a
+#: live connection whose every frame is dropped, which looks identical in the
+#: logs to a quiet market.
+STREAM_TRANSPORT_METHODS = ("stream_endpoint", "decode_stream_frame")

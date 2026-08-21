@@ -31,18 +31,38 @@ capability before ever calling one (MARKET_DATA_ARCHITECTURE.md, "Resolution
 procedure", step 3). A provider that cannot serve a symbol universe simply
 falls through to the next one for that universe.
 
-WHY THERE IS NO `subscribe()` / `on_raw()` IN D1
-------------------------------------------------
-The target contract in MARKET_DATA_ARCHITECTURE.md includes a push surface
-(`subscribe`, `unsubscribe`, `on_raw`) for streaming providers. D1 ships one
-provider — Yahoo, which is request/response only — and no consumer capable of
-receiving pushed ticks. Defining that surface now would mean writing plumbing
-that nothing implements and nothing calls, which is the "do not over-engineer
-future providers" instruction in the D1 brief and dead code by any measure. The
-push surface arrives in D3 with the first broker WebSocket adapter, alongside
-the consumer that needs it. :attr:`MarketDataProvider.kind` already distinguishes
-the two families so nothing above this layer has to be rewritten when it lands.
-See ADR-028 in DECISIONS.md.
+THE PUSH SURFACE (D4.4)
+-----------------------
+D1 deliberately omitted `subscribe` / `unsubscribe` / `on_raw` — it shipped one
+request/response provider and no consumer able to receive a pushed tick, so the
+surface would have been plumbing nothing implemented and nothing called (ADR-028).
+D4.4 lands it, together with the first provider that pushes and the gateway sink
+that receives.
+
+The shape is the one MARKET_DATA_ARCHITECTURE.md specifies, with one deliberate
+asymmetry: `subscribe` / `unsubscribe` are *pull-direction* calls the platform
+makes on a provider, and are meaningful for both families (a polling provider
+adds a symbol to its poll set, a streaming provider sends a subscribe frame), so
+they live on the base class and default to bookkeeping only. `on_raw` is the
+*push-direction* call the provider makes on the platform, is meaningless for a
+provider that cannot push, and therefore defaults to raising — a polling
+provider that somehow gets a payload pushed into it fails loudly instead of
+delivering data through a path that was never designed to carry it.
+
+WHAT MAKES A PROVIDER LEGITIMATELY "STREAMING" (D4.4)
+-----------------------------------------------------
+Three declarations that must agree, enforced by
+:meth:`ProviderRegistry.register` rather than by review:
+
+    a push capability (TICKS / DEPTH)  ⟺  kind=STREAMING  ⟹  on_raw() overridden
+    tier=STREAMING                     ⟹  kind=STREAMING
+
+The implication that matters is the second one. `tier` is what the AI calibrates
+its language against and what the UI renders as "Live"; `kind` is how the data
+physically arrives. A provider that polls on a timer and declares
+`tier=STREAMING` would have the platform tell a user a 30-second-old number is
+live — polling disguised as streaming, which CLAUDE.md's data rules forbid
+outright. Registration rejects it. See ADR-034.
 """
 from __future__ import annotations
 
@@ -51,7 +71,7 @@ from abc import ABC
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -202,6 +222,28 @@ class CapabilityUnavailable(RuntimeError):
     """
 
 
+class ProviderContractError(RuntimeError):
+    """Raised when an adapter's declarations contradict each other (D4.4).
+
+    Registration-time only, and fatal on purpose. Every condition it reports is
+    a statement the adapter makes about itself that cannot be true — a delayed
+    poll loop claiming the streaming tier, a streaming provider with nothing to
+    push, a push capability with no `on_raw` to receive on. None of them can be
+    detected later by observing behaviour: they all produce a provider that
+    registers cleanly, resolves cleanly, and serves either nothing or a lie.
+    """
+
+
+#: Capabilities that can only be served by pushing — a feed delivers them, a
+#: request/response call cannot. Declaring one is what commits an adapter to the
+#: streaming contract checked at registration.
+#:
+#: DEPTH is here alongside TICKS although no provider serves it yet: order-book
+#: depth is a stream by nature, and leaving it out would let the first depth
+#: provider register as a polling adapter and quietly poll an order book.
+PUSH_CAPABILITIES = frozenset({Capability.TICKS, Capability.DEPTH})
+
+
 #: Consecutive failures before a provider is considered degraded, then down.
 #: Two thresholds rather than one because a single blip must not cost a provider
 #: its primary slot — MARKET_DATA_ARCHITECTURE.md's flap-suppression concern in
@@ -302,6 +344,13 @@ class MarketDataProvider(ABC):
     def __init__(self) -> None:
         self._health = ProviderHealth()
         self._connected = False
+        #: Symbols this provider has been asked to deliver, in request order.
+        self._subscribed: Dict[str, None] = {}
+        #: Where pushed payloads go. Set by the Market Gateway when the provider
+        #: is registered, never by the provider itself — a provider that chose
+        #: its own sink could deliver around the gateway, which Developer Rule 2
+        #: forbids ("nothing may bypass the Market Gateway").
+        self._sink: Optional[Callable[["MarketDataProvider", Any], Awaitable[None]]] = None
 
     # ── Lifecycle ────────────────────────────────────────
 
@@ -321,6 +370,91 @@ class MarketDataProvider(ABC):
     @property
     def is_connected(self) -> bool:
         return self._connected
+
+    @property
+    def is_ready(self) -> bool:
+        """Whether this provider can serve *right now*, as opposed to in principle.
+
+        Separate from health, which is evidence accumulated from past calls. A
+        streaming provider that has been registered but whose connection is not
+        up has no failures to its name and is still unusable; readiness is how
+        it says so without having to fail a request first to prove it.
+
+        Polling providers over a stateless API are ready as soon as they exist,
+        which is what the default expresses.
+        """
+        return True
+
+    # ── Push surface (D4.4) ──────────────────────────────
+    #
+    # MARKET_DATA_ARCHITECTURE.md's adapter contract, rule 5: "polling adapters
+    # expose the same interface as streaming adapters ... the rest of the system
+    # cannot distinguish the two". `subscribe` therefore lives here rather than
+    # on a streaming subclass, and the default keeps the symbol set so a polling
+    # adapter that wants a poll set gets one for free.
+
+    async def subscribe(self, symbols: Iterable[str]) -> Tuple[str, ...]:
+        """Begin delivering data for `symbols`. Returns the full active set.
+
+        Idempotent and additive: re-subscribing a symbol already active is a
+        no-op rather than a duplicate. Symbols are canonicalized on the way in
+        (uppercase, trimmed) so the set is keyed the same way every other market
+        surface keys instruments.
+        """
+        for symbol in symbols or ():
+            key = str(symbol or "").strip().upper()
+            if key:
+                self._subscribed.setdefault(key, None)
+        return self.subscribed_symbols
+
+    async def unsubscribe(self, symbols: Iterable[str]) -> Tuple[str, ...]:
+        """Stop delivering data for `symbols`. Returns the remaining active set."""
+        for symbol in symbols or ():
+            self._subscribed.pop(str(symbol or "").strip().upper(), None)
+        return self.subscribed_symbols
+
+    @property
+    def subscribed_symbols(self) -> Tuple[str, ...]:
+        return tuple(self._subscribed)
+
+    def bind_sink(self, sink: Optional[Callable[["MarketDataProvider", Any], Awaitable[None]]]) -> None:
+        """Point this provider's pushed output at the Market Gateway.
+
+        Called by the gateway at registration and cleared at unregistration.
+        A provider whose sink is None drops what it is handed rather than
+        buffering it: an unbound provider is one nothing is listening to, and
+        holding ticks for a listener that may never arrive is how a per-user
+        feed becomes an unbounded per-user buffer.
+        """
+        self._sink = sink
+
+    @property
+    def has_sink(self) -> bool:
+        return self._sink is not None
+
+    async def on_raw(self, payload: Any) -> int:
+        """Receive one pushed payload from this provider's own transport.
+
+        The push direction of the contract, and the mirror image of `fetch_*`:
+        those are gated by capability because a provider that cannot serve
+        quotes must fail loudly rather than return nothing, and this is gated
+        for the same reason. A provider with no push capability has no path
+        designed to carry pushed data, so delivering it anyway would mean data
+        entering the platform through an unreviewed route.
+
+        Returns the number of records accepted, so a caller can tell "the feed
+        is delivering" from "the feed is connected and everything it sends is
+        being rejected" — two states that look identical from outside and mean
+        opposite things.
+        """
+        raise self._unsupported(Capability.TICKS)
+
+    async def _emit(self, payload: Any) -> None:
+        """Hand one validated record to the gateway sink, if one is bound."""
+        sink = self._sink
+        if sink is None:
+            return
+        await sink(self, payload)
 
     # ── Health ───────────────────────────────────────────
 
@@ -457,6 +591,8 @@ class MarketDataProvider(ABC):
             "tier": self.tier.value,
             "priority": self.priority,
             "connected": self._connected,
+            "ready": self.is_ready,
+            "subscriptions": len(self._subscribed),
             "scope": "global" if self.owner_user_id is None else "user",
             "capabilities": sorted(c.value for c in self.capabilities),
             "health": self._health.as_dict(),

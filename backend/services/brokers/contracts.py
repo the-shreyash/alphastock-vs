@@ -131,11 +131,14 @@ class BrokerProfile:
 class BrokerHolding:
     """One long-term holding in the user's demat account.
 
-    `instrument_token` is the broker's own opaque instrument identifier. It is
-    canonical rather than a leak because the realtime tick feed keys on it —
-    `portfolio_stream.apply_broker_ticks` and `trade_stream.apply_broker_ticks`
-    match ticks to holdings by this value — and it is never interpreted, only
-    matched. Nothing downstream parses it or assumes a format.
+    `instrument_token` is the broker's own opaque instrument identifier, and it
+    is carried here for one reason: paired with `symbol` and `exchange` on the
+    same row, it *is* the account's instrument mapping table. `InstrumentMap`
+    (`services/brokers/instruments.py`) builds itself from these rows, which is
+    how a broker's tick identifier becomes a canonical symbol without any extra
+    fetch. It is matched, never interpreted, and since D4.3 it stops at that
+    boundary — no core service reads it and it does not appear on a canonical
+    tick.
     """
 
     symbol: Optional[str] = None

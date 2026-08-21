@@ -65,6 +65,7 @@ from services.brokers.errors import (
     CapabilityUnsupported,
 )
 from services.brokers.health import BrokerHealth
+from services.brokers.streaming import BrokerStreamEndpoint, BrokerStreamEvent
 
 logger = logging.getLogger(__name__)
 
@@ -385,6 +386,74 @@ class BrokerAdapter(ABC):
         registry for whichever adapter owns the connection and calls this.
         """
         raise self._unsupported(BrokerCapability.ORDER_STREAM)
+
+    # -- realtime: the codec boundary (D4.2) ----------------------------------
+    #
+    # These three methods are the entire wire-format surface of a broker stream,
+    # and they are the reason `stream.py` no longer contains one. Before D4.2 a
+    # shared module held Kite's ticker URL, Kite's subscribe frames, Kite's
+    # binary packet layout and Upstox's JSON envelope — so adding a streaming
+    # broker meant editing code no broker owns, and the tick shape that came out
+    # was whatever that broker's parser happened to build.
+    #
+    # The transport is now generic and these are broker-owned: connect where the
+    # adapter says, send what the adapter says, and hand every frame to the
+    # adapter to decode. What comes back is a `BrokerStreamEvent` built from
+    # canonical types, which is what stops a raw broker payload from continuing
+    # up into the engine.
+
+    @capability_stub
+    def stream_endpoint(self, session: dict, credentials: dict = None) -> BrokerStreamEndpoint:
+        """Where to connect for this user's stream, and how to authenticate.
+
+        `credentials` is what :meth:`stream_credentials` returned, passed back
+        rather than re-read so the transport holds the material and the adapter
+        stays free of environment access.
+
+        Auth style is protocol knowledge and differs per broker in a way no
+        shared module can generalise: a query string here, a bearer header
+        there, a negotiated subprotocol at the next one. Anything credential-
+        bearing that ends up in the URL is protected by
+        :attr:`BrokerStreamEndpoint.safe_url`, which is the only form the
+        transport logs.
+        """
+        raise self._unsupported(BrokerCapability.TICK_STREAM)
+
+    def stream_subscribe_frames(self, instruments: list = None) -> List[Any]:
+        """Frames to send immediately after connecting, in order.
+
+        Returns strings or bytes ready for the socket — the adapter decides both
+        the encoding and how many frames it takes, because "subscribe" is not
+        one shape across brokers: Kite sends a subscribe frame and then a
+        separate mode frame, and a broker that subscribes by URL sends none.
+
+        The default is no frames, which is correct for a feed that pushes the
+        account's updates without being asked (every order-only stream).
+        """
+        return []
+
+    @capability_stub
+    def decode_stream_frame(self, frame: Any) -> BrokerStreamEvent:
+        """Decode ONE raw frame into a canonical :class:`BrokerStreamEvent`.
+
+        The only code in the platform entitled to see a raw broker frame, and
+        the reason for the whole module: whatever this returns is the most
+        broker-shaped thing anything above the adapter will ever hold, and the
+        transport type-checks it, so a payload cannot be passed through by
+        accident.
+
+        `frame` is `bytes` or `str` exactly as the socket produced it — brokers
+        mix both on one connection (Kite carries ticks in binary and orders in
+        JSON text), so splitting this into two methods would encode one broker's
+        framing into the contract.
+
+        Must not raise for a frame it does not understand: return
+        :meth:`BrokerStreamEvent.ignore`. Heartbeats, keep-alives and update
+        types the platform does not consume are the normal case, not an error,
+        and a codec that raises on them fills the log with noise from a working
+        connection.
+        """
+        raise self._unsupported(BrokerCapability.TICK_STREAM)
 
     # -- health --------------------------------------------------------------
     async def health_check(self, session: dict) -> dict:

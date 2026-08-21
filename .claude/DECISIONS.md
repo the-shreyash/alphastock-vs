@@ -1126,6 +1126,212 @@ BROKER_INTEGRATION.md (broker behavior), MARKET_DATA_ARCHITECTURE.md (market dat
 
 # Pending Decisions
 
+---
+
+# ADR-032
+
+Title
+
+Broker Streaming Contract — Generic Transport, Broker-Owned Codec (Sprint D4.2)
+
+Date
+
+2026-08-21
+
+Status
+
+Accepted — implemented
+
+Context
+
+D3 (ADR-031) removed every broker *name* from the streaming path: `stream.py` stopped branching on `if self.broker == "zerodha"` and dispatched on a declared `stream_protocol` instead. What it did not remove was every broker's *wire format*. After D3, a module no broker owns still held Kite's ticker URL, Kite's binary packet layout, Kite's two subscribe frames, Kite's error-frame convention and Upstox's JSON envelope. Three consequences, the third of which is the serious one:
+
+• **Adding a streaming broker still meant editing shared code.** Developer Rule 9 of MARKET_DATA_ARCHITECTURE.md — one adapter plus one registry entry — held for the fetch surface and not for the stream.
+
+• **A stream had no capability gate.** Every REST call passes one before the adapter is reached; a decoded frame passed none, so a broker could deliver ticks it never declared TICK_STREAM for and nothing would object.
+
+• **The platform's tick contract was an accident.** `parse_kite_binary` produced `{"instrument_token", "last_price"}` and that list went straight to `BrokerEngine._on_stream_tick`, `portfolio_stream.apply_broker_ticks`, `trade_stream.apply_broker_ticks` and the user's app WebSocket. Both service docstrings state the input shape as fact; it was true only because exactly one broker's parser happened to build it. A second streaming broker whose parser emitted `{"token", "ltp"}` would have type-checked, imported, connected, and silently stopped every live P&L recompute for its users — no exception, no log line, no failing test. D4 registers a broker feed as a market-data provider, which puts a second and third streaming broker on the near roadmap (Upstox, Angel One, Groww, INDmoney, Dhan, Fyers), so this had to close before the feature lands rather than after.
+
+Decision
+
+**The transport is generic and the codec belongs to the broker.** Three adapter methods carry the entire wire-format surface — `stream_endpoint()`, `stream_subscribe_frames()`, `decode_stream_frame()` — and one new module, `services/brokers/streaming.py`, defines what a codec is allowed to return: `BrokerStreamEndpoint`, `BrokerTick`, `BrokerStreamEvent`.
+
+Four properties, each pinned by a falsification test:
+
+1. **A broker can stream without inheriting a Kite-shaped assumption.** The test suite's fictional `NovaAdapter` is deliberately Kite's opposite in every axis — text frames not binary, trading-symbol identity not an opaque numeric token, string prices not integer paise, a comma-separated subscribe frame not JSON, header auth not query-string auth — and it streams end to end with no Nova-specific code anywhere outside its adapter.
+
+2. **Unsupported streaming is refused by the capability framework**, at registration *and* at runtime. `BrokerRegistry.validate` rejects a broker that declares ORDER_STREAM or TICK_STREAM without a codec (it would open a live socket whose every frame decodes to nothing — indistinguishable in the logs from a quiet market), and rejects a `stream_protocol` declared with no streaming capability to use it. `BrokerGateway.stream_event_allowed` then drops any decoded event whose capability the broker did not declare: the capability set is the authority on what a broker serves, and a codec may not widen it.
+
+3. **A raw broker payload cannot escape into the canonical layer.** `BrokerTick` drops every key the contract does not name — the streaming counterpart of what `contracts.py` does to Kite's `raw` blob — and the transport type-checks the codec's return value, so an adapter returning its own dict produces nothing and logs an error rather than passing a broker shape upward. Streamed orders are now coerced through the same `BrokerOrder` as fetched ones, ending two writers to `db.orders` with only one of them enforced.
+
+4. **No core module branches on a broker name.** `stream.py`'s D3 exemption from the core-module name ban is withdrawn: it holds no broker name, no endpoint literal, no `struct`, no `json`.
+
+**Why this supersedes DB-3.** D3 recorded a debt to move each *transport* into its owning adapter. Splitting frame decoding from connection management is strictly better, because the transport is the part that genuinely is identical everywhere: connect, subscribe, iterate, honour capabilities, reconnect with jittered backoff. A per-broker copy would duplicate the reconnect and auth-expiry handling — precisely the code where copies diverge and one broker quietly stops reconnecting. `PROTOCOL_RUNNERS` survives as an empty override table for a protocol that is not a WebSocket at all, so such a broker adds an entry rather than reintroducing a branch. DB-3 is therefore closed by a different mechanism than it proposed, and adding a WebSocket broker now changes *nothing* in shared code.
+
+Consequences
+
+• Adding a streaming broker is one adapter file and one registry entry, matching the fetch surface.
+
+• `BrokerStreamEndpoint.safe_url` is the only form of a stream URL that may be logged. Kite authenticates its ticker by query string, so "connected to <url>" — the most natural log line a transport could contain — would write a live access token into the application log, the same class of defect D3 found in `BrokerAdapter._request` arriving by a second route.
+
+• A streamed order frame with no `order_id`, or an unmapped status, is now dropped at the boundary and logged rather than written to `db.orders`. This is the `contracts.py` rule applied consistently: an untrackable row in the order book is worse than an error.
+
+• `BrokerTick` carries an optional `symbol` that nothing consumed at D4.2. It is what lets a symbol-identified broker feed skip the holdings join that token-identified feeds require; its consumer arrived in D4.3 (**ADR-033**), where both identification styles resolve through one instrument-mapping boundary.
+
+• The canonical tick still flows as a dict rather than a dataclass, for the reason `contracts.py` gives: these values go straight into MongoDB, onto the Event Bus and out as JSON. The dataclass is the definition; the dict is the currency.
+
+Review Date
+
+At D4.3, when broker ticks are first routed into the Market Gateway as a market-data feed and a second streaming adapter is written against this contract.
+
+Authoritative documents
+
+BROKER_INTEGRATION.md, MARKET_DATA_ARCHITECTURE.md
+
+---
+
+# ADR-033
+
+Title
+
+Canonical Instrument Identity for Broker Ticks (Sprint D4.3)
+
+Date
+
+2026-08-21
+
+Status
+
+Accepted — implemented
+
+Context
+
+D4.2 (ADR-032) closed the tick *shape* leak: an adapter's codec is the only code that sees a raw frame, and the only thing it may return is a canonical `BrokerStreamEvent`. It deliberately left one field broker-shaped — `BrokerTick.instrument_token`, the broker's own opaque instrument handle, typed `Any` because narrowing it to `int` would encode one broker's choice into the contract.
+
+That handle then travelled the whole way up. `BrokerEngine._on_stream_tick` forwarded it to the user's app WebSocket, to `portfolio_stream.apply_broker_ticks` and to `trade_stream.apply_broker_ticks`, and both services performed the token→symbol join themselves against `db.holdings`. Three consequences:
+
+• **Two core services were coupled to one broker's identifier format.** The join was written twice, in modules that have no business knowing what a broker instrument identifier looks like.
+
+• **A symbol-identified broker silently marked nothing.** Most brokers outside Kite identify instruments by trading symbol, so their ticks carry no token to join on. Every join produced nothing, `override` stayed empty, and every live P&L recompute for those users stopped — on a healthy socket delivering good prices, with no exception, no log line and no failing test. This is the same class of defect ADR-032 found one layer down, surviving one layer up.
+
+• **A broker's numeric handle reached the browser.** The frontend stored `brokerTicks` "keyed by instrument token", which is provider-shaped data in a client that MARKET_DATA_ARCHITECTURE.md says must never learn where a price came from.
+
+Decision
+
+**Resolve instrument identity at the broker boundary; hand core services a canonical tick.**
+
+Two modules, one on each side of the D4.1 direction rule:
+
+• `services/market_engine/ticks.py` — `MarketInstrument` (symbol, exchange) and `MarketTick` (symbol, price, exchange, volume, ingested_at). The canonical shape, on the market side, naming no broker. It invents no identity scheme: `symbol` + `exchange` is what quotes, holdings, trades and the watchlist already key on, so a canonical tick joins against all of them with no translation table.
+
+• `services/brokers/instruments.py` — `InstrumentMap`, built from the account's synced holdings and positions. Those canonical rows carry `instrument_token`, `symbol` and `exchange` together, so the mapping table costs no broker call and is per-account by nature, which is correct: an instrument identifier is only meaningful inside the broker that issued it.
+
+`BrokerEngine._on_stream_tick` is the boundary. Everything above it — the app WebSocket, the portfolio recompute, the trade recompute — receives `MarketTick` dicts.
+
+Four properties, each pinned by a falsification test run against a deliberately broken version:
+
+1. **Both identification styles pass through unchanged core code.** A numeric token resolves through the map; a trading symbol canonicalizes directly and is qualified with the account's exchange when it has one. The fictional `NovaAdapter` — symbol-identified, string-priced, never synced — reaches both core services end to end.
+
+2. **An unmapped token is dropped, never renamed.** Using the token as a symbol would push a broker's numeric handle into `db.holdings`, the trade snapshot and the AI's context as an instrument name.
+
+3. **The canonical shape is enforced by the type.** A lowercase symbol, a non-numeric price, a zero price (what a truncated binary packet decodes to, and what would mark a whole position at zero) and a price outside the Market Engine's own quote bounds are all refused at construction, so canonicality does not depend on every caller remembering to normalize.
+
+4. **No broker identifier reaches a core service**, asserted on the real delivery path *and* by a source sweep over `portfolio_stream.py` and `trade_stream.py`, so the join cannot return in a helper the behavioural test does not exercise.
+
+**Why the engine and not the transport.** Mapping needs the account's synced portfolio, which is the engine's to hold. A transport that reached for it would be back to knowing things about brokers, undoing ADR-032.
+
+**Why the map has no TTL.** Holdings change only through `sync_portfolio`, so invalidating there is exact; `start_stream` seeds it from the same two lists that decide the subscription (the only way an intraday position — never persisted — is mappable at all), and `disconnect` drops it. A timer would only add a window in which a correct map is discarded and rebuilt from a narrower source.
+
+Consequences
+
+• `trade_stream` gained coverage rather than losing it: a trade in a symbol the *demat account* does not hold could not previously be marked from ticks at all and waited for the 60s monitor. A canonical tick marks any open trade in that symbol.
+
+• A batch that resolves to nothing now stops at the boundary instead of pushing an empty tick list to the browser and waking two recomputes on every frame.
+
+• `MarketTick` carries `ingested_at` (UTC, ours) and not the broker's timestamp, which `BrokerTick` keeps as a verbatim string precisely because brokers disagree on format and timezone and a wrong parse is worse than none.
+
+• The frontend's `broker_price_tick` payload is now symbol-keyed. Nothing consumed the token form, so this is a contract improvement with no UI change.
+
+• The "nothing resolved" warning is throttled to once a minute per broker. The condition is persistent (a stale map stays stale until the next sync) while the ticks hitting it arrive several times a second per account, so an unthrottled line is tens of thousands of identical warnings an hour — visible enough to bury everything else, which is the same as not being visible.
+
+• Still deliberately not done: no broker is registered as a `MarketDataProvider`, there is no `subscribe`/`on_raw` push surface, no make-before-break switching and no provider failover. Those need a canonical tick to exist first, which is what this ADR provides.
+
+Review Date
+
+At D4.4, when broker ticks are first routed into the Market Gateway as a registered market-data feed.
+
+Authoritative documents
+
+BROKER_INTEGRATION.md, MARKET_DATA_ARCHITECTURE.md
+
+---
+
+# ADR-034
+
+Title
+
+The Broker Feed as a Registered Market-Data Provider (Sprint D4.4)
+
+Date
+
+2026-08-21
+
+Status
+
+Accepted — implemented
+
+Context
+
+After D4.3 a connected broker's ticks were canonical `MarketTick`s and reached three consumers: the user's app WebSocket, `portfolio_stream` and `trade_stream`. They drove P&L and nothing else. The Market Engine did not know a live feed existed; `source_manager.status()` reported the delayed baseline to a user watching tick-by-tick prices; and the `TICKS` capability — declared in D1 specifically so the Source Manager could resolve *nothing* for it rather than have call sites invent a provider — resolved to nothing for every user in the platform. A broker feed was real data that was not market data.
+
+MARKET_DATA_ARCHITECTURE.md has always specified the missing link (a push surface on the adapter contract, `subscribe`/`unsubscribe`/`on_raw`) and D1 deliberately deferred it (ADR-028) because it shipped one request/response provider and no consumer able to receive a pushed tick. D4.2 and D4.3 built the two segments underneath it. D4.4 is the join.
+
+Decision
+
+**A pushed feed enters the platform as an ordinary `MarketDataProvider`, through one generic market-side class and one broker-side construction seam.**
+
+• `MarketDataProvider` gains the push surface. `subscribe`/`unsubscribe` are pull-direction calls meaningful to both provider families and live on the base class with bookkeeping defaults (MARKET_DATA_ARCHITECTURE.md's adapter rule 5: "the rest of the system cannot distinguish the two"). `on_raw` is push-direction, is meaningless for a provider that cannot push, and defaults to raising.
+
+• `providers/streaming.py` holds `StreamingTickProvider` — generic, naming no broker, no exchange and no vendor. `services/brokers/market_feed.py` constructs one per connected account and injects it through the Market Gateway. broker → market is the permitted direction; the Market Engine still imports no broker module.
+
+• The Market Gateway owns registration and the sink. A provider cannot deliver into anything but the gateway, because the gateway is the only thing that ever binds its sink (Developer Rule 2).
+
+• Registration validates the provider's declarations about itself (`validate_provider`), raising `ProviderContractError` on three contradictions: a push capability without `kind=STREAMING`; `tier=STREAMING` without `kind=STREAMING`; `kind=STREAMING` without an `on_raw`.
+
+Alternatives considered
+
+**Register the broker feed with `QUOTES` and let it take the quote path immediately.** This is the headline feature and it was rejected for this sprint. A priority-1 provider declaring QUOTES outranks the baseline the instant it registers, which *is* the feed switch — performed without the make-before-break gate MARKET_DATA_ARCHITECTURE.md requires ("connect the new provider, confirm first valid data, then release the old one"). The registration seam and the switch are separable, and shipping them together would mean the switch's failure modes could only be tested through the registration path. The provider therefore declares `TICKS` alone: a capability nothing has ever served, so nothing is taken from anybody, and the baseline continues to answer every quote for every user.
+
+**A per-user feed registry inside the broker layer.** Rejected outright: the provider registry already answers "which providers exist for this user", and a second one would have to be kept in step across register, unregister, replace and process restart, and would answer differently the first time one was missed. `publish_market_ticks` looks the account's provider up in the existing registry.
+
+**Normalize broker ticks in the gateway, like every other provider payload.** There is nothing to normalize. Normalization converts a *provider's* shape into the platform's, and what arrives here is already `MarketTick`, the platform's own canonical tick, produced at the broker adapter boundary in D4.3. `normalizer_key` says so rather than naming a family that does not exist.
+
+**One bus event per tick.** Rejected on cost: a feed frame is already a batch of up to hundreds of packets, and the event bridge mirrors every event to Redis. One `market.tick` event carries the batch.
+
+Consequences
+
+• `resolve_feed(TICKS)` now resolves for a user with a streaming broker connected, at `tier=streaming`, and for nobody else — `owner_user_id` plus D2's entitlement filter make cross-user leakage impossible by construction.
+
+• The tick event carries `user_id` when the feed is owned by one. The event bridge delivers a payload with a `user_id` to that user alone, which is what stops data consumed under one user's entitlement from being broadcast to every socket on the market channel. This is an entitlement boundary, not a preference.
+
+• **Readiness became a distinct concept from health.** A registered provider whose socket is not up has no failures to its name and is still unusable, so health — which is evidence from past calls — cannot express it. `is_ready` can, and `StreamingTickProvider.is_eligible_for` consults it, which is the override `base.py` anticipated in D2.
+
+• **The contract check found two pre-existing test doubles that were not valid providers.** `FakeStreamingProvider` and `UserScopedProvider` in `test_market_gateway.py` both declared `kind=STREAMING` with no way to be pushed into — a double for a broker feed that could not receive a broker feed. Both gained a real `on_raw`. That is the check doing its job before a real adapter made the same mistake.
+
+• `kind=STREAMING` requires `on_raw`, not a push *capability*. The stricter first draft would have rejected a streaming provider serving pushed quotes — exactly the shape the D4.5 feed switch produces — which is how the two existing doubles exposed the over-strict rule.
+
+• Still deliberately not done: no make-before-break switch, no broker→baseline failover, no `QUOTES` on a broker provider, no additional broker adapters, no Zerodha market-feed integration. Each is separately testable and none is entangled with this seam.
+
+Authoritative documents
+
+MARKET_DATA_ARCHITECTURE.md, BROKER_INTEGRATION.md
+
+Review Date
+
+At D4.5, when the make-before-break feed switch promotes a broker feed to primary for quotes.
+
+---
+
 Future decisions to document.
 
 International Markets

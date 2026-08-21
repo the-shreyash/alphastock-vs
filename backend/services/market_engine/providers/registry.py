@@ -25,10 +25,14 @@ from typing import Dict, List, Optional
 
 from services.market_engine.providers.base import (
     GLOBAL_CONTEXT,
+    PUSH_CAPABILITIES,
     Capability,
     MarketDataProvider,
+    ProviderContractError,
+    ProviderKind,
     ProviderState,
     ResolutionContext,
+    SourceTier,
 )
 
 logger = logging.getLogger(__name__)
@@ -59,7 +63,16 @@ class ProviderRegistry:
         that into a crash would make the failure mode of a harmless duplicate
         worse than the duplicate itself. It is logged so a genuine name
         collision is still visible.
+
+        A provider whose declarations contradict each other is a different
+        matter and raises :class:`ProviderContractError` — see
+        :func:`validate_provider`. That is deliberately harsher than the
+        duplicate-name path: a duplicate registration is a harmless repeat of
+        something already correct, while a contradictory one is a provider that
+        would go on to serve the wrong thing silently for as long as it stayed
+        registered.
         """
+        validate_provider(provider)
         existing = self._providers.get(provider.name)
         if existing is not None and not replace:
             logger.warning(
@@ -161,6 +174,62 @@ class ProviderRegistry:
         Carries provider names — admin/diagnostics surfaces and logs only.
         """
         return [provider.describe() for provider in self.all()]
+
+
+def validate_provider(provider: MarketDataProvider) -> None:
+    """Check that a provider's declarations about itself are mutually consistent.
+
+    Run at registration, raising :class:`ProviderContractError` on the first
+    contradiction. The broker layer's :meth:`BrokerRegistry.validate` does the
+    same job on its side of the platform and for the same reason: a capability
+    set that nothing verifies is a comment.
+
+    The four rules, and the failure each one prevents:
+
+    * **A push capability requires `kind=STREAMING`.** TICKS and DEPTH cannot be
+      served by a request/response call. A polling adapter declaring TICKS would
+      be resolved for the tick capability and then answer it by polling — the
+      "no polling disguised as streaming" failure, arriving through the
+      capability set.
+
+    * **`tier=STREAMING` requires `kind=STREAMING`.** The same failure arriving
+      through the freshness label instead. `tier` is what the AI calibrates its
+      language against and what the UI renders as "Live", so a poll loop wearing
+      it makes the platform describe a 30-second-old number as live. Forbidden
+      by CLAUDE.md's data rules; caught here rather than noticed in production.
+
+    * **`kind=STREAMING` requires `on_raw` to be overridden.** A streaming
+      provider is one whose data is pushed into it, so a provider with no push
+      entry point holds a connection that can deliver nothing —
+      indistinguishable in the logs from a quiet market, which is the exact
+      failure shape D4.2 found one layer down in the broker codec. The rule is
+      stated on `kind` rather than on the push capabilities because a streaming
+      provider serving pushed *quotes* needs the same entry point as one serving
+      ticks, and requiring a TICKS declaration from it would be requiring a
+      capability it does not serve.
+
+    Yahoo is unaffected by all three: it is POLLING/DELAYED and declares no push
+    capability, which is exactly what the rules describe as consistent.
+    """
+    pushes = PUSH_CAPABILITIES & set(provider.capabilities)
+    streaming = provider.kind is ProviderKind.STREAMING
+
+    if pushes and not streaming:
+        raise ProviderContractError(
+            f"provider {provider.name!r} declares push capabilities "
+            f"{sorted(c.value for c in pushes)} but kind={provider.kind.value!r} — "
+            "a pushed capability cannot be served by polling"
+        )
+    if provider.tier is SourceTier.STREAMING and not streaming:
+        raise ProviderContractError(
+            f"provider {provider.name!r} declares tier={provider.tier.value!r} with "
+            f"kind={provider.kind.value!r} — a polling provider may not claim the streaming tier"
+        )
+    if streaming and type(provider).on_raw is MarketDataProvider.on_raw:
+        raise ProviderContractError(
+            f"provider {provider.name!r} declares kind='streaming' without implementing "
+            "on_raw() — it has no entry point for the data it is supposed to be pushed"
+        )
 
 
 def _registration_index(providers: Dict[str, MarketDataProvider],

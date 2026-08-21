@@ -197,34 +197,30 @@ async def apply_broker_ticks(db, user_id: str, broker: str, ticks: list,
                              quotes_map_func: Optional[Callable[[list], Awaitable[dict]]] = None) -> Optional[dict]:
     """Fold live broker ticks into the user's open trades and stream the result.
 
-    Ticks are ``[{instrument_token, last_price}]`` (official broker feed).
-    Tokens map to symbols through the user's synced ``db.holdings`` rows (same
-    approach as portfolio_stream — trades in symbols the broker account does
-    not hold simply wait for the 60s monitor). Non-ticked open symbols are
-    marked from ``quotes_map_func`` (defaults to the cached Yahoo layer) so the
-    snapshot is always complete. Throttled per user.
+    Ticks are canonical ``MarketTick`` dicts (`services/market_engine/ticks.py`):
+    ``symbol`` (canonical, uppercase) and ``price``. The broker's own instrument
+    identifier is resolved to a symbol at the broker boundary
+    (`services/brokers/instruments.py`, D4.3) and never reaches this module.
+
+    That join used to happen here against ``db.holdings``, which had a second
+    cost beyond the coupling: a trade in a symbol the *demat account* does not
+    hold — an intraday position, a trade taken elsewhere — could not be marked
+    from ticks at all and waited for the 60s monitor. A canonical tick marks any
+    open trade in that symbol.
+
+    Non-ticked open symbols are marked from ``quotes_map_func`` (defaults to the
+    cached Yahoo layer) so the snapshot is always complete. Throttled per user.
     """
     if not ticks or db is None:
         return None
     if not _tick_allowed(user_id):
         return None
 
-    token_price = {
-        t.get("instrument_token"): t.get("last_price")
+    override = {
+        (t.get("symbol") or "").upper(): float(t["price"])
         for t in ticks
-        if t.get("instrument_token") is not None and t.get("last_price") is not None
+        if t.get("symbol") and t.get("price") is not None
     }
-    if not token_price:
-        return None
-
-    docs = await db.holdings.find({"user_id": user_id, "broker": broker}).to_list(500)
-    override = {}
-    for d in docs:
-        price = token_price.get(d.get("instrument_token"))
-        sym = (d.get("symbol") or "").upper()
-        if price is None or not sym:
-            continue
-        override[sym] = float(price)
     if not override:
         return None
 

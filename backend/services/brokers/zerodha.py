@@ -7,7 +7,9 @@ daily around 06:00 IST; Kite Connect has no refresh grant for retail apps,
 so refresh_session() reports "reconnect required".
 """
 import hashlib
+import json
 import logging
+import struct
 from datetime import datetime, timedelta, timezone
 from typing import Any, List
 from urllib.parse import quote
@@ -17,11 +19,57 @@ from services.brokers.base import (
 )
 from services.brokers.capabilities import BrokerCapability
 from services.brokers.credentials import BrokerCredentialSpec
+from services.brokers.streaming import BrokerStreamEndpoint, BrokerStreamEvent
 
 logger = logging.getLogger(__name__)
 
 BASE_URL = "https://api.kite.trade"
 LOGIN_URL = "https://kite.zerodha.com/connect/login"
+#: Kite ticker v3. Moved here from `stream.py` in D4.2 — a broker's endpoint is
+#: the broker's business, and a shared module holding it is what made adding a
+#: streaming broker an edit to code no broker owns.
+WS_URL = "wss://ws.kite.trade"
+
+#: Kite quotes equity and derivative prices in paise (price * 100). The currency
+#: segment uses a different divisor; equities are our scope.
+PAISE = 100.0
+
+
+def parse_kite_binary(payload: bytes) -> list:
+    """Parse a Kite ticker binary frame into [{instrument_token, last_price}].
+
+    Frame layout (Kite Connect v3 docs):
+      2 bytes  number of packets (int16 BE)
+      per packet: 2 bytes length (int16 BE) + packet bytes
+      LTP packet: 4 bytes instrument_token + 4 bytes ltp (price * 100)
+    1-byte frames are heartbeats.
+
+    Lived in `stream.py` until D4.2. Nothing about this layout is generic — it
+    is Kite's framing, byte for byte — and holding it in the shared transport
+    meant the *shape it produced* became the platform's de-facto tick contract
+    by accident. It is now one step inside the adapter, and its output is
+    coerced through `BrokerTick` before anything else sees it.
+    """
+    if len(payload) < 4:
+        return []
+    ticks = []
+    try:
+        count = struct.unpack_from(">H", payload, 0)[0]
+        offset = 2
+        for _ in range(count):
+            if offset + 2 > len(payload):
+                break
+            length = struct.unpack_from(">H", payload, offset)[0]
+            offset += 2
+            packet = payload[offset : offset + length]
+            offset += length
+            if len(packet) < 8:
+                continue
+            token, ltp = struct.unpack_from(">ii", packet, 0)
+            ticks.append({"instrument_token": token, "last_price": ltp / PAISE})
+    except struct.error:
+        logger.debug("Malformed Kite binary frame skipped")
+    return ticks
 
 
 class ZerodhaAdapter(BrokerAdapter):
@@ -304,6 +352,68 @@ class ZerodhaAdapter(BrokerAdapter):
             if isinstance(row.get("instrument_token"), int)
         }
         return sorted(tokens)
+
+    # -- realtime: the Kite ticker codec (D4.2) --------------------------------
+    def stream_endpoint(self, session: dict, credentials: dict = None) -> BrokerStreamEndpoint:
+        """The Kite ticker socket for one user.
+
+        Kite authenticates the ticker by query string, which is why
+        `BrokerStreamEndpoint.safe_url` exists and why the transport logs
+        nothing else: this URL carries a live access token.
+        """
+        credentials = credentials or self.stream_credentials()
+        api_key = credentials.get("api_key") or ""
+        token = (session or {}).get("access_token") or ""
+        return BrokerStreamEndpoint(url=f"{WS_URL}?api_key={quote(str(api_key))}&access_token={quote(str(token))}")
+
+    def stream_subscribe_frames(self, instruments: list = None) -> List[Any]:
+        """Kite's two-frame subscription: subscribe, then set the mode.
+
+        LTP mode deliberately — the tick feed drives portfolio and trade marks,
+        which need a last price and nothing else. Full mode multiplies the
+        bandwidth for depth nothing currently reads.
+        """
+        instruments = list(instruments or [])
+        if not instruments:
+            return []
+        return [
+            json.dumps({"a": "subscribe", "v": instruments}),
+            json.dumps({"a": "mode", "v": ["ltp", instruments]}),
+        ]
+
+    def decode_stream_frame(self, frame: Any) -> BrokerStreamEvent:
+        """Decode one Kite ticker frame: binary carries ticks, text carries JSON.
+
+        Both arrive on the same socket, which is exactly why the contract
+        decodes `bytes | str` in one method rather than assuming a broker's
+        frames are all one type.
+        """
+        if isinstance(frame, (bytes, bytearray)):
+            if len(frame) <= 1:
+                return BrokerStreamEvent.ignore()  # heartbeat
+            return BrokerStreamEvent.tick_event(parse_kite_binary(bytes(frame)))
+
+        try:
+            data = json.loads(frame)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return BrokerStreamEvent.ignore()
+        if not isinstance(data, dict):
+            return BrokerStreamEvent.ignore()
+
+        message_type = data.get("type")
+        if message_type == "order":
+            return BrokerStreamEvent.order_event(
+                self.normalize_stream_order(data.get("data") or {}), broker=self.name
+            )
+        if message_type == "error":
+            text = str(data.get("data", ""))
+            # Kite reports a dead access token as a plain error frame. Treated
+            # as an auth failure so the transport stops instead of reconnecting
+            # into the same rejection every two seconds until the ceiling.
+            if "token" in text.lower():
+                return BrokerStreamEvent.auth_expired(text)
+            return BrokerStreamEvent.error(text)
+        return BrokerStreamEvent.ignore()
 
     # -- order management ------------------------------------------------------
     async def place_order(self, session: dict, order: dict) -> dict:

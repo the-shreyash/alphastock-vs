@@ -213,28 +213,40 @@ async def apply_broker_ticks(db, user_id: str, broker: str, ticks: list,
                              quotes_map_func: Optional[Callable[[list], Awaitable[dict]]] = None) -> Optional[dict]:
     """Fold live broker ticks into the user's portfolio and stream the result.
 
-    Ticks are ``[{instrument_token, last_price}]`` (official broker feed). The
-    tokens are mapped to symbols through the user's synced ``db.holdings`` rows;
-    fresh marks are persisted (so REST reads reflect the live broker price even
-    between Yahoo refreshes) and a throttled ``portfolio.updated`` follows."""
+    Ticks are canonical ``MarketTick`` dicts (`services/market_engine/ticks.py`):
+    ``symbol`` (canonical, uppercase) and ``price``, with no broker instrument
+    identifier anywhere in them. The broker's own identifier — a Kite integer,
+    an Upstox instrument key — is resolved to a symbol at the broker boundary
+    (`services/brokers/instruments.py`, D4.3) and never reaches this module.
+
+    That resolution used to happen *here*, joining ``instrument_token`` against
+    ``db.holdings``. It made this core service depend on one broker's identifier
+    format, duplicated the join into `trade_stream`, and gave a
+    symbol-identified broker no join key at all — so its users' live P&L stopped
+    updating with nothing raised or logged.
+
+    Fresh marks are still persisted (so REST reads reflect the live broker price
+    even between Yahoo refreshes) and a throttled ``portfolio.updated`` follows."""
     if not ticks or db is None:
         return None
     if not _tick_allowed(user_id):
         return None
 
-    token_price = {
-        t.get("instrument_token"): t.get("last_price")
+    ticked = {
+        (t.get("symbol") or "").upper(): t.get("price")
         for t in ticks
-        if t.get("instrument_token") is not None and t.get("last_price") is not None
+        if t.get("symbol") and t.get("price") is not None
     }
-    if not token_price:
+    if not ticked:
         return None
 
+    # The holdings read stays: it is a *portfolio* join (which rows to re-mark),
+    # not an identity join, and both sides of it are canonical symbols.
     docs = await db.holdings.find({"user_id": user_id, "broker": broker}).to_list(500)
     override = {}
     for d in docs:
-        price = token_price.get(d.get("instrument_token"))
         sym = (d.get("symbol") or "").upper()
+        price = ticked.get(sym)
         if price is None or not sym:
             continue
         override[sym] = float(price)

@@ -1,102 +1,130 @@
-"""Realtime broker WebSocket streaming.
+"""Realtime broker WebSocket transport — connection management, no wire formats.
 
 Official broker feeds only — no simulated ticks.
 
-Zerodha  : wss://ws.kite.trade (Kite ticker v3).
-           Binary frames carry price ticks (parsed in LTP mode); text frames
-           carry JSON order updates / errors.
-Upstox   : wss://api.upstox.com/v2/feed/portfolio-stream-feed
-           JSON order/position/holding updates. (Upstox market ticks use a
-           protobuf feed and are intentionally out of scope here.)
-
-Each connected broker account gets one background task with exponential
-backoff reconnect. Updates are forwarded through callbacks supplied by the
-BrokerEngine (order upsert + per-user app WebSocket push), keeping this module
-transport-only.
+Each connected broker account gets one background task with jittered
+exponential-backoff reconnect. Decoded updates are forwarded through callbacks
+supplied by the Broker Engine (order upsert + per-user app WebSocket push),
+keeping this module transport-only.
 
 WHAT D3 CHANGED HERE
 --------------------
-Dispatch is by *protocol*, not by broker name. The run loop used to read
+Dispatch became protocol-based. The run loop used to read
 
     if self.broker == "zerodha": ... elif self.broker == "upstox": ...
 
-which is a chain that grows by one branch per broker in a module no broker
-owns — the exact shape the Broker Provider Framework exists to prevent. Each
-adapter now declares a `stream_protocol`, and this module maps protocols to
-transports. Two brokers reselling the same vendor API share one entry; a broker
-with no stream declares no protocol and never reaches here.
+a chain that grows by one branch per broker in a module no broker owns.
 
-Frame normalization moved to the adapters too: this module used to import
-`ZerodhaAdapter` and `UpstoxAdapter` by name to canonicalize an order frame.
-It now asks the registry for whichever adapter owns the connection and calls
-`normalize_stream_order`, which is part of the ORDER_STREAM capability and
-verified at registration.
+WHAT D4.2 CHANGED HERE — AND WHY IT WENT FURTHER
+-------------------------------------------------
+D3 removed the broker *names* but left every broker's *wire format* here: Kite's
+ticker URL, Kite's binary packet layout, Kite's two subscribe frames, Kite's
+error-frame convention, and Upstox's JSON envelope all lived in this file. So
+adding a streaming broker still meant editing shared code, and — worse — the
+tick shape the platform consumed was whatever the parser in this module happened
+to build. `portfolio_stream` and `trade_stream` both document their input as
+``[{instrument_token, last_price}]``, which was true only because exactly one
+broker's parser produced it. A second broker emitting ``{"token", "ltp"}`` would
+have connected cleanly and silently stopped every live P&L recompute for its
+users.
 
-Still out of scope, deliberately (D4): routing broker ticks into the Market
-Gateway as a streaming market-data feed. Ticks here drive portfolio and trade
-P&L only, exactly as they did before D3.
+All of it moved behind :meth:`BrokerAdapter.decode_stream_frame`. What is left
+here is the part that genuinely is identical for every broker:
+
+  * open the connection the adapter describes,
+  * send the frames the adapter says to send,
+  * hand each raw frame to the adapter and take back a `BrokerStreamEvent`,
+  * refuse any event the broker's capabilities do not cover,
+  * forward canonical data, and reconnect with jittered backoff.
+
+Two properties follow, and both are asserted rather than hoped for:
+
+  * **No broker name or protocol detail appears in this file** — it is now
+    inside the same core-module ban as `broker_engine.py` and the gateway.
+  * **A raw broker payload cannot pass through.** The decoded value is
+    type-checked; only canonical `BrokerTick` / `BrokerOrder` shapes continue up.
+
+Adding a WebSocket broker therefore changes nothing here at all.
+
+What this module forwards is still a `BrokerTick` — broker-identified. D4.3 put
+the canonical boundary immediately above it, in `BrokerEngine._on_stream_tick`,
+where the account's `InstrumentMap` turns that identifier into a canonical
+symbol and the broker's handle stops. The transport is deliberately not the
+place for that: mapping needs the account's synced portfolio, which is the
+engine's to hold, and a transport that reached for it would be back to knowing
+things about brokers.
+
+Since D4.4 the canonical batch the engine produces also enters the Market
+Gateway, through a `MarketDataProvider` the broker side registers per account
+(`services/brokers/market_feed.py`). None of that is visible here: this module
+still forwards a `BrokerTick` to one callback and knows nothing about providers,
+capabilities or tiers.
+
+Still out of scope, deliberately (D4.5+): the make-before-break switch that
+promotes a broker feed to primary for quotes, and failover back to the baseline.
 """
+
 import asyncio
-import json
 import logging
-import struct
+import random
+
+from services.brokers.errors import BrokerContractError
+from services.brokers.streaming import BrokerStreamEndpoint, BrokerStreamEvent, StreamEventKind
 
 logger = logging.getLogger(__name__)
 
-KITE_WS_URL = "wss://ws.kite.trade"
-UPSTOX_WS_URL = "wss://api.upstox.com/v2/feed/portfolio-stream-feed?update_types=order"
-
-RECONNECT_BASE_DELAY = 2      # seconds
-RECONNECT_MAX_DELAY = 60      # seconds
+RECONNECT_BASE_DELAY = 2  # seconds
+RECONNECT_MAX_DELAY = 60  # seconds
 
 
-def parse_kite_binary(payload: bytes) -> list:
-    """Parse a Kite ticker binary frame into [{instrument_token, last_price}].
+def reconnect_pause(delay: float) -> float:
+    """Equal-jitter backoff: half the current ceiling, plus a random half.
 
-    Frame layout (Kite Connect v3 docs):
-      2 bytes  number of packets (int16 BE)
-      per packet: 2 bytes length (int16 BE) + packet bytes
-      LTP packet: 4 bytes instrument_token + 4 bytes ltp (price * 100)
-    1-byte frames are heartbeats.
+    The ceiling still doubles deterministically; only the *sleep* is randomized.
+
+    Without this every stream reconnects in lockstep, and the reason is
+    structural rather than unlucky: one broker-side blip disconnects every
+    connected user's socket in the same instant, so an unjittered schedule has
+    all of them retry in the same instant too — then again 2s later, 4s later,
+    8s later, as a synchronized herd that grows with the user count and hits the
+    broker hardest at exactly the moment it is least able to answer.
+
+    Equal jitter rather than full jitter (`uniform(0, delay)`) because full
+    jitter can roll a near-zero pause, which turns a still-down broker into a
+    tight retry loop for whichever stream got the low number. Keeping a floor at
+    half the ceiling preserves the backoff's purpose while still decorrelating
+    the herd.
     """
-    if len(payload) < 4:
-        return []
-    ticks = []
-    try:
-        count = struct.unpack_from(">H", payload, 0)[0]
-        offset = 2
-        for _ in range(count):
-            if offset + 2 > len(payload):
-                break
-            length = struct.unpack_from(">H", payload, offset)[0]
-            offset += 2
-            packet = payload[offset:offset + length]
-            offset += length
-            if len(packet) < 8:
-                continue
-            token, ltp = struct.unpack_from(">ii", packet, 0)
-            # Equity/derivative prices are paise (price * 100). Currency
-            # segment uses a different divisor; equities are our scope.
-            ticks.append({"instrument_token": token, "last_price": ltp / 100.0})
-    except struct.error:
-        logger.debug("Malformed Kite binary frame skipped")
-    return ticks
+    half = delay / 2.0
+    return half + random.uniform(0.0, half)
 
 
 class BrokerStream:
     """One live WebSocket connection for one (user, broker) account."""
 
-    def __init__(self, user_id: str, broker: str, session: dict,
-                 credentials: dict = None, instrument_tokens: list = None,
-                 on_order_update=None, on_tick=None, on_expired=None):
+    def __init__(
+        self,
+        user_id: str,
+        broker: str,
+        session: dict,
+        credentials: dict = None,
+        instrument_tokens: list = None,
+        on_order_update=None,
+        on_tick=None,
+        on_expired=None,
+    ):
         self.user_id = user_id
         self.broker = broker
         self.session = session
         #: Credential material supplied by the adapter through the gateway. A
         #: dict rather than a bare `api_key` because what a transport needs is
-        #: the transport's business: Kite authenticates by query string, Upstox
-        #: by bearer header, and the next broker by something else again.
+        #: the transport's business: one broker authenticates by query string,
+        #: another by bearer header, and the next by something else again.
         self.credentials = dict(credentials or {})
+        #: Opaque broker instrument identifiers, produced by the adapter's
+        #: `stream_instruments` and understood only by the adapter that made
+        #: them. This module counts them and passes them back; it never reads
+        #: one.
         self.instrument_tokens = instrument_tokens or []
         self.on_order_update = on_order_update
         self.on_tick = on_tick
@@ -128,17 +156,18 @@ class BrokerStream:
     def _adapter(self):
         """The adapter owning this connection — the only broker-aware lookup."""
         from services.brokers.registry import broker_registry
+
         return broker_registry.require(self.broker)
 
     async def _run(self):
         delay = RECONNECT_BASE_DELAY
         while not self._stopped:
             try:
-                runner = PROTOCOL_RUNNERS.get(self._adapter.stream_protocol)
+                runner = resolve_transport(self._adapter)
                 if runner is None:
                     logger.warning(
-                        "No stream transport for protocol %r (broker %s)",
-                        self._adapter.stream_protocol, self.broker)
+                        "No stream transport for protocol %r (broker %s)", self._adapter.stream_protocol, self.broker
+                    )
                     return
                 await runner(self)
                 delay = RECONNECT_BASE_DELAY  # clean close → quick reconnect
@@ -156,88 +185,146 @@ class BrokerStream:
                 logger.warning(f"{self.broker} stream error for user {self.user_id}: {e}")
             if self._stopped:
                 return
-            await asyncio.sleep(delay)
+            await asyncio.sleep(reconnect_pause(delay))
             delay = min(delay * 2, RECONNECT_MAX_DELAY)
 
-    async def _connect(self, url: str, headers: dict = None):
+    async def _connect(self, endpoint: BrokerStreamEndpoint):
         import websockets
+
+        kwargs = dict(
+            additional_headers=endpoint.headers or None,
+            ping_interval=endpoint.ping_interval,
+            ping_timeout=endpoint.ping_timeout,
+        )
+        if endpoint.subprotocols:
+            kwargs["subprotocols"] = list(endpoint.subprotocols)
         try:
-            return await websockets.connect(url, additional_headers=headers, ping_interval=20, ping_timeout=20)
+            return await websockets.connect(endpoint.url, **kwargs)
         except TypeError:
             # websockets < 14 uses extra_headers
-            return await websockets.connect(url, extra_headers=headers, ping_interval=20, ping_timeout=20)
+            kwargs["extra_headers"] = kwargs.pop("additional_headers")
+            return await websockets.connect(endpoint.url, **kwargs)
 
-    # -- Zerodha ---------------------------------------------------------------
-    async def _run_kite(self):
-        token = self.session.get("access_token")
-        url = f"{KITE_WS_URL}?api_key={self.credentials.get('api_key', '')}&access_token={token}"
-        ws = await self._connect(url)
-        logger.info(f"Zerodha ticker connected for user {self.user_id}")
+    # -- the generic transport -------------------------------------------------
+    async def _run_websocket(self):
+        """Connect, subscribe, and pump frames through the adapter's codec.
+
+        The whole transport. Every broker-specific answer it needs — the URL,
+        the auth material, the subscribe frames, the meaning of a frame — comes
+        from the adapter, so this body does not change when a broker is added.
+        """
+        adapter = self._adapter
+        endpoint = adapter.stream_endpoint(self.session, self.credentials)
+        ws = await self._connect(endpoint)
+        # `safe_url`, never `url`: a broker that authenticates by query string
+        # puts a live access token in it, and SECURITY.md forbids credentials in
+        # logs. See BrokerStreamEndpoint.safe_url.
+        logger.info("%s stream connected for user %s (%s)", self.broker, self.user_id, endpoint.safe_url)
         try:
-            if self.instrument_tokens:
-                await ws.send(json.dumps({"a": "subscribe", "v": self.instrument_tokens}))
-                await ws.send(json.dumps({"a": "mode", "v": ["ltp", self.instrument_tokens]}))
+            for frame in adapter.stream_subscribe_frames(self.instrument_tokens) or ():
+                await ws.send(frame)
             async for message in ws:
-                if isinstance(message, (bytes, bytearray)):
-                    if len(message) <= 1:
-                        continue  # heartbeat
-                    ticks = parse_kite_binary(bytes(message))
-                    if ticks and self.on_tick:
-                        await self.on_tick(self.user_id, self.broker, ticks)
-                else:
-                    await self._handle_kite_text(message)
+                await self._dispatch(self._decode(message))
         finally:
             await ws.close()
 
-    async def _handle_kite_text(self, message: str):
+    def _decode(self, message) -> BrokerStreamEvent:
+        """Run one raw frame through the adapter's codec, defensively.
+
+        Three failure modes, each of which must leave a live connection alone:
+
+        * the codec raises — one malformed frame must never drop a socket that
+          is otherwise delivering good prices;
+        * the codec returns something that is not a `BrokerStreamEvent` — this
+          is the barrier that stops a raw broker payload from continuing up. A
+          codec that returns its own dict does not leak; it produces nothing and
+          says so in the log;
+        * the codec returns an event carrying an unusable record, which
+          `BrokerStreamEvent` itself refuses to construct.
+
+        Logged at warning rather than debug: a codec that decodes nothing looks
+        exactly like a quiet market from the outside, and that is precisely the
+        failure this whole boundary exists to make visible.
+        """
         try:
-            data = json.loads(message)
-        except (json.JSONDecodeError, TypeError):
+            event = self._adapter.decode_stream_frame(message)
+        except BrokerContractError as e:
+            logger.warning("%s stream frame rejected by the contract: %s", self.broker, e)
+            return BrokerStreamEvent.ignore()
+        except Exception as e:
+            logger.warning("%s stream frame could not be decoded: %s", self.broker, e)
+            return BrokerStreamEvent.ignore()
+        if not isinstance(event, BrokerStreamEvent):
+            logger.error(
+                "%s codec returned %s instead of BrokerStreamEvent — frame dropped",
+                self.broker,
+                type(event).__name__,
+            )
+            return BrokerStreamEvent.ignore()
+        return event
+
+    async def _dispatch(self, event: BrokerStreamEvent):
+        """Deliver one decoded event, after the capability gate has allowed it."""
+        if event.kind is StreamEventKind.IGNORE:
             return
-        msg_type = data.get("type")
-        if msg_type == "order" and self.on_order_update:
-            await self.on_order_update(
-                self.user_id, self.broker,
-                self._adapter.normalize_stream_order(data.get("data") or {}))
-        elif msg_type == "error":
-            text = str(data.get("data", ""))
-            if "token" in text.lower():
-                raise _AuthExpired(text)
-            logger.warning(f"Zerodha ticker error: {text}")
 
-    # -- Upstox ------------------------------------------------------------------
-    async def _run_upstox(self):
-        token = self.session.get("access_token")
-        ws = await self._connect(UPSTOX_WS_URL, headers={"Authorization": f"Bearer {token}"})
-        logger.info(f"Upstox portfolio stream connected for user {self.user_id}")
-        try:
-            async for message in ws:
-                if isinstance(message, (bytes, bytearray)):
-                    message = message.decode("utf-8", errors="ignore")
-                try:
-                    data = json.loads(message)
-                except (json.JSONDecodeError, TypeError):
-                    continue
-                # The feed sends the order payload directly (update_type=order)
-                if data.get("update_type") in (None, "order") and (data.get("order_id") or data.get("data")):
-                    payload = data.get("data") or data
-                    if self.on_order_update:
-                        await self.on_order_update(
-                            self.user_id, self.broker,
-                            self._adapter.normalize_stream_order(payload))
-        finally:
-            await ws.close()
+        if event.kind is StreamEventKind.AUTH_EXPIRED:
+            raise _AuthExpired(event.message or "broker reported an expired session")
+
+        if event.kind is StreamEventKind.ERROR:
+            logger.warning("%s stream reported an error: %s", self.broker, event.message)
+            return
+
+        from services.brokers.gateway import broker_gateway
+
+        if not broker_gateway.stream_event_allowed(self.broker, event.kind):
+            # The adapter decoded something its own capability set does not
+            # cover. Dropped rather than delivered: the capability model is the
+            # authority on what a broker serves, and a codec may not widen it.
+            logger.warning(
+                "%s decoded a %s event without declaring the capability — dropped", self.broker, event.kind.value
+            )
+            return
+
+        if event.kind is StreamEventKind.TICKS and self.on_tick:
+            # `as_dict()` rather than the dataclass: `contracts.py` explains why
+            # dicts are the currency at this boundary — these go straight into
+            # MongoDB, onto the Event Bus and out as JSON. The dataclass is the
+            # definition; the dict is what flows.
+            await self.on_tick(self.user_id, self.broker, [tick.as_dict() for tick in event.ticks])
+        elif event.kind is StreamEventKind.ORDER and self.on_order_update:
+            await self.on_order_update(self.user_id, self.broker, event.order)
 
 
-#: Wire protocol -> transport coroutine.
+#: Wire protocol -> transport coroutine, for protocols the generic WebSocket
+#: transport cannot serve.
 #:
-#: The whole broker-awareness of this module. Adding a broker that speaks an
-#: existing protocol adds nothing here; adding one with a new protocol adds a
-#: single entry beside a new `_run_*` method, and no existing branch changes.
-PROTOCOL_RUNNERS = {
-    "kite_ticker": BrokerStream._run_kite,
-    "upstox_portfolio": BrokerStream._run_upstox,
-}
+#: Empty by design. Every broker on a WebSocket — which is every broker the
+#: platform supports and every one on the roadmap — is served by
+#: `_run_websocket`, because after D4.2 the only per-broker differences are the
+#: endpoint, the subscribe frames and the codec, and all three come from the
+#: adapter. An entry belongs here only for a protocol that is not a WebSocket at
+#: all (a long-poll feed, a raw TCP session), where connection management itself
+#: differs rather than the payloads.
+#:
+#: Kept as a lookup rather than deleted so that such a broker adds an entry
+#: instead of reintroducing a branch — the property D3 established and this
+#: table preserves.
+PROTOCOL_RUNNERS = {}
+
+
+def resolve_transport(adapter):
+    """The transport coroutine for an adapter, or None if it declares no stream.
+
+    Protocol-specific override first, generic WebSocket transport otherwise.
+    A broker with no `stream_protocol` gets None and never connects — checked
+    here rather than at the call site so "does this broker stream" has one
+    answer.
+    """
+    protocol = (getattr(adapter, "stream_protocol", "") or "").strip()
+    if not protocol:
+        return None
+    return PROTOCOL_RUNNERS.get(protocol, BrokerStream._run_websocket)
 
 
 class _AuthExpired(Exception):
@@ -250,14 +337,28 @@ class BrokerStreamManager:
     def __init__(self):
         self._streams: dict = {}  # (user_id, broker) -> BrokerStream
 
-    async def start_stream(self, user_id: str, broker: str, session: dict,
-                           credentials: dict = None, instrument_tokens: list = None,
-                           on_order_update=None, on_tick=None, on_expired=None):
+    async def start_stream(
+        self,
+        user_id: str,
+        broker: str,
+        session: dict,
+        credentials: dict = None,
+        instrument_tokens: list = None,
+        on_order_update=None,
+        on_tick=None,
+        on_expired=None,
+    ):
         await self.stop_stream(user_id, broker)
-        stream = BrokerStream(user_id, broker, session, credentials=credentials,
-                              instrument_tokens=instrument_tokens,
-                              on_order_update=on_order_update, on_tick=on_tick,
-                              on_expired=on_expired)
+        stream = BrokerStream(
+            user_id,
+            broker,
+            session,
+            credentials=credentials,
+            instrument_tokens=instrument_tokens,
+            on_order_update=on_order_update,
+            on_tick=on_tick,
+            on_expired=on_expired,
+        )
         self._streams[(user_id, broker)] = stream
         stream.start()
         return stream
@@ -289,12 +390,15 @@ class BrokerStreamManager:
             await self.stop_stream(*key)
 
     def status(self) -> list:
-        return [{
-            "user_id": user_id,
-            "broker": broker,
-            "running": stream.running,
-            "subscribed_instruments": len(stream.instrument_tokens),
-        } for (user_id, broker), stream in self._streams.items()]
+        return [
+            {
+                "user_id": user_id,
+                "broker": broker,
+                "running": stream.running,
+                "subscribed_instruments": len(stream.instrument_tokens),
+            }
+            for (user_id, broker), stream in self._streams.items()
+        ]
 
 
 stream_manager = BrokerStreamManager()

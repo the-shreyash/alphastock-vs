@@ -66,6 +66,7 @@ from services.brokers.errors import (
     normalize_broker_error,
 )
 from services.brokers.registry import BrokerRegistry, broker_registry
+from services.brokers.streaming import EVENT_CAPABILITY, StreamEventKind
 
 logger = logging.getLogger(__name__)
 
@@ -321,6 +322,30 @@ class BrokerGateway:
 
     def stream_credentials(self, broker: str) -> Dict[str, str]:
         return self.resolve(broker).stream_credentials()
+
+    def stream_event_allowed(self, broker: str, kind: StreamEventKind) -> bool:
+        """Whether a decoded stream event may be delivered for this broker (D4.2).
+
+        The capability check the streaming path was missing. Every REST call
+        passes a capability gate before the adapter is reached; a decoded frame
+        had none, so a codec could deliver ticks for a broker that never
+        declared TICK_STREAM and nothing would object. That is not hypothetical
+        housekeeping — it is how an order-only feed ends up marking a user's
+        portfolio from a payload nobody validated it could produce.
+
+        Enforced here rather than in the transport because the gateway is the
+        choke point where "may this broker do X" is answered for everything
+        else, and answering it in two places is how the two answers diverge.
+
+        Connection-level events (a dead token, a broker error, a heartbeat) are
+        ungated: they are facts about the socket rather than data crossing into
+        the platform, and a stream that cannot report its own expiry reconnects
+        forever into a rejection.
+        """
+        required = EVENT_CAPABILITY.get(kind)
+        if required is None:
+            return True
+        return self.resolve(broker).supports(BrokerCapability(required))
 
     def stream_instruments(self, broker: str, holdings: list = None, positions: list = None) -> List[Any]:
         """Instrument identifiers to subscribe on this broker's tick feed.

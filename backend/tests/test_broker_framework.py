@@ -221,6 +221,10 @@ def test_core_modules_do_not_know_any_broker_by_name():
         "services/brokers/gateway.py",
         "services/brokers/contracts.py",
         "services/brokers/capabilities.py",
+        # Joined the ban in D4.2. D3 exempted it because it held the per-protocol
+        # transports themselves; it no longer holds any.
+        "services/brokers/stream.py",
+        "services/brokers/streaming.py",
     ]
     pattern = re.compile(r"zerodha|upstox|kite", re.IGNORECASE)
     offenders = {}
@@ -251,34 +255,48 @@ def test_routes_never_compare_a_broker_name():
         assert comparison not in code, f"server.py branches on a broker name: {comparison!r}"
 
 
-def test_the_stream_transport_dispatches_on_protocol_not_on_broker_name():
-    """`stream.py` is exempt from the name ban above, and this is why.
+def test_the_stream_transport_holds_no_broker_wire_format():
+    """`stream.py`'s D3 exemption from the name ban above is withdrawn (D4.2).
 
-    It holds the per-protocol WebSocket transports themselves — the code that
-    speaks Kite's binary framing and Upstox's JSON feed — so the protocol names
-    and endpoint URLs legitimately live there, exactly as a provider's wire
-    format lives in its adapter. What must NOT live there is *branching* on a
-    broker name, which is what it did before D3:
+    D3 exempted this module for a stated reason: it held the per-protocol
+    transports themselves — the code that spoke Kite's binary framing and
+    Upstox's JSON feed — so protocol names and endpoint URLs legitimately lived
+    there. Dispatch was a protocol lookup rather than a broker-name chain, which
+    removed the branch but not the knowledge. It is now in the protected list
+    above with every other core module.
 
-        if self.broker == "zerodha": ... elif self.broker == "upstox": ...
-
-    a chain that grew by one branch per broker in a module no broker owns.
-    Dispatch is now a protocol lookup, so a broker reusing an existing protocol
-    adds nothing here and a broker with a new one adds a table entry beside a
-    new transport — never an edit to an existing branch.
+    This test guards the same property one level below the names, because a wire
+    format can return without one: a broker's endpoint is a `wss://` literal, a
+    binary framing is `struct`, and a JSON envelope is `json.loads`. None of the
+    three has any business in a module whose entire job is to open a socket and
+    hand each frame to the adapter that owns it — and each is exactly what was
+    here before D4.2.
     """
-    from services.brokers.stream import PROTOCOL_RUNNERS
+    source = (BACKEND / "services/brokers/stream.py").read_text()
+    code = _strip_comments_and_strings(source)
+    for machinery in ("import struct", "import json", "json.loads", "struct.unpack"):
+        assert machinery not in code, f"stream.py is decoding a broker wire format again: {machinery!r}"
+    for literal in ("ws://", "wss://"):
+        assert literal not in source, f"stream.py names a broker endpoint again: {literal!r}"
 
-    code = _strip_comments_and_strings((BACKEND / "services/brokers/stream.py").read_text())
-    assert "self.broker ==" not in code
-    assert "broker ==" not in code
 
-    # Every registered broker that declares a stream has a transport for it, and
-    # every broker without one declares no protocol.
+def test_every_streaming_broker_resolves_a_transport():
+    """A declared stream must have something able to run it.
+
+    The D3 invariant, preserved through the D4.2 change of mechanism: it used to
+    mean "this protocol has an entry in PROTOCOL_RUNNERS", and now means "this
+    protocol resolves to a transport" — the generic WebSocket one unless the
+    broker's protocol needs its own. The failure it guards is unchanged: a
+    broker that declares a realtime capability and then connects to nothing.
+    """
+    from services.brokers.stream import resolve_transport
+
     for adapter in broker_registry.all():
         streams = broker_gateway.stream_capabilities(adapter.name)
         if streams["orders"] or streams["ticks"]:
-            assert adapter.stream_protocol in PROTOCOL_RUNNERS, f"{adapter.name} declares a stream with no transport"
+            assert resolve_transport(adapter) is not None, f"{adapter.name} declares a stream with no transport"
+        else:
+            assert resolve_transport(adapter) is None, f"{adapter.name} has a transport but declares no stream"
 
 
 def test_broker_engine_reads_no_broker_credentials_from_the_environment():

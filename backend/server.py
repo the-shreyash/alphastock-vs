@@ -6876,6 +6876,26 @@ async def startup():
         await db.feature_flags.insert_many(default_flags)
         logger.info("Seeded default feature flags")
 
+    # Broker lifecycle events must have a subscriber BEFORE any session is
+    # restored (D4.1, closing DB-2).
+    #
+    # `load_sessions()` below republishes `broker.connected` for every session it
+    # brings back, and the Source Manager's per-user connected-broker registry is
+    # built from exactly those events. That subscription is otherwise made by
+    # `market_gateway.initialize()`, which runs *after* this point — so
+    # publishing first would fire into a bus with no matching handler.
+    #
+    # That failure would be silent, which is the reason this call is here rather
+    # than left to the gateway: `EventBus.publish` treats "no matching handler"
+    # as normal (it records a metric and returns — no raise, no warning). The
+    # restore would look correct, every log line would read correctly, and the
+    # registry would simply stay empty until each user's session happened to be
+    # exercised by other traffic.
+    #
+    # Idempotent, so `market_gateway.initialize()` calling it again is a no-op.
+    from services.market_engine.source_manager import source_manager
+    source_manager.subscribe_broker_events()
+
     # Restore same-day broker sessions (Zerodha/Upstox) + realtime streams so
     # a backend restart doesn't force re-login. Encrypts legacy plaintext tokens.
     await broker_engine.load_sessions()

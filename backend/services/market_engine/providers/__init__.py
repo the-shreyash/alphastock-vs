@@ -19,27 +19,42 @@ from services.market_engine.providers.base import (
     GLOBAL_CONTEXT,
     Capability,
     CapabilityUnavailable,
+    PUSH_CAPABILITIES,
     MarketDataProvider,
+    ProviderContractError,
     ProviderHealth,
     ProviderKind,
     ProviderState,
     ResolutionContext,
     SourceTier,
 )
-from services.market_engine.providers.registry import ProviderRegistry, provider_registry
+from services.market_engine.providers.registry import (
+    ProviderRegistry,
+    provider_registry,
+    validate_provider,
+)
+from services.market_engine.providers.streaming import (
+    STREAMING_FEED_PRIORITY,
+    StreamingTickProvider,
+)
 from services.market_engine.providers.yahoo import YahooPollingAdapter
 
 __all__ = [
     "GLOBAL_CONTEXT",
+    "PUSH_CAPABILITIES",
+    "STREAMING_FEED_PRIORITY",
     "Capability",
     "CapabilityUnavailable",
     "MarketDataProvider",
+    "ProviderContractError",
     "ProviderHealth",
     "ProviderKind",
     "ProviderRegistry",
     "ProviderState",
     "ResolutionContext",
     "SourceTier",
+    "StreamingTickProvider",
     "YahooPollingAdapter",
     "provider_registry",
+    "validate_provider",
 ]

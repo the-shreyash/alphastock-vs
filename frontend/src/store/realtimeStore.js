@@ -266,7 +266,10 @@ export const useRealtimeStore = create((set, get) => ({
         set((s) => ({ brokerOrders: [data, ...s.brokerOrders].slice(0, MAX_BROKER_ORDERS) }));
         break;
       case "broker_price_tick":
-        // Raw broker feed: { broker, ticks: [...] } keyed by instrument token.
+        // Live broker feed, canonical since D4.3: { broker, ticks: [{ symbol,
+        // price, exchange, volume, ingested_at }] }. Keyed by canonical symbol
+        // — the broker's own instrument identifier (a Kite integer, an Upstox
+        // instrument key) is resolved server-side and never reaches the client.
         set({ brokerTicks: data });
         break;
       default:

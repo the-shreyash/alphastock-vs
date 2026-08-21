@@ -482,8 +482,15 @@ class SourceManager:
 
         The question MARKET_DATA_ARCHITECTURE.md's priority algorithm asks first,
         answered from the capabilities carried on the lifecycle event rather than
-        by importing a broker module. D4 turns a non-empty answer here into a
-        registered priority-1 provider; D3 stops at being able to ask.
+        by importing a broker module.
+
+        Note what this method is *not*, since D4.4: it is not how a feed becomes
+        a provider. Registration is attached to the stream itself, on the side
+        that owns it, where the live socket and the entitlement both are — this
+        registry is a record of connections, and a record of a connection is not
+        evidence that a socket is up. Kept because it answers the priority
+        algorithm's first question without resolving anything, which diagnostics
+        and the D4.5 switch both need.
         """
         if not user_id:
             return []

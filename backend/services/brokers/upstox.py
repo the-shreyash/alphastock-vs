@@ -11,8 +11,10 @@ Note on instruments: Upstox order APIs address instruments by instrument key
 instrument keys from the user's own holdings/positions; callers may also pass
 `instrument_token` explicitly.
 """
+import json
 import logging
 from datetime import datetime, timedelta, timezone
+from typing import Any
 from urllib.parse import urlencode
 
 from services.brokers.base import (
@@ -20,8 +22,14 @@ from services.brokers.base import (
 )
 from services.brokers.capabilities import BrokerCapability
 from services.brokers.credentials import BrokerCredentialSpec
+from services.brokers.streaming import BrokerStreamEndpoint, BrokerStreamEvent
 
 logger = logging.getLogger(__name__)
+
+#: Upstox v2 portfolio stream. Order updates only — Upstox's market ticks are a
+#: separate protobuf feed and remain out of scope. Moved here from `stream.py`
+#: in D4.2 with the rest of this broker's wire knowledge.
+WS_URL = "wss://api.upstox.com/v2/feed/portfolio-stream-feed?update_types=order"
 
 BASE_URL = "https://api.upstox.com/v2"
 AUTH_URL = f"{BASE_URL}/login/authorization/dialog"
@@ -99,7 +107,8 @@ class UpstoxAdapter(BrokerAdapter):
         api_key, _, redirect = self._credentials()
         if not (api_key and redirect):
             return {"url": None, "configured": False,
-                    "message": "Upstox not configured. Add UPSTOX_API_KEY, UPSTOX_API_SECRET and UPSTOX_REDIRECT_URL to .env"}
+                    "message": "Upstox not configured. Add UPSTOX_API_KEY, "
+                               "UPSTOX_API_SECRET and UPSTOX_REDIRECT_URL to .env"}
         params = {"response_type": "code", "client_id": api_key, "redirect_uri": redirect}
         if user_id:
             params["state"] = f"uid={user_id}"  # echoed back on the callback
@@ -243,6 +252,41 @@ class UpstoxAdapter(BrokerAdapter):
     def normalize_stream_order(self, payload: dict) -> dict:
         """Canonicalize an Upstox portfolio-stream order frame."""
         return self._normalize_order(payload or {})
+
+    # -- realtime: the portfolio-stream codec (D4.2) ---------------------------
+    def stream_endpoint(self, session: dict, credentials: dict = None) -> BrokerStreamEndpoint:
+        """The Upstox portfolio socket, authenticated by bearer header.
+
+        A different auth style from Zerodha's query string, on the same
+        contract — which is the point of returning an endpoint object rather
+        than a URL string.
+        """
+        token = (session or {}).get("access_token") or ""
+        return BrokerStreamEndpoint(url=WS_URL, headers={"Authorization": f"Bearer {token}"})
+
+    def decode_stream_frame(self, frame: Any) -> BrokerStreamEvent:
+        """Decode one portfolio-stream frame.
+
+        The feed sends the order payload directly when subscribed with
+        `update_types=order`, but wraps it in `{"data": …}` on some update
+        types, so both shapes are accepted. Anything else — position and
+        holding updates the platform does not consume from this feed — is
+        ignored rather than logged: they are a working connection, not an error.
+        """
+        if isinstance(frame, (bytes, bytearray)):
+            frame = frame.decode("utf-8", errors="ignore")
+        try:
+            data = json.loads(frame)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return BrokerStreamEvent.ignore()
+        if not isinstance(data, dict):
+            return BrokerStreamEvent.ignore()
+        if data.get("update_type") not in (None, "order"):
+            return BrokerStreamEvent.ignore()
+        payload = data.get("data") or data
+        if not isinstance(payload, dict) or not payload.get("order_id"):
+            return BrokerStreamEvent.ignore()
+        return BrokerStreamEvent.order_event(self.normalize_stream_order(payload), broker=self.name)
 
     @staticmethod
     def _normalize_order(o: dict) -> dict:

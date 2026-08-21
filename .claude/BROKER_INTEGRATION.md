@@ -3,7 +3,7 @@
 
 Version: 1.2
 
-Status: Framework Implemented (Sprint D3, 2026-08-20) — broker market-data streaming pending (D4)
+Status: Framework Implemented (Sprint D3, 2026-08-20); streaming contract / codec boundary Implemented (Sprint D4.2, 2026-08-21, ADR-032) — broker market-data streaming pending (D4.3+)
 
 ---
 
@@ -166,7 +166,8 @@ Code: `backend/services/brokers/` (framework + adapters), `backend/services/brok
 | `health.py` | Broker API health (distinct from a user's session) |
 | `registry.py` | The broker list, with registration-time verification |
 | `gateway.py` | The single choke point every broker call passes through |
-| `stream.py` | Realtime transport, dispatched by protocol |
+| `streaming.py` | The canonical streaming contract — endpoint, tick, decoded event |
+| `stream.py` | Realtime transport — connection management only, no wire formats |
 | `crypto.py` | Token encryption at rest |
 
 ## Adding a broker — the whole checklist
@@ -253,6 +254,12 @@ stream_instruments()
 
 normalize_stream_order()
 
+stream_endpoint()
+
+stream_subscribe_frames()
+
+decode_stream_frame()
+
 health_check()
 
 ---
@@ -278,9 +285,73 @@ Rules:
 
 • **Unnamed fields are dropped.** Kite returned its whole `equity`/`commodity` margin tree under a `raw` key; nothing read it, and any consumer that had started to would have been reading a shape only one broker produces. If a field in there turns out to be needed, it becomes a canonical field every adapter fills.
 
-• **`instrument_token` is canonical, not a leak.** It is the broker's opaque instrument identifier, matched (never parsed) by the tick pipeline in `portfolio_stream` and `trade_stream`.
+• **`instrument_token` is the account's mapping table, not a leak — and not an export.** It is the broker's opaque instrument identifier, carried beside `symbol` and `exchange` on the same row, which is precisely what lets `InstrumentMap` name an arriving tick with no extra fetch. It is matched, never parsed, and since D4.3 it stops at the broker boundary: no core service reads it and it appears on no canonical tick.
 
 • **`BrokerOrderAck` is separate from `BrokerOrder` on purpose.** `place_order` persists `{**request, **ack}`; a full-order acknowledgement would overwrite the request's real quantity, price and symbol with its default zeros.
+
+---
+
+# Streaming Contract (Sprint D4.2, ADR-032)
+
+A broker's WebSocket is described entirely by its adapter. `stream.py` holds connection management and nothing else — no endpoint, no framing, no broker name. Adding a WebSocket broker changes no shared code at all.
+
+| Contract | Fields |
+|---|---|
+| `BrokerStreamEndpoint` | url, headers, subprotocols, ping_interval, ping_timeout |
+| `BrokerTick` | instrument_token, last_price, symbol, exchange, volume, timestamp |
+| `BrokerStreamEvent` | kind (`ticks` / `order` / `auth_expired` / `error` / `ignore`), ticks, order, message |
+
+Three adapter methods carry the whole wire format:
+
+| Method | Answers |
+|---|---|
+| `stream_endpoint(session, credentials)` | Where to connect, and how to authenticate — query string, bearer header, negotiated subprotocol |
+| `stream_subscribe_frames(instruments)` | What to send on connect, in the broker's own encoding, verbatim |
+| `decode_stream_frame(frame)` | What one raw frame *means*, as a `BrokerStreamEvent` |
+
+Rules:
+
+• **The codec is the only code that sees a raw frame.** Whatever `decode_stream_frame` returns is the most broker-shaped thing anything above the adapter will ever hold, and the transport type-checks it — an adapter returning its own dict produces nothing and logs an error rather than leaking a payload upward.
+
+• **A capability gates every decoded event.** `TICKS` requires `tick_stream` and `ORDER` requires `order_stream`, enforced by the gateway. The registry additionally refuses at startup any broker that declares a realtime capability without a codec, or a `stream_protocol` with no realtime capability to use it — a broker that declares a stream it cannot decode holds a live socket that looks, in every log line, exactly like a quiet market.
+
+• **Never log a stream URL.** Use `BrokerStreamEndpoint.safe_url`, which strips the query. Kite authenticates its ticker by query string, so the raw URL carries a live access token, and SECURITY.md forbids credentials in logs.
+
+• **A frame is a batch.** One unusable tick is dropped; the rest of its frame is delivered. A frame that yields nothing usable decodes to `ignore`, so "nothing to deliver" has one shape.
+
+• **A codec must not raise on a frame it does not understand.** Heartbeats, keep-alives and unconsumed update types are the normal case, and returning `ignore` for them is what keeps a working connection out of the log.
+
+---
+
+# Canonical Instrument Identity (Sprint D4.3)
+
+D4.2 stopped a broker's *wire format* at the adapter. D4.3 stops its *instrument identity* one layer above, in `BrokerEngine._on_stream_tick`:
+
+```
+broker wire frame → codec (adapter) → BrokerStreamEvent → BrokerTick
+                                                              ↓  InstrumentMap
+                                                          MarketTick → portfolio_stream / trade_stream / app WebSocket
+```
+
+| Contract | Where | Fields |
+|---|---|---|
+| `MarketInstrument` | `services/market_engine/ticks.py` | symbol (canonical, uppercase), exchange |
+| `MarketTick` | `services/market_engine/ticks.py` | symbol, price, exchange, volume, ingested_at |
+| `InstrumentMap` | `services/brokers/instruments.py` | broker identifier → `MarketInstrument`, per account |
+
+Rules:
+
+• **A broker instrument identifier may not cross into a core service.** `portfolio_stream` and `trade_stream` used to join `instrument_token` against `db.holdings` themselves. That coupled two core services to one broker's identifier format and gave a symbol-identified broker no join key at all — its users' live P&L stopped updating with nothing raised, logged or failed. Pinned by `test_no_broker_instrument_identifier_reaches_a_core_service` and a source sweep.
+
+• **Both identification styles resolve through the same boundary.** A token broker's tick is looked up in the account's map; a symbol broker's tick is canonicalized directly and qualified with the account's exchange when it has one. Adding either kind of broker changes no core service.
+
+• **An unmapped token is dropped, never used as a symbol.** A fallback would push a broker's numeric handle into `db.holdings`, the trade snapshot and the AI's context as if it were an instrument name.
+
+• **The map is built from rows the platform already syncs.** A canonical holding/position carries `instrument_token`, `symbol` and `exchange` together, so mapping costs no broker call. It is cached per account and rebuilt by `sync_portfolio` and `start_stream`, dropped on disconnect — no TTL, because holdings only change through a sync.
+
+• **A tick that cannot be represented canonically is dropped, not raised.** Same batch discipline as the codec: one unusable record must not cost the other 299 their prices, nor drop a live socket. A batch that resolves to nothing wakes no consumer.
+
+• **Canonical ticks carry no broker name, no provider identity and no broker timestamp.** `ingested_at` (UTC, ours) replaces `BrokerTick.timestamp`, which is a verbatim broker string precisely because brokers disagree on format and timezone.
 
 ---
 

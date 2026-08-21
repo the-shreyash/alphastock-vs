@@ -2222,7 +2222,7 @@ Implementation phases (per MARKET_DATA_ARCHITECTURE.md):
 - [x] **D1 / Phase 1 — Market Gateway Foundation** — **COMPLETE (2026-08-19)** — Provider Adapter contract, Provider Registry, Source Manager foundation, Yahoo migration. Scope decisions in **ADR-028**.
 - [x] **D2 / Phase 2 — Source Manager completion** — **BACKEND COMPLETE (2026-08-20)** — failover chain, `UnavailableReason`, `ResolutionContext`, `unknown` health. Scope decisions in **ADR-029**; public-contract reconciliation in **ADR-030**. Frontend reactive tier indicator outstanding (DD-7).
 - [x] **D3 / Phase 3 — Broker Provider Framework** — **COMPLETE (2026-08-20)** — re-scoped from "Zerodha Kite WebSocket adapter"; scope decisions in **ADR-031**. See "D3 — What shipped" below.
-- [ ] D4 / Phase 4 — Broker market-data streaming (Zerodha Kite ticker as a registered priority-1 provider, streaming push surface `subscribe`/`on_raw`, tick normalization, per-user resolution, make-before-break switching, failover to Yahoo) + remaining broker adapters (Upstox, Angel One, Fyers, Dhan)
+- [ ] D4 / Phase 4 — **IN PROGRESS.** D4.1 (DB-2 startup ordering + reconnect jitter), D4.2 (broker streaming contract / codec boundary, ADR-032), D4.3 (canonical instrument identity / market tick, ADR-033) and D4.4 (broker feed registered as a market-data provider + the `subscribe`/`on_raw` push surface, ADR-034) complete; D4.5+ outstanding — Broker market-data streaming (Zerodha Kite ticker as a registered priority-1 provider, streaming push surface `subscribe`/`on_raw`, tick normalization, per-user resolution, make-before-break switching, failover to Yahoo) + remaining broker adapters (Upstox, Angel One, Fyers, Dhan)
 - [ ] D5 / Phase 5 — Hardening: latency scoring, flap suppression, probation windows, multi-connection sharding, chaos tests
 - [ ] D6 / Phase 6 — Enterprise/licensed feeds (future)
 
@@ -2301,11 +2301,91 @@ Backend suite **3,064 passed** (3,015 before D3 + 49 new), 4 xfailed, 0 failed. 
 - No DD-6 provider recovery / re-probe.
 - No Upstox, Angel One, Groww, INDmoney, Dhan or Fyers *new* adapters (Upstox was already present and was brought onto the framework).
 
+## D4 — What has shipped so far
+
+### D4.1 — prerequisites (2026-08-21)
+
+- **DB-2 closed.** `BrokerEngine.load_sessions()` now publishes `broker.connected` for each restored session, and `server.py` subscribes the Source Manager *before* restoring them. The ordering is the whole fix: `EventBus.publish` treats "no matching handler" as normal, so publishing first would have logged a correct-looking restore and left the per-user registry empty. Pinned by an ordering assertion, not a "publish was called" assertion.
+- **Reconnect jitter.** Equal-jitter backoff (`half + uniform(0, half)`) replaced a deterministic doubling that had every user's socket retry in the same instant after a single broker-side blip.
+- **The dependency boundary locked.** market → broker imports are banned by test before D4.2 code landed, rather than audited after.
+
+### D4.2 — the streaming contract / codec boundary (2026-08-21, ADR-032)
+
+**Created**
+
+- `backend/services/brokers/streaming.py` — `BrokerStreamEndpoint`, `BrokerTick`, `BrokerStreamEvent` / `StreamEventKind`, `EVENT_CAPABILITY`. The canonical streaming shapes, and the rule that a codec may return nothing else.
+
+**Modified**
+
+- `brokers/base.py` — `stream_endpoint()`, `stream_subscribe_frames()`, `decode_stream_frame()`: the entire wire-format surface of a broker stream, now adapter-owned.
+- `brokers/stream.py` — one generic WebSocket transport replacing `_run_kite` / `_run_upstox`. Kite's URL, binary framing, subscribe frames and error convention, and Upstox's JSON envelope, all left the module. `PROTOCOL_RUNNERS` is now an empty override table with `resolve_transport()` in front of it.
+- `brokers/zerodha.py`, `brokers/upstox.py` — each broker's codec, in the only module entitled to hold it. `parse_kite_binary` moved here from `stream.py`.
+- `brokers/capabilities.py` — `STREAMING_CAPABILITIES`, `STREAM_TRANSPORT_METHODS`.
+- `brokers/registry.py` — `_validate_streaming`: a realtime capability without a codec, and a `stream_protocol` without a realtime capability, are both rejected at registration.
+- `brokers/gateway.py` — `stream_event_allowed()`: the capability gate the streaming path never had.
+
+**The defect this closed.** The platform's tick contract was an accident. `parse_kite_binary` produced `{"instrument_token", "last_price"}` and that list went straight to `portfolio_stream.apply_broker_ticks`, `trade_stream.apply_broker_ticks` and the user's app WebSocket — both service docstrings state that shape as fact, and it was true only because exactly one broker's parser happened to build it. A second streaming broker emitting `{"token", "ltp"}` would have type-checked, imported, connected, and silently stopped every live P&L recompute for its users. Nothing would have raised, logged or failed.
+
+**Two smaller ones closed with it.** Streamed order frames reached `db.orders` as whatever `normalize_stream_order` returned while the identical order fetched over REST went through `BrokerOrder` — two writers to one collection with one unenforced; streamed orders are now coerced through the same contract. And a stream URL had no safe log form, which matters because Kite puts a live access token in the ticker's query string.
+
+**Validation.** Backend suite **3,093 passed**, 4 xfailed; the 15 `test_entrypoint_log_level.py` failures are the documented pre-existing Docker baseline, unchanged. flake8 clean across `services/brokers/` and the new tests (one pre-existing E501 in `upstox.py` fixed on the way); `black` and `isort` clean on the new files. **Nine falsification probes run**, each mutation observed red and reverted: codec type-check removed → 1 red; runtime capability gate removed → 1 red; registration streaming validation removed → 2 red; `BrokerTick` key-dropping removed → 1 red; streamed-order coercion bypassed → 1 red; raw URL logged → 1 red; `json` re-imported into `stream.py` → 1 red; Kite paise divisor changed → 2 red; subscribe frames re-encoded by the transport → 1 red.
+
+**Deliberately NOT done in D4.2** — no broker registered as a market-data provider, no `subscribe`/`on_raw` on `MarketDataProvider`, no Zerodha *market-feed* provider, no new broker adapters. `BrokerTick.symbol` is carried but unconsumed; D4.3 is where a consumer for it arrives.
+
+### D4.3 — canonical instrument identity / market tick (2026-08-21, ADR-033)
+
+**Created**
+
+- `backend/services/market_engine/ticks.py` — `MarketInstrument`, `MarketTick`, `MarketTickError`. The canonical tick and instrument identity, on the market side of the D4.1 direction rule, naming no broker.
+- `backend/services/brokers/instruments.py` — `InstrumentMap`, `canonical_ticks()`. The boundary a broker instrument identifier does not cross, built from rows the platform already syncs.
+
+**Modified**
+
+- `broker_engine.py` — `_on_stream_tick` canonicalizes before delivering; `_instrument_map` / `_remember_instrument_map` / `_forget_instrument_map` own the per-account map (seeded by `start_stream`, rebuilt by `sync_portfolio`, dropped by `disconnect`).
+- `portfolio_stream.py`, `trade_stream.py` — consume `MarketTick` dicts keyed by canonical symbol; neither names a broker instrument identifier any more.
+- `brokers/contracts.py`, `brokers/streaming.py`, `brokers/stream.py` — docstrings corrected where they described the join that D4.3 removed.
+- `frontend/src/store/realtimeStore.js` — `broker_price_tick` is symbol-keyed; comment updated (nothing consumed the token form, so no UI change).
+
+**The defect this closed.** `BrokerTick.instrument_token` — a Kite integer, an Upstox instrument key — travelled into `portfolio_stream`, `trade_stream` and the browser, and both services did the token→symbol join themselves against `db.holdings`. Two core services were coupled to one broker's identifier format, the join was written twice, and a **symbol-identified broker had no join key at all**: every join produced nothing and every live P&L recompute for its users stopped, on a healthy socket delivering good prices, with nothing raised, logged or failed. Same class of defect as D4.2's, surviving one layer up.
+
+**Two smaller ones closed with it.** A trade in a symbol the demat account does not hold could not be marked from ticks at all and waited for the 60s monitor; a batch that resolved to nothing still pushed an empty tick list to the browser and woke two recomputes on every frame.
+
+**Validation.** Backend suite **3,109 passed**, 4 xfailed; the 15 `test_entrypoint_log_level.py` failures are the documented pre-existing Docker baseline, unchanged. flake8 clean on every changed file except two pre-existing findings in `broker_engine.py` (present at HEAD); `black` and `isort` clean on both new modules. **Eleven falsification probes run**, each mutation observed red and reverted: unmapped token used as a symbol → 4 red; canonical boundary removed from the engine → 4 red; `MarketTick` identity/price enforcement removed → 1 red; symbol resolution dropped → 3 red; token/str matching reverted to raw values → 1 red; a malformed tick aborting the batch → 1 red; sync no longer rebuilding the map → 1 red; `start_stream` no longer seeding it → 1 red; disconnect keeping it → 1 red; canonical output built by patching the broker payload → 3 red; the stale-map warning unthrottled → 1 red.
+
+**Deliberately NOT done in D4.3** — no broker registered as a `MarketDataProvider`, no `subscribe`/`on_raw` push surface, no Zerodha live market feed, no make-before-break, no provider failover, no new broker adapters.
+
+### D4.4 — the provider-registration seam (2026-08-21, ADR-034)
+
+**The chain, complete.** `broker stream → canonical MarketTick → MarketDataProvider → Market Gateway → Source Manager → Market Engine`. D4.2 gave the tick its shape, D4.3 gave it a canonical identity; D4.4 is where it becomes *market* data instead of portfolio input.
+
+**Created**
+
+- `backend/services/market_engine/providers/streaming.py` — `StreamingTickProvider`, `STREAMING_FEED_PRIORITY`, `TICK_FIELDS`. A generic pushed-feed provider. Names no broker, no exchange and no vendor; a second streaming broker adds zero lines to it.
+- `backend/services/brokers/market_feed.py` — `attach_market_feed` / `detach_market_feed` / `publish_market_ticks` / `feed_provider_name`. The construction seam on the broker side of the D4.1 direction rule.
+
+**Modified**
+
+- `providers/base.py` — the push surface: `subscribe` / `unsubscribe` / `subscribed_symbols` / `on_raw` / `bind_sink` / `_emit`, plus `is_ready` and `ProviderContractError` / `PUSH_CAPABILITIES`. Closes the D1 deferral recorded in ADR-028.
+- `providers/registry.py` — `validate_provider()`, run at registration.
+- `market_engine/gateway.py` — `register_streaming_provider` / `unregister_streaming_provider` / `_ingest_ticks`, and `TICK_TOPIC = "market.tick"`.
+- `broker_engine.py` — `start_stream` attaches the feed, `_on_stream_tick` publishes the canonical batch into it, `disconnect` and `_on_stream_expired` detach it.
+- `tests/test_market_gateway.py` — `FakeStreamingProvider` and `UserScopedProvider` gained a real `on_raw` (see below).
+
+**The scope line, and why it is where it is.** The registered provider declares `TICKS` and **not** `QUOTES`. Declaring QUOTES would make a priority-1 provider outrank the baseline the instant it registered — which *is* the feed switch, performed without the make-before-break gate MARKET_DATA_ARCHITECTURE.md requires. `TICKS` has never been served by anything, so registering the feed takes nothing away from anybody and the baseline continues to answer every quote for every user. The switch is D4.5 and is separately testable. Pinned by `test_yahoo_is_unchanged_by_the_streaming_seam`, which goes red the day `QUOTES` is added without a gate.
+
+**What the contract check found immediately.** `validate_provider` rejects three contradictions — a push capability without `kind=STREAMING`, `tier=STREAMING` without `kind=STREAMING`, and `kind=STREAMING` without an `on_raw`. Its first two catches were pre-existing test doubles: `FakeStreamingProvider` and `UserScopedProvider` both declared themselves streaming broker feeds with no way to be pushed into. They were corrected rather than exempted. The first draft of the rule was *stricter* — it required a push capability rather than an `on_raw` — and `UserScopedProvider` is what exposed that as wrong: a streaming provider serving pushed quotes is exactly the shape D4.5 produces, and requiring `TICKS` of it would require a capability it does not serve.
+
+**Security.** The tick event carries `user_id` when the feed is owned by one, because the event bridge delivers a `user_id`-bearing payload to that user alone and broadcasts everything else to every socket on the market channel. Without it, data consumed under one user's broker entitlement would have fanned out to every connected user — a Category 2 entitlement breach, not a preference. Ending the entitlement (disconnect, expired token) unregisters the provider immediately rather than waiting for a health transition. Provider names carry the broker and the user id and reach only the registry, gateway logs and the admin diagnostics surface; `source_manager.status()`, every normalized event and every API response still carry a `source_tier` and no identity (Developer Rule 4).
+
+**Validation.** Backend suite **3,119 passed**, 4 xfailed; the 15 `test_entrypoint_log_level.py` failures are the documented pre-existing Docker baseline, unchanged. **Twelve falsification tests added** to `test_broker_streaming.py`, and **five mutations run against them**, each observed red and reverted: the broker capability gate removed → 1 red; `validate_provider` removed from registration → 1 red; the closed-field-set check removed → 1 red; the engine no longer publishing into the feed → 1 red; the provider declaring `QUOTES` → 3 red. A sixth probe was run *before* the tests were finished: the broker-agnosticism sweep's own non-vacuity assertion failed, which is how the string-literal sweep (`if broker == "zerodha"` survives an identifier sweep untouched) was added.
+
+**Deliberately NOT done in D4.4** — no make-before-break switch, no broker→baseline failover, no `QUOTES` on a broker provider, no Zerodha market-feed integration, no additional broker adapters.
+
 ## D3 — Debts carried into D4
 
 - **DB-1 — Broker health is process-local.** `BrokerHealth` lives on the registry's adapter instance, so a multi-worker deployment has one health view per worker and the Admin Portal sees whichever worker answers. Acceptable while health is diagnostic; it needs a shared store (Redis, as `infrastructure/` already provides) before it drives any automatic behaviour.
 - **DB-2 — The per-user connected-broker registry is process-local and not restored at startup.** `SourceManager._connected_brokers` is populated only by live lifecycle events, so a restart forgets who is connected until each user's session is exercised. `BrokerEngine.load_sessions()` is the natural place to re-publish `broker.connected` for restored sessions; deferred because nothing consumes the registry yet. Closing this is a prerequisite for D4's feed switch.
-- **DB-3 — Stream transports still live in `stream.py` rather than in the adapters.** Dispatch is by protocol and no broker-name branch remains, so adding a broker no longer edits a branch — but a broker with a genuinely new protocol still adds its transport to a shared module. Moving each transport into its owning adapter is the cleaner end state and belongs with D4's streaming work, not before it.
+- **DB-3 — Stream transports still live in `stream.py` rather than in the adapters.** ✅ **CLOSED (D4.2, 2026-08-21) — by a different mechanism than proposed.** Moving each *transport* into its adapter would have duplicated the reconnect loop, the auth-expiry path and the capability checks into every broker, which is exactly the code where copies diverge and one broker quietly stops reconnecting. The split that actually holds is **transport generic, codec broker-owned**: `stream_endpoint()`, `stream_subscribe_frames()` and `decode_stream_frame()` carry the whole wire format, and `stream.py` keeps only connection management. It now contains no broker name, no endpoint literal, no `struct` and no `json`, and adding a WebSocket broker changes nothing in it. `PROTOCOL_RUNNERS` survives as an empty override table for a protocol that is not a WebSocket at all. Full reasoning: **ADR-032**.
 - **DB-4 — `/api/zerodha/*` legacy routes remain.** A deprecated public surface with its own URL prefix (not a framework leak); they delegate to the Broker Engine. Retire with a deprecation window.
 
 ## D1 — Debts carried into D2 (tracked, tested, not hidden)

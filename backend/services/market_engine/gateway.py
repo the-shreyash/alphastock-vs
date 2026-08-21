@@ -68,10 +68,12 @@ from services.market_engine.normalizer import (
 from services.market_engine.providers import (
     Capability,
     MarketDataProvider,
+    ProviderContractError,
     ResolutionContext,
     YahooPollingAdapter,
     provider_registry,
 )
+from services.market_engine.ticks import MarketTick
 from services.market_engine.source_manager import source_manager
 from services.market_engine.validator import (
     validate_stock_quote,
@@ -91,6 +93,13 @@ T = TypeVar("T")
 #: the gateway supplies the name at the normalization boundary. Without this the
 #: normalization step silently never applied and every overview passed through
 #: raw. See ADR-028.
+#: Bus topic carrying canonical ticks out of the gateway (D4.4).
+#:
+#: `market.` rather than `tick.` deliberately: the event bridge routes by leading
+#: domain segment and already maps `market` to the `market` socket channel, so a
+#: tick lands where every other market event lands with no routing-table change.
+TICK_TOPIC = "market.tick"
+
 OVERVIEW_INDEX_NAMES = {
     "nifty": "NIFTY 50",
     "bank_nifty": "BANK NIFTY",
@@ -203,6 +212,97 @@ class MarketGateway:
         """
         tier = source_manager.active_tier(capability, user_id=user_id)
         return tier.value if tier else None
+
+    # ── Streaming provider registration (D4.4) ───────────
+    #
+    # The gateway is where a pushed feed joins the platform, for the same reason
+    # it is where a polled one does: Developer Rule 2 says nothing may bypass it,
+    # and a provider that registered itself and delivered into its own consumer
+    # would be a second entry point for market data with none of the health,
+    # tier stamping or event fan-out this one performs.
+    #
+    # Whoever owns the feed constructs the provider and calls this; the gateway
+    # never constructs one, and never learns what kind of feed is behind it.
+
+    async def register_streaming_provider(self, provider: MarketDataProvider) -> bool:
+        """Register a pushed feed and bind its output to this gateway.
+
+        Returns True when the provider is registered and connected. Raises
+        :class:`ProviderContractError` — from the registry's own contract check —
+        when the provider's declarations contradict each other; that is a
+        programming error in the adapter and is not something a caller can
+        degrade around.
+
+        `replace=True` because a feed re-registering under the same name is a
+        *reconnection*, and the reconnected provider is the live one. Ignoring it
+        as a duplicate (the registry's default) would leave the platform holding
+        a provider bound to a socket that no longer exists.
+        """
+        provider.bind_sink(self._ingest_ticks)
+        try:
+            provider_registry.register(provider, replace=True)
+        except ProviderContractError:
+            provider.bind_sink(None)
+            raise
+        await provider.connect()
+        logger.info(
+            "Streaming provider registered: %s (tier=%s, priority=%d, scope=%s)",
+            provider.name, provider.tier.value, provider.priority,
+            "global" if provider.owner_user_id is None else "user",
+        )
+        await source_manager.publish_status()
+        return True
+
+    async def unregister_streaming_provider(self, name: str) -> bool:
+        """Drop a pushed feed. Returns True when one was actually removed.
+
+        Disconnect and unbind before unregistering: an entitlement that has
+        ended must stop being resolvable *and* stop being able to deliver, and
+        doing only the first would leave a live socket pushing into a gateway
+        that no longer lists its provider.
+        """
+        provider = provider_registry.get(name)
+        if provider is None:
+            return False
+        try:
+            await provider.disconnect()
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("Streaming provider %s failed to disconnect cleanly: %s", name, exc)
+        provider.bind_sink(None)
+        provider_registry.unregister(name)
+        await source_manager.publish_status()
+        return True
+
+    async def _ingest_ticks(self, provider: MarketDataProvider,
+                            ticks: List[MarketTick]) -> None:
+        """The sink every pushed tick arrives through — validate, stamp, publish.
+
+        One event per *batch*, not per tick. A feed frame is already a batch of
+        up to hundreds of packets, and one bus event per packet would put a
+        Redis round-trip behind every price change on every connected account.
+
+        The published payload carries `source_tier` and no provider identity, so
+        a consumer learns the data is live without learning who produced it
+        (Developer Rule 4). It carries `user_id` when the feed is owned by one:
+        the event bridge delivers a payload with a `user_id` to that user alone,
+        which is what keeps a feed consumed under one user's entitlement from
+        being broadcast to every socket on the market channel. For a
+        platform-wide feed there is no `user_id` and the event fans out normally.
+        """
+        if not ticks:
+            return
+        if source_manager.record_success(provider):
+            await source_manager.publish_status()
+
+        payload: Dict[str, Any] = {
+            "ticks": [tick.as_dict() for tick in ticks],
+            "count": len(ticks),
+            "source_tier": provider.tier.value,
+            "ingested_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if provider.owner_user_id:
+            payload["user_id"] = provider.owner_user_id
+        await event_bus.publish(TICK_TOPIC, payload)
 
     # ── Provider invocation ──────────────────────────────
 
