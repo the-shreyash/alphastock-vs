@@ -60,8 +60,24 @@ Gateway, through a `MarketDataProvider` the broker side registers per account
 still forwards a `BrokerTick` to one callback and knows nothing about providers,
 capabilities or tiers.
 
-Still out of scope, deliberately (D4.5+): the make-before-break switch that
-promotes a broker feed to primary for quotes, and failover back to the baseline.
+WHAT D4.6 ADDED — AND WHY IT IS NOT A BROKER BRANCH
+----------------------------------------------------
+One `try` around the connect call. `decode_stream_frame` can only classify a
+failure the broker reports *in a frame*, which presupposes a connection; a
+broker that refuses a dead session during the WebSocket handshake produces no
+frame at all, so the codec never sees it and this loop saw only "connect
+raised". An expired token was therefore indistinguishable from a broker outage
+and reconnected on the backoff schedule indefinitely, with the account's market
+feed left registered and the user never asked to reconnect.
+
+`BrokerAdapter.stream_connect_error` asks the adapter what its broker's
+rejection meant. The adapter *classifies*; this module *acts*, by raising the
+same `_AuthExpired` a frame-reported expiry raises, so one expiry path serves
+both. The default answer is `None`, so no other adapter is affected and this
+file still names no broker.
+
+Still out of scope, deliberately (D5+): probation windows, latency scoring,
+flap suppression, and sharding a subscription across several connections.
 """
 
 import asyncio
@@ -257,7 +273,21 @@ class BrokerStream:
         """
         adapter = self._adapter
         endpoint = adapter.stream_endpoint(self.session, self.credentials)
-        ws = await self._connect(endpoint)
+        try:
+            ws = await self._connect(endpoint)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # A broker that rejects a dead session during the handshake never
+            # sends the error *frame* `decode_stream_frame` would classify, so
+            # the codec cannot see this failure at all. Ask the adapter what its
+            # broker's rejection means; a `None` answer — the default — leaves
+            # the exception to the normal backoff, unchanged. See
+            # `BrokerAdapter.stream_connect_error`.
+            expired = adapter.stream_connect_error(exc)
+            if expired:
+                raise _AuthExpired(expired) from exc
+            raise
         # `safe_url`, never `url`: a broker that authenticates by query string
         # puts a live access token in it, and SECURITY.md forbids credentials in
         # logs. See BrokerStreamEndpoint.safe_url.

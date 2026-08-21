@@ -301,13 +301,14 @@ A broker's WebSocket is described entirely by its adapter. `stream.py` holds con
 | `BrokerTick` | instrument_token, last_price, symbol, exchange, volume, timestamp |
 | `BrokerStreamEvent` | kind (`ticks` / `order` / `auth_expired` / `error` / `ignore`), ticks, order, message |
 
-Three adapter methods carry the whole wire format:
+Four adapter methods carry the whole wire format:
 
 | Method | Answers |
 |---|---|
 | `stream_endpoint(session, credentials)` | Where to connect, and how to authenticate — query string, bearer header, negotiated subprotocol |
 | `stream_subscribe_frames(instruments)` | What to send on connect, in the broker's own encoding, verbatim |
 | `decode_stream_frame(frame)` | What one raw frame *means*, as a `BrokerStreamEvent` |
+| `stream_connect_error(error)` | Whether a failed *handshake* means this session is dead (D4.6). Default `None` — retry on the normal backoff |
 
 Rules:
 
@@ -320,6 +321,36 @@ Rules:
 • **A frame is a batch.** One unusable tick is dropped; the rest of its frame is delivered. A frame that yields nothing usable decodes to `ignore`, so "nothing to deliver" has one shape.
 
 • **A codec must not raise on a frame it does not understand.** Heartbeats, keep-alives and unconsumed update types are the normal case, and returning `ignore` for them is what keeps a working connection out of the log.
+
+• **A dead session may be refused before any frame exists.** `decode_stream_frame` can only classify a failure the broker reports *in a frame*, which means a connection that was established. Some brokers reject a stale token during the WebSocket handshake instead — Kite answers HTTP 403 — so no frame is ever decoded and the transport sees only "connect raised". `stream_connect_error` is where an adapter says what its broker's rejection meant; the transport then raises its own auth-expiry signal and the existing expiry path runs unchanged. **Adapters classify, they do not act** — a broker that implements failover of its own is reintroducing the branch this framework removed.
+
+---
+
+# Zerodha Kite — the first concrete stream adapter (Sprint D4.6, ADR-036)
+
+Zerodha is the platform's first real streaming broker. **It is not the market-data architecture.** Everything above this section was built and proved against a broker that does not exist (`NovaAdapter` in the tests); D4.6 only puts a real wire format through it. No module outside `services/brokers/zerodha.py` learned that Kite exists, and `test_kite_added_no_kite_knowledge_outside_its_own_adapter` sweeps `services/` to keep that true.
+
+**Protocol, as implemented:**
+
+| Aspect | Kite Connect v3 | Where it lives |
+|---|---|---|
+| Endpoint | `wss://ws.kite.trade?api_key=…&access_token=…` | `stream_endpoint` |
+| Auth | Query string (which is why `safe_url` exists) | `stream_endpoint` |
+| Subscribe | `{"a":"subscribe","v":[tokens]}` then `{"a":"mode","v":["ltp",[tokens]]}` | `stream_subscribe_frames` |
+| Instrument id | Unsigned 32-bit token; its **low byte is the exchange segment** | `instrument_token`, `price_divisor` |
+| Binary frame | `[uint16 packet count]` then `[uint16 length][packet]…` | `parse_kite_binary` |
+| Packet | LTP is 8 bytes: token + price. Quote (44) and full (184) open with the same 8 | `parse_kite_binary` |
+| Price scale | Paise (÷100), except `cds` (÷10⁷) and `bcd` (÷10⁴) | `price_divisor` |
+| Heartbeat | A 1-byte binary frame | `decode_stream_frame` |
+| Order updates | JSON text `{"type":"order"}` on the same socket | `decode_stream_frame` |
+| Errors | JSON text `{"type":"error"}`; a token error is auth expiry | `decode_stream_frame` |
+| Dead token at connect | **HTTP 403 during the handshake — no frame at all** | `stream_connect_error` |
+
+**Mode is LTP, deliberately.** The tick feed marks holdings and open trades and answers streamed quotes; all three need a last price and nothing else. The decision lives in one named constant (`STREAM_MODE`) rather than a literal. **Consequence: a Kite-derived `MarketTick` carries no volume**, because an LTP packet has none. The decoder reads only the first eight bytes of each packet, which every tradable mode fills identically, so widening the mode later is a subscribe-frame change rather than a decoder rewrite.
+
+**Limitations, recorded rather than worked around:** no volume on a Kite tick; only holdings-and-positions instruments are streamed (a full Kite instrument dump is a catalog with its own storage and refresh semantics, and is a sprint of its own); no wire-level unsubscribe, because a portfolio sync restarts the stream and nothing else changes a subscription incrementally; Kite's 3,000-instrument-per-connection cap is neither enforced nor sharded (D5 owns sharding).
+
+**Live validation has not been performed.** A Kite ticker connection needs a per-user `access_token`, obtainable only through an interactive browser login. Everything asserted about this adapter is deterministic validation against fixtures built from the Kite Connect v3 binary specification.
 
 ---
 

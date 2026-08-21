@@ -3,7 +3,7 @@
 
 Version: 1.1
 
-Status: Approved Design — Phase 1 Implemented (Sprint D1, 2026-08-19); Phase 2 Implemented in backend (Sprint D2, 2026-08-20, frontend tier indicator outstanding); Phase 3 re-scoped to the Broker Provider Framework and Implemented (Sprint D3, 2026-08-20, ADR-031); Phases 4–6 pending
+Status: Approved Design — Phase 1 Implemented (Sprint D1, 2026-08-19); Phase 2 Implemented in backend (Sprint D2, 2026-08-20, frontend tier indicator outstanding); Phase 3 re-scoped to the Broker Provider Framework and Implemented (Sprint D3, 2026-08-20, ADR-031); Phase 4 Implemented through 4.6 (Sprints D4.1–D4.6, 2026-08-21, ADR-032…036 — Zerodha Kite is the first concrete stream adapter; **live validation not yet performed**); remaining broker adapters, Phase 5 and Phase 6 pending
 
 Priority: Critical
 
@@ -847,7 +847,19 @@ REGISTERED → CONNECTING → CONNECTED → SUBSCRIBED → READY
 
 **Known limitation.** A tick-derived quote carries no `change` / `change_pct` and no OHLC, because a canonical tick carries no previous close. Stitching them from the baseline's last quote would present two readings at two timestamps as one and is forbidden as fabrication. The canonical tick grows those fields when a real feed that populates them lands; per-user quote routing on the REST surface is gated on that. Full reasoning: **ADR-035**.
 
-**Phase 4.6 — the remaining broker adapters.** The Zerodha Kite WebSocket market feed as the first real implementation behind this switch, then Upstox, Angel One, Fyers, Dhan — each one adapter and nothing else, per Developer Rule 9. The switching machinery is in place and broker-agnostic; a fictional broker exercises it end to end today (`test_a_broker_feed_is_promoted_and_demoted_through_the_real_seam`).
+**Phase 4.6 — the Zerodha Kite market feed, the first concrete stream adapter (2026-08-21).** The switching machinery above was designed, built and proved against a broker that does not exist. D4.6 puts a real broker's wire format through it, and the result is the property this whole document is written to obtain: **Zerodha is one adapter file and nothing else.**
+
+Nothing changed in the Market Engine, the Market Gateway, the Source Manager, `StreamingTickProvider`, the provider registry, or the canonical tick contract. Three files were touched: the Zerodha adapter, and two generic additions that name no broker — `BrokerAdapter.stream_connect_error` (a classification hook, default `None`) and the one `try` in the transport that calls it.
+
+`test_kite_added_no_kite_knowledge_outside_its_own_adapter` sweeps every module under `services/` for Kite's vocabulary in executable code and permits exactly one file. `test_zerodha_and_a_fictional_broker_stream_through_the_identical_transport` drives Kite and Nova through the same transport function in one test — binary versus text, numeric token versus trading symbol, integer paise versus a rupee string, query-string auth versus a header — and asserts one canonical shape comes out of both. That pair is the multi-broker acceptance criterion, and D4.6 is not complete without it.
+
+**Tracing the existing code found four protocol defects and one lifecycle defect**, all in code D4.2 had moved into the adapter without re-deriving it against the Kite Connect v3 specification: a flat paise divisor that mispriced currency segments by four to five orders of magnitude, a signed read that silently orphaned tokens above 2³¹, a truncated frame that was resynchronised into plausible-looking invented ticks, a persisted (string) instrument token that never reached the subscribe frame, and a token refused at the *handshake* (HTTP 403 — before any frame exists, so the codec could never see it) that reconnected forever instead of ending the session. Each was re-introduced as a mutation and observed red. Full detail: **ADR-036** and TASK.md.
+
+**Kite streams in LTP mode**, which is what the repository already documented. The consequence is recorded rather than papered over: **a Kite-derived tick carries no volume**, because an LTP packet has none. The other D4.6 limitations — holdings-and-positions instrument scope only, no wire-level unsubscribe, no per-connection sharding — are in ADR-036.
+
+**Live validation has not been performed.** A Kite ticker connection needs a per-user `access_token` obtainable only through an interactive browser login, and no connected Zerodha session exists in the development environment. Every claim above rests on deterministic validation against fixtures built from the published binary specification. This document does not describe StockAssist as Zerodha-dependent, and the platform is not: Yahoo remains the permanent baseline beneath every feed, and a user with no broker is unaffected by any of it.
+
+**Phase 4.7 — the remaining broker adapters.** Upstox, Angel One, Fyers, Dhan — each one adapter and nothing else, per Developer Rule 9.
 
 **Phase 5 — Hardening.** Latency scoring, flap suppression, probation windows, multi-connection sharding, chaos tests (kill connections in staging, verify silent failover).
 

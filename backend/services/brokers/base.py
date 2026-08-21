@@ -432,6 +432,32 @@ class BrokerAdapter(ABC):
         """
         return []
 
+    def stream_connect_error(self, error: BaseException) -> Optional[str]:
+        """Whether a failed stream *connection* means this session is dead.
+
+        Returns a human-readable reason when it does, and `None` — the default —
+        when the failure is ordinary connection weather the transport should
+        retry through its normal backoff.
+
+        WHY THIS IS A SEPARATE HOOK FROM `decode_stream_frame`
+        -------------------------------------------------------
+        `decode_stream_frame` can only classify a failure the broker reports *in
+        a frame*, which means a connection that was established. Some brokers
+        reject a dead session during the WebSocket handshake instead, so no
+        frame is ever decoded and the transport sees only "connect raised". Left
+        unclassified, an expired token is indistinguishable from a broker
+        outage: the stream reconnects on the backoff schedule forever, the
+        account's market feed stays registered, and the user is never told to
+        reconnect.
+
+        The interpretation is the adapter's because only the adapter knows what
+        its broker's rejection looks like. What happens next stays generic — the
+        transport raises its own auth-expiry signal, and the existing expiry
+        path (stop the stream, detach the market feed, notify) runs unchanged.
+        Adapters must not act on the error themselves.
+        """
+        return None
+
     @capability_stub
     def decode_stream_frame(self, frame: Any) -> BrokerStreamEvent:
         """Decode ONE raw frame into a canonical :class:`BrokerStreamEvent`.

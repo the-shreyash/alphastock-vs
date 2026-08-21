@@ -11,7 +11,7 @@ import json
 import logging
 import struct
 from datetime import datetime, timedelta, timezone
-from typing import Any, List
+from typing import Any, List, Optional
 from urllib.parse import quote
 
 from services.brokers.base import (
@@ -30,43 +30,141 @@ LOGIN_URL = "https://kite.zerodha.com/connect/login"
 #: streaming broker an edit to code no broker owns.
 WS_URL = "wss://ws.kite.trade"
 
-#: Kite quotes equity and derivative prices in paise (price * 100). The currency
-#: segment uses a different divisor; equities are our scope.
-PAISE = 100.0
+# ── Kite ticker binary framing (Kite Connect v3) ────────────────────────────
+#
+# Frame layout, byte for byte:
+#
+#     2 bytes            number of packets in this frame  (uint16 BE)
+#     per packet:
+#       2 bytes          packet length                    (uint16 BE)
+#       `length` bytes   the packet itself
+#
+# Packet layouts differ by *mode*, but every tradable packet — LTP (8 bytes),
+# quote (44) and full (184) — opens with the same eight bytes: the instrument
+# token then the last traded price. This adapter reads exactly those eight and
+# stops, which is what makes it correct for the mode it subscribes to (see
+# :data:`STREAM_MODE`) and forward-compatible with a wider one.
+#
+# A one-byte frame is the ticker's heartbeat, handled in `decode_stream_frame`.
+
+#: Bytes of frame header before the first packet.
+FRAME_HEADER_BYTES = 2
+#: Bytes of per-packet length prefix.
+PACKET_HEADER_BYTES = 2
+#: The smallest priceable packet: instrument_token (4) + last_price (4).
+LTP_PACKET_BYTES = 8
+
+#: Kite quotes most segments in paise (price * 100), but not all of them: the
+#: instrument token's low byte *is* the exchange segment, and the currency
+#: segments are quoted at a different scale. Dividing everything by 100 prices a
+#: currency instrument four to five orders of magnitude wrong — a number that is
+#: not obviously wrong on a chart and would be marked against a real position.
+#:
+#: Segment ids are Kite's own (`nse=1, nfo=2, cds=3, bse=4, bfo=5, bcd=6,
+#: mcx=7, mcxsx=8, indices=9`); only the two that deviate are named here.
+SEGMENT_CDS = 3
+SEGMENT_BCD = 6
+#: Paise. Equities, derivatives, commodities and indices.
+DEFAULT_PRICE_DIVISOR = 100.0
+PRICE_DIVISORS = {SEGMENT_CDS: 10_000_000.0, SEGMENT_BCD: 10_000.0}
+
+#: The ticker mode this adapter subscribes in.
+#:
+#: LTP deliberately, and the choice is recorded here rather than inline because
+#: it is the one protocol decision with a product consequence. The tick feed
+#: marks portfolio holdings and open trades and answers streamed quotes; all
+#: three need a last price and nothing else. Quote mode multiplies the bandwidth
+#: of every frame for OHLC and depth no consumer reads, and full mode multiplies
+#: it again for a twenty-level book the platform has no surface for.
+#:
+#: What it costs, stated plainly: a Kite-derived `MarketTick` carries no volume,
+#: because an LTP packet has none. See TASK.md's D4.6 limitations.
+STREAM_MODE = "ltp"
+
+
+def price_divisor(instrument_token: int) -> float:
+    """The scale Kite quotes this instrument at, from its token's segment byte."""
+    return PRICE_DIVISORS.get(int(instrument_token) & 0xFF, DEFAULT_PRICE_DIVISOR)
+
+
+def instrument_token(value: Any) -> Optional[int]:
+    """Coerce a stored instrument identifier into Kite's numeric token, or None.
+
+    The same token reaches this adapter as an `int` from a freshly fetched
+    holding and as `"738561"` from a MongoDB round trip — `InstrumentMap`
+    documents that split on the resolution side, and the subscription side has
+    the same exposure with a worse failure mode: a token rejected here is simply
+    absent from the subscribe frame, so the wire never carries that instrument
+    and the user's feed is quietly narrower than their portfolio. Nothing
+    raises, nothing logs, and the missing prices look exactly like an untraded
+    instrument.
+
+    `bool` is excluded explicitly: it is an `int` subclass, and `True` would
+    otherwise subscribe to token 1.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    text = str(value).strip()
+    if not text.isdigit():
+        return None
+    return int(text) or None
 
 
 def parse_kite_binary(payload: bytes) -> list:
     """Parse a Kite ticker binary frame into [{instrument_token, last_price}].
 
-    Frame layout (Kite Connect v3 docs):
-      2 bytes  number of packets (int16 BE)
-      per packet: 2 bytes length (int16 BE) + packet bytes
-      LTP packet: 4 bytes instrument_token + 4 bytes ltp (price * 100)
-    1-byte frames are heartbeats.
+    See the framing notes above the module constants for the layout. Reads the
+    instrument token and last traded price out of the first eight bytes of each
+    packet, which is where every tradable mode puts them, and prices it through
+    :func:`price_divisor` so a currency instrument is not quoted in paise.
 
     Lived in `stream.py` until D4.2. Nothing about this layout is generic — it
     is Kite's framing, byte for byte — and holding it in the shared transport
     meant the *shape it produced* became the platform's de-facto tick contract
     by accident. It is now one step inside the adapter, and its output is
     coerced through `BrokerTick` before anything else sees it.
+
+    NOTHING RAISES, AND THREE KINDS OF DAMAGE ARE TOLD APART
+    --------------------------------------------------------
+    A frame is a batch of up to hundreds of packets, so the discipline is the
+    same one `BrokerStreamEvent.tick_event` and `canonical_ticks` apply above:
+    salvage what is intact, drop what is not, never drop the batch.
+
+    * a packet **shorter than a priceable one** is skipped — its own length
+      prefix says where the next packet starts, so the framing survives it;
+    * a packet whose declared length **runs past the buffer** stops the parse —
+      the frame is truncated, so every subsequent offset is guesswork, and
+      guessing produces plausible tokens at plausible prices, which is the one
+      outcome worse than returning nothing;
+    * a packet count larger than the frame can hold simply exhausts the buffer
+      and stops at the same check.
+
+    An unsigned read (`>II`) rather than a signed one: Kite tokens and prices
+    are unsigned 32-bit. A token above 2^31 read as signed becomes negative,
+    matches nothing in the account's `InstrumentMap`, and drops every tick for
+    that instrument with no error anywhere.
     """
-    if len(payload) < 4:
+    if len(payload) < FRAME_HEADER_BYTES + PACKET_HEADER_BYTES:
         return []
     ticks = []
     try:
         count = struct.unpack_from(">H", payload, 0)[0]
-        offset = 2
+        offset = FRAME_HEADER_BYTES
         for _ in range(count):
-            if offset + 2 > len(payload):
+            if offset + PACKET_HEADER_BYTES > len(payload):
                 break
             length = struct.unpack_from(">H", payload, offset)[0]
-            offset += 2
-            packet = payload[offset : offset + length]
-            offset += length
-            if len(packet) < 8:
+            offset += PACKET_HEADER_BYTES
+            if offset + length > len(payload):
+                break
+            if length < LTP_PACKET_BYTES:
+                offset += length
                 continue
-            token, ltp = struct.unpack_from(">ii", packet, 0)
-            ticks.append({"instrument_token": token, "last_price": ltp / PAISE})
+            token, ltp = struct.unpack_from(">II", payload, offset)
+            offset += length
+            ticks.append({"instrument_token": token, "last_price": ltp / price_divisor(token)})
     except struct.error:
         logger.debug("Malformed Kite binary frame skipped")
     return ticks
@@ -346,11 +444,13 @@ class ZerodhaAdapter(BrokerAdapter):
         adapter can be correct about. Sorted and de-duplicated so a resubscribe
         after a portfolio sync produces a stable subscription list.
         """
-        tokens = {
-            row.get("instrument_token")
-            for row in list(holdings or []) + list(positions or [])
-            if isinstance(row.get("instrument_token"), int)
-        }
+        tokens = set()
+        for row in list(holdings or []) + list(positions or []):
+            if not isinstance(row, dict):
+                continue
+            token = instrument_token(row.get("instrument_token"))
+            if token is not None:
+                tokens.add(token)
         return sorted(tokens)
 
     # -- realtime: the Kite ticker codec (D4.2) --------------------------------
@@ -369,17 +469,56 @@ class ZerodhaAdapter(BrokerAdapter):
     def stream_subscribe_frames(self, instruments: list = None) -> List[Any]:
         """Kite's two-frame subscription: subscribe, then set the mode.
 
-        LTP mode deliberately — the tick feed drives portfolio and trade marks,
-        which need a last price and nothing else. Full mode multiplies the
-        bandwidth for depth nothing currently reads.
+        Two frames rather than one because that is Kite's protocol — a
+        subscription defaults to quote mode and a separate `mode` frame narrows
+        it. See :data:`STREAM_MODE` for why the mode is LTP.
+
+        The tokens are re-coerced here as well as in `stream_instruments`,
+        because this method is part of the adapter's public contract and the
+        transport hands back whatever it was given at stream start. A string
+        token would serialize into the frame as `"738561"`, which Kite rejects
+        for the whole subscription rather than for the one instrument.
         """
-        instruments = list(instruments or [])
-        if not instruments:
+        tokens = [t for t in (instrument_token(i) for i in (instruments or [])) if t is not None]
+        if not tokens:
             return []
         return [
-            json.dumps({"a": "subscribe", "v": instruments}),
-            json.dumps({"a": "mode", "v": ["ltp", instruments]}),
+            json.dumps({"a": "subscribe", "v": tokens}),
+            json.dumps({"a": "mode", "v": [STREAM_MODE, tokens]}),
         ]
+
+    def stream_connect_error(self, error: BaseException) -> Optional[str]:
+        """Whether a failed ticker handshake means this session is dead.
+
+        Kite refuses a ticker connection carrying a stale `api_key`/
+        `access_token` pair with **HTTP 403 during the WebSocket handshake** —
+        before a single frame is exchanged, so the `{"type": "error"}` frame
+        that `decode_stream_frame` reads for a token that dies *mid-session*
+        never arrives. Without this classification a dead token looked to the
+        generic transport like any other connection failure: it reconnected on
+        the backoff schedule, forever, into the same rejection, while the
+        account's market feed stayed registered and the user was never asked to
+        reconnect. Kite invalidates every access token daily at ~06:00 IST, so
+        that is not an edge case — it is every connected user, every morning.
+
+        Interpreting the failure is the adapter's job (only Kite knows that 403
+        means this rather than a proxy rejecting the upgrade); *acting* on it
+        stays generic — the transport raises its own `_AuthExpired` and the same
+        expiry path that a mid-session token death takes runs unchanged.
+
+        The message carries the status code and no URL, because the ticker URL
+        carries the access token in its query string.
+        """
+        status = getattr(error, "status_code", None)
+        if status is None:
+            # websockets >= 14 wraps the handshake response instead.
+            status = getattr(getattr(error, "response", None), "status_code", None)
+        if status in (401, 403):
+            return (
+                f"Zerodha refused the ticker handshake (HTTP {status}) — the access token is no "
+                "longer valid. Kite tokens reset daily at 6 AM IST; please reconnect."
+            )
+        return None
 
     def decode_stream_frame(self, frame: Any) -> BrokerStreamEvent:
         """Decode one Kite ticker frame: binary carries ticks, text carries JSON.

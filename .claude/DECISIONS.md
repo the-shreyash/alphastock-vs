@@ -1404,6 +1404,81 @@ At D5, when probation windows, latency scoring and flap suppression are designed
 
 ---
 
+# ADR-036
+
+Title
+
+Zerodha Kite as the First Concrete Stream Adapter (Sprint D4.6)
+
+Date
+
+2026-08-21
+
+Status
+
+Accepted — implemented; **live validation not performed** (see Consequences)
+
+Context
+
+D4.1–D4.5 built a generic broker-streaming architecture — a broker-owned codec, a canonical tick, a canonical instrument identity, a registered market-data provider, a readiness gate and make-before-break switching — and proved every part of it against `NovaAdapter`, a broker that does not exist. That is the right way round: a framework validated only by its first real user is a framework shaped by that user. But a framework validated *only* by a fictional user has never met a real wire format, and the question D4.6 exists to answer is whether the generality was real or merely untested.
+
+The Kite protocol was already partly present. D4.2 moved Kite's binary framing, ticker URL, subscribe frames and error convention out of the shared transport and into the adapter. Moving working code is where a silent behaviour change hides, and D4.2's parity test asserted the *moved* code against what the removed code produced — which is a regression test, not a specification test. Nothing had re-derived the implementation against the Kite Connect v3 documentation.
+
+Decision
+
+**Zerodha is the first concrete stream adapter. Zerodha is not the market-data architecture.**
+
+• **The adapter owns the entire Kite surface and nothing else does.** Endpoint construction, query-string authentication, subscribe frames, binary decoding, instrument-token interpretation, price scaling, and the meaning of a Kite error. `test_kite_added_no_kite_knowledge_outside_its_own_adapter` sweeps every module under `services/` for Kite's vocabulary in executable code — comments and string literals stripped, so prose about Kite stays legal and computing with Kite does not — and permits exactly one file.
+
+• **Stream mode is LTP, and the decision is a named constant.** `STREAM_MODE = "ltp"`, which is what TASK.md and the adapter already documented. The tick feed marks holdings and open trades and answers streamed quotes; all three need a last price. Quote mode multiplies every frame for OHLC and depth no consumer reads; full mode multiplies it again for a twenty-level book with no surface. The decoder reads only the first eight bytes of each packet — the token and last price, which every tradable Kite mode puts there — so widening the mode later is a subscribe-frame change rather than a decoder rewrite.
+
+• **Four protocol defects in the pre-existing implementation were corrected**, each of which fails silently rather than loudly, which is why none had been noticed:
+
+  1. **Segment-aware price scaling.** Kite encodes the exchange segment in the low byte of the instrument token and quotes `cds` at ÷10⁷ and `bcd` at ÷10⁴, not ÷100. A flat divisor prices a currency instrument four to five orders of magnitude wrong — plausible on a chart, and marked against a real position.
+  2. **Unsigned packet reads (`>II`, not `>ii`).** A token above 2³¹ read signed comes back negative, matches nothing in the account's `InstrumentMap`, and drops every tick for that instrument with no exception and no log line.
+  3. **A truncated frame stops the parse instead of resynchronising.** A Kite packet is two integers, so a misaligned read produces a plausible token at a plausible price — the one outcome worse than returning nothing. A packet merely *too short to price* is still skipped, because its own length prefix keeps the framing intact; the two cases are distinct and are told apart.
+  4. **Instrument tokens are coerced, not type-tested.** `isinstance(token, int)` rejected `"738561"` — the same value after a MongoDB round trip, a split `InstrumentMap` already documents on the resolution side. On the subscription side the instrument is simply absent from the subscribe frame: the wire never carries it, and the missing prices look exactly like an instrument that has not traded.
+
+• **A new adapter hook, `stream_connect_error(error) -> str | None`, for a session refused before any frame exists.** Kite answers a stale token with HTTP 403 during the WebSocket handshake, so the `{"type": "error"}` frame `decode_stream_frame` reads for a mid-session token death never arrives. Unclassified, the transport could not tell a dead token from a broker outage: it reconnected on the backoff schedule indefinitely, the account's market feed stayed registered, and the user was never asked to reconnect — every connected user, every morning, since Kite invalidates all access tokens daily at ~06:00 IST.
+
+  The hook is deliberately **classification, not action**. The adapter says what the failure meant; the transport raises its own `_AuthExpired` and the existing expiry path (stop the stream, detach the market feed, notify the user) runs unchanged. An adapter that acted on its own would be reintroducing the per-broker branch this framework exists to remove. The default is `None` — retry on the normal backoff — so no other adapter changes.
+
+Alternatives considered
+
+**Implement quote or full mode for the volume field.** Rejected for now. It multiplies the bandwidth of every frame for a field one consumer would use, against a documented decision that already exists. The absent volume is recorded as a limitation instead, and the decoder is written so the change is a subscribe frame rather than a rewrite.
+
+**Fetch Kite's full instrument dump so the feed can stream anything.** Rejected as out of scope, explicitly rather than silently. ~80k rows refreshed daily is a catalog with its own storage, refresh schedule and staleness semantics — a sprint, not a line — and nothing in D4.6 needs it: a tick for an instrument the account does not hold has nothing to be joined to. Holdings-and-positions scope is unchanged from D4.3.
+
+**Implement `{"a": "unsubscribe"}` for completeness.** Rejected as speculative generality. The framework has no incremental-subscription caller — a portfolio sync restarts the stream, which resubscribes from the current holdings — so the frame would be code nothing sends and nothing could exercise honestly. It is a one-line adapter addition the day an incremental caller exists.
+
+**Handle the 403 inside the Zerodha adapter by stopping the stream itself.** Rejected. That is broker-specific failover logic, which is the branch D3 removed and D4 was built to keep out. The adapter interprets; the generic lifecycle acts.
+
+**Trust D4.2's parity test as sufficient evidence the codec was correct.** Rejected, and this is the general lesson: a test that asserts moved code against what the removed code produced proves the move, not the protocol. Four defects survived it, all of them silent. A concrete adapter needs a specification test, and the specification is the broker's documentation.
+
+Consequences
+
+• A user with a connected Zerodha account and a synced portfolio gets an exchange-grade streaming feed for the instruments they hold, promoted over the Yahoo baseline only after a valid canonical `MarketTick` has arrived on the current link, and demoted back the instant the link drops. All of that is the unchanged D4.5 machinery; D4.6 added no switching, no readiness and no failover of its own.
+
+• **A Kite-derived `MarketTick` carries no volume.** LTP packets have none. The D4.5 limitation stands unchanged alongside it: a tick-derived quote still carries no `change` / `change_pct` and no OHLC.
+
+• Kite's 3,000-instrument-per-connection cap is neither enforced nor sharded. D5 owns multi-connection sharding; a retail portfolio is nowhere near the cap.
+
+• **LIVE VALIDATION WAS NOT PERFORMED.** `KITE_API_KEY` and `KITE_API_SECRET` are configured in this environment, but a ticker connection needs a per-user `access_token` obtainable only through an interactive browser login (`request_token` → `POST /session/token`), and no connected Zerodha session exists here. Every claim rests on deterministic validation against fixtures built from the published Kite Connect v3 binary specification, plus 15 source mutations observed red. A live smoke test — connect, subscribe, real tick, canonical tick, readiness, promotion over the baseline, disconnect, fallback — is outstanding and must be run before this is called production-verified.
+
+• The multi-broker acceptance criterion is met and asserted, not assumed: all Nova tests remain green, and one test drives Kite and Nova through the identical transport function and asserts a single canonical output shape. A second broker with a different protocol and instrument model still needs no change to the Market Engine, the Market Gateway, the Source Manager, `StreamingTickProvider`, the provider registry or the canonical tick contract.
+
+• The frontend is untouched and shows generic source status. No Kite detail, no broker label on a market-data surface.
+
+Authoritative documents
+
+MARKET_DATA_ARCHITECTURE.md, BROKER_INTEGRATION.md
+
+Review Date
+
+When the first live Zerodha session is available, to close the live-validation gap; and at the second streaming broker (Upstox), which is the real test of whether D4.6 generalised or merely worked.
+
+---
+
 Future decisions to document.
 
 International Markets

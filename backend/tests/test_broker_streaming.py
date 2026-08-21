@@ -2557,3 +2557,725 @@ def test_the_feed_status_a_user_sees_follows_their_own_promotion():
 
     run(feed.mark_link_down("socket closed"))
     assert manager.status(user_id="u1")["tier"] == "delayed"
+
+
+# ==================================================================
+# D4.6 — the Zerodha Kite market feed: the first concrete stream adapter
+#
+# Everything above this line is the framework. Nothing below it extends the
+# framework; it exercises the framework with a real broker's wire format, which
+# is the only way to find out whether the framework was actually general or
+# merely untested.
+#
+# The chain each of these drives, and the line each of them is written to be
+# able to fail on:
+#
+#     Kite ticker bytes
+#         → ZerodhaAdapter.decode_stream_frame     (the only Kite-aware code)
+#         → BrokerTick                             (canonical shape)
+#         → InstrumentMap                          (canonical identity)
+#         → MarketTick                             (canonical tick)
+#         → StreamingTickProvider                  (readiness earned)
+#         → Source Manager                         (promoted over the baseline)
+#
+# Two properties are asserted throughout rather than in one place, because they
+# are the ones a concrete adapter is most likely to quietly break: no Kite
+# identifier or credential survives past the adapter, and no line of Kite
+# knowledge exists outside it.
+# ==================================================================
+
+
+def _kite_frame(*packets, declared_lengths=None, packet_count=None):
+    """One Kite ticker binary frame carrying `(instrument_token, paise)` packets.
+
+    `declared_lengths` and `packet_count` override the length prefixes and the
+    header count *without* changing the bytes that follow, which is how the
+    malformed-frame tests produce genuine protocol damage rather than a short
+    buffer: a Kite frame that lies about its own shape is exactly what a
+    truncated TCP read looks like.
+    """
+    lengths = declared_lengths or [8] * len(packets)
+    body = b"".join(
+        struct.pack(">H", length) + struct.pack(">II", token, paise)
+        for (token, paise), length in zip(packets, lengths)
+    )
+    return struct.pack(">H", len(packets) if packet_count is None else packet_count) + body
+
+
+def _zerodha():
+    return broker_registry.require("zerodha")
+
+
+def _kite_ticks(frame):
+    """The canonical `BrokerTick` dicts one raw Kite frame decodes to."""
+    event = _zerodha().decode_stream_frame(frame)
+    return [tick.as_dict() for tick in event.ticks]
+
+
+# -- protocol -------------------------------------------------------------
+
+
+def test_the_kite_ticker_endpoint_authenticates_by_query_string_and_logs_neither_half():
+    """Kite's auth style is the reason `safe_url` exists — pinned on the real adapter.
+
+    The generic version of this test (`test_an_endpoint_never_carries_its
+    _credentials_into_a_log_line`) uses Nova, which authenticates by header and
+    therefore cannot fail the way Kite can. This one is written against the
+    broker that actually puts a live access token in its URL.
+    """
+    from services.brokers.zerodha import WS_URL
+
+    endpoint = _zerodha().stream_endpoint(
+        {"access_token": "live-access-token"}, {"api_key": "live-api-key"}
+    )
+    assert endpoint.url.startswith(f"{WS_URL}?")
+    assert "live-api-key" in endpoint.url and "live-access-token" in endpoint.url
+    assert endpoint.safe_url == WS_URL
+    assert "live-api-key" not in endpoint.safe_url
+    assert "live-access-token" not in endpoint.safe_url
+
+
+def test_the_kite_subscribe_handshake_requests_the_mode_the_repository_documents():
+    """Two frames, in order, in the documented mode.
+
+    The mode is not a free choice made here: `STREAM_MODE` records the decision
+    and TASK.md states it. Asserting against the constant rather than the string
+    means changing the mode is a one-line change with a test that follows it,
+    instead of a literal duplicated in two files that can disagree.
+    """
+    from services.brokers.zerodha import STREAM_MODE
+
+    frames = [json.loads(f) for f in _zerodha().stream_subscribe_frames([738561, 2953217])]
+    assert frames == [
+        {"a": "subscribe", "v": [738561, 2953217]},
+        {"a": "mode", "v": [STREAM_MODE, [738561, 2953217]]},
+    ]
+    assert STREAM_MODE == "ltp", "the documented mode changed without the documentation"
+    assert _zerodha().stream_subscribe_frames([]) == []
+    assert _zerodha().stream_subscribe_frames(None) == []
+
+
+def test_a_kite_token_that_round_tripped_through_mongo_still_reaches_the_wire():
+    """A persisted instrument token is a string, and a string must still subscribe.
+
+    `InstrumentMap` documents this split for the *resolution* side. The
+    subscription side has the same exposure and a worse failure mode: a token
+    rejected here is simply absent from the subscribe frame, so the wire never
+    carries that instrument. Nothing raises and nothing logs — the user's feed
+    is quietly narrower than their portfolio, and the missing prices look
+    exactly like an instrument that has not traded.
+    """
+    adapter = _zerodha()
+    holdings = [
+        {"symbol": "RELIANCE", "exchange": "NSE", "instrument_token": 738561},
+        {"symbol": "TCS", "exchange": "NSE", "instrument_token": "2953217"},  # from MongoDB
+        {"symbol": "NOTOKEN", "exchange": "NSE"},
+        {"symbol": "JUNK", "exchange": "NSE", "instrument_token": "NSE_EQ|INE002A01018"},
+        {"symbol": "BOOL", "exchange": "NSE", "instrument_token": True},
+    ]
+    tokens = adapter.stream_instruments(holdings=holdings, positions=[])
+    assert tokens == [738561, 2953217], tokens
+
+    # And they leave as JSON numbers, not strings: Kite rejects the whole
+    # subscription for one quoted token, not just that instrument.
+    subscribe = json.loads(adapter.stream_subscribe_frames(["2953217", 738561])[0])
+    assert subscribe["v"] == [2953217, 738561]  # order preserved; only the type is coerced
+
+
+def test_a_kite_packet_is_priced_by_the_segment_its_token_encodes():
+    """The low byte of a Kite token is the exchange segment, and it sets the scale.
+
+    Dividing every segment by 100 prices a currency instrument four to five
+    orders of magnitude wrong — a number that looks perfectly plausible on a
+    chart and would be marked against a real position.
+    """
+    from services.brokers.zerodha import SEGMENT_BCD, SEGMENT_CDS, parse_kite_binary
+
+    nse_token = (100 << 8) | 1          # nse segment
+    cds_token = (100 << 8) | SEGMENT_CDS
+    bcd_token = (100 << 8) | SEGMENT_BCD
+
+    priced = {
+        t["instrument_token"]: t["last_price"]
+        for t in parse_kite_binary(
+            _kite_frame((nse_token, 150000), (cds_token, 873_450_000), (bcd_token, 873_450))
+        )
+    }
+    assert priced[nse_token] == 1500.0
+    assert priced[cds_token] == 87.345
+    assert priced[bcd_token] == 87.345
+
+
+def test_a_high_kite_instrument_token_is_not_read_as_a_negative_number():
+    """Kite tokens are unsigned 32-bit; a signed read silently orphans them.
+
+    A token above 2^31 read as signed comes out negative, matches nothing in the
+    account's `InstrumentMap`, and drops every tick for that instrument with no
+    error anywhere — the exact failure this whole boundary exists to make
+    visible.
+    """
+    from services.brokers.zerodha import parse_kite_binary
+
+    token = 3_000_000_000 & ~0xFF | 1  # > 2^31, nse segment
+    ticks = parse_kite_binary(_kite_frame((token, 150000)))
+    assert ticks == [{"instrument_token": token, "last_price": 1500.0}]
+    assert ticks[0]["instrument_token"] > 0
+
+
+def test_a_truncated_kite_frame_yields_no_invented_ticks():
+    """A packet whose declared length runs past the buffer stops the parse.
+
+    Continuing would resynchronise the reader on the wrong byte, and Kite's
+    packets are nothing but two integers — so a misaligned read does not produce
+    garbage that is obviously garbage. It produces a plausible instrument token
+    at a plausible price, which is the one outcome worse than returning nothing.
+    """
+    from services.brokers.zerodha import parse_kite_binary
+
+    good = _kite_frame((738561, 150000))
+    assert parse_kite_binary(good[:-3]) == [], "a truncated packet was decoded anyway"
+    # A length prefix that lies about a packet the frame does not contain.
+    assert parse_kite_binary(_kite_frame((738561, 150000), declared_lengths=[64])) == []
+    # A header claiming more packets than the frame holds exhausts the buffer.
+    decoded = parse_kite_binary(_kite_frame((738561, 150000), packet_count=9))
+    assert decoded == [{"instrument_token": 738561, "last_price": 1500.0}]
+
+
+def test_a_kite_packet_too_short_to_price_costs_only_itself():
+    """Framing survives a short packet — its own length prefix says where the next one starts.
+
+    The distinction from a truncated frame is the whole point: one is a packet
+    this adapter cannot use, the other is a frame it can no longer trust.
+    """
+    from services.brokers.zerodha import parse_kite_binary
+
+    frame = (
+        struct.pack(">H", 3)
+        + struct.pack(">H", 8) + struct.pack(">II", 738561, 150000)
+        + struct.pack(">H", 4) + struct.pack(">I", 111)          # too short to price
+        + struct.pack(">H", 8) + struct.pack(">II", 2953217, 420050)
+    )
+    assert parse_kite_binary(frame) == [
+        {"instrument_token": 738561, "last_price": 1500.0},
+        {"instrument_token": 2953217, "last_price": 4200.5},
+    ]
+
+
+def test_a_kite_heartbeat_and_an_empty_frame_deliver_nothing():
+    """The overwhelmingly common frames on a live ticker are not errors."""
+    adapter = _zerodha()
+    assert adapter.decode_stream_frame(b"\x00").kind is StreamEventKind.IGNORE
+    assert adapter.decode_stream_frame(struct.pack(">H", 0)).kind is StreamEventKind.IGNORE
+    assert adapter.decode_stream_frame(b"").kind is StreamEventKind.IGNORE
+    assert adapter.decode_stream_frame("not json at all").kind is StreamEventKind.IGNORE
+    assert adapter.decode_stream_frame(json.dumps({"type": "message", "data": "x"})).kind is StreamEventKind.IGNORE
+
+
+# -- canonicalization ------------------------------------------------------
+
+
+def test_a_kite_ltp_packet_becomes_a_canonical_market_tick():
+    """Raw Kite bytes in, canonical `MarketTick` out — the whole D4.3 boundary.
+
+    Written on the bytes rather than on a hand-built dict, because a hand-built
+    dict is the codec's output asserted against itself.
+    """
+    instrument_map = InstrumentMap.from_portfolio(
+        [{"symbol": "RELIANCE", "exchange": "NSE", "instrument_token": 738561}]
+    )
+    ticks = canonical_ticks(_kite_ticks(_kite_frame((738561, 265050))), instrument_map, broker="zerodha")
+
+    assert len(ticks) == 1
+    assert ticks[0]["symbol"] == "RELIANCE"
+    assert ticks[0]["exchange"] == "NSE"
+    assert ticks[0]["price"] == 2650.5
+    assert "ingested_at" in ticks[0]
+    # Nothing Kite-shaped survived: not the token, not `last_price`, not a mode.
+    assert set(ticks[0]) == set(MarketTick(symbol="X", price=1.0).as_dict())
+    assert "instrument_token" not in ticks[0] and "last_price" not in ticks[0]
+
+
+def test_an_unknown_kite_token_is_dropped_rather_than_named():
+    """A token the account cannot name is not an instrument called "738561".
+
+    The generic rule is pinned on a synthetic tick above. This is the same rule
+    on real Kite bytes, because a numeric-token broker is the only kind that can
+    fail this way and Kite is the platform's first one.
+    """
+    instrument_map = InstrumentMap.from_portfolio(
+        [{"symbol": "RELIANCE", "exchange": "NSE", "instrument_token": 738561}]
+    )
+    ticks = canonical_ticks(
+        _kite_ticks(_kite_frame((738561, 265050), (9999999, 12345))), instrument_map, broker="zerodha"
+    )
+    assert [t["symbol"] for t in ticks] == ["RELIANCE"]
+    assert "9999999" not in json.dumps(ticks)
+
+
+def test_a_kite_packet_with_no_usable_price_is_dropped_at_the_canonical_boundary():
+    """Zero paise is what a zeroed or truncated packet decodes to, and it is not a price."""
+    instrument_map = InstrumentMap.from_portfolio(
+        [{"symbol": "RELIANCE", "exchange": "NSE", "instrument_token": 738561}]
+    )
+    assert canonical_ticks(_kite_ticks(_kite_frame((738561, 0))), instrument_map, broker="zerodha") == []
+    # ... and an absurd one, which is what an unsigned read of a negative price gives.
+    huge = _kite_ticks(_kite_frame((738561, 4_294_000_000)))
+    assert canonical_ticks(huge, instrument_map, broker="zerodha") == []
+
+
+# -- lifecycle: the handshake rejection ------------------------------------
+
+
+class _KiteHandshakeRefused(Exception):
+    """`websockets < 14`: the rejected status is on the exception."""
+
+    def __init__(self, status_code):
+        super().__init__(f"server rejected WebSocket connection: HTTP {status_code}")
+        self.status_code = status_code
+
+
+class _KiteHandshakeRefused14(Exception):
+    """`websockets >= 14`: the rejected status is on a wrapped response."""
+
+    def __init__(self, status_code):
+        super().__init__(f"server rejected WebSocket connection: HTTP {status_code}")
+        self.response = type("Response", (), {"status_code": status_code})()
+
+
+def _kite_stream(**kwargs):
+    return BrokerStream(
+        "user-1", "zerodha", {"access_token": "live-access-token"},
+        credentials={"api_key": "live-api-key"}, instrument_tokens=[738561], **kwargs
+    )
+
+
+@pytest.mark.parametrize("refusal", [_KiteHandshakeRefused, _KiteHandshakeRefused14])
+@pytest.mark.parametrize("status", [401, 403])
+def test_kite_refusing_the_ticker_handshake_expires_the_session(refusal, status):
+    """A dead Kite token is refused *during the handshake* — no frame is ever decoded.
+
+    Kite invalidates every access token daily at ~06:00 IST, so this is not an
+    edge case: it is every connected user, every morning. Unclassified, the
+    generic transport cannot tell it from a broker outage and reconnects into
+    the same rejection forever, while the account's market feed stays registered
+    and the user is never asked to reconnect.
+
+    Both `websockets` exception shapes are exercised because the two versions
+    put the status in different places and a guard that models only one of them
+    is a guard that silently stops working on an upgrade.
+    """
+    expired, slept = [], []
+
+    async def on_expired(user_id, broker):
+        expired.append((user_id, broker))
+
+    stream = _kite_stream(on_expired=on_expired, on_tick=AsyncMock())
+
+    async def stop_instead_of_reconnecting(delay):
+        # The reconnect pause is bounded so this test *fails* rather than hangs
+        # when the classification is removed. Without it the mutation that
+        # reintroduces the defect reproduces the defect exactly — an unbounded
+        # reconnect loop — and a test that hangs is a test that cannot go red.
+        slept.append(delay)
+        stream._stopped = True
+
+    async def scenario():
+        with patch.object(BrokerStream, "_connect", AsyncMock(side_effect=refusal(status))), \
+                patch("services.brokers.stream.asyncio.sleep", new=stop_instead_of_reconnecting):
+            await stream._run()
+
+    run(scenario())
+    assert expired == [("user-1", "zerodha")], "a refused Kite handshake did not end the session"
+    assert slept == [], "a refused Kite handshake was retried instead of ending the session"
+
+
+def test_an_ordinary_kite_connection_failure_still_reconnects():
+    """The other half of the pair — without it the test above proves nothing.
+
+    A gateway 502, a DNS blip or a dropped route is broker weather, not a dead
+    session, and treating it as expiry would stop a stream that would have come
+    back on its own.
+    """
+    expired, slept = [], []
+
+    async def on_expired(user_id, broker):
+        expired.append((user_id, broker))
+
+    stream = _kite_stream(on_expired=on_expired, on_tick=AsyncMock())
+
+    async def stop_after_one_pause(delay):
+        slept.append(delay)
+        stream._stopped = True
+
+    async def scenario():
+        with patch.object(BrokerStream, "_connect", AsyncMock(side_effect=_KiteHandshakeRefused(502))), \
+                patch("services.brokers.stream.asyncio.sleep", new=stop_after_one_pause):
+            await stream._run()
+
+    run(scenario())
+    assert expired == [], "an ordinary connection failure was treated as an expired session"
+    assert slept, "the stream never reached its reconnect pause"
+
+
+def test_the_handshake_classification_is_the_adapters_and_the_default_is_to_retry():
+    """The hook is generic; only its answer is Kite's.
+
+    A broker that says nothing about a connection failure gets the unchanged
+    backoff, which is what keeps this from being Zerodha-specific failover logic
+    inside the transport.
+    """
+    with nova_registered() as nova:
+        assert nova.stream_connect_error(_KiteHandshakeRefused(403)) is None
+    assert _zerodha().stream_connect_error(_KiteHandshakeRefused(403))
+    assert _zerodha().stream_connect_error(_KiteHandshakeRefused(502)) is None
+    assert _zerodha().stream_connect_error(RuntimeError("boom")) is None
+    # And the reason it hands back carries no URL — Kite's is credential-bearing.
+    reason = _zerodha().stream_connect_error(_KiteHandshakeRefused(403))
+    assert "wss://" not in reason and "access_token" not in reason
+
+
+def test_a_mid_session_kite_token_death_still_takes_the_frame_route():
+    """The handshake hook did not replace the error-frame path; both must work."""
+    event = _zerodha().decode_stream_frame(json.dumps({"type": "error", "data": "Invalid access token"}))
+    assert event.kind is StreamEventKind.AUTH_EXPIRED
+    other = _zerodha().decode_stream_frame(json.dumps({"type": "error", "data": "Subscription limit reached"}))
+    assert other.kind is StreamEventKind.ERROR
+
+
+def test_a_kite_stream_runs_through_the_generic_transport_unchanged():
+    """Real Kite frames over the real transport: subscribe, tick, heartbeat, close.
+
+    The subscribe frames must reach the socket verbatim — the transport cannot
+    know what encoding Kite expects — and a heartbeat must not be mistaken for
+    data.
+    """
+    frames = [b"\x00", _kite_frame((738561, 265050)), json.dumps({"type": "message", "data": "hi"})]
+    ticks, orders, expired, socket = drive_stream(
+        _zerodha(), frames, instruments=[738561], session={"access_token": "live-access-token"}
+    )
+
+    assert [json.loads(f) for f in socket.sent] == [
+        {"a": "subscribe", "v": [738561]},
+        {"a": "mode", "v": ["ltp", [738561]]},
+    ]
+    assert len(ticks) == 1, "the heartbeat or the message frame was delivered as data"
+    assert ticks[0][1] == "zerodha"
+    assert ticks[0][2] == [
+        {"instrument_token": 738561, "last_price": 2650.5, "symbol": None,
+         "exchange": None, "volume": 0, "timestamp": None}
+    ]
+    assert orders == [] and expired == []
+    assert socket.closed
+
+
+# -- readiness, promotion and failover, on real Kite bytes ------------------
+
+
+def _kite_feed(user_id="u1", symbols=("RELIANCE",)):
+    """Attach a Zerodha market feed for `user_id` on the real registry."""
+    from services.brokers.market_feed import feed_provider_name
+    from services.market_engine.providers import provider_registry
+
+    run(_attach(user_id, "zerodha", list(symbols)))
+    return provider_registry.get(feed_provider_name(user_id, "zerodha"))
+
+
+def _kite_map():
+    return InstrumentMap.from_portfolio(
+        [
+            {"symbol": "RELIANCE", "exchange": "NSE", "instrument_token": 738561},
+            {"symbol": "TCS", "exchange": "NSE", "instrument_token": 2953217},
+        ]
+    )
+
+
+def test_a_connected_kite_stream_is_not_ready_until_a_real_packet_arrives():
+    """CONNECTED != READY, driven by the bytes rather than by a synthetic tick.
+
+    Every milestone short of data is reached — registered, link up, subscribed,
+    a heartbeat received, a malformed frame received — and the baseline still
+    serves the quote.
+    """
+    from services.brokers.market_feed import set_market_feed_link
+    from services.market_engine.providers import Capability, ResolutionContext, YahooPollingAdapter
+    from services.market_engine.source_manager import SourceManager
+
+    with _clean_provider_registry() as registry:
+        registry.clear()
+        baseline = YahooPollingAdapter()
+        registry.register(baseline)
+        manager = SourceManager(registry)
+        ctx = ResolutionContext(user_id="u1", symbol="RELIANCE")
+
+        feed = _kite_feed()
+        run(set_market_feed_link("u1", "zerodha", up=True))
+        assert feed.is_link_up and not feed.is_ready
+        assert manager.resolve(Capability.QUOTES, context=ctx) is baseline
+
+        # A heartbeat is not evidence.
+        assert _kite_ticks(b"\x00") == []
+        # Neither is a frame that decodes to nothing usable.
+        truncated = canonical_ticks(
+            _kite_ticks(_kite_frame((738561, 150000), declared_lengths=[64])), _kite_map(), broker="zerodha"
+        )
+        assert truncated == []
+        run(feed.on_raw(truncated))
+        assert not feed.is_ready, "a malformed Kite frame promoted the feed"
+        assert manager.resolve(Capability.QUOTES, context=ctx) is baseline
+
+        # A real packet is.
+        priced = canonical_ticks(_kite_ticks(_kite_frame((738561, 265050))), _kite_map(), broker="zerodha")
+        run(feed.on_raw(priced))
+        assert feed.is_ready
+        assert manager.resolve(Capability.QUOTES, context=ctx) is feed
+
+
+def test_a_kite_feed_is_promoted_over_the_baseline_and_falls_back_on_link_loss():
+    """Make-before-break, end to end, with Zerodha as the concrete feed.
+
+    The baseline is never unregistered and never disconnected at any point — it
+    moves to standby inside the same failover chain, which is what makes the
+    promotion make-before-break rather than break-before-make.
+    """
+    from services.brokers.market_feed import set_market_feed_link
+    from services.market_engine.providers import Capability, ResolutionContext, YahooPollingAdapter
+    from services.market_engine.source_manager import SourceManager
+
+    with _clean_provider_registry() as registry:
+        registry.clear()
+        baseline = YahooPollingAdapter()
+        registry.register(baseline)
+        run(baseline.connect())
+        manager = SourceManager(registry)
+        ctx = ResolutionContext(user_id="u1", symbol="RELIANCE")
+
+        feed = _kite_feed()
+        run(set_market_feed_link("u1", "zerodha", up=True))
+        assert manager.resolve(Capability.QUOTES, context=ctx) is baseline
+
+        run(feed.on_raw(canonical_ticks(_kite_ticks(_kite_frame((738561, 265050))), _kite_map(), broker="zerodha")))
+        assert manager.resolve(Capability.QUOTES, context=ctx) is feed
+        assert baseline.name in registry and baseline._connected, "the baseline was released on promotion"
+
+        # An instrument this Kite feed does not stream stays with the baseline
+        # in the same session.
+        assert manager.resolve(Capability.QUOTES, context=ResolutionContext(user_id="u1", symbol="SPX")) is baseline
+
+        # The socket dies: the very next resolution is the baseline again.
+        run(set_market_feed_link("u1", "zerodha", up=False, reason="socket closed"))
+        assert manager.resolve(Capability.QUOTES, context=ctx) is baseline
+
+        # It comes back, and has to re-earn readiness on the new link.
+        run(set_market_feed_link("u1", "zerodha", up=True))
+        assert manager.resolve(Capability.QUOTES, context=ctx) is baseline
+        run(feed.on_raw(canonical_ticks(_kite_ticks(_kite_frame((738561, 266000))), _kite_map(), broker="zerodha")))
+        assert manager.resolve(Capability.QUOTES, context=ctx) is feed
+
+
+def test_a_kite_feed_that_never_ticks_leaves_the_baseline_primary_for_everyone():
+    """A failure before readiness changes nothing, for the owner or anybody else."""
+    from services.brokers.market_feed import set_market_feed_link
+    from services.market_engine.providers import Capability, ResolutionContext, YahooPollingAdapter
+    from services.market_engine.source_manager import SourceManager
+
+    with _clean_provider_registry() as registry:
+        registry.clear()
+        baseline = YahooPollingAdapter()
+        registry.register(baseline)
+        manager = SourceManager(registry)
+
+        feed_a, feed_b = _kite_feed("u1"), _kite_feed("u2")
+        run(set_market_feed_link("u1", "zerodha", up=True))
+        run(set_market_feed_link("u2", "zerodha", up=True))
+        run(feed_b.on_raw(canonical_ticks(_kite_ticks(_kite_frame((738561, 265050))), _kite_map(), broker="zerodha")))
+
+        run(set_market_feed_link("u1", "zerodha", up=False, reason="connection refused"))
+
+        assert manager.resolve(Capability.QUOTES, context=ResolutionContext(user_id="u1", symbol="RELIANCE")) is baseline
+        assert manager.resolve(Capability.QUOTES, context=ResolutionContext(user_id="u2", symbol="RELIANCE")) is feed_b, \
+            "one user's Kite failure moved another user's feed"
+        assert feed_a is not feed_b
+
+
+def test_the_engine_carries_kite_bytes_all_the_way_into_the_registered_feed():
+    """The real seam: `BrokerEngine._on_stream_tick` with what the Kite codec produced.
+
+    This is the join every earlier test stops short of — the engine's instrument
+    map, the canonical boundary and the provider push, driven by bytes that came
+    off a Kite frame rather than by a dict a test wrote.
+    """
+    from services.market_engine.providers import Capability, ResolutionContext, YahooPollingAdapter
+    from services.market_engine.source_manager import SourceManager
+
+    holdings = [{"symbol": "RELIANCE", "exchange": "NSE", "instrument_token": 738561}]
+    engine = BrokerEngine()
+    engine.configure(FakeDB())
+
+    with _clean_provider_registry() as registry:
+        registry.clear()
+        baseline = YahooPollingAdapter()
+        registry.register(baseline)
+        manager = SourceManager(registry)
+        ctx = ResolutionContext(user_id="u1", symbol="RELIANCE")
+
+        with patch("services.brokers.stream.stream_manager.start_stream", new=AsyncMock()), \
+                patch.object(BrokerEngine, "get_session", new=AsyncMock(return_value={"access_token": "t"})), \
+                patch("services.brokers.gateway.broker_gateway.get_holdings", new=AsyncMock(return_value=holdings)), \
+                patch("services.brokers.gateway.broker_gateway.get_positions", new=AsyncMock(return_value=[])):
+            run(engine.start_stream("u1", "zerodha"))
+
+        feed = registry.get("brokerfeed:zerodha:u1")
+        assert feed is not None, "the engine never registered the Kite feed"
+        assert feed.subscribed_symbols == ("RELIANCE",)
+        run(feed.mark_link_up())
+        assert manager.resolve(Capability.QUOTES, context=ctx) is baseline
+
+        with patch.object(BrokerEngine, "_push", new=AsyncMock()):
+            run(engine._on_stream_tick("u1", "zerodha", _kite_ticks(_kite_frame((738561, 265050)))))
+
+        assert feed.describe()["accepted_records"] == 1
+        assert manager.resolve(Capability.QUOTES, context=ctx) is feed
+        assert feed.covers("RELIANCE")
+        assert run(feed.fetch_quote("RELIANCE"))["price"] == 2650.5
+
+
+# -- security ---------------------------------------------------------------
+
+
+def test_no_kite_credential_reaches_a_log_line(caplog):
+    """The whole transport pass, at DEBUG, with a live-looking token.
+
+    Kite is the broker that can actually fail this: its ticker authenticates by
+    query string, so "connected to <url>" — the most natural log line anybody
+    would write — writes a live access token into the application log.
+    """
+    caplog.set_level(logging.DEBUG)
+    drive_stream(
+        _zerodha(),
+        [b"\x00", _kite_frame((738561, 265050)), json.dumps({"type": "error", "data": "Subscription limit reached"})],
+        instruments=[738561],
+        session={"access_token": "SECRET-ACCESS-TOKEN"},
+    )
+    emitted = "\n".join(r.getMessage() for r in caplog.records)
+    assert emitted, "nothing was logged — the sweep could not have failed"
+    assert "SECRET-ACCESS-TOKEN" not in emitted
+    assert "access_token=" not in emitted
+    assert "nova-key" not in emitted
+
+
+def test_no_kite_credential_or_identifier_can_reach_a_market_tick():
+    """A canonical tick has no field for either, and the field list is closed."""
+    tick = canonical_ticks(_kite_ticks(_kite_frame((738561, 265050))), _kite_map(), broker="zerodha")[0]
+    blob = json.dumps(tick).lower()
+    for forbidden in ("zerodha", "kite", "access_token", "api_key", "instrument_token", "738561"):
+        assert forbidden not in blob, f"{forbidden} reached a canonical market tick"
+
+
+def test_a_kite_quote_carries_no_broker_identity_and_no_other_users_data():
+    """The public gateway surface, after a Zerodha promotion."""
+    from services.market_engine.gateway import market_gateway
+    from services.market_engine.providers import YahooPollingAdapter
+
+    async def fake_quote(symbol):
+        return {"symbol": symbol, "name": symbol, "price": 100.0, "prev_close": 99.0,
+                "change_pct": 1.01, "volume": 1000}
+
+    with _clean_provider_registry() as registry:
+        registry.clear()
+        registry.register(YahooPollingAdapter())
+        feed = _kite_feed("u1")
+        run(feed.on_raw(canonical_ticks(_kite_ticks(_kite_frame((738561, 265050))), _kite_map(), broker="zerodha")))
+
+        with patch.object(YahooPollingAdapter, "fetch_quote", staticmethod(fake_quote)):
+            streamed = run(market_gateway.get_quote("RELIANCE", user_id="u1"))
+            other_user = run(market_gateway.get_quote("RELIANCE", user_id="u2"))
+
+    assert streamed["source_tier"] == "streaming" and streamed["price"] == 2650.5
+    blob = json.dumps(streamed).lower()
+    for forbidden in ("zerodha", "kite", "brokerfeed", "yahoo", "instrument_token"):
+        assert forbidden not in blob
+    assert other_user["source_tier"] == "delayed", "another user's request was served by this Kite feed"
+
+
+def test_an_expired_kite_session_detaches_the_market_feed():
+    """A dead token stops being resolvable immediately, not at the next health tick."""
+    from services.market_engine.providers import provider_registry
+
+    engine = BrokerEngine()
+    engine.configure(FakeDB())
+    with _clean_provider_registry():
+        feed = _kite_feed("u1")
+        run(feed.on_raw(canonical_ticks(_kite_ticks(_kite_frame((738561, 265050))), _kite_map(), broker="zerodha")))
+        assert provider_registry.get("brokerfeed:zerodha:u1") is not None
+
+        run(engine._on_stream_expired("u1", "zerodha"))
+        assert provider_registry.get("brokerfeed:zerodha:u1") is None
+
+
+# -- the multi-broker acceptance criterion ----------------------------------
+
+
+def test_kite_added_no_kite_knowledge_outside_its_own_adapter():
+    """D4.6's acceptance criterion, swept rather than asserted by eye.
+
+    The Kite vocabulary — the ticker URL, the packet layout, the mode, the
+    segment divisors — must exist in exactly one module. A second module that
+    knows any of it is the beginning of the branch this whole framework was
+    built to make unnecessary.
+    """
+    # Identifiers, not prose: `_strip_source` removes comments and string
+    # literals (docstrings included), so a module explaining Kite is legal and a
+    # module *computing* with Kite's protocol is not. `instrument_token` is
+    # deliberately absent — it is `BrokerTick`'s own generic field name, carried
+    # by every broker, and banning it would ban the contract rather than Kite.
+    kite_words = ("kite", "paise", "tradingsymbol", "price_divisor", "segment_cds", "segment_bcd")
+    allowed = {
+        "services/brokers/zerodha.py",       # the adapter — the only owner
+    }
+    offenders = {}
+    scanned = 0
+    for path in sorted((BACKEND / "services").rglob("*.py")):
+        rel = path.relative_to(BACKEND).as_posix()
+        if rel in allowed:
+            continue
+        scanned += 1
+        source = _strip_source(path.read_text(encoding="utf-8")).lower()
+        hit = [w for w in kite_words if w in source]
+        if hit:
+            offenders[rel] = hit
+    assert scanned > 50, "the sweep found almost no modules — it could not have failed"
+    assert not offenders, offenders
+
+
+def test_zerodha_and_a_fictional_broker_stream_through_the_identical_transport():
+    """The acceptance criterion D4.6 is not complete without.
+
+    Two brokers that share nothing — binary versus text, numeric token versus
+    trading symbol, integer paise versus a rupee string, query-string auth
+    versus a header — reach the engine's callbacks in the same canonical shape,
+    through the same transport function, with no shared module naming either.
+    """
+    from services.brokers.stream import PROTOCOL_RUNNERS, resolve_transport
+
+    kite_ticks, _, _, kite_socket = drive_stream(
+        _zerodha(), [_kite_frame((738561, 265050))], instruments=[738561]
+    )
+    with nova_registered() as nova:
+        nova_ticks, _, _, nova_socket = drive_stream(
+            nova,
+            [json.dumps({"kind": "price", "rows": [{"scrip": "reliance", "rate": "2650.50"}]})],
+            instruments=["RELIANCE"],
+        )
+        assert resolve_transport(nova) is BrokerStream._run_websocket
+    assert resolve_transport(_zerodha()) is BrokerStream._run_websocket
+    assert PROTOCOL_RUNNERS == {}, "a broker-specific transport was reintroduced"
+
+    # Different wires, different identity styles, one canonical shape.
+    assert isinstance(kite_socket.sent[0], str) and kite_socket.sent[0].startswith("{")
+    assert nova_socket.sent[0].startswith("SUB ")
+    assert set(kite_ticks[0][2][0]) == set(nova_ticks[0][2][0])
+
+    kite_map = _kite_map()
+    nova_map = InstrumentMap.from_portfolio([{"symbol": "RELIANCE", "exchange": "NSE"}])
+    assert canonical_ticks(kite_ticks[0][2], kite_map, broker="zerodha")[0]["symbol"] == "RELIANCE"
+    assert canonical_ticks(nova_ticks[0][2], nova_map, broker="nova")[0]["symbol"] == "RELIANCE"
