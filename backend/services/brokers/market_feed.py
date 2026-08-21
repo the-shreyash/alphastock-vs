@@ -37,16 +37,29 @@ Adding a second streaming broker therefore adds nothing here, nothing in the
 Market Engine, and nothing in any core service. It adds one adapter, exactly as
 Developer Rule 9 of MARKET_DATA_ARCHITECTURE.md requires.
 
-WHAT THIS MODULE DELIBERATELY DOES NOT DO
-------------------------------------------
-It does not switch the feed. The registered provider declares `TICKS` and not
-`QUOTES`, so it serves a capability nothing has ever served and takes nothing
-away from Yahoo, which continues to answer every quote for every user. Promoting
-a broker feed to primary for quotes is the make-before-break switch —
-"connect the new provider, confirm first valid data, then release the old one"
-— and MARKET_DATA_ARCHITECTURE.md is explicit that the switch has a gate. That
-gate is separately testable work and is deliberately not smuggled in here. See
-`StreamingTickProvider` for the full reasoning and ADR-034.
+WHAT D4.5 ADDED: THE ACCOUNT'S SIDE OF THE READINESS GATE
+----------------------------------------------------------
+D4.4 registered the feed and stopped there — the provider declared `TICKS` and
+not `QUOTES`, so it took nothing away from the baseline, and no switch existed.
+D4.5 builds the switch in the Market Engine, generically, and this module
+supplies the two account-level facts the gate needs and only the broker side
+knows:
+
+  * **what the feed was asked for.** :func:`attach_market_feed` subscribes the
+    provider to the account's canonical instrument universe. A provider with no
+    subscription can never reach READY, which is deliberate: the platform will
+    not promote a feed over the baseline on the strength of a socket nobody can
+    say what was asked of.
+  * **whether the wire is actually up.** :func:`set_market_feed_link` relays the
+    transport's own connect/disconnect, which is what makes failover immediate
+    and push-driven — the side holding the socket already knows the moment it
+    dies, so nothing polls and nothing waits for a health counter.
+
+What this module still does not do is *decide* anything. It has no notion of
+primary, standby, promotion or failover; those live entirely in
+`StreamingTickProvider` and the Source Manager, where they are the same for
+every feed. That is what keeps a second broker from needing a line here. See
+`StreamingTickProvider` for the full reasoning and ADR-035.
 """
 
 from __future__ import annotations
@@ -80,7 +93,11 @@ def feed_provider_name(user_id: Any, broker: str) -> str:
     return f"{FEED_NAME_PREFIX}:{broker}:{user_id}"
 
 
-async def attach_market_feed(user_id: Any, broker: str) -> Optional[str]:
+async def attach_market_feed(
+    user_id: Any,
+    broker: str,
+    symbols: Optional[Sequence[str]] = None,
+) -> Optional[str]:
     """Register this account's broker stream as a market-data provider.
 
     Returns the provider name, or None when the broker is not a candidate. The
@@ -90,6 +107,15 @@ async def attach_market_feed(user_id: Any, broker: str) -> Optional[str]:
     deliver silence — which the Source Manager would rank *above* the working
     baseline. The capability model is the authority on what a broker serves;
     this module does not second-guess it and does not probe for methods.
+
+    `symbols` is the account's canonical instrument universe — the same
+    holdings-and-positions set the stream subscribes to on the wire, named the
+    way the platform names instruments. Passing it is what lets the provider
+    reach READY at all (D4.5): registering and connecting are not evidence a
+    feed can serve, and a feed that never declared what it asked for cannot
+    later claim to be delivering it. Attaching without symbols is legal and
+    yields a feed that serves TICKS and never displaces the baseline — the
+    correct behaviour for an account with nothing to stream.
 
     Idempotent. A reconnecting stream re-registers under the same name and
     replaces the provider bound to the socket that died.
@@ -107,7 +133,37 @@ async def attach_market_feed(user_id: Any, broker: str) -> Optional[str]:
     name = feed_provider_name(user_id, broker)
     provider = StreamingTickProvider(name, owner_user_id=str(user_id))
     await market_gateway.register_streaming_provider(provider)
+    if symbols:
+        await provider.subscribe(symbols)
     return name
+
+
+async def set_market_feed_link(user_id: Any, broker: str, *, up: bool,
+                               reason: str = "") -> bool:
+    """Relay this account's transport connect/disconnect to its provider.
+
+    True when the provider's readiness actually changed. False — not an error —
+    when no provider is registered for the account, which is the normal state
+    for a broker with no tick stream.
+
+    WHY THIS IS NOT A DETACH
+    ------------------------
+    A dropped socket that is reconnecting is not an ended entitlement. Detaching
+    would unregister the provider, discard its diagnostics, and then re-register
+    a fresh one on every blip of a flapping connection. Marking the link down
+    leaves the feed registered and merely un-resolvable: the baseline serves the
+    next request, and the feed climbs back through the same readiness gate it
+    passed the first time, on the connection that actually exists.
+
+    Entitlement termination is a different event with a different handler —
+    :func:`detach_market_feed`.
+    """
+    provider = provider_registry.get(feed_provider_name(user_id, broker))
+    if provider is None:
+        return False
+    if up:
+        return await provider.mark_link_up()
+    return await provider.mark_link_down(reason)
 
 
 async def detach_market_feed(user_id: Any, broker: str) -> bool:

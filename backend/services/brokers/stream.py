@@ -112,6 +112,7 @@ class BrokerStream:
         on_order_update=None,
         on_tick=None,
         on_expired=None,
+        on_link_state=None,
     ):
         self.user_id = user_id
         self.broker = broker
@@ -129,6 +130,21 @@ class BrokerStream:
         self.on_order_update = on_order_update
         self.on_tick = on_tick
         self.on_expired = on_expired
+        #: Called `(user_id, broker, up: bool, reason: str)` when this
+        #: connection is established and when it is lost (D4.5).
+        #:
+        #: The transport is the only party that knows the instant a socket dies,
+        #: so it is the only party that can make failover immediate. Without
+        #: this the market side would have to *notice* the silence, and noticing
+        #: silence means a timer — a poll loop in everything but name, which
+        #: MARKET_DATA_ARCHITECTURE.md's streaming path exists to eliminate.
+        #:
+        #: It carries connection state and nothing else: no session, no
+        #: credentials, no ticks. A reconnect is reported as a fresh `up`, which
+        #: is what makes the consumer re-earn whatever it had concluded about
+        #: the previous connection.
+        self.on_link_state = on_link_state
+        self._link_up = False
         self._stopped = False
         self._task = None
 
@@ -136,6 +152,24 @@ class BrokerStream:
     def start(self):
         self._task = asyncio.create_task(self._run(), name=f"broker-stream-{self.broker}-{self.user_id}")
         return self._task
+
+    async def _notify_link(self, up: bool, reason: str = ""):
+        """Report a connection state change once, best-effort.
+
+        Change-gated: a transport that reconnects reports `up` again, and a
+        consumer must see one transition per real transition rather than one per
+        loop iteration. Failures are swallowed — a consumer's bookkeeping error
+        must never drop a live market feed.
+        """
+        if up == self._link_up:
+            return
+        self._link_up = up
+        if not self.on_link_state:
+            return
+        try:
+            await self.on_link_state(self.user_id, self.broker, up, reason)
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning("%s stream link-state callback failed: %s", self.broker, e)
 
     async def stop(self):
         self._stopped = True
@@ -169,7 +203,15 @@ class BrokerStream:
                         "No stream transport for protocol %r (broker %s)", self._adapter.stream_protocol, self.broker
                     )
                     return
-                await runner(self)
+                try:
+                    await runner(self)
+                finally:
+                    # Every exit from a transport run is a lost connection —
+                    # clean close, broker error, cancellation, dead token. Put
+                    # in `finally` rather than after each branch so a transport
+                    # added later cannot leave the consumer believing a link is
+                    # up that has in fact ended.
+                    await self._notify_link(False, "stream ended")
                 delay = RECONNECT_BASE_DELAY  # clean close → quick reconnect
             except asyncio.CancelledError:
                 raise
@@ -223,6 +265,13 @@ class BrokerStream:
         try:
             for frame in adapter.stream_subscribe_frames(self.instrument_tokens) or ():
                 await ws.send(frame)
+            # Announced after the subscribe frames are away, not on the socket
+            # opening: an open socket nobody has asked anything of delivers
+            # nothing, and reporting the link up before then would hand the
+            # consumer the "connected therefore ready" conflation that D4.5's
+            # readiness gate exists to refuse. It is still only a *link* signal —
+            # the consumer treats it as evidence of nothing more.
+            await self._notify_link(True)
             async for message in ws:
                 await self._dispatch(self._decode(message))
         finally:
@@ -347,6 +396,7 @@ class BrokerStreamManager:
         on_order_update=None,
         on_tick=None,
         on_expired=None,
+        on_link_state=None,
     ):
         await self.stop_stream(user_id, broker)
         stream = BrokerStream(
@@ -358,6 +408,7 @@ class BrokerStreamManager:
             on_order_update=on_order_update,
             on_tick=on_tick,
             on_expired=on_expired,
+            on_link_state=on_link_state,
         )
         self._streams[(user_id, broker)] = stream
         stream.start()

@@ -2222,7 +2222,7 @@ Implementation phases (per MARKET_DATA_ARCHITECTURE.md):
 - [x] **D1 / Phase 1 — Market Gateway Foundation** — **COMPLETE (2026-08-19)** — Provider Adapter contract, Provider Registry, Source Manager foundation, Yahoo migration. Scope decisions in **ADR-028**.
 - [x] **D2 / Phase 2 — Source Manager completion** — **BACKEND COMPLETE (2026-08-20)** — failover chain, `UnavailableReason`, `ResolutionContext`, `unknown` health. Scope decisions in **ADR-029**; public-contract reconciliation in **ADR-030**. Frontend reactive tier indicator outstanding (DD-7).
 - [x] **D3 / Phase 3 — Broker Provider Framework** — **COMPLETE (2026-08-20)** — re-scoped from "Zerodha Kite WebSocket adapter"; scope decisions in **ADR-031**. See "D3 — What shipped" below.
-- [ ] D4 / Phase 4 — **IN PROGRESS.** D4.1 (DB-2 startup ordering + reconnect jitter), D4.2 (broker streaming contract / codec boundary, ADR-032), D4.3 (canonical instrument identity / market tick, ADR-033) and D4.4 (broker feed registered as a market-data provider + the `subscribe`/`on_raw` push surface, ADR-034) complete; D4.5+ outstanding — Broker market-data streaming (Zerodha Kite ticker as a registered priority-1 provider, streaming push surface `subscribe`/`on_raw`, tick normalization, per-user resolution, make-before-break switching, failover to Yahoo) + remaining broker adapters (Upstox, Angel One, Fyers, Dhan)
+- [ ] D4 / Phase 4 — **IN PROGRESS.** D4.1 (DB-2 startup ordering + reconnect jitter), D4.2 (broker streaming contract / codec boundary, ADR-032), D4.3 (canonical instrument identity / market tick, ADR-033), D4.4 (broker feed registered as a market-data provider + the `subscribe`/`on_raw` push surface, ADR-034) and D4.5 (make-before-break switching, readiness gate, per-symbol coverage, push-driven baseline failover, ADR-035) complete; D4.6+ outstanding — the first real broker market feed behind the switch (Zerodha Kite ticker) + remaining broker adapters (Upstox, Angel One, Fyers, Dhan), each one adapter and nothing else
 - [ ] D5 / Phase 5 — Hardening: latency scoring, flap suppression, probation windows, multi-connection sharding, chaos tests
 - [ ] D6 / Phase 6 — Enterprise/licensed feeds (future)
 
@@ -2380,6 +2380,37 @@ Backend suite **3,064 passed** (3,015 before D3 + 49 new), 4 xfailed, 0 failed. 
 **Validation.** Backend suite **3,119 passed**, 4 xfailed; the 15 `test_entrypoint_log_level.py` failures are the documented pre-existing Docker baseline, unchanged. **Twelve falsification tests added** to `test_broker_streaming.py`, and **five mutations run against them**, each observed red and reverted: the broker capability gate removed → 1 red; `validate_provider` removed from registration → 1 red; the closed-field-set check removed → 1 red; the engine no longer publishing into the feed → 1 red; the provider declaring `QUOTES` → 3 red. A sixth probe was run *before* the tests were finished: the broker-agnosticism sweep's own non-vacuity assertion failed, which is how the string-literal sweep (`if broker == "zerodha"` survives an identifier sweep untouched) was added.
 
 **Deliberately NOT done in D4.4** — no make-before-break switch, no broker→baseline failover, no `QUOTES` on a broker provider, no Zerodha market-feed integration, no additional broker adapters.
+
+### D4.5 — make-before-break switching + baseline failover (2026-08-21, ADR-035)
+
+**The switch D4.4 stopped short of.** A connected account's feed can now become the primary QUOTES provider — but only after proving it can produce valid canonical data, only for the instruments it actually streams, and only for the user who owns it. The baseline is never disconnected; it moves to standby inside the same failover chain.
+
+**Modified**
+
+- `providers/streaming.py` — `FeedReadiness` (`REGISTERED → CONNECTING → CONNECTED → SUBSCRIBED → READY`, plus `FAILED` / `DISCONNECTED`), the readiness gate in `is_eligible_for`, per-symbol coverage with a 120s staleness bound, `mark_link_up` / `mark_link_down`, `bind_readiness_listener`, and `fetch_quote` answering from the last streamed tick. `capabilities` now includes `QUOTES`.
+- `providers/base.py` — `ResolutionContext.capability` + `for_capability()`, so `is_eligible_for` can answer differently for a pushed capability than for the quote capability that displaces the baseline.
+- `providers/registry.py` — `candidates_for` stamps the capability onto the context it filters with.
+- `market_engine/normalizer.py` — the `canonical` family: one canonical tick → the platform's StockQuote shape.
+- `market_engine/source_manager.py` — `publish_status(user_id=…)` publishes a user-scoped `provider.status`, change-gated per user; `forget_user_status`.
+- `market_engine/gateway.py` — binds/unbinds the readiness listener alongside the tick sink; `_on_provider_readiness` announces a promotion or demotion to the owning user only.
+- `brokers/instruments.py` — `InstrumentMap.symbols`, the account's canonical instrument universe.
+- `brokers/market_feed.py` — `attach_market_feed(user_id, broker, symbols)` subscribes the provider; `set_market_feed_link` relays transport link state.
+- `brokers/stream.py` — `on_link_state` callback, reported after the subscribe frames are away and on every exit from a transport run.
+- `broker_engine.py` — passes the account's symbols to `attach_market_feed`, wires `_on_stream_link_state`.
+
+**Why `PRIMARY` is not a provider state.** It is the head of one `resolve_feed` chain, recomputed every time from current readiness. Storing it would be a lagging copy of a derived fact, and would make it possible for two providers to believe they were primary for one quote stream — the state MARKET_DATA_ARCHITECTURE.md forbids. Because nothing stores it, promotion is atomic with no lock and no handover protocol, and make-before-break falls out for free.
+
+**What "ready" means, and what it deliberately does not.** A record that survived coercion into a canonical `MarketTick`, on this link, while subscribed. Not the socket opening, not authentication, not a subscribe frame, and never elapsed time. Evidence is per link: a reconnect discards it and readiness is re-earned. A feed attached with no symbols can never become ready — the safe default.
+
+**Two design decisions worth revisiting later.** (1) A symbol-less QUOTES resolution — which only `status()` / `active_tier()` / `diagnostics()` produce, since every fetch path supplies a symbol — reports the *feed*, so a promoted user's tier indicator reads `streaming` even though instruments the feed does not stream are still served (and individually labelled) by the baseline. (2) The stale-tick bound is 120s: longer than the baseline's own delay would mean serving something worse than the fallback under a `streaming` label.
+
+**Known limitation — a tick-derived quote is thinner than a polled one.** A canonical tick carries no previous close, so the quote built from it has no `change` / `change_pct` and no OHLC. Stitching those from the baseline's last quote would present two readings at two timestamps as one and is fabrication. **No production caller passes `user_id` to `market_gateway.get_quote` today**, so nothing regresses now; wiring per-user quote routing into the REST surface is gated on the canonical tick growing those fields, which needs a real feed that populates them.
+
+**Security.** Promotion and demotion move exactly one user's feed — verified against a second user and a no-user (guest) context across both transitions. `provider.status` for a per-user feed carries `user_id` and is delivered to that user alone, so one user's promotion neither moves another's indicator nor discloses that they have a broker connected. A dropped socket demotes but does not unregister; an *ended entitlement* still unregisters immediately. No broker name, provider name or credential material appears on any consumer surface.
+
+**Validation.** Backend suite **3,138 passed**, 4 xfailed (baseline before D4.5: 3,114); the 15 `test_entrypoint_log_level.py` failures remain the documented pre-existing Docker baseline, unchanged. **24 tests added**, including the falsification pair that keeps the rest honest: `test_removing_the_readiness_gate_would_promote_an_unproven_feed` (gate neutralised → the feed takes the quote path immediately, so the "not promoted" assertions are known to be about the gate) and `test_breaking_before_making_is_what_the_ordering_test_would_catch` (baseline released first → a window with no quote provider at all, so the ordering assertions are known to be capable of failing).
+
+**Deliberately NOT done in D4.5** — no Zerodha Kite market-feed adapter and no other broker adapters, no generalized provider re-probe, no probation windows / latency scoring / flap suppression (D5), no frontend tier-indicator work, no trading, portfolio or frontend changes.
 
 ## D3 — Debts carried into D4
 

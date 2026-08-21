@@ -38,7 +38,8 @@ logger = logging.getLogger(__name__)
 def normalize_stock_quote(raw: Dict[str, Any], provider: str = "yahoo") -> Optional[Dict[str, Any]]:
     """Normalize a raw stock quote into the canonical StockQuote format.
 
-    Supports: yahoo (from real_market.py), alpha_vantage, broker (Kite).
+    Supports: yahoo (from real_market.py), alpha_vantage, broker (Kite),
+    canonical (a streaming feed's own canonical tick — D4.5).
     Returns None if the raw data is unusable.
     """
     if not raw:
@@ -51,6 +52,8 @@ def normalize_stock_quote(raw: Dict[str, Any], provider: str = "yahoo") -> Optio
             return _normalize_av_quote(raw)
         if provider == "broker":
             return _normalize_broker_quote(raw)
+        if provider == "canonical":
+            return _normalize_canonical_quote(raw)
         # Unknown provider — attempt passthrough with defaults
         return _apply_defaults(raw)
     except Exception as exc:
@@ -153,6 +156,62 @@ def _normalize_broker_quote(raw: Dict[str, Any]) -> Dict[str, Any]:
         "ema_20": None,
         "sma_50": None,
         "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _normalize_canonical_quote(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize one canonical market tick into the canonical StockQuote shape.
+
+    The `canonical` family, used by streaming providers whose pull surface
+    answers from the last tick they received (D4.5,
+    `providers/streaming.py`). It is the shortest normalizer in this module for
+    a good reason: the input is already the platform's own shape, so this
+    function moves five fields and *invents nothing*.
+
+    WHY SO MANY FIELDS COME OUT `None`
+    ----------------------------------
+    A tick carries a price, not a session. There is no previous close in it, so
+    there is no honest `change` or `change_pct`; no OHLC, so no day range. Every
+    other normalizer here fills those from what its provider actually sent, and
+    this one does the same — the difference is only that a tick sends less.
+
+    Filling them by carrying values forward from a *different* provider's last
+    quote is the tempting alternative and it is forbidden: the result would be a
+    quote whose price and whose day-change came from two sources with different
+    timestamps, presented as one reading. CLAUDE.md's data rules rule out
+    fabricating market data, and a stitched quote is fabricated in the only way
+    that matters — nobody downstream could tell.
+
+    `timestamp` is the tick's own `ingested_at`, not "now": the freshness this
+    quote deserves is the freshness of the tick behind it.
+    """
+    return {
+        "symbol": (raw.get("symbol") or "").upper(),
+        "name": raw.get("symbol", ""),
+        "price": _to_float(raw.get("price")),
+        "open": None,
+        "high": None,
+        "low": None,
+        "close": _to_float(raw.get("price")),
+        "prev_close": None,
+        "change": None,
+        "change_pct": None,
+        "volume": _to_int(raw.get("volume")),
+        "avg_volume": None,
+        "volume_ratio": None,
+        "market_cap": None,
+        "pe_ratio": None,
+        "week_52_high": None,
+        "week_52_low": None,
+        "day_range": "",
+        "sector": "",
+        "exchange": raw.get("exchange") or "NSE",
+        "rsi": None,
+        "macd": None,
+        "vwap": None,
+        "ema_20": None,
+        "sma_50": None,
+        "timestamp": raw.get("ingested_at") or datetime.now(timezone.utc).isoformat(),
     }
 
 

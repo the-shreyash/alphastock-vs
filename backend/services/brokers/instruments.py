@@ -62,7 +62,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from services.market_engine.ticks import MarketInstrument, MarketTick, MarketTickError
 
@@ -168,6 +168,23 @@ class InstrumentMap:
         # A token this account cannot name, and no symbol to fall back on. The
         # token is NOT used as a symbol — see the module docstring.
         return None
+
+    @property
+    def symbols(self) -> Tuple[str, ...]:
+        """Every canonical symbol this account's feed can name, sorted.
+
+        The account's *instrument universe* as the platform knows it, which is
+        what a market-data provider fed by this account's stream subscribes to
+        (D4.5): the same two lists that decide what the wire is asked for decide
+        what an arriving tick can be called, so they also decide what the
+        resulting provider claims to cover.
+
+        Read off `_by_symbol` alone. Every row that produced a token entry
+        produced a symbol entry too — `from_portfolio` derives both from the
+        same `MarketInstrument` — so the token table adds no symbol this misses,
+        and reading it would only risk returning a token as if it were one.
+        """
+        return tuple(sorted(self._by_symbol))
 
     def __len__(self) -> int:
         return len(self._by_token) + len(self._by_symbol)

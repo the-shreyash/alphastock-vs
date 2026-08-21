@@ -1508,9 +1508,12 @@ def test_no_polling_is_introduced_by_the_streaming_seam():
     provider = StreamingTickProvider("nova-feed", owner_user_id="u1")
     assert provider.kind is ProviderKind.STREAMING
     assert provider.tier is SourceTier.STREAMING
-    # Nothing on the provider fetches: TICKS is the only capability, and every
-    # `fetch_*` on the base raises rather than returning a polled answer.
-    assert provider.capabilities == frozenset({Capability.TICKS})
+    # D4.5 added QUOTES to the declaration, behind the readiness gate. The
+    # property this test guards is unchanged and is now sharper: nothing on the
+    # provider *fetches*. The quote surface answers only from ticks that were
+    # pushed into it, so a feed that has been handed nothing has nothing to
+    # give — and says so by raising rather than by polling for an answer.
+    assert provider.capabilities == frozenset({Capability.TICKS, Capability.QUOTES})
     with pytest.raises(Exception):
         run(provider.fetch_quote("RELIANCE"))
 
@@ -1800,9 +1803,757 @@ def test_the_engine_publishes_canonical_ticks_into_the_registered_feed():
         assert provider.describe()["accepted_records"] == 1, "the engine never pushed into the registered feed"
 
 
-def _attach(user_id, broker):
+def _attach(user_id, broker, symbols=None):
     """`attach_market_feed`, imported at call time so the seam is exercised as
     the engine imports it rather than through a name bound at module load."""
     from services.brokers.market_feed import attach_market_feed
 
-    return attach_market_feed(user_id, broker)
+    return attach_market_feed(user_id, broker, symbols)
+
+
+# ==================================================================
+# D4.5 — make-before-break provider switching + baseline failover
+#
+# D4.4 registered a broker feed as a market-data provider and deliberately
+# stopped short of letting it serve quotes: registering is not a switch, and a
+# switch performed the moment a socket opens is exactly the "break-before-make"
+# that MARKET_DATA_ARCHITECTURE.md forbids. D4.5 is the switch.
+#
+# The sequence every test below is written against:
+#
+#     baseline primary
+#         → feed connects        (still baseline)
+#         → feed subscribes      (still baseline)
+#         → valid canonical tick (readiness earned)
+#         → feed primary, baseline standby
+#
+# and its inverse, on any failure, at any point, with the baseline never having
+# been disconnected or unregistered at all.
+#
+# Every test is written so that removing the control it covers turns it red;
+# the mutations are exercised explicitly in the falsification tests at the end.
+# ==================================================================
+
+
+def _switching_fixture(user_id="u1", symbols=("RELIANCE",)):
+    """A registry holding a baseline and one unpromoted feed, plus a resolver.
+
+    Returns `(registry, manager, baseline, feed, ctx)` where `ctx(symbol)` builds
+    the resolution context a quote request would carry. The feed is registered
+    and connected — the state D4.4 left it in — and subscribed, so every test
+    starts one valid tick away from promotion and the tick is the only variable.
+    """
+    from services.market_engine.providers import (
+        ProviderRegistry,
+        ResolutionContext,
+        StreamingTickProvider,
+        YahooPollingAdapter,
+    )
+    from services.market_engine.source_manager import SourceManager
+
+    registry = ProviderRegistry()
+    baseline = YahooPollingAdapter()
+    registry.register(baseline)
+    run(baseline.connect())
+    feed = StreamingTickProvider(f"feed:{user_id}", owner_user_id=user_id)
+    registry.register(feed)
+    run(feed.connect())
+    if symbols:
+        run(feed.subscribe(symbols))
+
+    def ctx(symbol="RELIANCE"):
+        return ResolutionContext(user_id=user_id, symbol=symbol)
+
+    return registry, SourceManager(registry), baseline, feed, ctx
+
+
+def _tick(symbol="RELIANCE", price=2650.0):
+    return MarketTick(symbol=symbol, price=price, exchange="NSE").as_dict()
+
+
+def _quote_provider(manager, ctx):
+    from services.market_engine.providers import Capability
+
+    return manager.resolve(Capability.QUOTES, context=ctx)
+
+
+def test_a_connected_feed_is_not_a_ready_feed():
+    """CONNECTED != READY — the distinction the whole sprint turns on.
+
+    A feed that connected, authenticated and subscribed has demonstrated
+    nothing about its ability to produce data. Every one of those milestones is
+    reached here and the baseline still serves the quote.
+    """
+    from services.market_engine.providers import Capability, FeedReadiness
+
+    _registry, manager, baseline, feed, ctx = _switching_fixture()
+
+    assert feed.readiness is FeedReadiness.SUBSCRIBED
+    assert feed.is_link_up, "the fixture never connected the feed — the rest proves nothing"
+    assert not feed.is_ready
+    assert _quote_provider(manager, ctx()) is baseline
+
+    # And the feed is a legitimate answer for the *pushed* capability meanwhile:
+    # a live stream exists, it simply has not proved it can price anything.
+    assert manager.resolve(Capability.TICKS, context=ctx()) is feed
+
+
+def test_the_make_before_break_ordering_holds_at_every_step():
+    """The ordering assertion: the baseline is released last, or never.
+
+    Checked after each step rather than only at the end, because the failure
+    this guards against is a *window* — a switch that ends in the right state
+    having passed through one request in which neither provider served.
+    """
+    from services.market_engine.providers import Capability
+
+    registry, manager, baseline, feed, ctx = _switching_fixture()
+    seen = []
+
+    def observe(label):
+        resolution = manager.resolve_feed(Capability.QUOTES, ctx())
+        seen.append((label, resolution.provider.name, resolution.tier.value))
+        # There is never a moment with no quote provider at all.
+        assert resolution.available, f"the feed went dark at: {label}"
+        # And the baseline is never taken away — not unregistered, not
+        # disconnected, not made ineligible. It moves from head of the chain to
+        # standby *inside* the chain, which is what "make before break" means.
+        assert baseline.name in registry, f"the baseline was unregistered at: {label}"
+        assert baseline in resolution.chain, f"the baseline left the failover chain at: {label}"
+
+    observe("connected + subscribed")
+    assert run(feed.on_raw([_tick()])) == 1
+    observe("first valid tick accepted")
+
+    assert [step[1] for step in seen] == [baseline.name, feed.name], seen
+    assert [step[2] for step in seen] == ["delayed", "streaming"], seen
+    # The baseline is still connected and still serving everything the feed does
+    # not carry — standby, not stopped.
+    assert baseline.is_connected
+    assert _quote_provider(manager, ctx("SPX")) is baseline
+
+
+def test_a_malformed_first_tick_does_not_promote_the_feed():
+    """Evidence means a *valid* canonical tick, not a delivered frame.
+
+    A feed whose records are all rejected has demonstrated the opposite of
+    readiness, and promoting it would put the quote path behind a boundary that
+    refuses everything the feed sends.
+    """
+    _registry, manager, baseline, feed, ctx = _switching_fixture()
+
+    for junk in (
+        [{"symbol": "RELIANCE", "price": -5.0}],              # out of range
+        [{"symbol": "", "price": 2650.0}],                     # unnamed
+        [{"symbol": "RELIANCE", "price": "2650.0", "instrument_token": 1}],  # feed-shaped
+        ["not a record at all"],
+    ):
+        assert run(feed.on_raw(junk)) == 0, junk
+        assert not feed.is_ready, junk
+        assert _quote_provider(manager, ctx()) is baseline, junk
+
+    # The control: the identical call with a valid record does promote, so the
+    # assertions above are about the records and not about the path being dead.
+    assert run(feed.on_raw([_tick()])) == 1
+    assert _quote_provider(manager, ctx()) is feed
+
+
+def test_a_feed_that_fails_before_promotion_leaves_the_baseline_primary():
+    """Pre-promotion failure: nothing to undo, and nothing was taken away."""
+    from services.market_engine.providers import Capability
+
+    _registry, manager, baseline, feed, ctx = _switching_fixture()
+
+    run(feed.mark_link_down("connection refused"))
+
+    assert _quote_provider(manager, ctx()) is baseline
+    # The feed stops answering the pushed capability too — a dead link is not a
+    # stream — and it does so without being unregistered.
+    assert manager.resolve(Capability.TICKS, context=ctx()) is None
+    assert feed.describe()["last_failure"] == "connection refused"
+
+
+def test_a_feed_that_fails_after_promotion_returns_the_baseline_to_primary():
+    """Post-promotion failure: demotion on the very next resolution.
+
+    No health counter has to escalate, no timer has to fire, and nothing polls:
+    the side holding the socket says it died and the next resolve recomputes.
+    """
+    _registry, manager, baseline, feed, ctx = _switching_fixture()
+
+    run(feed.on_raw([_tick()]))
+    assert _quote_provider(manager, ctx()) is feed, "the feed was never promoted"
+    assert feed.health().consecutive_failures == 0, "the demotion below must not need a failure count"
+
+    run(feed.mark_link_down("socket closed"))
+
+    assert _quote_provider(manager, ctx()) is baseline
+    assert feed.health().consecutive_failures == 0
+    # And the prices from the dead link are gone, so a later bypass of
+    # resolution cannot serve them either.
+    assert feed.covered_symbols == ()
+
+
+def test_a_reconnected_feed_re_earns_readiness_rather_than_inheriting_it():
+    """Evidence is per link. A feed that ticked once, died and came back has
+    proved nothing about the connection it now holds."""
+    from services.market_engine.providers import FeedReadiness
+
+    _registry, manager, baseline, feed, ctx = _switching_fixture()
+
+    run(feed.on_raw([_tick()]))
+    assert _quote_provider(manager, ctx()) is feed
+
+    run(feed.mark_link_down("socket closed"))
+    run(feed.mark_link_up())
+
+    assert feed.readiness is FeedReadiness.SUBSCRIBED
+    assert feed.is_link_up and not feed.is_ready
+    assert _quote_provider(manager, ctx()) is baseline, "a reconnect inherited the old link's readiness"
+
+    run(feed.on_raw([_tick()]))
+    assert _quote_provider(manager, ctx()) is feed
+
+
+def test_a_feed_that_never_subscribed_cannot_be_promoted_by_data_alone():
+    """A feed nobody can say what was asked of does not take the quote path.
+
+    The gate has three conditions and this is the one that is easiest to leave
+    out, because a tick arriving looks like proof on its own.
+    """
+    _registry, manager, baseline, feed, ctx = _switching_fixture(symbols=())
+
+    assert feed.subscribed_symbols == ()
+    assert run(feed.on_raw([_tick()])) == 1, "the tick was not even accepted — this proves nothing"
+    assert not feed.is_ready
+    assert _quote_provider(manager, ctx()) is baseline
+
+    # Subscribing then re-delivering is what opens the gate.
+    run(feed.subscribe(["RELIANCE"]))
+    run(feed.on_raw([_tick()]))
+    assert _quote_provider(manager, ctx()) is feed
+
+
+def test_a_promoted_feed_only_answers_for_instruments_it_actually_streams():
+    """Coverage, not just readiness: the baseline keeps everything else.
+
+    MARKET_DATA_ARCHITECTURE.md's per-symbol rule. A promoted feed that claimed
+    the whole universe would answer a US index with silence while a provider
+    that carries it sat one rank below.
+    """
+    _registry, manager, baseline, feed, ctx = _switching_fixture(symbols=("RELIANCE", "TCS"))
+
+    run(feed.on_raw([_tick("RELIANCE")]))
+
+    assert _quote_provider(manager, ctx("RELIANCE")) is feed
+    # Subscribed but never ticked — no price, so no claim.
+    assert _quote_provider(manager, ctx("TCS")) is baseline
+    assert _quote_provider(manager, ctx("SPX")) is baseline
+    assert feed.covered_symbols == ("RELIANCE",)
+
+
+def test_a_feed_whose_ticks_go_stale_stops_covering_them():
+    """The backstop beneath the explicit link-down signal.
+
+    A link that dies without saying so stops delivering, and a price older than
+    the delayed baseline must not keep being served under the streaming label.
+    Evaluated at resolve time: no timer, no sweeper, nothing scheduled.
+    """
+    _registry, manager, baseline, feed, ctx = _switching_fixture()
+    feed.tick_max_age_seconds = 0.0  # every tick is immediately too old
+
+    run(feed.on_raw([_tick()]))
+
+    assert feed.is_ready, "readiness itself is not what expires — coverage is"
+    assert feed.covered_symbols == ()
+    assert _quote_provider(manager, ctx()) is baseline
+
+    feed.tick_max_age_seconds = 120.0
+    assert _quote_provider(manager, ctx()) is feed
+
+
+def test_one_users_feed_failure_moves_only_that_users_feed():
+    """User entitlement isolation across the switch.
+
+    The property D4.4 established by construction (`owner_user_id`), re-asserted
+    across a promotion and a demotion — the two operations that could plausibly
+    reach for a global switch and take every other user with them.
+    """
+    from services.market_engine.providers import ResolutionContext, StreamingTickProvider
+
+    registry, manager, baseline, feed_a, ctx_a = _switching_fixture(user_id="userA")
+    feed_b = StreamingTickProvider("feed:userB", owner_user_id="userB")
+    registry.register(feed_b)
+    run(feed_b.connect())
+    run(feed_b.subscribe(["RELIANCE"]))
+    ctx_b = ResolutionContext(user_id="userB", symbol="RELIANCE")
+    guest = ResolutionContext(user_id=None, symbol="RELIANCE")
+
+    run(feed_a.on_raw([_tick()]))
+    run(feed_b.on_raw([_tick()]))
+    assert _quote_provider(manager, ctx_a()) is feed_a
+    assert _quote_provider(manager, ctx_b) is feed_b
+    assert _quote_provider(manager, guest) is baseline, "a per-user feed served a request with no user"
+
+    run(feed_a.mark_link_down("userA socket closed"))
+
+    assert _quote_provider(manager, ctx_a()) is baseline
+    assert _quote_provider(manager, ctx_b) is feed_b, "one user's failure moved another user's feed"
+    assert _quote_provider(manager, guest) is baseline
+    # And neither user's feed is ever resolvable for the other, ready or not.
+    assert _quote_provider(manager, ResolutionContext(user_id="userA", symbol="RELIANCE")) is baseline
+    assert feed_b.owner_user_id == "userB"
+
+
+def test_declaring_the_quote_capability_grants_nothing_on_its_own():
+    """The QUOTES-safety invariant, stated directly.
+
+    The provider declares QUOTES and outranks the baseline by priority. Neither
+    fact promotes it. This is the assertion that would go red if a future change
+    moved the gate out of `is_eligible_for` and back into the declaration.
+    """
+    from services.market_engine.providers import Capability
+
+    _registry, manager, baseline, feed, ctx = _switching_fixture()
+
+    assert Capability.QUOTES in feed.capabilities
+    assert feed.supports(Capability.QUOTES)
+    assert feed.priority < baseline.priority
+    assert not feed.is_eligible_for(ctx().for_capability(Capability.QUOTES))
+    assert _quote_provider(manager, ctx()) is baseline
+
+
+def test_promotion_and_demotion_are_deterministic_under_repeated_events():
+    """Duplicate readiness, duplicate disconnects, and a tick on a dead link.
+
+    Repeated lifecycle events are normal on a reconnecting transport. The final
+    state must depend on what actually happened, not on how many times it was
+    reported.
+    """
+    from services.market_engine.providers import FeedReadiness
+
+    _registry, manager, baseline, feed, ctx = _switching_fixture()
+    transitions = []
+
+    async def listener(provider, previous, current):
+        transitions.append((previous.value, current.value))
+
+    feed.bind_readiness_listener(listener)
+
+    # Duplicate readiness evidence: one promotion, not three.
+    for _ in range(3):
+        run(feed.on_raw([_tick()]))
+    assert transitions == [("subscribed", "ready")]
+    assert _quote_provider(manager, ctx()) is feed
+
+    # Repeated disconnects: one demotion.
+    for _ in range(3):
+        run(feed.mark_link_down("socket closed"))
+    assert transitions[-1] == ("ready", "failed")
+    assert len(transitions) == 2
+    assert _quote_provider(manager, ctx()) is baseline
+
+    # A tick arriving on a link already reported dead promotes nothing: the
+    # record is from a connection the platform can no longer ask anything of.
+    run(feed.on_raw([_tick()]))
+    assert feed.readiness is FeedReadiness.FAILED
+    assert _quote_provider(manager, ctx()) is baseline
+
+    # Re-connect, re-earn, and the state is exactly where the events say it is.
+    run(feed.mark_link_up())
+    run(feed.on_raw([_tick()]))
+    assert _quote_provider(manager, ctx()) is feed
+    assert [t[1] for t in transitions] == ["ready", "failed", "subscribed", "ready"]
+
+
+def test_a_feed_that_disconnects_during_promotion_does_not_end_up_primary():
+    """The race: readiness evidence and a link loss in the same instant.
+
+    Whichever order they are applied in, a feed whose link is down is not the
+    primary quote source — there is no interleaving that leaves it there,
+    because eligibility is recomputed from current state rather than latched at
+    the moment of promotion.
+    """
+    _registry, manager, baseline, feed, ctx = _switching_fixture()
+
+    async def race():
+        # The listener fires *inside* the promotion, which is the sharpest
+        # possible interleaving: the link dies while the transition that would
+        # promote it is still running.
+        async def kill(provider, previous, current):
+            if current.value == "ready":
+                provider.bind_readiness_listener(None)
+                await provider.mark_link_down("died during promotion")
+
+        feed.bind_readiness_listener(kill)
+        await feed.on_raw([_tick()])
+
+    run(race())
+
+    assert not feed.is_ready
+    assert _quote_provider(manager, ctx()) is baseline
+
+
+def test_the_baseline_being_unavailable_does_not_change_the_gate():
+    """A feed is not promoted because the baseline is struggling.
+
+    Readiness is evidence about the feed. If it were relaxed when the baseline
+    was in trouble, the worst moment in the platform's day would be the moment
+    it lowered its standard for going live.
+    """
+    from services.market_engine.providers import Capability, ProviderState
+    from services.market_engine.source_manager import UnavailableReason
+
+    _registry, manager, baseline, feed, ctx = _switching_fixture()
+
+    for _ in range(12):
+        baseline.record_failure(RuntimeError("baseline outage"))
+    assert baseline.health().state is ProviderState.DOWN
+
+    unavailable = manager.resolve_feed(Capability.QUOTES, ctx())
+    assert not unavailable.available, "the baseline never went down — this proves nothing"
+    assert unavailable.reason is UnavailableReason.ALL_PROVIDERS_DOWN
+
+    run(feed.on_raw([_tick()]))
+    assert _quote_provider(manager, ctx()) is feed
+
+
+# ------------------------------------------------------------------
+# D4.5 — falsification: remove the control, watch the test go red
+# ------------------------------------------------------------------
+
+
+def test_removing_the_readiness_gate_would_promote_an_unproven_feed():
+    """The mutation the make-before-break tests exist to catch.
+
+    Every "not promoted" assertion above is only worth something if the gate is
+    what is holding the feed back — rather than, say, an unrelated eligibility
+    rule or a resolution that never reaches the feed at all. So: neutralise the
+    gate, on a feed that has produced no data whatsoever, and confirm the feed
+    takes the quote path immediately. If this test ever stops seeing the switch
+    happen, the tests above have stopped proving anything.
+    """
+    from services.market_engine.providers import StreamingTickProvider
+
+    _registry, manager, baseline, feed, ctx = _switching_fixture()
+    assert _quote_provider(manager, ctx()) is baseline
+
+    with patch.object(StreamingTickProvider, "is_ready", property(lambda self: True)), \
+            patch.object(StreamingTickProvider, "covers", lambda self, symbol: True):
+        assert _quote_provider(manager, ctx()) is feed, (
+            "with the readiness gate removed the feed still did not take the quote path — "
+            "the make-before-break tests above are not testing the gate"
+        )
+
+    assert _quote_provider(manager, ctx()) is baseline
+
+
+def test_breaking_before_making_is_what_the_ordering_test_would_catch():
+    """The wrong ordering, performed deliberately.
+
+    Releasing the baseline before the feed is ready is the failure mode
+    make-before-break is named after. Driven here so the ordering assertions in
+    `test_the_make_before_break_ordering_holds_at_every_step` are known to be
+    capable of failing: with the baseline released first there is a window in
+    which the platform serves no quote at all.
+    """
+    from services.market_engine.providers import Capability
+
+    registry, manager, baseline, feed, ctx = _switching_fixture()
+
+    registry.unregister(baseline.name)  # break first — the mistake
+
+    gap = manager.resolve_feed(Capability.QUOTES, ctx())
+    assert not gap.available, (
+        "releasing the baseline before the feed was ready left a working quote provider — "
+        "the ordering assertions cannot fail and are proving nothing"
+    )
+
+    registry.register(baseline)
+    run(feed.on_raw([_tick()]))
+    assert _quote_provider(manager, ctx()) is feed
+
+
+def test_the_switching_machinery_names_no_broker():
+    """No `if broker == "…"` anywhere in the switch, in any of its three forms.
+
+    Extends the D4.4 sweep to the modules D4.5 changed. Kept as a separate test
+    from the D4.4 one so a failure says which sprint's boundary moved.
+    """
+    modules = {
+        "providers/streaming.py": BACKEND / "services" / "market_engine" / "providers" / "streaming.py",
+        "providers/base.py": BACKEND / "services" / "market_engine" / "providers" / "base.py",
+        "providers/registry.py": BACKEND / "services" / "market_engine" / "providers" / "registry.py",
+        "source_manager.py": BACKEND / "services" / "market_engine" / "source_manager.py",
+        "gateway.py": BACKEND / "services" / "market_engine" / "gateway.py",
+        "normalizer.py": BACKEND / "services" / "market_engine" / "normalizer.py",
+    }
+    broker_names = re.compile(r"\b(zerodha|kite|upstox|nova|orion|angel|fyers|dhan|groww|indmoney)\b", re.I)
+
+    offenders = {}
+    for label, path in modules.items():
+        assert path.exists(), f"{label} moved — this sweep proves nothing"
+        source = path.read_text()
+        hits = sorted(set(broker_names.findall(_strip_source(source))))
+        literals = sorted({
+            name for literal in _executable_strings(source) for name in broker_names.findall(literal)
+        })
+        if hits or literals:
+            offenders[label] = sorted(set(hits) | set(literals))
+
+    assert not offenders, f"the switching machinery names a broker: {offenders}"
+
+    # Non-vacuity: the planted branch this sweep exists to catch.
+    planted = 'def promote(broker):\n    if broker == "zerodha":\n        return True\n'
+    assert broker_names.findall(" ".join(_executable_strings(planted))) == ["zerodha"]
+
+
+def test_no_polling_is_introduced_by_the_switch():
+    """Failover must stay push-driven.
+
+    A timer anywhere in the switch would mean the platform *noticing* a dead
+    feed rather than being told about one, which is a poll loop with a different
+    name — and it would put a scheduled task behind every connected account.
+    """
+    seam = [
+        BACKEND / "services" / "market_engine" / "providers" / "streaming.py",
+        BACKEND / "services" / "brokers" / "market_feed.py",
+    ]
+    assert all(path.exists() for path in seam), "the seam files moved — this sweep proves nothing"
+    banned = re.compile(
+        r"\b(?:asyncio\.sleep|time\.sleep|create_task|call_later|call_soon|poll_interval|"
+        r"ensure_future|Timer|schedule)\b"
+    )
+    offenders = {path.name for path in seam if banned.search(_strip_source(path.read_text()))}
+    assert not offenders, f"a timer/poll construct appeared in the switching seam: {sorted(offenders)}"
+    # Non-vacuity.
+    assert banned.search("asyncio.create_task(x)")
+
+
+# ------------------------------------------------------------------
+# D4.5 — the switch, driven through the real seam
+# ------------------------------------------------------------------
+
+
+def test_a_broker_feed_is_promoted_and_demoted_through_the_real_seam():
+    """End to end on the global registry: attach, tick, promote, drop, demote.
+
+    The unit tests above build their own registry. This one uses the real one,
+    the real Market Gateway, and the real broker-side seam, because the failure
+    D3 found — a boundary that is defined, documented and never actually wired —
+    is invisible to a test that constructs both halves itself.
+    """
+    from services.brokers.market_feed import set_market_feed_link
+    from services.market_engine.providers import (
+        Capability,
+        ResolutionContext,
+        YahooPollingAdapter,
+    )
+    from services.market_engine.source_manager import SourceManager
+
+    with _clean_provider_registry() as registry:
+        registry.clear()
+        baseline = YahooPollingAdapter()
+        registry.register(baseline)
+        manager = SourceManager(registry)
+        ctx = ResolutionContext(user_id="u1", symbol="RELIANCE")
+
+        with nova_registered():
+            name = run(_attach("u1", "nova", ["RELIANCE"]))
+            assert name in registry
+            assert manager.resolve(Capability.QUOTES, context=ctx) is baseline
+
+            provider = registry.get(name)
+            assert run(provider.on_raw([_tick()])) == 1
+            assert manager.resolve(Capability.QUOTES, context=ctx) is provider
+
+            assert run(set_market_feed_link("u1", "nova", up=False, reason="socket closed")) is True
+            assert manager.resolve(Capability.QUOTES, context=ctx) is baseline
+
+            assert run(set_market_feed_link("u1", "nova", up=True)) is True
+            assert manager.resolve(Capability.QUOTES, context=ctx) is baseline, \
+                "a reconnect promoted the feed without fresh evidence"
+            run(provider.on_raw([_tick()]))
+            assert manager.resolve(Capability.QUOTES, context=ctx) is provider
+
+
+def test_a_promoted_feed_serves_a_quote_carrying_no_provider_identity():
+    """The quote path, through the public gateway API, after a promotion.
+
+    Two properties in one drive, because they fail together: the quote is
+    labelled `streaming` and carries no provider or broker identity anywhere,
+    and an instrument the feed does not stream still comes from the baseline in
+    the very same session.
+    """
+    from services.market_engine.gateway import market_gateway
+    from services.market_engine.providers import YahooPollingAdapter, provider_registry
+
+    async def fake_quote(symbol):
+        return {"symbol": symbol, "name": symbol, "price": 100.0, "prev_close": 99.0,
+                "change_pct": 1.01, "volume": 1000}
+
+    with _clean_provider_registry() as registry:
+        registry.clear()
+        baseline = YahooPollingAdapter()
+        registry.register(baseline)
+
+        with nova_registered():
+            name = run(_attach("u1", "nova", ["RELIANCE"]))
+        provider = provider_registry.get(name)
+        run(provider.on_raw([_tick("RELIANCE", 2650.0)]))
+
+        with patch.object(YahooPollingAdapter, "fetch_quote", staticmethod(fake_quote)):
+            streamed = run(market_gateway.get_quote("RELIANCE", user_id="u1"))
+            other_symbol = run(market_gateway.get_quote("SPX", user_id="u1"))
+            other_user = run(market_gateway.get_quote("RELIANCE", user_id="u2"))
+
+    assert streamed["source_tier"] == "streaming"
+    assert streamed["price"] == 2650.0
+    # Nothing about who produced it — not the provider name, not the broker.
+    blob = json.dumps(streamed).lower()
+    assert "nova" not in blob and "brokerfeed" not in blob and "yahoo" not in blob
+    assert set(streamed) >= {"symbol", "price", "source_tier", "ingested_at"}
+
+    assert other_symbol["source_tier"] == "delayed", "an unstreamed symbol was claimed by the feed"
+    assert other_user["source_tier"] == "delayed", "another user's request was served by this feed"
+
+
+def test_a_promotion_is_announced_only_to_the_user_who_owns_the_feed():
+    """The status event follows the entitlement.
+
+    A per-user promotion published platform-wide would tell every other user's
+    tier indicator that their feed went live when it did not — and would leak
+    the existence of one user's broker connection to everybody else's socket.
+    """
+    from services.market_engine.providers import YahooPollingAdapter, provider_registry
+    from services.market_engine.source_manager import PROVIDER_STATUS_TOPIC
+
+    published = []
+
+    async def capture(event):
+        published.append(event["data"])
+
+    with _clean_provider_registry() as registry:
+        registry.clear()
+        registry.register(YahooPollingAdapter())
+        with nova_registered():
+            name = run(_attach("u1", "nova", ["RELIANCE"]))
+        provider = provider_registry.get(name)
+
+        event_bus.subscribe(PROVIDER_STATUS_TOPIC, capture)
+        try:
+            run(provider.on_raw([_tick()]))
+        finally:
+            event_bus.unsubscribe(PROVIDER_STATUS_TOPIC, capture)
+
+    assert published, "a promotion published nothing — the tier indicator would never move"
+    owned = [p for p in published if p.get("user_id") == "u1"]
+    assert owned, f"no user-scoped status was published: {published}"
+    assert all(p.get("user_id") == "u1" for p in published), (
+        f"a per-user promotion was announced platform-wide: {published}"
+    )
+    # And the payload still carries freshness without provenance.
+    for payload in published:
+        assert "tier" in payload
+        assert "nova" not in json.dumps(payload).lower()
+        assert not any("provider" in key for key in payload if key != "previous_tier")
+
+
+def test_the_engine_subscribes_the_feed_to_the_accounts_instruments():
+    """The wiring that makes the gate reachable at all.
+
+    `attach_market_feed` is called by `BrokerEngine.start_stream` and the
+    subscription comes from the account's instrument map. If that argument were
+    dropped the feed could never become ready, every user would stay on the
+    baseline forever, and no other test in this file would notice — which is
+    exactly the shape of failure D3 found on the lifecycle topic.
+    """
+    from services.brokers.market_feed import feed_provider_name
+    from services.market_engine.providers import provider_registry
+
+    engine = BrokerEngine()
+    engine.configure(FakeDB())
+    holdings = [
+        {"symbol": "RELIANCE", "exchange": "NSE", "instrument_token": 738561},
+        {"symbol": "TCS", "exchange": "NSE", "instrument_token": 2953217},
+    ]
+
+    with _clean_provider_registry():
+        with nova_registered():
+            with patch("services.brokers.stream.stream_manager.start_stream", new=AsyncMock()), \
+                    patch.object(BrokerEngine, "get_session", new=AsyncMock(return_value={"access_token": "t"})):
+                run(engine.start_stream("u1", "nova", holdings=holdings, positions=[]))
+
+            provider = provider_registry.get(feed_provider_name("u1", "nova"))
+            assert provider is not None, "the engine never registered the feed"
+            assert provider.subscribed_symbols == ("RELIANCE", "TCS"), (
+                "the engine registered a feed it never told what to expect — it can never become ready"
+            )
+            assert not provider.is_ready
+            run(provider.on_raw([_tick()]))
+            assert provider.is_ready
+
+
+def test_the_transport_reports_its_link_state_to_whoever_owns_the_feed():
+    """The push signal that makes failover immediate, driven through the real transport.
+
+    Without this the market side would have to notice silence, and noticing
+    silence means a timer. Asserted on both edges — the link is reported up only
+    after the subscribe frames are away, and reported down when the run ends —
+    because a signal that only ever fires one way is half a failover.
+    """
+    states = []
+
+    async def on_link_state(user_id, broker, up, reason):
+        states.append((user_id, broker, up))
+
+    with nova_registered() as adapter:
+        socket = _FakeSocket([json.dumps({"kind": "price", "rows": [{"scrip": "reliance", "rate": "2650.5"}]})])
+        stream = BrokerStream(
+            "user-1", adapter.name, {"access_token": "live-token"},
+            credentials={"api_key": "nova-key"},
+            instrument_tokens=["RELIANCE"],
+            on_tick=AsyncMock(),
+            on_link_state=on_link_state,
+        )
+
+        async def scenario():
+            with patch.object(BrokerStream, "_connect", AsyncMock(return_value=socket)):
+                await stream._run_websocket()
+                await stream._notify_link(False, "stream ended")
+
+        run(scenario())
+
+    assert states == [("user-1", "nova", True), ("user-1", "nova", False)], states
+    # Reported after the subscribe frames, not on the socket opening: a socket
+    # nobody has asked anything of delivers nothing.
+    assert socket.sent, "no subscribe frame was sent — the ordering claim is untested"
+
+
+def test_the_feed_status_a_user_sees_follows_their_own_promotion():
+    """The tier indicator moves for the promoted user and nobody else.
+
+    `status()` asks about the feed, not about an instrument, so it is the one
+    quote resolution that carries no symbol — and it must answer "streaming"
+    once this user's feed is live. Pinned because the two rules meet here: a
+    symbol-less resolution reports the feed, a symbol-ful one still has to cover
+    the instrument.
+    """
+    from services.market_engine.providers import Capability
+
+    _registry, manager, _baseline, feed, ctx = _switching_fixture()
+
+    assert manager.status(user_id="u1")["tier"] == "delayed"
+    assert manager.status()["tier"] == "delayed"
+
+    run(feed.on_raw([_tick()]))
+
+    assert manager.status(user_id="u1")["tier"] == "streaming"
+    assert manager.status(user_id="u2")["tier"] == "delayed", "another user's indicator moved"
+    assert manager.status()["tier"] == "delayed", "the platform-wide indicator moved for one user's feed"
+    # A quote for an instrument this feed does not stream is still delayed, and
+    # says so on its own payload rather than inheriting the feed-level label.
+    assert manager.resolve_feed(Capability.QUOTES, ctx("SPX")).tier.value == "delayed"
+
+    run(feed.mark_link_down("socket closed"))
+    assert manager.status(user_id="u1")["tier"] == "delayed"

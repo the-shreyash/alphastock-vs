@@ -149,6 +149,14 @@ class ProviderRegistry:
         tried impossible. Only DOWN is disqualifying.
         """
         ctx = context if context is not None else GLOBAL_CONTEXT
+        # The capability travels *inside* the context from here down (D4.5), so
+        # a provider's own `is_eligible_for` can answer differently for a pushed
+        # tick capability than for the quote capability that displaces the
+        # baseline. Stamped here rather than trusted from the caller: the
+        # registry is the only place that knows both, and a context carrying a
+        # capability that disagrees with the one being filtered on would make
+        # every eligibility rule below it answer the wrong question.
+        ctx = ctx.for_capability(capability)
         return [
             provider
             for provider in self.all()

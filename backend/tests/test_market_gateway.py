@@ -1533,10 +1533,22 @@ class TestResolutionContext:
     def test_context_carries_no_provider_preference(self):
         """The context describes the *request*, never the answer. A field named
         after a provider here would reintroduce caller-side selection through
-        the back door."""
+        the back door.
+
+        `capability` joined the set in D4.5 and belongs to the request side of
+        that line: it says what is being asked for, not who should answer, and
+        it is stamped by the registry rather than supplied by a caller. The
+        guard the assertion actually encodes — no field a caller could use to
+        express a preference for a particular provider — is re-stated below so
+        widening the set cannot quietly become a way to relax it.
+        """
         fields = set(ResolutionContext.__dataclass_fields__)
 
-        assert fields == {"user_id", "symbol", "exchange"}
+        assert fields == {"user_id", "symbol", "exchange", "capability"}
+        # Every field names a property of the request. None names a provider,
+        # a tier, a priority, or a preference.
+        forbidden = ("provider", "tier", "priority", "prefer", "source", "adapter")
+        assert not [f for f in fields if any(word in f for word in forbidden)]
 
 
 # --------------------------------------------------------------------------- #

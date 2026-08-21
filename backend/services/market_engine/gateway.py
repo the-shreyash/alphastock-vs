@@ -239,10 +239,22 @@ class MarketGateway:
         a provider bound to a socket that no longer exists.
         """
         provider.bind_sink(self._ingest_ticks)
+        # D4.5: readiness transitions are announced through the gateway for the
+        # same reason ticks are delivered through it — nothing reaches a
+        # consumer around this choke point (Developer Rule 2), and a promotion
+        # is a consumer-visible fact. Bound only on providers that have the
+        # surface: the contract for a pushed feed is `on_raw`, and a readiness
+        # gate is a property of the streaming *implementation*, not of every
+        # provider the gateway may be handed.
+        binder = getattr(provider, "bind_readiness_listener", None)
+        if callable(binder):
+            binder(self._on_provider_readiness)
         try:
             provider_registry.register(provider, replace=True)
         except ProviderContractError:
             provider.bind_sink(None)
+            if callable(binder):
+                binder(None)
             raise
         await provider.connect()
         logger.info(
@@ -269,9 +281,49 @@ class MarketGateway:
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning("Streaming provider %s failed to disconnect cleanly: %s", name, exc)
         provider.bind_sink(None)
+        binder = getattr(provider, "bind_readiness_listener", None)
+        if callable(binder):
+            binder(None)
         provider_registry.unregister(name)
+        owner = provider.owner_user_id
+        if owner:
+            # Announce the demotion *before* forgetting the cached per-user
+            # status: publishing is change-gated against that cache, and
+            # clearing it first would make the last event look like a repeat of
+            # nothing and be suppressed — the user would be dropped back to the
+            # baseline without ever being told.
+            await source_manager.publish_status(user_id=owner)
+            source_manager.forget_user_status(owner)
         await source_manager.publish_status()
         return True
+
+    async def _on_provider_readiness(self, provider: MarketDataProvider,
+                                     previous: Any, current: Any) -> None:
+        """A pushed feed changed readiness — promote or demote its owner's feed.
+
+        There is nothing to *do* here beyond announcing it, and that is the
+        design rather than an omission. Promotion is not an action the gateway
+        performs on a provider: resolution recomputes eligibility from current
+        readiness on every request, so the switch has already happened by the
+        time this runs, atomically, for the one user who owns the feed. What is
+        left is telling that user's consumers their tier moved.
+
+        Scoped to the owner. A per-user feed changing state must not publish a
+        platform-wide status — that would tell every other user's tier indicator
+        that something changed for them when nothing did.
+        """
+        owner = provider.owner_user_id
+        logger.info(
+            "Streaming feed %s readiness %s -> %s (owner=%s)",
+            provider.name,
+            getattr(previous, "value", previous),
+            getattr(current, "value", current),
+            "user" if owner else "global",
+        )
+        if owner:
+            await source_manager.publish_status(user_id=owner)
+        else:
+            await source_manager.publish_status()
 
     async def _ingest_ticks(self, provider: MarketDataProvider,
                             ticks: List[MarketTick]) -> None:

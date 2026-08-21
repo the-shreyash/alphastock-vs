@@ -820,7 +820,34 @@ The provider declares **`ticks` and not `quotes`**, deliberately. A priority-1 p
 
 Registration is now contract-checked (`validate_provider`): a push capability requires `kind=streaming`, `tier=streaming` requires `kind=streaming`, and `kind=streaming` requires an `on_raw`. The second rule is what makes "no polling disguised as streaming" enforceable rather than aspirational — a poll loop wearing the streaming tier would have the AI call a 30-second-old number live. Full reasoning: **ADR-034**.
 
-**Phase 4.5 — the make-before-break switch, then remaining brokers.** The Zerodha Kite WebSocket adapter as a registered priority-1 market provider (`owner_user_id` set to the connected user), the streaming push surface on `MarketDataProvider`, tick normalization, per-user resolution, make-before-break switching, failover back to Yahoo — then Upstox, Angel One, Fyers, Dhan, each one adapter. This phase delivers the headline feature. The entitlement filter (`is_eligible_for`, D2) and the per-user connected-broker registry (D3) are already in place for it.
+**Phase 4.5 — make-before-break switching and baseline failover (2026-08-21).** The switch this document has always specified is implemented, generically, on the `MarketDataProvider` contract. It names no broker and works for any feed that satisfies the contract.
+
+`StreamingTickProvider` now declares **`quotes`** alongside `ticks`, and declaring it grants nothing. The gate is eligibility, not the capability set:
+
+```
+REGISTERED → CONNECTING → CONNECTED → SUBSCRIBED → READY
+                                                    ▲
+                                 a valid canonical MarketTick arrived
+                                 on THIS link, while subscribed
+```
+
+`connected` is not `ready`, and `ready` is not `primary`:
+
+• **connected** — a session exists. Evidence of nothing: a feed that authenticated, subscribed and went silent is connected, healthy by every counter the platform keeps, and can serve no price.
+• **ready** — a record survived coercion into a canonical `MarketTick` on this link. Not the socket opening, not authentication, not a subscribe frame, and never elapsed time. Evidence is per *link*: a reconnect discards it and readiness is re-earned.
+• **primary** — the head of one `resolve_feed` chain, recomputed on every resolution and stored nowhere. This is what makes promotion atomic with no lock and no handover protocol, and why two providers can never both be primary for one quote stream.
+
+**Make-before-break falls out of that.** The baseline is never disconnected, never unregistered and never made ineligible; it moves from head of the failover chain to standby *inside* the chain. At every instant of the switch a provider can serve. Pinned by `test_the_make_before_break_ordering_holds_at_every_step`, whose ordering assertions are proved capable of failing by `test_breaking_before_making_is_what_the_ordering_test_would_catch`.
+
+**Per-symbol coverage** decides which instruments a promoted feed answers for: it must hold a tick fresher than 120s for that instrument. This is the rule above — "a broker feed covering NSE equities does not disqualify Yahoo from serving a US index the broker doesn't carry" — implemented entirely inside one provider's `is_eligible_for`, with no call site aware two providers were involved. It is also the lazy backstop for a link that dies without saying so.
+
+**Failover is push-driven and immediate.** The broker transport reports its own connect/disconnect (`BrokerStream.on_link_state` → `set_market_feed_link` → `mark_link_up` / `mark_link_down`), so the next resolution — the very next one — ranks the baseline first again. Nothing polls, nothing sweeps, and no health counter has to escalate. Pinned by `test_no_polling_is_introduced_by_the_switch`.
+
+**Entitlement isolation across the switch.** A promotion or a demotion moves exactly one user's feed. `provider.status` is published user-scoped (carrying `user_id`, delivered by the event bridge to that user alone), so one user's tier indicator moving does not tell every other socket that something changed for them — nor leak the existence of that user's broker connection.
+
+**Known limitation.** A tick-derived quote carries no `change` / `change_pct` and no OHLC, because a canonical tick carries no previous close. Stitching them from the baseline's last quote would present two readings at two timestamps as one and is forbidden as fabrication. The canonical tick grows those fields when a real feed that populates them lands; per-user quote routing on the REST surface is gated on that. Full reasoning: **ADR-035**.
+
+**Phase 4.6 — the remaining broker adapters.** The Zerodha Kite WebSocket market feed as the first real implementation behind this switch, then Upstox, Angel One, Fyers, Dhan — each one adapter and nothing else, per Developer Rule 9. The switching machinery is in place and broker-agnostic; a fictional broker exercises it end to end today (`test_a_broker_feed_is_promoted_and_demoted_through_the_real_seam`).
 
 **Phase 5 — Hardening.** Latency scoring, flap suppression, probation windows, multi-connection sharding, chaos tests (kill connections in staging, verify silent failover).
 

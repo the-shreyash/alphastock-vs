@@ -1332,6 +1332,78 @@ At D4.5, when the make-before-break feed switch promotes a broker feed to primar
 
 ---
 
+# ADR-035
+
+Title
+
+Make-Before-Break Provider Switching and Baseline Failover (Sprint D4.5)
+
+Date
+
+2026-08-21
+
+Status
+
+Accepted — implemented
+
+Context
+
+D4.4 registered a connected account's tick stream as a real `MarketDataProvider` and deliberately stopped one step short of the headline feature: the provider declared `TICKS` and not `QUOTES`, so the polled baseline continued to answer every quote for every user. The reason was explicit in ADR-034 — a priority-1 provider that declares `QUOTES` outranks the baseline the instant it registers, and that *is* the feed switch, performed without the gate MARKET_DATA_ARCHITECTURE.md requires: "connect the new provider, confirm first valid data, then release the old one."
+
+D4.5 builds that gate. The requirement it has to satisfy is narrow and unforgiving: a user's feed may become the primary quote source only after it has demonstrably produced valid canonical data, must revert to the baseline the moment that stops being true, and neither transition may affect any other user or leave a moment in which no provider serves.
+
+Decision
+
+**Promotion is not an operation. It is the outcome of eligibility, recomputed on every resolution.**
+
+• `StreamingTickProvider` now declares `QUOTES` alongside `TICKS`, and declaring it grants nothing. `is_eligible_for` is the gate: entitlement (unchanged from D2), then link state for the pushed capabilities, then readiness *and* per-symbol coverage for quotes.
+
+• **Readiness is earned by data, and only by data.** A feed reaches `READY` when a record survives coercion into a canonical `MarketTick` while its link is up and instruments are subscribed. Not on socket open, not on authentication, not on a subscribe frame, and never on elapsed time. The states are `REGISTERED → CONNECTING → CONNECTED → SUBSCRIBED → READY`, with `FAILED` / `DISCONNECTED` on link loss.
+
+• **`PRIMARY` is deliberately not a provider state.** Being primary is the head of one `resolve_feed` chain for one capability and one context. Storing it on a provider would create a second, lagging copy of a fact the resolver already computes — and would make it possible for two providers to believe they were primary for one quote stream, the state this document forbids. With promotion expressed only as "what does resolution return", atomicity is free: one function, one head, recomputed from current readiness, no lock and no handover protocol.
+
+• **Make-before-break falls out of the same property.** The baseline is never disconnected, never unregistered, and never made ineligible. It moves from head of the failover chain to standby *inside* the chain, so at every instant of the switch there is a provider that can serve.
+
+• **Failover is push-driven.** `BrokerStream` reports its transport's connect/disconnect through a new `on_link_state` callback; `set_market_feed_link` relays it to the provider. Nothing polls, nothing sweeps, and no health counter has to escalate. A stale-tick bound on coverage (`DEFAULT_TICK_MAX_AGE_SECONDS`, 120s) is the lazy backstop for a link that dies without saying so — evaluated at resolve time, with no timer.
+
+• **`ResolutionContext` gains a `capability` field**, stamped by `ProviderRegistry.candidates_for`. `is_eligible_for` is the documented per-provider extension point and D4.5 needs it to answer differently by capability: a live stream is a legitimate answer to "is a tick feed attached to this user" the moment its link is up, and is not a legitimate answer to "who serves this user's quotes" until it has proved it can.
+
+Alternatives considered
+
+**A promotion/demotion orchestrator in the Source Manager, holding the current primary per user.** Rejected. It is a cache of a derived fact, needing invalidation on link state, readiness, registration, unregistration, entitlement and health — six paths guarding a sorted traversal of a short list. Every one of them is a way for two providers to be primary at once, which is the exact failure the orchestrator would exist to prevent.
+
+**Gate readiness on a timer ("connected for N seconds").** Rejected outright. It promotes a feed that connected and then said nothing at all, which is the precise failure make-before-break exists to prevent, and it is a poll loop wearing a different name.
+
+**Unregister the feed on a dropped socket and re-attach on reconnect.** Rejected. A blip is not an ended entitlement. It would churn the registry, discard the feed's diagnostics, and conflate a reconnecting transport with a revoked token — two events with opposite correct responses. `mark_link_down` leaves the feed registered and un-resolvable; `detach_market_feed` remains what an ended entitlement calls.
+
+**Let a promoted feed answer every symbol.** Rejected. A tick feed prices what it streams. Claiming the rest would answer a US index with silence while a provider that carries it sat one rank below — and it contradicts this document's own per-symbol rule. Coverage is "I hold a recent tick for this instrument".
+
+**Stitch the missing quote fields (previous close, OHLC) from the baseline's last quote.** Rejected as fabrication. The result would present two readings from two sources at two timestamps as one quote, and nothing downstream could tell.
+
+Consequences
+
+• A user with a connected, ready, streaming broker feed resolves to that feed for quotes on the instruments it streams, at `tier=streaming`, and to the baseline for everything else — in the same session, with no call site aware two providers were involved.
+
+• `source_manager.publish_status` accepts `user_id` and publishes a user-scoped `provider.status` carrying `user_id`, which the event bridge already delivers to that user alone. No new topic. Without it the one user whose tier actually flipped would be the only consumer never told.
+
+• **A tick-derived quote carries no `change` / `change_pct` and no OHLC**, because a canonical tick carries no previous close. This is a known limitation recorded in TASK.md, not an oversight: the canonical tick grows those fields when a real feed that populates them lands. Until per-user quote routing is wired into the REST surface, no production caller passes `user_id` to `market_gateway.get_quote`, so nothing regresses today — and that wiring is gated on closing this gap.
+
+• `attach_market_feed` takes the account's canonical instrument universe (`InstrumentMap.symbols`). A feed attached without symbols can never become ready — the safe default, and the correct behaviour for an account with nothing to stream.
+
+• The switching machinery names no broker anywhere: not in an import, not in an identifier, not in a string literal. Pinned by `test_the_switching_machinery_names_no_broker`, proved non-vacuous against a planted `if broker == "zerodha"`.
+
+• Still deliberately not done: no Zerodha Kite market-feed adapter and no other broker adapters, no generalized provider re-probe, no probation windows or latency scoring (D5), no frontend tier-indicator work.
+
+Authoritative documents
+
+MARKET_DATA_ARCHITECTURE.md, BROKER_INTEGRATION.md
+
+Review Date
+
+At D5, when probation windows, latency scoring and flap suppression are designed on top of this gate.
+
+---
+
 Future decisions to document.
 
 International Markets

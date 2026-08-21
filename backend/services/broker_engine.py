@@ -47,7 +47,12 @@ from services.brokers.base import BrokerAdapter
 from services.brokers.crypto import decrypt_token, encrypt_token, is_encrypted
 from services.brokers.errors import BrokerAuthError, BrokerError
 from services.brokers.instruments import InstrumentMap, canonical_ticks
-from services.brokers.market_feed import attach_market_feed, detach_market_feed, publish_market_ticks
+from services.brokers.market_feed import (
+    attach_market_feed,
+    detach_market_feed,
+    publish_market_ticks,
+    set_market_feed_link,
+)
 from services.brokers.stream import stream_manager
 
 logger = logging.getLogger(__name__)
@@ -530,6 +535,7 @@ class BrokerEngine:
 
         session = await self.get_session(user_id, broker)
         instrument_tokens = []
+        feed_symbols = ()
         if streams["ticks"]:
             if holdings is None:
                 try:
@@ -547,7 +553,9 @@ class BrokerEngine:
             # decide what an arriving tick can be named — seed the map from them
             # so the first tick after a reconnect is already resolvable, and so
             # intraday positions (never persisted) are mappable at all.
-            self._remember_instrument_map(user_id, broker, holdings=holdings, positions=positions)
+            instrument_map = self._remember_instrument_map(
+                user_id, broker, holdings=holdings, positions=positions)
+            feed_symbols = instrument_map.symbols
 
         await stream_manager.start_stream(
             user_id, broker, session,
@@ -556,6 +564,7 @@ class BrokerEngine:
             on_order_update=self._on_stream_order,
             on_tick=self._on_stream_tick,
             on_expired=self._on_stream_expired,
+            on_link_state=self._on_stream_link_state,
         )
         if streams["ticks"]:
             # D4.4: this account's tick stream becomes a registered market-data
@@ -563,8 +572,14 @@ class BrokerEngine:
             # up and driving portfolio and trade P&L, and a provider-registry
             # problem must not take that away. The Market Engine simply does not
             # see the feed until the next stream start.
+            #
+            # D4.5: the account's canonical instrument universe goes with it.
+            # Registration and connection are not evidence a feed can serve, so
+            # the provider stays behind the readiness gate until a valid tick
+            # arrives on it — the symbols are what it is allowed to become ready
+            # *for*.
             try:
-                await attach_market_feed(user_id, broker)
+                await attach_market_feed(user_id, broker, feed_symbols)
             except Exception as e:
                 logger.warning(f"Registering the {broker} market feed failed: {e}")
 
@@ -691,6 +706,24 @@ class BrokerEngine:
             await trade_stream.apply_broker_ticks(self.db, user_id, broker, ticks)
         except Exception as e:
             logger.warning(f"Live trade recompute from {broker} ticks failed: {e}")
+
+    async def _on_stream_link_state(self, user_id: str, broker: str, up: bool, reason: str = ""):
+        """The broker transport's connection came up or went down (D4.5).
+
+        Relayed straight through to this account's market-data provider, which
+        is where the make-before-break gate lives. Nothing is decided here: a
+        lost link demotes the feed below the baseline on the very next
+        resolution, and a restored one puts it back at the start of the gate to
+        re-earn readiness from a fresh tick.
+
+        Best-effort, like every other market-feed call on this path — the stream
+        itself is driving live portfolio and trade P&L, and a provider
+        bookkeeping error must never cost the user that.
+        """
+        try:
+            await set_market_feed_link(user_id, broker, up=up, reason=reason)
+        except Exception as e:
+            logger.warning(f"Market feed link update from {broker} failed: {e}")
 
     async def _on_stream_expired(self, user_id: str, broker: str):
         self._sessions.pop((user_id, broker), None)

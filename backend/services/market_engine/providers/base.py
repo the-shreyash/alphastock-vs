@@ -196,6 +196,35 @@ class ResolutionContext:
     #: Venue (`NSE`, `BSE`, …). Same status as `symbol`.
     exchange: Optional[str] = None
 
+    #: What is being resolved (D4.5). Set by
+    #: :meth:`ProviderRegistry.candidates_for`, never by a caller, so a provider
+    #: reading it always sees the capability it is actually being considered for.
+    #:
+    #: WHY IT LIVES HERE RATHER THAN AS A SECOND ARGUMENT
+    #: --------------------------------------------------
+    #: `is_eligible_for` is the documented extension point for per-provider
+    #: eligibility rules, and D4.5 needs one that differs *by capability*: a
+    #: pushed feed is a legitimate answer to "is a live tick stream attached to
+    #: this user" the moment its connection is up, and is NOT a legitimate answer
+    #: to "who serves this user's quotes" until it has proved it can produce
+    #: valid data. Two different questions, one method — so the question has to
+    #: travel with the context. Adding a parameter instead would change the
+    #: signature of every override and every call site of a method whose whole
+    #: purpose is to be overridden, which is the churn this dataclass exists to
+    #: avoid.
+    capability: Optional[Capability] = None
+
+    def for_capability(self, capability: Optional[Capability]) -> "ResolutionContext":
+        """This context, scoped to `capability`. Returns `self` when unchanged."""
+        if capability is self.capability:
+            return self
+        return ResolutionContext(
+            user_id=self.user_id,
+            symbol=self.symbol,
+            exchange=self.exchange,
+            capability=capability,
+        )
+
     @classmethod
     def for_user(cls, user_id: Optional[str]) -> "ResolutionContext":
         """Build a context from a bare user id.

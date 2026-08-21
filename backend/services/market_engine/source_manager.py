@@ -202,6 +202,8 @@ class SourceManager:
     def __init__(self, registry: Optional[ProviderRegistry] = None) -> None:
         self._registry = registry if registry is not None else provider_registry
         self._last_status: Optional[Dict[str, Any]] = None
+        #: user_id -> last published per-user status, for change gating (D4.5).
+        self._last_status_by_user: Dict[str, Dict[str, Any]] = {}
         #: user_id -> {broker_name: (capabilities,)}. Populated from Event Bus
         #: broker lifecycle events; never written by anything that imports a
         #: broker module.
@@ -385,30 +387,69 @@ class SourceManager:
             "failover_chain": [p.name for p in quotes.chain],
         }
 
-    async def publish_status(self, *, force: bool = False) -> Optional[Dict[str, Any]]:
+    async def publish_status(
+        self,
+        *,
+        force: bool = False,
+        user_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
         """Publish `provider.status` when the feed state, tier or reason changed.
 
         Change-gated because this fires from the gateway's per-call health
         bookkeeping. Publishing unconditionally would put one event on the bus
         per market request, drowning the topic that a tier flip — the single
         thing a consumer cares about — needs to be visible on.
+
+        WHY `user_id` EXISTS (D4.5)
+        ---------------------------
+        Feed resolution has been per-user since D2, but this method only ever
+        published the *platform* view. That was harmless while every user
+        resolved to the same baseline. It stops being harmless the moment a
+        user's feed is promoted to a streaming provider nobody else can see: the
+        platform view does not change, so the one user whose tier actually
+        flipped is the one consumer never told — the tier indicator keeps
+        reading "delayed" while the data behind it is live.
+
+        A user-scoped publish carries `user_id` on the payload, which is the
+        convention the event bridge already uses to deliver an event to exactly
+        one user (the same one `market.tick` uses for an owned feed). So this
+        adds no topic and no second mechanism: one more argument, and change
+        gating kept per user so a promotion is announced once rather than on
+        every tick that follows it.
         """
-        current = self.status()
-        if not force and current == self._last_status:
+        current = self.status(user_id=user_id) if user_id else self.status()
+        key = str(user_id) if user_id else None
+        previous = self._last_status if key is None else self._last_status_by_user.get(key)
+        if not force and current == previous:
             return None
 
-        previous = self._last_status
-        self._last_status = current
-        await event_bus.publish(PROVIDER_STATUS_TOPIC, {
-            **current,
-            "previous_tier": (previous or {}).get("tier"),
-        })
+        if key is None:
+            self._last_status = current
+        else:
+            self._last_status_by_user[key] = current
+
+        payload = {**current, "previous_tier": (previous or {}).get("tier")}
+        if key is not None:
+            payload["user_id"] = key
+        await event_bus.publish(PROVIDER_STATUS_TOPIC, payload)
         logger.info(
-            "Market feed status: state=%s tier=%s reason=%s (was tier=%s)",
+            "Market feed status%s: state=%s tier=%s reason=%s (was tier=%s)",
+            f" for user {key}" if key else "",
             current["state"], current["tier"], current["reason"],
             (previous or {}).get("tier"),
         )
         return current
+
+    def forget_user_status(self, user_id: Optional[str]) -> None:
+        """Drop the cached per-user status for `user_id`.
+
+        Called when a user's feed is unregistered. Without it this map keeps one
+        entry per user who has ever had a feed for the life of the process —
+        the same unbounded-growth trap `record_broker_disconnected` avoids by
+        dropping empty user entries.
+        """
+        if user_id:
+            self._last_status_by_user.pop(str(user_id), None)
 
     # ── Broker connection tracking (D3) ──────────────────
 
@@ -536,6 +577,7 @@ class SourceManager:
         """Drop cached status, broker tracking and every provider's health.
         Startup and tests only."""
         self._last_status = None
+        self._last_status_by_user.clear()
         self._connected_brokers.clear()
         for provider in self._registry.all():
             provider.reset_health()
