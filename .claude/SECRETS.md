@@ -97,6 +97,7 @@ inventory below is the human summary; the registry is authoritative.
 | `ALPHA_VANTAGE_KEY` | market-data | yes | optional | Intraday fallback source | On exposure |
 | `KITE_API_KEY` / `KITE_API_SECRET` | broker | yes | both-or-neither | Zerodha Kite | On exposure |
 | `UPSTOX_API_KEY` / `UPSTOX_API_SECRET` | broker | yes | both-or-neither | Upstox | On exposure |
+| `ANGELONE_API_KEY` / `ANGELONE_REDIRECT_URL` | broker | key only | key + redirect | Angel One SmartAPI — no app secret: the publisher login returns the session tokens on the redirect, so there is nothing server-side to sign | On exposure |
 | `BROKER_TOKEN_KEY` | broker | yes | optional | Fernet key for broker tokens at rest (derived from `JWT_SECRET` when unset) | Careful — re-encrypts stored tokens |
 | `TWILIO_ACCOUNT_SID` / `TWILIO_AUTH_TOKEN` | notifications | yes | optional | WhatsApp alerts | On exposure |
 | `SENDGRID_API_KEY` / `SMTP_USER` / `SMTP_PASSWORD` | notifications | yes | optional | Transactional email | On exposure |

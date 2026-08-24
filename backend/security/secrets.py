@@ -396,6 +396,14 @@ SECRET_REGISTRY: List[SecretSpec] = [
         example="http://localhost:8000/api/brokers/upstox/callback", rotation="N/A",
     ),
     SecretSpec(
+        "ANGELONE_API_KEY", CAT_BROKER, "Angel One SmartAPI key.",
+        sensitive=True, example="", rotation="Rotate in the SmartAPI developer portal on exposure",
+    ),
+    SecretSpec(
+        "ANGELONE_REDIRECT_URL", CAT_BROKER, "Angel One SmartAPI publisher-login redirect URL.",
+        example="http://localhost:8000/api/brokers/angelone/callback", rotation="N/A",
+    ),
+    SecretSpec(
         "BROKER_TOKEN_KEY", CAT_BROKER,
         "Optional Fernet key encrypting broker tokens at rest; derived from JWT_SECRET when unset.",
         sensitive=True, example="",

@@ -111,6 +111,24 @@ Two things moved with it, both because a broker's connections fail
     TICK_STREAM on one channel would otherwise let its other channel deliver
     ticks it has no prices on.
 
+WHAT D4.9 ADDED — A KEEP-ALIVE THE PROTOCOL'S OWN PING IS NOT
+--------------------------------------------------------------
+One optional timer, declared on the endpoint rather than requested by a broker.
+`ping_interval` here has always configured the WebSocket protocol's own ping
+frames, which the library exchanges with the peer's library and neither
+application sees. The third streaming broker does not count those: Angel One's
+feed requires a keep-alive **in the data channel** and closes a connection that
+stops sending one, so a socket would connect, subscribe, deliver ticks for half
+a minute and be closed — repeatedly, on the reconnect schedule, looking from
+outside like a flapping feed rather than a missing frame.
+
+The split is the same one this module has made since D4.2: *what* the frame is
+is the adapter's (`BrokerStreamEndpoint.heartbeat_frame`), and sending it on a
+timer and cancelling it with the connection is the transport's. A broker that
+ran its own timer would own a task whose lifetime must match a connection it
+does not hold — and a task leaked per reconnect is forever on a flapping feed.
+Both current adapters declare no heartbeat and are unaffected.
+
 Still out of scope, deliberately (D5+): probation windows, latency scoring,
 flap suppression, and sharding one subscription across several connections —
 which is a different thing from a broker needing several connections, and is
@@ -118,6 +136,7 @@ still not done here.
 """
 
 import asyncio
+import contextlib
 import logging
 import random
 
@@ -369,6 +388,7 @@ class BrokerStream:
             "%s %s stream connected for user %s (%s)",
             self.broker, self.channel, self.user_id, endpoint.safe_url,
         )
+        heartbeat = self._start_heartbeat(ws, endpoint)
         try:
             for frame in codec.subscribe_frames(self.instrument_tokens) or ():
                 await ws.send(frame)
@@ -382,7 +402,49 @@ class BrokerStream:
             async for message in ws:
                 await self._dispatch(self._decode(message))
         finally:
+            if heartbeat is not None:
+                heartbeat.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await heartbeat
             await ws.close()
+
+    def _start_heartbeat(self, ws, endpoint: BrokerStreamEndpoint):
+        """Send the feed's application-level keep-alive until the socket ends.
+
+        `None` when the endpoint declares none, which is every feed whose
+        liveness the WebSocket protocol's own pings already satisfy.
+
+        Lives here rather than in an adapter for the reason every other part of
+        this loop does: a broker that started its own timer would own a task
+        whose lifetime has to match a connection it does not hold, and getting
+        that wrong leaks a task per reconnect — forever, on a flapping feed. The
+        frame's *content* is the adapter's (see `BrokerStreamEndpoint`); the
+        timer and its cancellation are the transport's.
+
+        A send failure is not raised: the socket is already ending, and the
+        iterator in the caller is where that is observed and reconnected from.
+        """
+        frame = endpoint.heartbeat_frame
+        interval = endpoint.heartbeat_interval
+        if frame is None or not interval:
+            return None
+
+        async def beat():
+            while True:
+                await asyncio.sleep(interval)
+                try:
+                    await ws.send(frame)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.debug(
+                        "%s %s stream keep-alive could not be sent: %s", self.broker, self.channel, e
+                    )
+                    return
+
+        return asyncio.create_task(
+            beat(), name=f"broker-stream-keepalive-{self.broker}-{self.channel}-{self.user_id}"
+        )
 
     def _decode(self, message) -> BrokerStreamEvent:
         """Run one raw frame through the adapter's codec, defensively.

@@ -22,6 +22,7 @@ from tests._fakedb import FakeDB
 
 from services.brokers.base import IST, BrokerAuthError, BrokerError, normalize_status
 from services.brokers.crypto import decrypt_token, encrypt_token, is_encrypted
+from services.brokers.registry import broker_registry
 # D4.2 moved Kite's binary framing out of the shared transport and into the
 # adapter that owns the protocol. Same parser, same expectations, new home.
 from services.brokers.zerodha import parse_kite_binary
@@ -390,7 +391,12 @@ def test_engine_status_reports_all_brokers(monkeypatch):
 
     status = asyncio.run(engine.get_status(uid))
 
-    assert set(status.keys()) == {"zerodha", "upstox"}
+    # Every registered broker, read from the registry rather than listed here:
+    # a status surface that omits a broker is the defect, and a literal set
+    # would have to be edited by each new adapter — which is the friction the
+    # framework exists to remove (D4.9 added the third).
+    assert set(status.keys()) == set(broker_registry.names())
+    assert {"zerodha", "upstox"} <= set(status.keys())
     assert status["zerodha"]["connected"] is True
     assert status["zerodha"]["mode"] == "live"
     assert status["upstox"]["connected"] is False

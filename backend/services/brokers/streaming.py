@@ -137,12 +137,54 @@ class BrokerStreamEndpoint:
     ping_interval: Optional[float] = 20.0
     ping_timeout: Optional[float] = 20.0
 
+    #: An APPLICATION-level keep-alive frame this feed requires, and how often
+    #: to send it (D4.9). `None` — the default — means the broker needs none,
+    #: which is both current adapters.
+    #:
+    #: WHY THIS IS NOT `ping_interval`
+    #: --------------------------------
+    #: `ping_interval` / `ping_timeout` configure the WebSocket *protocol's* own
+    #: ping frames (opcode 0x9), which the library sends and the peer's library
+    #: answers without either application seeing them. Some feeds do not count
+    #: those as liveness at all and require a keep-alive **in the data channel**
+    #: — Angel One's smart-stream requires the text frame `ping` every 30
+    #: seconds and closes a connection that stops sending it, regardless of how
+    #: many protocol pings crossed the wire.
+    #:
+    #: The failure that makes this worth a contract field rather than a broker's
+    #: private background task: without it the socket connects, subscribes,
+    #: delivers ticks for half a minute and is then closed by the broker — over
+    #: and over, on the reconnect schedule. From the outside that is a flapping
+    #: feed, not a missing keep-alive, and the account's market feed would spend
+    #: its life re-earning readiness it keeps losing.
+    #:
+    #: What the frame *is* stays broker knowledge (text here, a JSON envelope at
+    #: the next broker, a binary opcode at the one after); sending it on a timer
+    #: and cancelling it with the connection is transport work, and there is one
+    #: transport. See `stream.py`.
+    heartbeat_frame: Optional[Any] = None
+    heartbeat_interval: Optional[float] = None
+
     def __post_init__(self) -> None:
         url = (self.url or "").strip()
         if not url.startswith(("ws://", "wss://")):
             raise BrokerContractError(
                 f"stream endpoint must be a WebSocket URL, got {self.safe_url!r}", operation="stream_endpoint"
             )
+        if self.heartbeat_frame is not None:
+            # Both halves or neither. A frame with no interval would never be
+            # sent and an interval with no frame would send nothing — either way
+            # the feed is silently missing the keep-alive it declared, which is
+            # exactly the failure this field exists to prevent.
+            if not isinstance(self.heartbeat_frame, (str, bytes, bytearray)):
+                raise BrokerContractError(
+                    f"stream heartbeat frame must be str or bytes, got {type(self.heartbeat_frame).__name__}",
+                    operation="stream_endpoint",
+                )
+            if not self.heartbeat_interval or float(self.heartbeat_interval) <= 0:
+                raise BrokerContractError(
+                    "a stream heartbeat frame needs a positive interval", operation="stream_endpoint"
+                )
 
     @property
     def safe_url(self) -> str:

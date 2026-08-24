@@ -1573,6 +1573,102 @@ When the first live Upstox or Zerodha session is available, to close the live-va
 
 ---
 
+# ADR-038
+
+Title
+
+Angel One SmartAPI as the Third Concrete Stream Adapter, and the Application-Level Keep-Alive It Required (Sprint D4.9)
+
+Date
+
+2026-08-24
+
+Status
+
+Accepted — implemented; **live validation not performed** (see Consequences)
+
+Context
+
+ADR-037 closed with a Review Date naming its own test: "at the third streaming broker, which is where the channel model itself gets its first independent test." D4.9 is that test. Upstox forced `BrokerStreamChannel` into existence and was the only broker using it, so the concept had never been exercised by a broker that did *not* need it — and a generalisation validated only by the case that motivated it is a generalisation on a sample of one.
+
+Angel One arrives from the opposite direction. Its market feed is **one** socket, so it takes the free single-channel path: it declares nothing about channels, inherits `AdapterStreamChannel`, and is opened by the same transport that opens Upstox's two. It also agrees with neither predecessor at the wire: fixed 51-byte little-endian packets carrying **one tick per frame** (where Kite packs hundreds and Upstox returns a map), a numeric instrument token that is unique only *within an exchange segment*, four authentication headers, and integer paise on a segment rule that is Kite's trap without being Kite's rule.
+
+The protocol was taken from SmartAPI's own published WebSocket 2.0 request/response contract and its official Python SDK (`angel-one/smartapi-python`, `SmartApi/smartWebSocketV2.py`), not inferred from either broker already integrated. ADR-037's lesson applies with more force at a third broker, where the temptation to reason "like one of the other two, but…" is the whole risk — and two of this adapter's decisions (the price rule and the identity) are places where that reasoning produces code that runs and is wrong.
+
+Decision
+
+**The market side generalised again, and that is reported as the finding it is.** Nothing changed in the Market Engine, the Market Gateway, the Source Manager, `StreamingTickProvider`, the provider registry, the canonical `MarketTick`, the readiness gate, the failover path, the Portfolio Engine, the Trading Engine or the frontend. `InstrumentMap` needed no extension for the second consecutive broker.
+
+**The channel model passed its independent test.** Angel One declares no channels and gets one, backed by the five `stream_*` methods every adapter has implemented since D4.2. The transport, the registry validation, the per-channel `delivers` narrowing and the channel-scoped link routing all behaved as specified for a broker that had no part in their design.
+
+**One assumption did not generalise, and it is in the transport again.** `ping_interval` has always configured the WebSocket **protocol's** ping frames — opcode 0x9, exchanged by the two libraries, invisible to both applications. SmartAPI does not count those as liveness: it requires the **text** frame `ping` on the data channel every 30 seconds and closes a connection that stops sending it. Nothing in the platform could express that.
+
+The failure it would have produced is the kind this architecture keeps finding: not loud. The socket connects, subscribes, delivers ticks for half a minute and is closed by the broker — then reconnects, and does it again. In the logs that is a flapping feed, not a missing frame; the account's market-data provider would spend its life re-earning readiness it keeps losing, and the user would see the tier flicker between live and delayed all session.
+
+`BrokerStreamEndpoint` therefore gained `heartbeat_frame` and `heartbeat_interval`. Three properties were required and all three hold:
+
+• **It names no broker.** The frame is an opaque `str`/`bytes` the adapter supplies; the transport sends it on a timer and cannot tell what it means.
+
+• **It is free for a broker that needs none.** Both fields default to `None`; Zerodha and Upstox are unchanged, and the contract refuses *half* a declaration (a frame with no interval, or an interval with no frame) because either one silently leaves the feed without the keep-alive it declared.
+
+• **It stops at the broker package boundary.** Nothing above the transport — no provider, no gateway, no resolver — learns that a feed has a heartbeat.
+
+**A second generic change, in the engine: `feed_token` joined `TOKEN_FIELDS`.** Angel One's socket authenticates with a per-session credential *separate* from the token its REST API takes. `TOKEN_FIELDS` is the list of session fields encrypted at rest and cleared on disconnect; a session credential outside it would have been the one field in `db.broker_accounts` that SECURITY.md's encryption-at-rest rule did not cover, and it is enough — with the app key and the client code — to open a market feed for the account. The list is generic session-credential names rather than a per-broker registry: an adapter's `exchange_token` decides which of them its broker issues, and a broker that issues none of one never sets it. The disconnect path now clears every field in the list rather than three named ones, so the next such addition cannot be half-applied.
+
+**Two protocol decisions where copying a predecessor produces code that runs and is wrong.**
+
+  1. **Identity is `(exchangeType, token)`, never the token alone.** SmartAPI numbers instruments per exchange segment: NSE 2885 and BSE 2885 are different instruments. Kite's shape — store the bare token — would have let a BSE tick resolve to an NSE holding and mark a position at another instrument's price. Nothing raises; the number is simply wrong. The adapter writes a segment-qualified `"1|2885"` onto every synced row and rebuilds the identical string from every decoded tick, from one function, so the two sides cannot drift.
+
+  2. **The price scale is keyed on the segment field, not on the token.** Both brokers quote paise and both have a currency exception, which makes `zerodha.price_divisor` look reusable. It is not: Kite derives its scale from the *low byte of its 32-bit token*, and applying that to a SmartAPI token consults a byte that means nothing at all. Same class of trap, different rule, decided from SmartAPI's own contract.
+
+**Trading-symbol series suffixes are stripped at the adapter boundary.** SmartAPI names an equity `TATASTEEL-EQ` where every other broker here names it `TATASTEEL`. Left alone, a user holding one stock at two brokers would hold two different canonical symbols — a split portfolio, a split watchlist, and a feed whose coverage never matches the platform's own instrument universe. The adapter is the only code entitled to know that the suffix is a series code rather than part of the name.
+
+Alternatives considered
+
+**Let the Angel One adapter run its own keep-alive task.** Rejected for the reason ADR-032 rejected per-broker transports and ADR-037 rejected a broker-opened second socket: the adapter would own a task whose lifetime has to match a connection it does not hold. Getting that wrong leaks one task per reconnect — forever, on precisely the flapping feed the keep-alive exists to prevent — and the correct cancellation point is inside the transport's `finally`, where the adapter cannot reach.
+
+**Reuse `ping_interval` by setting it to 30 and hoping.** Rejected because it is not the same mechanism. A protocol ping satisfies libraries, not SmartAPI's application-level liveness check, and a design that confuses the two produces a connection that looks healthy at every layer that can see it and is closed anyway.
+
+**Use SmartAPI's `loginByPassword` (client code + PIN + TOTP).** Rejected outright. It would require this platform to hold a user's trading PIN and TOTP seed — a class of secret no other broker here needs and SECURITY.md forbids. The publisher login is an ordinary browser redirect.
+
+**Use the documented query-string form of the socket URL** (`?clientCode=&feedToken=&apiKey=`), which SmartAPI provides for browser clients that cannot set headers. Rejected: it puts two live credentials into the string that every connection log line names. The header form means **nothing credential-bearing is in the URL at all**, which is strictly stronger than masking it — the same reasoning ADR-037 applied to Upstox's authorize step.
+
+**Store the feed token in the existing `public_token` field** to avoid touching the engine. Rejected: it is Kite's vocabulary carrying another broker's credential, which is a lie in the schema to avoid a four-word change, and the next broker with a second credential would inherit the confusion.
+
+**Subscribe in Quote or Snap Quote mode so the tick can carry volume.** Rejected for the third time and re-derived for the third broker: Quote is 123 bytes per tick against LTP's 51 and Snap Quote 379, for fields no consumer reads. The last-traded quantity those modes carry is *one trade's size*, not the day's cumulative volume, so it would populate `volume` with a number that means something else.
+
+**Declare `SESSION_REFRESH` using SmartAPI's `generateTokens` endpoint.** Deferred, not rejected. The endpoint exists and consumes a refresh token; the publisher-login redirect is documented as returning `auth_token` and `feed_token` only. Declaring a refresh whose input this platform may not hold would make the engine attempt a renewal that cannot succeed instead of asking the user to reconnect — a worse outcome than the absence. Whether the redirect carries a refresh token is an explicit question for live validation.
+
+**Declare Angel One's order and trading capabilities.** Deferred. D4.9 is a market-data sprint, SmartAPI's order surface is unvalidated against a live account here, and its order updates arrive on a *different* socket that would be a second channel. The capability model exists so a partial broker is declared partial rather than integrated with stub methods that lie.
+
+**Fetch SmartAPI's master scrip file.** Rejected as unnecessary rather than out of scope, for the third time: a synced holding or position already carries the token beside the symbol and the exchange, which *is* the mapping table in both directions.
+
+Consequences
+
+• A user with a connected Angel One account and a synced portfolio gets a streaming feed for the instruments they hold, promoted over the Yahoo baseline only after a valid canonical `MarketTick` has arrived on the current link, and demoted the instant that link drops — the unchanged D4.5 machinery, reached by a third broker sharing no wire format with either predecessor.
+
+• **The adapter count went from two to three; the number of market-data architectures stayed at one.** That is the sprint's actual claim, and it is asserted rather than asserted-by-eye: `test_three_brokers_speak_three_protocols_and_produce_identical_canonical_ticks` drives all three brokers' real bytes through their real codecs and compares the canonical ticks field for field, and `test_four_users_on_four_providers_stay_on_their_own` runs Angel One, Zerodha, Upstox and the baseline at once.
+
+• **Angel One is a partial broker by declaration.** Market data, portfolio and funds; no orders, no order stream, no session refresh. A user connecting it gets a live feed and a synced portfolio and cannot trade through it, and the UI can say so because the capability set is what it reads.
+
+• **An Angel-One-derived `MarketTick` carries no volume.** Third broker, same limitation, reached independently each time — which is itself a finding: the canonical `volume` field is unpopulated by every streaming broker this platform has, because every one of them puts cumulative volume behind a bandwidth-heavy mode. If volume becomes a product requirement, it is a mode decision at three adapters, not a contract change.
+
+• **Four mutations initially stayed green during falsification and each found a real test gap** — a planted `_is_angelone` branch that the vocabulary sweep could not see (string literals are stripped by design, and `\bangel` does not match after an underscore), a codec exception made fatal to the stream (this adapter *declines* damaged frames rather than raising, so the existing resilience test could not tell the two apart), and both keep-alive mutations (the timer test called the helper directly and proved nothing about the transport using it). All four are closed and red. The sweep now also bans broker-name *comparisons* on literal-preserving source, which is the one shape a vocabulary sweep structurally cannot catch.
+
+• **LIVE VALIDATION WAS NOT PERFORMED.** An Angel One feed needs a per-user session obtainable only through an interactive SmartAPI browser login, and no connected Angel One session exists in this environment. Every claim rests on deterministic validation against fixtures built from SmartAPI's published byte layout, plus 20 source mutations observed red. The outstanding smoke test includes two items unique to this broker: **holding the connection past 60 seconds**, which is the only way to prove the keep-alive is accepted, and **confirming whether the publisher-login redirect carries a `refresh_token`**, which decides `SESSION_REFRESH`. A live smoke test now remains outstanding for **all three** streaming brokers, and none is production-verified until it is run.
+
+• The frontend is untouched and shows generic source status. No SmartAPI detail, no exchange segment, no client code on any market-data surface.
+
+Authoritative documents
+
+MARKET_DATA_ARCHITECTURE.md, BROKER_INTEGRATION.md, SECURITY.md
+
+Review Date
+
+When the first live session for any of the three streaming brokers is available, to close a live-validation gap that now spans all of them; and at the fourth streaming broker, or at the first broker whose keep-alive is not a text frame, which is where the heartbeat contract gets its own independent test.
+
+---
+
 Future decisions to document.
 
 International Markets

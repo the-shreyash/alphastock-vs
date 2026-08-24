@@ -3,7 +3,7 @@
 
 Version: 1.1
 
-Status: Approved Design — Phase 1 Implemented (Sprint D1, 2026-08-19); Phase 2 Implemented in backend (Sprint D2, 2026-08-20, frontend tier indicator outstanding); Phase 3 re-scoped to the Broker Provider Framework and Implemented (Sprint D3, 2026-08-20, ADR-031); Phase 4 Implemented through 4.6 (Sprints D4.1–D4.6, 2026-08-21, ADR-032…036 — Zerodha Kite is the first concrete stream adapter; **live validation not yet performed**); remaining broker adapters, Phase 5 and Phase 6 pending
+Status: Approved Design — Phase 1 Implemented (Sprint D1, 2026-08-19); Phase 2 Implemented in backend (Sprint D2, 2026-08-20, frontend tier indicator outstanding); Phase 3 re-scoped to the Broker Provider Framework and Implemented (Sprint D3, 2026-08-20, ADR-031); Phase 4 Implemented through 4.9 (Sprints D4.1–D4.9, 2026-08-21…24, ADR-032…038 — Zerodha Kite, Upstox v3 and Angel One SmartAPI are the three concrete stream adapters; **live validation not yet performed for any of them**); remaining broker adapters, Phase 5 and Phase 6 pending
 
 Priority: Critical
 
@@ -867,7 +867,17 @@ Nothing changed in the Market Engine, the Market Gateway, the Source Manager, `S
 
 **An Upstox-derived tick carries no volume**, for the same shape of reason a Kite one does not: `ltpc` mode carries `ltq` — the *last traded* quantity, one trade's size — and not the day's cumulative volume, which lives in the bandwidth-heavy `full` modes. Populating `volume` from `ltq` would put a number there that means something else. **Live validation has not been performed for Upstox either**, and for the same reason: the feed needs a per-user token obtainable only through an interactive browser login.
 
-**Phase 4.8 — the remaining broker adapters.** Angel One, Fyers, Dhan — each one adapter and nothing else, per Developer Rule 9.
+**Phase 4.9 (shipped) — Angel One, the third streaming broker.** The independent test of the channel model 4.7 introduced, and it arrives from the opposite direction: Angel One's realtime surface is **one** socket, so it takes the free single-channel path rather than the multi-channel one. It also agrees with neither predecessor at the wire — fixed 51-byte little-endian packets carrying **one tick per frame**, an instrument token that is unique only *within an exchange segment*, four authentication headers, and paise on a segment rule that is Kite's trap without being Kite's rule.
+
+**The market side needed nothing, for the second consecutive broker.** No change to the Market Gateway, the Source Manager, `StreamingTickProvider`, the provider registry, the canonical `MarketTick`, the readiness gate, the failover path or `InstrumentMap` — the adapter builds a segment-qualified identifier on both sides of the boundary, so a third identity shape resolves through the same table. Developer Rule 9 held again.
+
+**The broker transport needed one generic change, and it is reported rather than hidden.** `ping_interval` configures the WebSocket protocol's own pings, which the two libraries exchange without either application seeing them — and Angel One does not count those: it closes a socket that stops sending the *text* frame `ping` on the data channel every 30 seconds. `BrokerStreamEndpoint` gained `heartbeat_frame` / `heartbeat_interval` (both default `None`, so the other two brokers are unchanged) and `stream.py` runs the timer, once, for every broker that declares one. An adapter running its own would own a task whose lifetime must match a connection it does not hold. See BROKER_INTEGRATION.md §"Streaming Contract" and **ADR-038**.
+
+**The engine's session-secret list gained one generic name.** Angel One's feed authenticates with a second per-session credential, so `feed_token` joined the fields encrypted at rest and cleared on disconnect. Generic session-credential names, not a per-broker registry.
+
+**An Angel-One-derived tick carries no volume** — LTP mode has none, and the wider modes' last-traded quantity is one trade's size rather than the day's cumulative volume. Third broker, same limitation, reached independently each time. **Live validation has not been performed for Angel One either**, and for the same reason: the feed needs a per-user session obtainable only through an interactive browser login. A live smoke test is now outstanding for all three streaming brokers.
+
+**Phase 4.10 — the remaining broker adapters.** Fyers, Dhan — each one adapter and nothing else, per Developer Rule 9.
 
 **Phase 5 — Hardening.** Latency scoring, flap suppression, probation windows, multi-connection sharding, chaos tests (kill connections in staging, verify silent failover).
 

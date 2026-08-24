@@ -4513,3 +4513,1289 @@ def test_the_stream_registry_keys_on_the_channel_so_one_feed_cannot_replace_anot
             assert manager.status() == []
 
     run(scenario())
+
+
+# ==================================================================
+# D4.9 — Angel One as the THIRD real streaming broker
+#
+# D4.7 closed with the open question ADR-037 recorded: the channel model itself
+# had had no independent test, because the broker that forced it into existence
+# was also the only broker using it. Angel One is that independent test, and it
+# arrives from the opposite direction — its realtime surface is ONE socket, so
+# it exercises the free single-channel path rather than the multi-channel one.
+#
+#     Kite                    Upstox v3               Angel One smart-stream
+#     ────                    ─────────               ──────────────────────
+#     one socket, both feeds  two sockets             one socket, ticks only
+#     bespoke binary          protobuf                fixed 51-byte packets
+#     frame = many packets    frame = many feeds      frame = ONE tick
+#     big-endian              protobuf varint         LITTLE-endian
+#     int token               "NSE_EQ|INE002A01018"   numeric token per SEGMENT
+#     paise, 3 scales         IEEE double, rupees     paise, currency ×10⁷
+#     query-string auth       bearer header           four auth headers
+#     2 frames, text          1 frame, JSON as binary 1 frame, JSON as text
+#     protocol ping suffices  protocol ping suffices  application "ping" or the
+#                                                     broker closes the socket
+#
+# The protocol below is transcribed from SmartAPI's own published WebSocket 2.0
+# contract and its official Python SDK (`angel-one/smartapi-python`,
+# `SmartApi/smartWebSocketV2.py`) — not inferred from Kite, not inferred from
+# Upstox, and not inferred from what the previous two adapters happened to need.
+#
+# Every test below was run against a deliberately broken implementation first;
+# the mutations are listed in TASK.md's D4.9 falsification table.
+# ==================================================================
+
+
+def _strip_prose(source: str) -> str:
+    """Docstrings and comments removed, string LITERALS kept.
+
+    `_strip_source` removes literals too, which is right for a vocabulary sweep
+    (a comment quoting a deleted branch is documentation, not a recurrence) and
+    exactly wrong for a sweep whose target *is* a literal: `if broker ==
+    "angelone"` is invisible to it. This keeps the literals and drops the prose,
+    so a module may still explain the branch it does not contain.
+    """
+    without_docstrings = re.sub(r'("""|\'\'\')(?:.|\n)*?\1', '""', source)
+    return re.sub(r"#[^\n]*", "", without_docstrings)
+
+
+def _angelone():
+    return broker_registry.require("angelone")
+
+
+def _angel_channel():
+    channels = _angelone().stream_channels()
+    assert len(channels) == 1, "Angel One's realtime surface is one socket"
+    return channels[0]
+
+
+def _angel_packet(token="2885", price=265075, segment=1, mode=1, timestamp=1_724_236_800_000,
+                  size=None, token_bytes=None):
+    """One SmartAPI binary tick packet, built from the published byte layout.
+
+    `size` and `token_bytes` exist to produce genuine protocol damage — a short
+    read, an unterminated token — rather than merely odd values.
+    """
+    packet = bytearray(51 if size is None else size)
+    if len(packet) >= 1:
+        packet[0] = mode
+    if len(packet) >= 2:
+        packet[1] = segment
+    raw = token_bytes if token_bytes is not None else token.encode("ascii")
+    packet[2:2 + len(raw)] = raw[: min(len(raw), 25)]
+    if len(packet) >= 51:
+        struct.pack_into("<q", packet, 27, 7)            # sequence number
+        struct.pack_into("<q", packet, 35, timestamp)
+        struct.pack_into("<q", packet, 43, price)
+    return bytes(packet)
+
+
+def _angel_ticks(frame):
+    """The canonical `BrokerTick` dicts one raw SmartAPI frame decodes to."""
+    event = _angelone().decode_stream_frame(frame)
+    return [tick.as_dict() for tick in event.ticks]
+
+
+def _angel_map():
+    """An account's instrument map as Angel One identifies instruments."""
+    return InstrumentMap.from_portfolio(
+        [
+            {"symbol": "RELIANCE", "exchange": "NSE", "instrument_token": "1|2885"},
+            {"symbol": "TCS", "exchange": "NSE", "instrument_token": "1|11536"},
+        ]
+    )
+
+
+def _angel_canonical(price=265075, token="2885", segment=1):
+    return canonical_ticks(
+        _angel_ticks(_angel_packet(token=token, price=price, segment=segment)),
+        _angel_map(), broker="angelone",
+    )
+
+
+def _angel_feed(user_id="u1", symbols=("RELIANCE",)):
+    """Attach an Angel One market feed for `user_id` on the real registry."""
+    from services.brokers.market_feed import feed_provider_name
+    from services.market_engine.providers import provider_registry
+
+    run(_attach(user_id, "angelone", list(symbols)))
+    return provider_registry.get(feed_provider_name(user_id, "angelone"))
+
+
+def _angel_session():
+    return {"access_token": "live-jwt-token", "feed_token": "live-feed-token", "account_id": "A123456"}
+
+
+# -- authentication and session ------------------------------------------------
+
+
+def test_the_angelone_login_flow_is_a_browser_redirect_and_holds_no_user_secret(monkeypatch):
+    """SmartAPI's publisher login, not its PIN + TOTP login.
+
+    SmartAPI also publishes `loginByPassword`, which takes the user's trading
+    PIN and a TOTP code. Using it would mean this platform holding a trading
+    PIN and a TOTP seed for every connected user — a class of secret no other
+    broker here requires and SECURITY.md forbids. The publisher login is an
+    ordinary browser redirect, so nothing of the user's is ever held.
+    """
+    monkeypatch.setenv("ANGELONE_API_KEY", "app-key")
+    monkeypatch.setenv("ANGELONE_REDIRECT_URL", "https://app.test/api/brokers/angelone/callback")
+    login = _angelone().get_login_url("user-123")
+
+    assert login["configured"] is True
+    assert login["url"].startswith("https://smartapi.angelone.in/publisher-login?")
+    assert "api_key=app-key" in login["url"]
+    # `uid=` is the platform's own convention for the state parameter, and the
+    # shared callback route reads it — a broker that spelled it differently
+    # would connect to nobody.
+    assert "state=uid%3Duser-123" in login["url"]
+    for absent in ("password", "totp", "pin"):
+        assert absent not in login["url"].lower()
+
+    # SmartAPI will not redirect without a registered URL, so a deployment
+    # missing one is reported as unconfigured rather than sent to a dead link.
+    monkeypatch.setenv("ANGELONE_REDIRECT_URL", "")
+    assert _angelone().get_login_url("user-123")["configured"] is False
+    assert _angelone().is_configured() is False
+
+
+def test_the_angelone_callback_carries_both_tokens_the_stream_needs():
+    """The redirect *is* the exchange — and it returns two credentials, not one.
+
+    A callback parser that kept only the auth token would produce a session that
+    authenticates every REST call and cannot open the market feed at all: the
+    socket needs `x-feed-token` as well, and would be refused with a 401 that
+    reads exactly like an expired session.
+    """
+    adapter = _angelone()
+    payload = adapter.parse_callback_params(
+        {"auth_token": "jwt-token", "feed_token": "feed-token", "state": "uid=user-123"})
+    assert payload == {"auth_token": "jwt-token", "feed_token": "feed-token", "refresh_token": ""}
+    # A cancelled login carries no auth token and must not be completed.
+    assert adapter.parse_callback_params({"state": "uid=user-123"}) is None
+    assert adapter.parse_callback_params({}) is None
+
+
+def test_completing_angelone_auth_resolves_the_client_code_the_socket_requires(monkeypatch):
+    """The redirect does not carry the client code, and the stream cannot connect without it.
+
+    So the "exchange" is a profile call: a session that cannot stream never gets
+    stored as connected in the first place.
+    """
+    monkeypatch.setenv("ANGELONE_API_KEY", "app-key")
+    monkeypatch.setenv("ANGELONE_REDIRECT_URL", "https://app.test/cb")
+    profile = {"status": True, "message": "SUCCESS", "errorcode": "", "data": {
+        "clientcode": "A123456", "name": "A Trader", "email": "t@example.test",
+        "exchanges": ["NSE", "BSE"], "products": ["DELIVERY"]}}
+
+    with patch.object(BrokerAdapter, "_request", new=AsyncMock(return_value=profile)):
+        session = run(_angelone().exchange_token(
+            {"auth_token": "jwt-token", "feed_token": "feed-token"}))
+
+    assert session["access_token"] == "jwt-token"
+    assert session["feed_token"] == "feed-token"
+    assert session["account_id"] == "A123456"
+    # And the resulting session is exactly what the stream endpoint needs.
+    headers = _angel_channel().endpoint(session, {"api_key": "app-key"}).headers
+    assert headers["x-client-code"] == "A123456" and headers["x-feed-token"] == "feed-token"
+
+
+def test_an_angelone_session_expires_at_midnight_ist():
+    """SmartAPI sessions live until midnight IST, not for a fixed number of hours."""
+    from services.brokers.base import IST
+
+    for hour in (1, 9, 15, 23):
+        connected = datetime(2026, 8, 24, hour, 30, tzinfo=IST)
+        expiry = _angelone().session_expiry(connected).astimezone(IST)
+        assert expiry == datetime(2026, 8, 25, 0, 0, tzinfo=IST), hour
+        assert expiry > connected
+
+
+# -- protocol: endpoint, authentication, keep-alive --------------------------
+
+
+def test_the_angelone_endpoint_authenticates_by_four_headers_and_none_reach_the_url():
+    """A third auth style: not Kite's query string, not Upstox's single header.
+
+    SmartAPI publishes a query-string form of this URL for browser clients
+    (`?clientCode=&feedToken=&apiKey=`), which would put two live credentials
+    into the string every connection log line names. The header form is used
+    instead, and this asserts the URL is clean *positively* rather than trusting
+    `safe_url` to hide a mistake.
+    """
+    from services.brokers.angelone import WS_URL
+
+    endpoint = _angel_channel().endpoint(_angel_session(), {"api_key": "app-key"})
+    assert endpoint.url == WS_URL == "wss://smartapisocket.angelone.in/smart-stream"
+    assert "?" not in endpoint.url, "Angel One does not authenticate this feed by query string"
+    assert endpoint.safe_url == endpoint.url
+    assert endpoint.headers == {
+        "Authorization": "live-jwt-token",
+        "x-api-key": "app-key",
+        "x-client-code": "A123456",
+        "x-feed-token": "live-feed-token",
+    }
+    for secret in ("live-jwt-token", "live-feed-token", "app-key", "A123456"):
+        assert secret not in endpoint.url
+
+
+def test_the_angelone_feed_declares_the_application_keepalive_the_protocol_ping_is_not():
+    """The one thing about this broker that needed anything outside its adapter.
+
+    `ping_interval` configures the WebSocket protocol's own ping frames, which
+    the two libraries exchange without either application seeing them. SmartAPI
+    does not count those: it requires the text frame `ping` on the data channel
+    every 30 seconds and closes a connection that stops sending one.
+    """
+    from services.brokers.angelone import HEARTBEAT_FRAME, HEARTBEAT_INTERVAL
+
+    endpoint = _angel_channel().endpoint(_angel_session(), {"api_key": "k"})
+    assert endpoint.heartbeat_frame == HEARTBEAT_FRAME == "ping"
+    assert isinstance(endpoint.heartbeat_frame, str), "SmartAPI's keep-alive is a text frame"
+    assert 0 < endpoint.heartbeat_interval <= 30, "the keep-alive must beat SmartAPI's 30s deadline"
+    assert endpoint.heartbeat_interval == HEARTBEAT_INTERVAL
+    # And it is genuinely a *different* mechanism from the protocol ping, which
+    # is still configured and still exchanged — the two are separate fields with
+    # separate effects, and satisfying one does not satisfy the other.
+    assert endpoint.ping_interval, "the protocol ping was turned off in favour of the app keep-alive"
+    assert BrokerStreamEndpoint(url=endpoint.url, ping_interval=endpoint.ping_interval).heartbeat_frame is None
+
+
+def test_a_declared_keepalive_frame_without_an_interval_is_refused_by_the_contract():
+    """Half a keep-alive is a socket the broker closes, so the contract has none.
+
+    A frame with no interval would never be sent and an interval with no frame
+    would send nothing — both leave the feed silently missing the keep-alive it
+    declared, which is the failure the field exists to prevent.
+    """
+    with pytest.raises(BrokerContractError):
+        BrokerStreamEndpoint(url="wss://example.test/feed", heartbeat_frame="ping")
+    with pytest.raises(BrokerContractError):
+        BrokerStreamEndpoint(url="wss://example.test/feed", heartbeat_frame="ping", heartbeat_interval=0)
+    with pytest.raises(BrokerContractError):
+        BrokerStreamEndpoint(url="wss://example.test/feed", heartbeat_frame={"op": "ping"}, heartbeat_interval=5)
+    # And a broker that needs none — both of the other two — is unaffected.
+    assert BrokerStreamEndpoint(url="wss://example.test/feed").heartbeat_frame is None
+
+
+def test_the_transport_sends_the_declared_keepalive_and_stops_with_the_socket():
+    """The generic half: a timer nobody's adapter owns, cancelled with the connection.
+
+    Driven with a compressed interval rather than the real 20 seconds, and the
+    assertion is on both halves — that it fires at all, and that it does not
+    outlive the socket. A keep-alive task leaked per reconnect is forever on a
+    flapping feed.
+    """
+    endpoint = BrokerStreamEndpoint(
+        url="wss://example.test/feed", heartbeat_frame="ping", heartbeat_interval=0.01)
+    socket = _FakeSocket([])
+    stream = BrokerStream("u1", "angelone", _angel_session(), channel=DEFAULT_STREAM_CHANNEL)
+
+    async def scenario():
+        task = stream._start_heartbeat(socket, endpoint)
+        assert task is not None
+        await asyncio.sleep(0.05)
+        assert socket.sent.count("ping") >= 2, socket.sent
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        sent_at_cancel = len(socket.sent)
+        await asyncio.sleep(0.05)
+        assert len(socket.sent) == sent_at_cancel, "the keep-alive outlived the connection"
+
+    run(scenario())
+    # A feed that declares no heartbeat gets no task at all.
+    assert stream._start_heartbeat(socket, BrokerStreamEndpoint(url="wss://example.test/feed")) is None
+
+
+class _PacedSocket(_FakeSocket):
+    """A socket whose frames arrive slowly enough for a timer to fire between them."""
+
+    def __init__(self, frames, pause=0.02):
+        super().__init__(frames)
+        self._pause = pause
+
+    def __aiter__(self):
+        async def gen():
+            for frame in self._frames:
+                await asyncio.sleep(self._pause)
+                yield frame
+
+        return gen()
+
+
+def test_the_keepalive_reaches_a_live_angelone_socket_and_stops_when_it_closes():
+    """The wiring, not just the timer — driven through the real transport pass.
+
+    WHY THIS IS SEPARATE FROM THE TIMER TEST ABOVE
+    ----------------------------------------------
+    The falsification pass mutated `_run_websocket` to never start the
+    heartbeat, and to never cancel it, and the timer test stayed green both
+    times: it calls `_start_heartbeat` directly, so it proves the helper works
+    and nothing about whether the transport uses it. A feed whose keep-alive is
+    built and never sent is a feed Angel One closes every 30 seconds.
+    """
+    with patch("services.brokers.angelone.HEARTBEAT_INTERVAL", 0.01):
+        socket = _PacedSocket([_angel_packet(price=265075)], pause=0.05)
+        stream = BrokerStream(
+            "u1", "angelone", _angel_session(), credentials={"api_key": "app-key"},
+            instrument_tokens=["1|2885"], channel=DEFAULT_STREAM_CHANNEL,
+        )
+
+        async def scenario():
+            with patch.object(BrokerStream, "_connect", AsyncMock(return_value=socket)):
+                await stream._run_websocket()
+            sent_at_close = list(socket.sent)
+            await asyncio.sleep(0.05)
+            return sent_at_close
+
+        sent_at_close = run(scenario())
+
+    assert sent_at_close.count("ping") >= 2, f"the keep-alive never reached the socket: {sent_at_close}"
+    assert json.loads(sent_at_close[0])["action"] == 1, "the subscribe frame must go first"
+    assert socket.closed
+    assert socket.sent == sent_at_close, "the keep-alive outlived the connection it belonged to"
+
+
+def test_a_codec_that_raises_does_not_terminate_a_live_angelone_stream():
+    """A frame the codec *raises* on, not merely one it declines to decode.
+
+    The resilience test below feeds damaged bytes, which this adapter decodes to
+    "nothing" without raising — so it cannot distinguish a transport that
+    swallows a codec exception from one that re-raises it. The falsification
+    pass proved that: making `_decode` re-raise left it green.
+    """
+    real_decode = _angelone().decode_stream_frame
+    calls = {"n": 0}
+
+    def exploding(frame):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise ValueError("codec defect")
+        return real_decode(frame)
+
+    with patch.object(type(_angelone()), "decode_stream_frame", staticmethod(exploding)):
+        ticks, _, _, socket = drive_stream(
+            _angelone(), [b"\x00" * 51, _angel_packet(price=265075)],
+            instruments=["1|2885"], session=_angel_session())
+
+    assert calls["n"] == 2, "the stream stopped at the frame that raised"
+    assert len(ticks) == 1 and ticks[0][2][0]["last_price"] == 2650.75
+    assert socket.closed
+
+
+# -- protocol: subscription ---------------------------------------------------
+
+
+def test_the_angelone_subscribe_handshake_groups_tokens_by_exchange_segment():
+    """One text frame, in the documented mode, grouped — not a flat list.
+
+    Three specifics, and a Kite- or Upstox-shaped assumption gets each wrong:
+    one frame rather than Kite's two; `str` rather than Upstox's `bytes`; and
+    instruments grouped by exchange segment, because the segment is half the
+    identity and a flat list has nowhere to put it.
+    """
+    from services.brokers.angelone import ACTION_SUBSCRIBE, STREAM_MODE_LTP
+
+    frames = _angelone().stream_subscribe_frames(["1|2885", "3|500325", "1|11536"])
+    assert len(frames) == 1, "SmartAPI subscribes in one frame; two is Kite's protocol"
+    assert isinstance(frames[0], str), "SmartAPI's subscribe frame is text, not Upstox's binary"
+
+    request = json.loads(frames[0])
+    assert request["action"] == ACTION_SUBSCRIBE == 1
+    assert request["params"]["mode"] == STREAM_MODE_LTP == 1
+    assert request["correlationID"], "SmartAPI echoes the correlation id on an error response"
+    assert request["params"]["tokenList"] == [
+        {"exchangeType": 1, "tokens": ["2885", "11536"]},
+        {"exchangeType": 3, "tokens": ["500325"]},
+    ]
+
+
+@pytest.mark.parametrize("bad", ["2885", "NSE|2885", "1|", "|2885", "99|2885", "1|abc", "", None, True, "1|0"])
+def test_a_malformed_angelone_instrument_identity_never_reaches_the_wire(bad):
+    """SmartAPI rejects a malformed *subscription* rather than the bad entry.
+
+    So one unusable row would otherwise cost the account every price it asked
+    for — a connected socket with nothing on it, which reads exactly like a
+    quiet market.
+    """
+    assert _angelone().stream_subscribe_frames([bad]) == []
+    frames = _angelone().stream_subscribe_frames([bad, "1|2885"])
+    assert json.loads(frames[0])["params"]["tokenList"] == [{"exchangeType": 1, "tokens": ["2885"]}]
+
+
+def test_an_angelone_subscription_with_no_instruments_sends_nothing():
+    """An account with nothing to stream opens a socket and asks for nothing."""
+    assert _angelone().stream_subscribe_frames([]) == []
+    assert _angelone().stream_subscribe_frames(None) == []
+
+
+def test_an_over_quota_angelone_subscription_is_trimmed_rather_than_rejected(caplog):
+    """SmartAPI's quota is per session, and exceeding it costs the whole request."""
+    from services.brokers.angelone import MAX_SUBSCRIBED_INSTRUMENTS
+
+    caplog.set_level(logging.WARNING)
+    instruments = [f"1|{token}" for token in range(1, MAX_SUBSCRIBED_INSTRUMENTS + 51)]
+    request = json.loads(_angelone().stream_subscribe_frames(instruments)[0])
+    subscribed = sum(len(group["tokens"]) for group in request["params"]["tokenList"])
+    assert subscribed == MAX_SUBSCRIBED_INSTRUMENTS
+    assert any("quota" in r.getMessage() for r in caplog.records), "an over-quota trim was silent"
+
+
+def test_a_duplicate_angelone_instrument_is_subscribed_once():
+    """Duplicates spend quota at SmartAPI; they are collapsed before the wire."""
+    request = json.loads(_angelone().stream_subscribe_frames(["1|2885", "1|2885"])[0])
+    assert request["params"]["tokenList"] == [{"exchangeType": 1, "tokens": ["2885"]}]
+
+
+# -- protocol: decoding --------------------------------------------------------
+
+
+def test_an_angelone_ltp_packet_decodes_to_one_canonical_broker_tick():
+    """A SmartAPI frame is ONE tick, not a batch — the opposite of both predecessors."""
+    ticks = _angel_ticks(_angel_packet(token="2885", price=265075))
+    assert ticks == [{
+        "instrument_token": "1|2885",
+        "last_price": 2650.75,
+        "symbol": None,
+        "exchange": "NSE",
+        "volume": 0,
+        "timestamp": "1724236800000",
+    }]
+
+
+@pytest.mark.parametrize("mode", [1, 2, 3])
+def test_every_priceable_angelone_mode_shares_the_first_51_bytes(mode):
+    """LTP, Quote and Snap Quote differ only after the price field.
+
+    Read here because a mode change must not produce a socket that connects,
+    subscribes and decodes nothing — which is indistinguishable from a quiet
+    market and is precisely how a feed goes silently narrow.
+    """
+    ticks = _angel_ticks(_angel_packet(mode=mode, price=265075, size=51 if mode == 1 else 379))
+    assert len(ticks) == 1 and ticks[0]["last_price"] == 2650.75
+
+
+def test_an_angelone_depth_packet_is_refused_rather_than_priced():
+    """Depth mode reuses the header and replaces everything after it.
+
+    Its bytes at the price offset are a book, so decoding one as a price would
+    publish a *quantity* as a rupee value — a number that is not obviously wrong
+    on a chart and would be marked against a real position.
+    """
+    assert _angel_ticks(_angel_packet(mode=4, price=1500, size=443)) == []
+
+
+def test_a_truncated_angelone_packet_yields_no_invented_tick():
+    """A short read must produce nothing, never a zero-padded price."""
+    for size in (0, 1, 2, 27, 43, 50):
+        assert _angel_ticks(_angel_packet(size=size)) == [], size
+
+
+def test_an_angelone_packet_from_an_unmapped_segment_is_dropped():
+    """The price divisor is per segment, so a segment we cannot name we cannot price."""
+    assert _angel_ticks(_angel_packet(segment=99)) == []
+
+
+def test_an_angelone_token_is_read_up_to_its_null_terminator():
+    """25 bytes of field, NUL-terminated ASCII — the trailing bytes are not the token."""
+    ticks = _angel_ticks(_angel_packet(token_bytes=b"2885\x00\x99\x99\x99"))
+    assert ticks[0]["instrument_token"] == "1|2885"
+    # A field with no digits at all identifies nothing and is dropped.
+    assert _angel_ticks(_angel_packet(token_bytes=b"\x00" * 25)) == []
+    assert _angel_ticks(_angel_packet(token_bytes=b"NOTATOKEN\x00")) == []
+
+
+def test_angelone_text_frames_are_classified_and_none_of_them_is_a_tick():
+    """`pong`, an error envelope, and junk — three text shapes, three outcomes."""
+    adapter = _angelone()
+    assert adapter.decode_stream_frame("pong").kind is StreamEventKind.IGNORE
+
+    error = adapter.decode_stream_frame(json.dumps(
+        {"correlationID": "abcde12345", "errorCode": "E1002",
+         "errorMessage": "Invalid Request. Subscription Limit Exceeded"}))
+    assert error.kind is StreamEventKind.ERROR
+    assert "E1002" in error.message and "Subscription Limit" in error.message
+
+    for junk in ("", "   ", "not json", "[]", json.dumps({"unrelated": 1})):
+        assert adapter.decode_stream_frame(junk).kind is StreamEventKind.IGNORE
+
+
+def test_an_angelone_subscription_error_does_not_drop_a_working_socket():
+    """SmartAPI states a failed subscription leaves existing ones streaming.
+
+    Dropping the connection would turn a partial rejection into a total outage.
+    """
+    frames = [
+        json.dumps({"correlationID": "abcde12345", "errorCode": "E1002",
+                    "errorMessage": "Invalid Request. Subscription Limit Exceeded"}),
+        _angel_packet(price=265075),
+    ]
+    ticks, _, expired, socket = drive_stream(
+        _angelone(), frames, instruments=["1|2885"], session=_angel_session())
+    assert expired == []
+    assert len(ticks) == 1 and ticks[0][2][0]["last_price"] == 2650.75
+    assert socket.closed
+
+
+def test_a_malformed_angelone_frame_does_not_terminate_a_live_stream():
+    """One damaged frame costs itself and nothing else."""
+    frames = [b"\xff\xff", _angel_packet(price=265075), b"", "pong"]
+    ticks, _, _, socket = drive_stream(
+        _angelone(), frames, instruments=["1|2885"], session=_angel_session())
+    assert len(ticks) == 1 and ticks[0][2][0]["last_price"] == 2650.75
+    assert socket.closed
+
+
+# -- price representation ------------------------------------------------------
+
+
+def test_an_angelone_price_is_paise_and_a_copied_divisor_would_be_wrong():
+    """Paise like Kite — and NOT Kite's *rule*, which is keyed on the token.
+
+    Kite reads the exchange segment out of the low byte of its 32-bit token;
+    SmartAPI carries the segment as its own field and quotes everything in paise
+    except currencies. Copying `zerodha.price_divisor` here would consult a byte
+    of a SmartAPI token that means nothing at all.
+    """
+    from services.brokers.zerodha import price_divisor as kite_divisor
+
+    assert _angel_ticks(_angel_packet(token="2885", price=265075))[0]["last_price"] == 2650.75
+    # Kite's rule applied to this SmartAPI token reads segment 69 — a divisor of
+    # 100 by luck here, and the wrong one the moment a currency tick arrives.
+    assert kite_divisor(2885) == 100.0
+    currency = _angel_ticks(_angel_packet(segment=13, token="12345", price=7512500))[0]
+    assert currency["last_price"] == 0.75125, "SmartAPI quotes currencies at 10^7"
+    assert kite_divisor(12345) != 10_000_000.0, "Kite's segment rule does not produce SmartAPI's scale"
+
+
+@pytest.mark.parametrize("paise,expected", [(1, 0.01), (105, 1.05), (265075, 2650.75), (99999999, 999999.99)])
+def test_angelone_decimal_precision_survives_the_codec(paise, expected):
+    assert _angel_ticks(_angel_packet(price=paise))[0]["last_price"] == expected
+
+
+def test_an_angelone_zero_or_negative_price_never_becomes_a_market_tick():
+    """A zero price is what a truncated packet decodes to and would mark a position at."""
+    for paise in (0, -100):
+        ticks = _angel_ticks(_angel_packet(price=paise))
+        # The broker tick may exist; the canonical boundary is where it stops.
+        assert canonical_ticks(ticks, _angel_map(), broker="angelone") == []
+
+
+def test_an_impossible_angelone_price_is_refused_at_the_canonical_boundary():
+    """The Market Engine's own quote bounds, reached through the tick path."""
+    huge = int((MAX_STOCK_PRICE + 1000) * 100)
+    assert canonical_ticks(_angel_ticks(_angel_packet(price=huge)), _angel_map(), broker="angelone") == []
+
+
+# -- volume semantics ----------------------------------------------------------
+
+
+def test_an_angelone_ltp_tick_carries_no_volume_rather_than_a_fabricated_one():
+    """LTP mode has no volume field, and the wider modes' `ltq` is not volume.
+
+    `lLastTradedQty` is one trade's size; the day's cumulative volume is
+    `lVolumeTradedToday`, and neither exists in the mode this adapter
+    subscribes. Putting either in the canonical `volume` field would populate it
+    with a number that means something else — the same rejection D4.6 and D4.7
+    made for Kite's LTP mode and Upstox's `ltpc`, reached a third time.
+    """
+    tick = _angel_canonical()[0]
+    assert tick["volume"] is None, "a volume appeared that the subscribed mode cannot carry"
+    assert _angel_ticks(_angel_packet())[0]["volume"] == 0
+
+
+# -- instrument identity -------------------------------------------------------
+
+
+def test_an_angelone_instrument_becomes_a_canonical_symbol_through_the_shared_map():
+    """A third identifier shape resolving through the unchanged `InstrumentMap`."""
+    ticks = canonical_ticks(_angel_ticks(_angel_packet(token="2885")), _angel_map(), broker="angelone")
+    assert ticks == [{
+        "symbol": "RELIANCE", "price": 2650.75, "exchange": "NSE",
+        "volume": None, "ingested_at": ticks[0]["ingested_at"],
+    }]
+
+
+def test_an_angelone_token_alone_is_not_an_identity():
+    """THE protocol fact this adapter is built around, asserted as a behaviour.
+
+    SmartAPI token numbers are unique within an exchange segment and nothing
+    more, so the same number means different instruments on NSE and BSE. Had the
+    adapter stored the bare token — Kite's shape — a BSE tick would resolve to
+    an NSE holding and mark a position at another instrument's price. Nothing
+    would raise; the number would simply be wrong.
+    """
+    from services.brokers.angelone import instrument_id
+
+    assert instrument_id("NSE", "2885") != instrument_id("BSE", "2885")
+
+    account = InstrumentMap.from_portfolio(
+        [{"symbol": "RELIANCE", "exchange": "NSE", "instrument_token": instrument_id("NSE", "2885")}]
+    )
+    nse = canonical_ticks(_angel_ticks(_angel_packet(token="2885", segment=1)), account, broker="angelone")
+    bse = canonical_ticks(_angel_ticks(_angel_packet(token="2885", segment=3)), account, broker="angelone")
+    assert [t["symbol"] for t in nse] == ["RELIANCE"]
+    assert bse == [], "a BSE tick was resolved to an NSE holding by its token number alone"
+
+
+def test_an_unknown_angelone_instrument_is_dropped_rather_than_named():
+    """A token the account has no row for is unresolvable, never a symbol."""
+    resolved = canonical_ticks(_angel_ticks(_angel_packet(token="999999")), _angel_map(), broker="angelone")
+    assert resolved == []
+
+
+def test_an_angelone_identity_that_round_tripped_through_mongo_still_reaches_the_wire():
+    """The subscription side of the same string/round-trip exposure D4.3 documents."""
+    holdings = [{"symbol": "RELIANCE", "exchange": "NSE", "instrument_token": "1|2885"}]
+    assert _angelone().stream_instruments(holdings=holdings) == ["1|2885"]
+    # And a row whose identity never got built is skipped rather than sent.
+    assert _angelone().stream_instruments(holdings=[{"symbol": "X", "instrument_token": None}]) == []
+
+
+def test_the_angelone_trading_symbol_series_suffix_is_stripped_at_the_boundary():
+    """`TATASTEEL-EQ` is SmartAPI's name for the instrument every other broker calls `TATASTEEL`.
+
+    Left alone, a user holding one stock at two brokers would hold two different
+    canonical symbols — a split portfolio and a feed whose coverage never
+    matches the platform's instrument universe.
+    """
+    from services.brokers.angelone import trading_symbol
+
+    assert trading_symbol("TATASTEEL-EQ") == "TATASTEEL"
+    assert trading_symbol("SBIN-BE") == "SBIN"
+    # A derivative symbol carries no series suffix and must not be truncated.
+    assert trading_symbol("NIFTY30JAN2523500CE") == "NIFTY30JAN2523500CE"
+    assert trading_symbol("M-M") == "M-M", "a hyphen that is not a series code was stripped"
+    assert trading_symbol(None) is None
+
+
+def test_angelone_needs_no_instrument_catalogue():
+    """The account's own synced rows are the mapping table, in both directions.
+
+    A holding row carries the exchange, the SmartAPI token and the trading
+    symbol side by side, so subscription and resolution are built from the same
+    two lists this platform already syncs. Requiring SmartAPI's master scrip
+    file would have turned an adapter sprint into a data-pipeline sprint.
+    """
+    holdings = [{"symbol": "RELIANCE", "exchange": "NSE", "instrument_token": "1|2885"}]
+    subscribed = _angelone().stream_instruments(holdings=holdings)
+    resolved = canonical_ticks(
+        _angel_ticks(_angel_packet(token="2885")),
+        InstrumentMap.from_portfolio(holdings), broker="angelone")
+    assert subscribed == ["1|2885"] and resolved[0]["symbol"] == "RELIANCE"
+
+
+def test_the_angelone_holdings_row_carries_the_identity_the_feed_subscribes():
+    """The two halves are one expression, so they cannot drift apart."""
+    payload = {"status": True, "message": "SUCCESS", "errorcode": "", "data": {"holdings": [
+        {"tradingsymbol": "TATASTEEL-EQ", "exchange": "NSE", "isin": "INE081A01020", "quantity": 2,
+         "t1quantity": 0, "averageprice": 111.87, "ltp": 130.15, "symboltoken": "3499",
+         "product": "DELIVERY", "profitandloss": 37, "pnlpercentage": 16.34}]}}
+
+    adapter = _angelone()
+    with patch.object(BrokerAdapter, "_request", new=AsyncMock(return_value=payload)):
+        holdings = run(adapter.get_holdings({"access_token": "t"}))
+    assert holdings[0]["symbol"] == "TATASTEEL"
+    assert holdings[0]["instrument_token"] == "1|3499"
+    assert adapter.stream_instruments(holdings=holdings) == ["1|3499"]
+
+
+# -- canonicalization ----------------------------------------------------------
+
+
+def test_no_raw_angelone_payload_escapes_the_adapter():
+    """The codec boundary, checked on the type rather than on the values."""
+    event = _angelone().decode_stream_frame(_angel_packet())
+    assert event.kind is StreamEventKind.TICKS
+    assert all(type(tick).__name__ == "BrokerTick" for tick in event.ticks)
+    blob = json.dumps(_angel_canonical()[0]).lower()
+    for forbidden in ("angel", "smartapi", "exchangetype", "correlationid", "symboltoken", "2885", "1|"):
+        assert forbidden not in blob, f"{forbidden} reached a canonical market tick"
+
+
+def test_three_brokers_speak_three_protocols_and_produce_identical_canonical_ticks():
+    """THE D4.9 acceptance criterion: a third wire, the same canonical output.
+
+    Three brokers agree on nothing at the wire — big-endian bespoke binary vs
+    protobuf vs little-endian fixed packets, integer token vs compound key vs
+    segment-qualified token, three different price rules, three auth styles, one
+    socket vs two vs one-with-a-keep-alive — and what reaches the Market Engine
+    from each is the same canonical `MarketTick`.
+    """
+    kite = canonical_ticks(_kite_ticks(_kite_frame((738561, 265075))), _kite_map(), broker="zerodha")
+    upstox = canonical_ticks(
+        _upstox_ticks(_upstox_frame(ltpc={"NSE_EQ|INE002A01018": 2650.75})), _upstox_map(), broker="upstox")
+    angel = _angel_canonical(price=265075, token="2885")
+
+    wires = [_kite_frame((738561, 265075)),
+             _upstox_frame(ltpc={"NSE_EQ|INE002A01018": 2650.75}),
+             _angel_packet(price=265075)]
+    assert len({bytes(w) for w in wires}) == 3, "two of the three wires are identical"
+
+    shaped = [[{k: v for k, v in tick.items() if k != "ingested_at"} for tick in batch]
+              for batch in (kite, upstox, angel)]
+    assert shaped[0] == shaped[1] == shaped[2] == [
+        {"symbol": "RELIANCE", "price": 2650.75, "exchange": "NSE", "volume": None}
+    ]
+
+
+# -- transport -----------------------------------------------------------------
+
+
+def test_an_angelone_stream_runs_through_the_generic_transport_unchanged():
+    """Real SmartAPI bytes over the real transport: subscribe, tick, pong, close.
+
+    The subscribe frame must reach the socket verbatim *as text* — the transport
+    cannot know what encoding this broker expects, so it must not re-encode what
+    the codec handed it.
+    """
+    frames = ["pong", _angel_packet(token="2885", price=265075)]
+    ticks, orders, expired, socket = drive_stream(
+        _angelone(), frames, instruments=["1|2885"], session=_angel_session())
+
+    assert len(socket.sent) == 1 and isinstance(socket.sent[0], str)
+    assert json.loads(socket.sent[0])["params"]["tokenList"] == [{"exchangeType": 1, "tokens": ["2885"]}]
+    assert len(ticks) == 1 and ticks[0][1] == "angelone"
+    assert ticks[0][2] == [{
+        "instrument_token": "1|2885", "last_price": 2650.75, "symbol": None,
+        "exchange": "NSE", "volume": 0, "timestamp": "1724236800000",
+    }]
+    assert orders == [] and expired == []
+    assert socket.closed
+
+
+def test_angelone_uses_one_channel_and_the_free_single_channel_path():
+    """The independent test of the channel model D4.7 introduced.
+
+    Upstox forced channels into existence and was the only user of them, so the
+    concept had never been exercised by a broker that did *not* need it. Angel
+    One's realtime surface is one socket, and it declares nothing about
+    channels: it gets the free one, backed by its own `stream_*` methods.
+    """
+    from services.brokers.base import AdapterStreamChannel
+
+    channel = _angel_channel()
+    assert isinstance(channel, AdapterStreamChannel)
+    assert channel.name == DEFAULT_STREAM_CHANNEL
+    assert channel.delivers == frozenset({StreamEventKind.TICKS})
+    assert channel.protocol == _angelone().stream_protocol == "smartapi_stream_v2"
+    # And it is served by the one generic WebSocket transport, like all the rest.
+    from services.brokers.stream import PROTOCOL_RUNNERS, resolve_transport
+
+    assert PROTOCOL_RUNNERS == {}
+    assert resolve_transport(channel) is BrokerStream._run_websocket
+
+
+# -- error classification ------------------------------------------------------
+
+
+class _AngelHandshakeRefused(Exception):
+    def __init__(self, status_code):
+        super().__init__(f"server rejected WebSocket connection: HTTP {status_code}")
+        self.status_code = status_code
+
+
+class _AngelHandshakeRefused14(Exception):
+    """websockets >= 14 wraps the handshake response instead of exposing a status."""
+
+    def __init__(self, status_code):
+        super().__init__("server rejected WebSocket connection")
+        self.response = type("Response", (), {"status_code": status_code})()
+
+
+@pytest.mark.parametrize("refusal", [_AngelHandshakeRefused, _AngelHandshakeRefused14])
+@pytest.mark.parametrize("status", [401, 403])
+def test_angelone_refusing_the_handshake_expires_the_session(refusal, status):
+    """SmartAPI rejects a dead session at the handshake, so no codec ever sees it.
+
+    Unclassified, an expired session is indistinguishable from a broker outage:
+    the stream reconnects on the backoff schedule forever, the account's market
+    feed stays registered, and the user is never asked to reconnect. A SmartAPI
+    session dies at midnight IST, so that is every connected user, every day.
+    """
+    stream = BrokerStream("u1", "angelone", _angel_session(), channel=DEFAULT_STREAM_CHANNEL)
+
+    async def scenario():
+        with patch.object(BrokerStream, "_connect", AsyncMock(side_effect=refusal(status))):
+            with pytest.raises(_AuthExpired) as excinfo:
+                await stream._run_websocket()
+        assert "reconnect" in str(excinfo.value).lower()
+
+    run(scenario())
+
+
+def test_an_ordinary_angelone_connection_failure_still_reconnects():
+    """Only a refusal means a dead session; everything else is connection weather."""
+    stream = BrokerStream("u1", "angelone", _angel_session(), channel=DEFAULT_STREAM_CHANNEL)
+
+    async def scenario():
+        with patch.object(BrokerStream, "_connect", AsyncMock(side_effect=OSError("connection reset"))):
+            with pytest.raises(OSError):
+                await stream._run_websocket()
+
+    run(scenario())
+    assert _angelone().stream_connect_error(OSError("connection reset")) is None
+    assert _angelone().stream_connect_error(_AngelHandshakeRefused(500)) is None
+
+
+def test_an_expired_angelone_rest_session_is_reported_as_an_auth_failure():
+    """SmartAPI answers HTTP 200 with `status: false` for a dead session.
+
+    So the transport-level 401 handling cannot see it, and an unchecked caller
+    would read `data: null` as an empty portfolio rather than a dead session.
+    """
+    from services.brokers.errors import BrokerAuthError, BrokerError
+
+    dead = {"status": False, "message": "Invalid Token", "errorcode": "AG8001", "data": None}
+    with patch.object(BrokerAdapter, "_request", new=AsyncMock(return_value=dead)):
+        with pytest.raises(BrokerAuthError):
+            run(_angelone().get_holdings({"access_token": "t"}))
+
+    other = {"status": False, "message": "Something else", "errorcode": "AB1004", "data": None}
+    with patch.object(BrokerAdapter, "_request", new=AsyncMock(return_value=other)):
+        with pytest.raises(BrokerError) as excinfo:
+            run(_angelone().get_holdings({"access_token": "t"}))
+    assert not isinstance(excinfo.value, BrokerAuthError)
+
+
+# -- readiness, promotion, failover ---------------------------------------------
+
+
+def test_a_connected_angelone_stream_is_not_ready_until_a_real_packet_arrives():
+    """CONNECTED != READY, driven by SmartAPI's own bytes.
+
+    Every milestone short of data is reached — registered, link up, subscribed,
+    a keep-alive answered, an error frame received, a damaged frame received —
+    and the baseline still serves the quote.
+    """
+    from services.brokers.market_feed import set_market_feed_link
+    from services.market_engine.providers import Capability, ResolutionContext, YahooPollingAdapter
+
+    with _clean_provider_registry() as registry:
+        registry.clear()
+        baseline = YahooPollingAdapter()
+        registry.register(baseline)
+        run(baseline.connect())
+        manager = SourceManager(registry)
+        ctx = ResolutionContext(user_id="u1", symbol="RELIANCE")
+
+        feed = _angel_feed("u1", symbols=("RELIANCE",))
+        run(set_market_feed_link("u1", "angelone", up=True))
+        assert manager.resolve(Capability.QUOTES, context=ctx) is baseline
+
+        for noise in ("pong", json.dumps({"errorCode": "E1001"}), b"\xff\xff", _angel_packet(size=20)):
+            run(feed.on_raw(canonical_ticks(
+                [t.as_dict() for t in _angelone().decode_stream_frame(noise).ticks],
+                _angel_map(), broker="angelone")))
+        assert not feed.is_ready
+        assert manager.resolve(Capability.QUOTES, context=ctx) is baseline
+
+        run(feed.on_raw(_angel_canonical()))
+        assert feed.is_ready
+        assert manager.resolve(Capability.QUOTES, context=ctx) is feed
+        assert run(feed.fetch_quote("RELIANCE"))["price"] == 2650.75
+        # Make-before-break: the baseline was never unregistered or disconnected.
+        assert registry.get(baseline.name) is baseline and baseline.is_connected
+
+
+def test_an_angelone_feed_is_promoted_over_the_baseline_and_falls_back_on_link_loss():
+    """The unchanged D4.5 machinery, reached by a third broker."""
+    from services.brokers.market_feed import set_market_feed_link
+    from services.market_engine.providers import Capability, ResolutionContext, YahooPollingAdapter
+
+    with _clean_provider_registry() as registry:
+        registry.clear()
+        baseline = YahooPollingAdapter()
+        registry.register(baseline)
+        manager = SourceManager(registry)
+        ctx = ResolutionContext(user_id="u1", symbol="RELIANCE")
+
+        feed = _angel_feed("u1", symbols=("RELIANCE",))
+        run(set_market_feed_link("u1", "angelone", up=True))
+        run(feed.on_raw(_angel_canonical()))
+        assert manager.resolve(Capability.QUOTES, context=ctx) is feed
+
+        run(set_market_feed_link("u1", "angelone", up=False, reason="socket closed"))
+        assert manager.resolve(Capability.QUOTES, context=ctx) is baseline
+        assert registry.get(feed.name) is feed, "a dropped socket unregistered the feed"
+
+
+def test_a_reconnected_angelone_feed_cannot_answer_from_the_dead_links_prices():
+    """The D4.8 stale-evidence hardening, re-checked on the third broker.
+
+    Readiness is re-earned by *any* symbol while coverage is per symbol, so a
+    feed that ticked A and B on link 1, lost it, reconnected and received one
+    fresh tick for A must not answer a quote for B from link 1's price.
+    """
+    from services.brokers.market_feed import set_market_feed_link
+    from services.market_engine.providers import Capability, ResolutionContext, YahooPollingAdapter
+
+    with _clean_provider_registry() as registry:
+        registry.clear()
+        baseline = YahooPollingAdapter()
+        registry.register(baseline)
+        manager = SourceManager(registry)
+
+        feed = _angel_feed("u1", symbols=("RELIANCE", "TCS"))
+        run(set_market_feed_link("u1", "angelone", up=True))
+        run(feed.on_raw(_angel_canonical(price=265075, token="2885")))    # RELIANCE
+        run(feed.on_raw(_angel_canonical(price=399010, token="11536")))   # TCS
+        assert feed.covers("RELIANCE") and feed.covers("TCS")
+
+        run(set_market_feed_link("u1", "angelone", up=False, reason="dropped"))
+        run(set_market_feed_link("u1", "angelone", up=True))
+        assert not feed.is_ready, "readiness survived the link that earned it"
+
+        run(feed.on_raw(_angel_canonical(price=266000, token="2885")))
+        assert feed.is_ready and feed.covers("RELIANCE")
+        assert not feed.covers("TCS"), "a price from the previous connection survived the reconnect"
+        assert manager.resolve(
+            Capability.QUOTES, context=ResolutionContext(user_id="u1", symbol="TCS")) is baseline
+
+
+def test_an_angelone_feed_that_never_ticks_leaves_the_baseline_primary():
+    """A socket that connects, subscribes and says nothing must change nothing."""
+    from services.brokers.market_feed import set_market_feed_link
+    from services.market_engine.providers import Capability, ResolutionContext, YahooPollingAdapter
+
+    with _clean_provider_registry() as registry:
+        registry.clear()
+        baseline = YahooPollingAdapter()
+        registry.register(baseline)
+        manager = SourceManager(registry)
+
+        _angel_feed("u1", symbols=("RELIANCE",))
+        run(set_market_feed_link("u1", "angelone", up=True))
+        assert manager.resolve(
+            Capability.QUOTES, context=ResolutionContext(user_id="u1", symbol="RELIANCE")) is baseline
+
+
+def test_angelone_registers_through_the_existing_provider_framework():
+    """No Angel-One-specific provider, gateway, registry or Source Manager exists."""
+    from services.brokers.market_feed import feed_provider_name
+    from services.market_engine.providers import StreamingTickProvider
+
+    with _clean_provider_registry() as registry:
+        registry.clear()
+        name = run(_attach("u1", "angelone", ["RELIANCE"]))
+        assert name == feed_provider_name("u1", "angelone") == "brokerfeed:angelone:u1"
+        provider = registry.get(name)
+        assert type(provider) is StreamingTickProvider, "a broker-specific provider class appeared"
+        assert provider.owner_user_id == "u1"
+
+
+def test_removing_the_angelone_tick_capability_removes_its_market_feed():
+    """The capability declaration is what makes the feed a provider — nothing else.
+
+    A broker that does not declare `TICK_STREAM` must not be registered as a
+    priority-1 streaming provider, because one that can only deliver silence
+    would still be ranked above the working baseline.
+    """
+    adapter = _angelone()
+    narrowed = adapter.capabilities - {BrokerCapability.TICK_STREAM}
+    with _clean_provider_registry() as registry:
+        registry.clear()
+        with patch.object(type(adapter), "capabilities", narrowed):
+            assert run(_attach("u1", "angelone", ["RELIANCE"])) is None
+        assert registry.get("brokerfeed:angelone:u1") is None
+
+
+# -- isolation ------------------------------------------------------------------
+
+
+def test_four_users_on_four_providers_stay_on_their_own(caplog):
+    """Angel One, Zerodha, Upstox and the shared baseline, at once.
+
+    The one test that exercises every streaming broker the platform has plus the
+    fallback, and the property is per user: each resolves to their own feed, and
+    one broker's failure moves exactly one user.
+    """
+    from services.brokers.market_feed import set_market_feed_link
+    from services.market_engine.providers import Capability, ResolutionContext, YahooPollingAdapter
+
+    with _clean_provider_registry() as registry:
+        registry.clear()
+        baseline = YahooPollingAdapter()
+        registry.register(baseline)
+        manager = SourceManager(registry)
+
+        feeds = {
+            "userA": _angel_feed("userA", symbols=("RELIANCE",)),
+            "userB": (_attach_and_get("userB", "zerodha")),
+            "userC": _upstox_feed("userC", symbols=("RELIANCE",)),
+        }
+        for user, broker in (("userA", "angelone"), ("userB", "zerodha"), ("userC", "upstox")):
+            run(set_market_feed_link(user, broker, up=True))
+        run(feeds["userA"].on_raw(_angel_canonical()))
+        run(feeds["userB"].on_raw(canonical_ticks(
+            _kite_ticks(_kite_frame((738561, 265075))), _kite_map(), broker="zerodha")))
+        run(feeds["userC"].on_raw(_upstox_canonical()))
+
+        def resolved(user):
+            return manager.resolve(Capability.QUOTES, context=ResolutionContext(user_id=user, symbol="RELIANCE"))
+
+        assert resolved("userA") is feeds["userA"]
+        assert resolved("userB") is feeds["userB"]
+        assert resolved("userC") is feeds["userC"]
+        assert resolved("userD") is baseline, "a user with no broker was served another user's feed"
+
+        # Angel One drops. Only user A moves.
+        run(set_market_feed_link("userA", "angelone", up=False, reason="socket closed"))
+        assert resolved("userA") is baseline
+        assert resolved("userB") is feeds["userB"]
+        assert resolved("userC") is feeds["userC"]
+        assert resolved("userD") is baseline
+
+
+def _attach_and_get(user_id, broker, symbols=("RELIANCE",)):
+    from services.brokers.market_feed import feed_provider_name
+    from services.market_engine.providers import provider_registry
+
+    run(_attach(user_id, broker, list(symbols)))
+    return provider_registry.get(feed_provider_name(user_id, broker))
+
+
+def test_an_angelone_quote_carries_no_broker_identity_and_no_other_users_data():
+    """What a consumer receives says `streaming` and nothing about Angel One."""
+    from services.brokers.market_feed import set_market_feed_link
+    from services.market_engine.providers import YahooPollingAdapter
+
+    with _clean_provider_registry() as registry:
+        registry.clear()
+        registry.register(YahooPollingAdapter())
+        feed = _angel_feed("u1", symbols=("RELIANCE",))
+        run(set_market_feed_link("u1", "angelone", up=True))
+        run(feed.on_raw(_angel_canonical()))
+        quote = run(feed.fetch_quote("RELIANCE"))
+
+    blob = json.dumps(quote).lower()
+    for forbidden in ("angel", "smartapi", "brokerfeed", "u1", "jwt", "feed_token", "2885"):
+        assert forbidden not in blob, f"{forbidden} reached a consumer-facing quote"
+
+
+# -- the engine seam -------------------------------------------------------------
+
+
+def test_the_engine_carries_angelone_bytes_all_the_way_into_the_registered_feed():
+    """The real join: the engine's instrument map, the canonical boundary, the push."""
+    from services.market_engine.providers import Capability, ResolutionContext, YahooPollingAdapter
+
+    holdings = [{"symbol": "RELIANCE", "exchange": "NSE", "instrument_token": "1|2885"}]
+    engine = BrokerEngine()
+    engine.configure(FakeDB())
+
+    with _clean_provider_registry() as registry:
+        registry.clear()
+        baseline = YahooPollingAdapter()
+        registry.register(baseline)
+        manager = SourceManager(registry)
+        ctx = ResolutionContext(user_id="u1", symbol="RELIANCE")
+
+        with patch("services.brokers.stream.stream_manager.start_stream", new=AsyncMock()) as started, \
+                patch.object(BrokerEngine, "get_session", new=AsyncMock(return_value=_angel_session())), \
+                patch("services.brokers.gateway.broker_gateway.get_holdings", new=AsyncMock(return_value=holdings)), \
+                patch("services.brokers.gateway.broker_gateway.get_positions", new=AsyncMock(return_value=[])):
+            run(engine.start_stream("u1", "angelone"))
+
+        # One channel, and the engine passed it this account's SmartAPI ids.
+        assert started.await_count == 1
+        assert started.await_args.kwargs["instrument_tokens"] == ["1|2885"]
+        assert started.await_args.kwargs["channel"] == DEFAULT_STREAM_CHANNEL
+
+        feed = registry.get("brokerfeed:angelone:u1")
+        assert feed is not None and feed.subscribed_symbols == ("RELIANCE",)
+        run(feed.mark_link_up())
+        assert manager.resolve(Capability.QUOTES, context=ctx) is baseline
+
+        with patch.object(BrokerEngine, "_push", new=AsyncMock()):
+            run(engine._on_stream_tick("u1", "angelone", _angel_ticks(_angel_packet(price=265050))))
+
+        assert feed.describe()["accepted_records"] == 1
+        assert manager.resolve(Capability.QUOTES, context=ctx) is feed
+        assert run(feed.fetch_quote("RELIANCE"))["price"] == 2650.5
+
+
+def test_an_expired_angelone_session_detaches_the_market_feed():
+    """A dead session must stop being resolvable now, not at the next transition."""
+    engine = BrokerEngine()
+    engine.configure(FakeDB())
+
+    with _clean_provider_registry() as registry:
+        registry.clear()
+        _angel_feed("u1", symbols=("RELIANCE",))
+        assert registry.get("brokerfeed:angelone:u1") is not None
+        with patch.object(BrokerEngine, "_push", new=AsyncMock()), \
+                patch("services.brokers.stream.stream_manager.stop_stream", new=AsyncMock()):
+            run(engine._on_stream_expired("u1", "angelone", DEFAULT_STREAM_CHANNEL))
+        assert registry.get("brokerfeed:angelone:u1") is None
+
+
+# -- security --------------------------------------------------------------------
+
+
+def test_no_angelone_credential_reaches_a_log_line(caplog):
+    """The whole transport pass, at DEBUG, with four live-looking credentials.
+
+    Angel One carries more credential material onto a socket than either
+    predecessor — a session JWT, a separate feed token, the app key and the
+    client code — so it has four ways to fail this rather than one.
+    """
+    caplog.set_level(logging.DEBUG)
+    drive_stream(
+        _angelone(),
+        ["pong", _angel_packet(price=265050), json.dumps({"errorCode": "E1002", "errorMessage": "limit"})],
+        instruments=["1|2885"],
+        session={"access_token": "SECRET-JWT", "feed_token": "SECRET-FEED-TOKEN", "account_id": "A123456"},
+    )
+    emitted = "\n".join(r.getMessage() for r in caplog.records)
+    assert emitted, "nothing was logged — the sweep could not have failed"
+    for secret in ("SECRET-JWT", "SECRET-FEED-TOKEN", "nova-key", "A123456"):
+        assert secret not in emitted, f"{secret} reached a log line"
+
+
+def test_the_angelone_feed_token_is_encrypted_at_rest_like_every_other_session_secret():
+    """The second per-session credential this broker's stream needs is a secret.
+
+    Stored in plaintext it would be the one field in `db.broker_accounts` that
+    SECURITY.md's encryption-at-rest rule did not cover — and it is enough, with
+    the app key, to open a market feed for the account.
+    """
+    from services.broker_engine import TOKEN_FIELDS
+    from services.brokers.crypto import is_encrypted
+
+    assert "feed_token" in TOKEN_FIELDS
+    engine = BrokerEngine()
+    engine.configure(FakeDB())
+    session = {"access_token": "jwt", "feed_token": "SECRET-FEED-TOKEN", "account_id": "A1"}
+    run(engine._save_account("u1", "angelone", session))
+
+    stored = run(engine.db.broker_accounts.find_one({"user_id": "u1", "broker": "angelone"}))
+    assert stored["feed_token"] != "SECRET-FEED-TOKEN"
+    assert is_encrypted(stored["feed_token"])
+    assert run(engine._load_account("u1", "angelone"))["feed_token"] == "SECRET-FEED-TOKEN"
+
+
+def test_disconnecting_an_angelone_account_clears_every_session_secret():
+    """Disconnect must not leave a usable feed credential behind."""
+    from services.broker_engine import TOKEN_FIELDS
+
+    engine = BrokerEngine()
+    engine.configure(FakeDB())
+    run(engine._save_account("u1", "angelone", {
+        "access_token": "jwt", "feed_token": "SECRET-FEED-TOKEN",
+        "refresh_token": "r", "account_id": "A1"}))
+
+    with patch("services.brokers.gateway.broker_gateway.invalidate_session", new=AsyncMock()), \
+            patch("services.brokers.stream.stream_manager.stop_stream", new=AsyncMock()), \
+            patch.object(BrokerEngine, "_push", new=AsyncMock()), \
+            patch.object(BrokerEngine, "_publish_connection", new=AsyncMock()):
+        run(engine.disconnect("angelone", "u1"))
+
+    stored = run(engine.db.broker_accounts.find_one({"user_id": "u1", "broker": "angelone"}))
+    assert stored["connected"] is False
+    for field in TOKEN_FIELDS:
+        assert stored.get(field) == "", f"{field} survived a disconnect"
+
+
+# -- architecture ----------------------------------------------------------------
+
+
+def test_angelone_added_no_angelone_knowledge_outside_its_own_adapter():
+    """D4.9's central acceptance criterion, swept rather than asserted by eye.
+
+    The SmartAPI vocabulary — the feed URL, the exchange segments, the
+    subscription mode, the packet offsets, the token notion — must exist in
+    exactly one module. A second module that knows any of it is the beginning of
+    the `if broker == "angelone"` branch this framework exists to make
+    unnecessary.
+    """
+    # `angel(?!og)` rather than `angel`, and rather than `\bangel`: "changelog"
+    # contains "angel" (a false positive is a sweep somebody turns off), while
+    # `\bangel` would miss the shape a branch actually takes — a helper named
+    # `_is_angelone`, where the preceding underscore is a word character. That
+    # exact mutation survived a `\bangel` sweep during the falsification pass.
+    angel_words = (r"angel(?!og)", "smartapi", "smart-stream", "exchangetype", "tokenlist",
+                   "symboltoken", "correlationid", "clientcode")
+    allowed = {
+        "services/brokers/angelone.py",   # the adapter — the only owner
+        "services/brokers/__init__.py",   # the registry entry — one line
+    }
+    offenders = {}
+    scanned = 0
+    for path in sorted((BACKEND / "services").rglob("*.py")):
+        rel = path.relative_to(BACKEND).as_posix()
+        if rel in allowed:
+            continue
+        scanned += 1
+        source = _strip_source(path.read_text(encoding="utf-8")).lower()
+        hit = [w for w in angel_words if re.search(w, source)]
+        if hit:
+            offenders[rel] = hit
+    assert scanned > 50, "the sweep found almost no modules — it could not have failed"
+    assert not offenders, offenders
+
+
+def test_the_market_layer_is_untouched_by_the_third_broker():
+    """Everything D4.9 promised would not move, re-checked with three brokers live."""
+    market_modules = [
+        "services/market_engine/gateway.py",
+        "services/market_engine/source_manager.py",
+        "services/market_engine/ticks.py",
+        "services/market_engine/providers/streaming.py",
+        "services/market_engine/providers/registry.py",
+        "services/market_engine/providers/base.py",
+    ]
+    for relative in market_modules:
+        source = _strip_source((BACKEND / relative).read_text(encoding="utf-8")).lower()
+        for name in (r"angel(?!og)", "upstox", "zerodha", "kite", "broker_gateway", "broker_registry"):
+            assert not re.search(name, source), f"{relative} names {name!r} in executable code"
+
+
+def test_the_third_broker_added_no_broker_knowledge_to_the_transport():
+    """`stream.py` grew a keep-alive timer and still cannot tell one broker from another.
+
+    D4.9 changed this module — that is the honest finding of the sprint, as
+    D4.7's channel concept was — but what it added is a timer driven by a value
+    the endpoint carries. The property that matters survives.
+    """
+    source = _strip_source((BACKEND / "services/brokers/stream.py").read_text(encoding="utf-8")).lower()
+    for name in (r"angel(?!og)", "smartapi", "upstox", "zerodha", "kite", "protobuf", "ping\"", "'ping'"):
+        assert not re.search(name, source), f"stream.py names {name!r} in executable code"
+
+
+def test_the_engine_names_no_broker_after_the_third_one():
+    """The engine's session-secret list is generic names, not a per-broker registry."""
+    source = _strip_source((BACKEND / "services/broker_engine.py").read_text(encoding="utf-8")).lower()
+    for name in (r"angel(?!og)", "smartapi", "upstox", "zerodha", "kite"):
+        assert not re.search(name, source), f"broker_engine.py names {name!r} in executable code"
+
+
+def test_all_three_streaming_brokers_reach_the_market_gateway_through_the_identical_seam():
+    """One seam, three brokers, no branch anywhere on the path."""
+    import inspect
+
+    from services.brokers import market_feed
+
+    source = _strip_source(inspect.getsource(market_feed)).lower()
+    for name in (r"angel(?!og)", "smartapi", "upstox", "zerodha", "kite"):
+        assert not re.search(name, source), f"market_feed.py names {name!r} in executable code"
+
+    # `_strip_source` removes string literals, so an `if broker == "angelone"`
+    # branch is invisible to the vocabulary sweep above by construction. The
+    # comparison itself is what is banned here, on the unstripped source — the
+    # same ban `test_the_public_broker_routes_do_not_branch_on_a_broker_name`
+    # places on `server.py`, extended to the seam a third broker would tempt
+    # somebody to branch in.
+    for relative in ("services/brokers/market_feed.py", "services/brokers/stream.py",
+                     "services/market_engine/source_manager.py"):
+        text = _strip_prose((BACKEND / relative).read_text(encoding="utf-8"))
+        for comparison in ("broker ==", "broker!=", "broker !=", "broker in ("):
+            assert comparison not in text, f"{relative} branches on a broker name: {comparison!r}"
+
+    for broker in ("zerodha", "upstox", "angelone"):
+        adapter = broker_registry.require(broker)
+        assert adapter.supports(BrokerCapability.TICK_STREAM)
+        channels = [c for c in adapter.stream_channels() if StreamEventKind.TICKS in c.delivers]
+        assert len(channels) == 1, f"{broker} must have exactly one tick-carrying channel"

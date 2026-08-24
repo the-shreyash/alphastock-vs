@@ -58,7 +58,18 @@ from services.brokers.streaming import StreamEventKind
 
 logger = logging.getLogger(__name__)
 
-TOKEN_FIELDS = ("access_token", "refresh_token", "public_token")
+#: Session fields that are SECRETS, and are therefore encrypted at rest and
+#: cleared on disconnect.
+#:
+#: A list of generic session-credential names, not a per-broker registry: an
+#: adapter's `exchange_token` decides which of them its broker issues, and a
+#: broker that issues none of one simply never sets it. `feed_token` joined the
+#: list in D4.9 because a broker whose market feed authenticates with a *second*
+#: per-session credential — separate from the token its REST API takes — is an
+#: ordinary shape rather than one broker's quirk, and a session credential this
+#: engine stored in plaintext would be the one field in `db.broker_accounts`
+#: that SECURITY.md's encryption-at-rest rule did not cover.
+TOKEN_FIELDS = ("access_token", "refresh_token", "public_token", "feed_token")
 
 
 def _now_iso() -> str:
@@ -271,8 +282,8 @@ class BrokerEngine:
         await detach_market_feed(user_id, broker)
         await self.db.broker_accounts.update_one(
             {"user_id": user_id, "broker": broker},
-            {"$set": {"connected": False, "access_token": "", "refresh_token": "",
-                      "public_token": "", "disconnected_at": _now_iso()}})
+            {"$set": {**{field: "" for field in TOKEN_FIELDS},
+                      "connected": False, "disconnected_at": _now_iso()}})
         await self._audit(user_id, "broker.disconnected", {"broker": broker})
         self._activity(f"{adapter.display_name} account disconnected")
         await self._push(user_id, {"type": "broker_status", "data": {

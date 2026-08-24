@@ -31,6 +31,7 @@ Module map:
     stream.py        realtime transport for the brokers that offer one
     crypto.py        token encryption at rest
 """
+from services.brokers.angelone import AngelOneAdapter
 from services.brokers.base import BrokerAdapter, normalize_status
 from services.brokers.capabilities import (
     SYNC_CAPABILITIES,
@@ -68,7 +69,7 @@ def register_default_brokers() -> None:
     list so the UI can say "not available on this deployment" instead of
     silently omitting it, and `configured` is a field on that listing.
     """
-    for adapter_cls in (ZerodhaAdapter, UpstoxAdapter):
+    for adapter_cls in (ZerodhaAdapter, UpstoxAdapter, AngelOneAdapter):
         if adapter_cls.name not in broker_registry:
             broker_registry.register(adapter_cls())
 
@@ -101,6 +102,7 @@ def create_adapter(broker: str) -> BrokerAdapter:
 
 
 __all__ = [
+    "AngelOneAdapter",
     "BrokerAdapter",
     "BrokerAdapterInvalid",
     "BrokerAuthError",
