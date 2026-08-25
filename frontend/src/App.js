@@ -15,6 +15,7 @@ import "./App.css";
  * dashboard never downloads them.
  */
 const Landing = lazy(() => import("./pages/Landing"));
+const LandingLight = lazy(() => import("./pages/LandingLight"));
 const Login = lazy(() => import("./pages/Login"));
 const Register = lazy(() => import("./pages/Register"));
 const AuthCallback = lazy(() => import("./pages/AuthCallback"));
@@ -98,6 +99,7 @@ export function AppRouter() {
     <Suspense fallback={<PageFallback />}>
     <Routes>
       <Route path="/" element={<PublicRoute><Landing /></PublicRoute>} />
+      <Route path="/light" element={<PublicRoute><LandingLight /></PublicRoute>} />
       <Route path="/login" element={<PublicRoute><Login /></PublicRoute>} />
       <Route path="/register" element={<PublicRoute><Register /></PublicRoute>} />
       <Route path="/auth/google/callback" element={<AuthCallback />} />
