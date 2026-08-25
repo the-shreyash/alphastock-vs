@@ -3,7 +3,7 @@
 
 Version: 1.1
 
-Status: Approved Design — Phase 1 Implemented (Sprint D1, 2026-08-19); Phase 2 Implemented in backend (Sprint D2, 2026-08-20, frontend tier indicator outstanding); Phase 3 re-scoped to the Broker Provider Framework and Implemented (Sprint D3, 2026-08-20, ADR-031); Phase 4 Implemented through 4.9 (Sprints D4.1–D4.9, 2026-08-21…24, ADR-032…038 — Zerodha Kite, Upstox v3 and Angel One SmartAPI are the three concrete stream adapters; **live validation not yet performed for any of them**); remaining broker adapters, Phase 5 and Phase 6 pending
+Status: Approved Design — Phase 1 Implemented (Sprint D1, 2026-08-19); Phase 2 Implemented in backend (Sprint D2, 2026-08-20, frontend tier indicator outstanding); Phase 3 re-scoped to the Broker Provider Framework and Implemented (Sprint D3, 2026-08-20, ADR-031); Phase 4 Implemented through 4.11 (Sprints D4.1–D4.11, 2026-08-21…25, ADR-032…040 — Zerodha Kite, Upstox v3, Angel One SmartAPI, Fyers HSM and Dhan DhanHQ v2 are the five concrete stream adapters, and Dhan is the first that required no generic framework change at all; **live validation not yet performed for any of them**); remaining broker adapters, Phase 5 and Phase 6 pending
 
 Priority: Critical
 
@@ -877,7 +877,31 @@ Nothing changed in the Market Engine, the Market Gateway, the Source Manager, `S
 
 **An Angel-One-derived tick carries no volume** — LTP mode has none, and the wider modes' last-traded quantity is one trade's size rather than the day's cumulative volume. Third broker, same limitation, reached independently each time. **Live validation has not been performed for Angel One either**, and for the same reason: the feed needs a per-user session obtainable only through an interactive browser login. A live smoke test is now outstanding for all three streaming brokers.
 
-**Phase 4.10 — the remaining broker adapters.** Fyers, Dhan — each one adapter and nothing else, per Developer Rule 9.
+**Phase 4.10 (shipped) — Fyers, the fourth streaming broker.** The first broker that disagreed with the **framework** rather than only with its predecessors. Its HSM feed authenticates with a **frame on the data channel** instead of in the handshake, and its steady-state frames are **deltas against an earlier snapshot**, keyed by a topic id the server mints per connection — so a Fyers frame is not decodable on its own, and what decodes it belongs to one socket.
+
+**The market side needed nothing, for the third consecutive broker.** No change to the Market Gateway, the Source Manager, `StreamingTickProvider`, the provider registry, the canonical `MarketTick`, the readiness gate, the failover path or `InstrumentMap` — the adapter derives an HSM topic string from the `fyToken` already on every synced row and rebuilds the identical string from every decoded record, so a fourth identity shape resolves through the same table. Developer Rule 9 held again.
+
+**The broker transport needed one generic change, and it is reported rather than hidden.** `BrokerStreamChannel` had assumed a codec is *stateless* — reasonable while a channel object is a registry singleton shared by every user of a broker, and false for a delta protocol. `BrokerStreamChannel.open(session, credentials)` returns the channel's view of one connection; the transport uses it for that connection's subscribe frames and decode, and drops it when the socket ends. **The default returns `self`**, so Zerodha, Upstox and Angel One are byte-for-byte unaffected, and `stream.py` still cannot tell one broker from another. The failure it prevents is the quiet kind: a shared topic table means one account's reconnect renumbers another account's instruments and a price is filed under the wrong company's name. See BROKER_INTEGRATION.md §"Streaming Contract" and **ADR-039**.
+
+**The price scale is the first one carried on the wire.** Fyers has no divisor: `multiplier` and `precision` arrive in the snapshot, per instrument. A copied ÷100 is *correct* for NSE cash and wrong for currency — it fails on a real position rather than on the first tick anybody tests with.
+
+**A Fyers-derived tick carries no volume** — lite mode has none, and the genuine cumulative volume the snapshot carries would freeze after the first frame. Fourth broker, same limitation, reached independently each time. **Live validation has not been performed for Fyers either**, and for the same reason: the feed needs a per-user session obtainable only through an interactive browser login. A live smoke test is now outstanding for all four streaming brokers.
+
+**Phase 4.11 (shipped) — Dhan, the fifth streaming broker, and the first that needed no framework change at all.** D4.7 needed channels, D4.9 needed a keep-alive frame, D4.10 needed a connection scope; D4.11 needed one adapter module and one registry line. `stream.py`, `streaming.py`, `instruments.py`, `market_feed.py` and `ticks.py` are byte-for-byte unchanged. Developer Rule 9 held in its strongest form yet.
+
+**That is only evidence because the fifth broker was genuinely different**, and it was, on every axis this architecture abstracts: query-string auth on a socket that takes **JSON text subscribe frames and answers in binary**; a `(segment name, security id)` identity; an **unscaled `float32` price in rupees — no divisor at all**, where the previous four have four different scaling rules; and a session that expires on a **24-hour duration** rather than at a calendar hour.
+
+**Dhan is the first of the five brokers to fill `MarketTick.volume`.** Its Quote packet carries a genuine cumulative day volume, so the mode chosen is the *middle* one — the narrowest that leaves nothing canonical unfilled — where every previous adapter rejected its broker's richer mode because the extra fields had nowhere canonical to go. Four brokers reported "no volume on a tick" as a limitation reached independently each time; the fifth does not have it.
+
+**The sharpest protocol trap in the sequence so far, and it is a market-data correctness one.** Dhan's Prev Close packet is **byte-for-byte the same shape** as its Ticker packet — 16 bytes, a `float32` at the same offset — and Dhan sends one per instrument the moment a subscription lands. A codec that priced by shape rather than by response code would publish **yesterday's close as today's price, once per holding, immediately after every connect and every reconnect**, marking a whole portfolio at stale prices with nothing raised anywhere. The priceable packets are keyed on the response code for exactly this reason.
+
+**One limitation is a market-data coverage gap rather than a tick-field gap.** Dhan's `/holdings` reports `exchange`, not `exchangeSegment`, and its documentation and its own SDK disagree about what that field contains — the docs show a consolidated `"ALL"`, the SDK fixture shows `"NSE"`. A row naming no exchange yields no instrument identity and is not subscribed, because a security id without a segment identifies two different companies; defaulting it would publish another company's price under the user's stock's name. The holding is unaffected everywhere else in the platform, and the count is warned.
+
+**One broker-neutral debt was found and named: DB-5.** The stream transport resets its reconnect backoff after any connection that *completed*, so a socket a broker accepts and immediately closes reconnects roughly every 1.5s indefinitely. Dhan's "too many connections" code is the first protocol to expose it. The fix is to reset the backoff only after a connection that lasted a minimum duration, which **is flap suppression** — Phase 5's, below, and deliberately not done here.
+
+**Live validation has not been performed for Dhan either**, and for the same reason as the other four: the feed needs a per-user session obtainable only through an interactive browser login. A live smoke test is now outstanding for **all five** streaming brokers. See BROKER_INTEGRATION.md §"Dhan (DhanHQ v2)" and **ADR-040**.
+
+**Phase 4.12 — the remaining broker adapters.** Groww, INDmoney — each one adapter and nothing else, per Developer Rule 9.
 
 **Phase 5 — Hardening.** Latency scoring, flap suppression, probation windows, multi-connection sharding, chaos tests (kill connections in staging, verify silent failover).
 

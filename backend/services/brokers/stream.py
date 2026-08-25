@@ -129,6 +129,34 @@ ran its own timer would own a task whose lifetime must match a connection it
 does not hold — and a task leaked per reconnect is forever on a flapping feed.
 Both current adapters declare no heartbeat and are unaffected.
 
+WHAT D4.10 ADDED — A CONNECTION SCOPE THE CODEC NEVER HAD
+----------------------------------------------------------
+Three lines: ask the channel for its view of *this* connection before the first
+frame is sent, use it for the subscribe frames and the decode, drop it when the
+socket ends. `BrokerStreamChannel.open()` returns `self` by default, so the
+three brokers that came before are byte-for-byte unaffected and this module
+still cannot tell one from another.
+
+What forced it is a feed whose frames are not independently decodable. The
+fourth streaming broker sends one *snapshot* per instrument — the identity and
+the price scale — and then updates that carry a small numeric handle and the
+changed values alone, so a steady-state frame means nothing without what earlier
+frames on the same socket established. A channel object is a registry singleton
+shared by every user of the broker, so that state could not live there: one
+account's reconnect renumbers another account's instruments, and the failure is
+a price attributed to the wrong company's holding, with nothing raised anywhere.
+
+The same scope answers a second thing the contract could not express — a feed
+that authenticates with a frame on the data channel rather than in the
+handshake, so the first thing it sends is a credential `subscribe_frames()` had
+no argument to reach.
+
+Widening `subscribe_frames` / `decode` instead was rejected for the reason D4.7
+rejected widening the adapter methods: it changes what every existing channel
+and every test double implements, so an unmigrated broker fails on a live socket
+rather than at import. A broker that has never heard of connection scope *is* a
+stateless broker, which is what it always was.
+
 Still out of scope, deliberately (D5+): probation windows, latency scoring,
 flap suppression, and sharding one subscription across several connections —
 which is a different thing from a broker needing several connections, and is
@@ -231,6 +259,14 @@ class BrokerStream:
         self._link_up = False
         self._stopped = False
         self._task = None
+        #: The channel's per-CONNECTION view, for the connection currently open
+        #: (D4.10). `None` between connections, and set fresh on every one — a
+        #: broker whose codec accumulates state across frames must start each
+        #: socket from nothing, because the state a dead socket left behind
+        #: describes instruments the new one has not been told about yet. Every
+        #: channel that has no such state returns itself here, so for three of
+        #: the four brokers this attribute simply holds the channel.
+        self._connection = None
 
     # -- lifecycle -----------------------------------------------------------
     def start(self):
@@ -389,8 +425,14 @@ class BrokerStream:
             self.broker, self.channel, self.user_id, endpoint.safe_url,
         )
         heartbeat = self._start_heartbeat(ws, endpoint)
+        # The channel's view of THIS connection (D4.10). Established before a
+        # single frame is sent or received, so the frames that open the
+        # conversation and the frames that answer it are handled by one object
+        # with one lifetime — the socket's. Cleared in the `finally` below, so a
+        # reconnect cannot decode against the dead connection's state.
+        self._connection = codec.open(self.session, self.credentials) or codec
         try:
-            for frame in codec.subscribe_frames(self.instrument_tokens) or ():
+            for frame in self._connection.subscribe_frames(self.instrument_tokens) or ():
                 await ws.send(frame)
             # Announced after the subscribe frames are away, not on the socket
             # opening: an open socket nobody has asked anything of delivers
@@ -402,6 +444,7 @@ class BrokerStream:
             async for message in ws:
                 await self._dispatch(self._decode(message))
         finally:
+            self._connection = None
             if heartbeat is not None:
                 heartbeat.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -464,7 +507,11 @@ class BrokerStream:
         exactly like a quiet market from the outside, and that is precisely the
         failure this whole boundary exists to make visible.
         """
-        codec = self._codec
+        # The connection's own view when one is open (D4.10), the channel
+        # otherwise — the latter for a direct caller outside a transport pass.
+        # For a stateless channel these are the same object, because `open()`
+        # returned `self`.
+        codec = self._connection if self._connection is not None else self._codec
         try:
             event = codec.decode(message)
         except BrokerContractError as e:

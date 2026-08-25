@@ -404,6 +404,32 @@ SECRET_REGISTRY: List[SecretSpec] = [
         example="http://localhost:8000/api/brokers/angelone/callback", rotation="N/A",
     ),
     SecretSpec(
+        "FYERS_APP_ID", CAT_BROKER, "Fyers API v3 app id (client id).",
+        sensitive=True, example="", rotation="Rotate in the Fyers API dashboard on exposure",
+    ),
+    SecretSpec(
+        "FYERS_SECRET_ID", CAT_BROKER, "Fyers API v3 secret id.",
+        sensitive=True, example="", rotation="Rotate in the Fyers API dashboard on exposure",
+    ),
+    SecretSpec(
+        "FYERS_REDIRECT_URL", CAT_BROKER, "Fyers OAuth redirect URL.",
+        example="http://localhost:8000/api/brokers/fyers/callback", rotation="N/A",
+    ),
+    SecretSpec(
+        "DHAN_PARTNER_ID", CAT_BROKER, "Dhan partner id (DhanHQ v2 partner consent flow).",
+        sensitive=True, example="", rotation="Rotate in the Dhan partner dashboard on exposure",
+    ),
+    SecretSpec(
+        # Sent as a REQUEST HEADER on generate-consent / consume-consent, never
+        # as a query parameter — a consent login URL is shown to the user.
+        "DHAN_PARTNER_SECRET", CAT_BROKER, "Dhan partner secret; sent as a request header, never in a URL.",
+        sensitive=True, example="", rotation="Rotate in the Dhan partner dashboard on exposure",
+    ),
+    SecretSpec(
+        "DHAN_REDIRECT_URL", CAT_BROKER, "Dhan partner-consent redirect URL; receives ?tokenId= on success.",
+        example="http://localhost:8000/api/brokers/dhan/callback", rotation="N/A",
+    ),
+    SecretSpec(
         "BROKER_TOKEN_KEY", CAT_BROKER,
         "Optional Fernet key encrypting broker tokens at rest; derived from JWT_SECRET when unset.",
         sensitive=True, example="",

@@ -40,6 +40,7 @@ from services.brokers.capabilities import (
 )
 from services.brokers.contracts import BrokerConnection, ORDER_STATUS
 from services.brokers.credentials import BrokerCredentials, BrokerCredentialSpec
+from services.brokers.dhan import DhanAdapter
 from services.brokers.errors import (
     BrokerAuthError,
     BrokerContractError,
@@ -48,6 +49,7 @@ from services.brokers.errors import (
     CapabilityUnsupported,
     UnknownBrokerError,
 )
+from services.brokers.fyers import FyersAdapter
 from services.brokers.gateway import BrokerGateway, broker_gateway
 from services.brokers.health import BrokerConnectionState, BrokerHealth
 from services.brokers.registry import (
@@ -69,7 +71,7 @@ def register_default_brokers() -> None:
     list so the UI can say "not available on this deployment" instead of
     silently omitting it, and `configured` is a field on that listing.
     """
-    for adapter_cls in (ZerodhaAdapter, UpstoxAdapter, AngelOneAdapter):
+    for adapter_cls in (ZerodhaAdapter, UpstoxAdapter, AngelOneAdapter, FyersAdapter, DhanAdapter):
         if adapter_cls.name not in broker_registry:
             broker_registry.register(adapter_cls())
 
@@ -118,6 +120,8 @@ __all__ = [
     "BrokerHealth",
     "BrokerRegistry",
     "CapabilityUnsupported",
+    "DhanAdapter",
+    "FyersAdapter",
     "ORDER_STATUS",
     "SUPPORTED_BROKERS",
     "SYNC_CAPABILITIES",

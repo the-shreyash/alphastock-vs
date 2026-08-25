@@ -3,7 +3,7 @@
 
 Version: 1.2
 
-Status: Framework Implemented (Sprint D3, 2026-08-20); streaming contract / codec boundary Implemented (Sprint D4.2, 2026-08-21, ADR-032); three concrete market feeds implemented — Zerodha (D4.6, ADR-036), Upstox (D4.7, ADR-037), Angel One (D4.9, ADR-038). **All three deterministic-validated only; live validation not performed.**
+Status: Framework Implemented (Sprint D3, 2026-08-20); streaming contract / codec boundary Implemented (Sprint D4.2, 2026-08-21, ADR-032); five concrete market feeds implemented — Zerodha (D4.6, ADR-036), Upstox (D4.7, ADR-037), Angel One (D4.9, ADR-038), Fyers (D4.10, ADR-039), Dhan (D4.11, ADR-040 — **the first that needed no framework change at all**). **All five deterministic-validated only; live validation not performed.**
 
 ---
 
@@ -73,15 +73,15 @@ Upstox API — implemented, incl. market feed (D4.7)
 
 Angel One SmartAPI — market feed implemented (D4.9); trading surface outstanding
 
+Fyers API v3 — market feed implemented (D4.10); trading surface outstanding
+
+Dhan DhanHQ v2 — market feed implemented (D4.11); trading surface outstanding
+
 ---
 
 ## Phase 2
 
 Groww (if public APIs become available)
-
-Dhan
-
-Fyers
 
 Alice Blue
 
@@ -346,6 +346,8 @@ Rules:
 
 • **An application-level keep-alive is not the protocol's ping.** `ping_interval` configures the WebSocket protocol's own ping frames, which the two libraries exchange without either application seeing them. Some feeds do not count those and require a keep-alive **in the data channel** — Angel One closes a socket that stops sending the text frame `ping` every 30 seconds. A broker that needs one declares `heartbeat_frame` and `heartbeat_interval` on its endpoint (both, or neither: the contract refuses half of one); the transport sends it on a timer started after the subscribe frames and cancelled with the connection. **An adapter must not run its own timer** — it would own a task whose lifetime has to match a connection it does not hold, and a task leaked per reconnect is forever on a flapping feed. The failure this prevents is not loud: the socket connects, subscribes, delivers ticks for half a minute and is closed, over and over, which reads as a flapping feed rather than a missing frame.
 
+
+• **A codec may need a scope, and the scope is one connection.** `BrokerStreamChannel.open(session, credentials)` returns the channel's view of the connection about to be opened; the transport uses it for that connection's `subscribe_frames` and `decode`, and drops it when the socket ends. **The default returns `self`**, so a broker whose frames are independently decodable and whose credential travels in the handshake never notices this exists — three of the four brokers do not. Two things need it, and Fyers needs both: a feed whose steady-state frames are *deltas* against an earlier snapshot (the decode state is invalidated by a reconnect and differs per user, so it cannot live on a channel singleton shared by every user of the broker), and a feed that authenticates with a **frame on the data channel** rather than in the handshake (so the first thing it sends is a per-session credential `subscribe_frames()` had no argument to reach). The failure the scope prevents is not loud in either case: a shared table means one account's reconnect renumbers another account's instruments and a price is filed under the wrong company's name, with nothing raised. `endpoint`, `connect_error` and `delivers` are deliberately **not** routed through it — they are properties of the channel, not of a connection.
 • **A dead session may be refused before any frame exists.** `decode_stream_frame` can only classify a failure the broker reports *in a frame*, which means a connection that was established. Some brokers reject a stale token during the WebSocket handshake instead — Kite answers HTTP 403 — so no frame is ever decoded and the transport sees only "connect raised". `stream_connect_error` is where an adapter says what its broker's rejection meant; the transport then raises its own auth-expiry signal and the existing expiry path runs unchanged. **Adapters classify, they do not act** — a broker that implements failover of its own is reintroducing the branch this framework removed.
 
 ---
@@ -412,6 +414,97 @@ Angel One is the **independent test of the channel model** D4.7 introduced. Upst
 **Limitations, recorded rather than worked around:** no volume on an Angel One tick; no order/trading surface; no `session_refresh`; only holdings-and-positions instruments are streamed; the 1,000-token session quota is enforced by trimming with a warning rather than by sharding (D5 owns sharding — SmartAPI allows three sockets per client code, which is the headroom any sharding must fit inside); no wire-level unsubscribe; series-suffix stripping covers the documented NSE/BSE cash series only.
 
 **Live validation has not been performed.** An Angel One feed needs a per-user session obtainable only through an interactive SmartAPI browser login. Everything asserted about this adapter is deterministic validation against fixtures built from SmartAPI's published byte layout, plus 20 source mutations observed red. The outstanding smoke test is listed in TASK.md's D4.9 section — including **holding the connection past 60 seconds**, which is the only way to prove the keep-alive, and **confirming whether the redirect carries a `refresh_token`**, which decides `session_refresh`.
+
+---
+
+# Fyers API v3 — the fourth concrete stream adapter (Sprint D4.10, ADR-039)
+
+Fyers is the first broker that disagreed with the **framework** rather than only with its predecessors. Kite, Upstox and Angel One each authenticate in the handshake and each send frames that can be decoded on their own; Fyers' HSM feed does neither. It is also the first adapter whose protocol was transcribed from the broker's own *reference client* (`fyers-apiv3` 3.1.16, `FyersWebsocket/data_ws.py` and its bundled `map.json`) rather than from a published byte table. No module outside `services/brokers/fyers.py` learned that Fyers exists, and `test_fyers_added_no_fyers_knowledge_outside_its_own_adapter` sweeps `services/` to keep that true.
+
+**Protocol, as implemented:**
+
+| Aspect | Fyers HSM v1-5 | Where it lives |
+|---|---|---|
+| Endpoint | `wss://socket.fyers.in/hsm/v1-5/prod` | `FyersMarketFeedChannel.endpoint` |
+| Auth | **A binary frame on the data channel** (ReqType 1) carrying the `hsm_key` claim decoded out of the session JWT. Nothing in the URL, nothing in a header — `safe_url` has nothing to strip | `FyersFeedConnection.subscribe_frames`, `hsm_key` |
+| Login | Standard OAuth2 authorization-code; the redirect carries `?s=ok&code=200&auth_code=…` — **`code` is an HTTP-style status, not the grant** | `get_login_url`, `parse_callback_params` |
+| Token exchange | `POST /validate-authcode` with `appIdHash = SHA256("<app id>:<secret id>")`; the secret itself is never sent | `exchange_token`, `_app_id_hash` |
+| Opening frames | **Three, in order**: credential → mode → subscription. All `bytes` | `FyersFeedConnection.subscribe_frames` |
+| Subscribe | ReqType 4: `<uint16 count>` then each topic as `<uint8 len><ascii>`, batched 1,500 per frame | `subscribe_frame` |
+| Instrument id | The HSM topic `"sf|<segment>|<exchange token>"`, derived from the `fyToken` already on every synced row (`fyToken[:4]` → segment, `fyToken[10:]` → token). The same string is subscribed and returned | `instrument_id`, `parse_instrument_id` |
+| Data frame | A batch of **mixed** record kinds: snapshot (83), full update (85), lite update (76) | `FyersFeedConnection._data_frame` |
+| Decodability | **A snapshot names the topic and carries the price scale; every later record is a delta keyed by a server-minted topic id.** An update is not decodable on its own | `BrokerStreamChannel.open()` → `FyersFeedConnection` |
+| Price scale | **Carried on the wire, per instrument**: `raw / (10**precision * multiplier)`, both read from the snapshot. Fyers has no divisor | `_price`, `_snapshot_record` |
+| Exchange | Derived from the segment, and it is the **exchange**, not the segment: `nse_cm`/`nse_fo`/`cde_fo` are all `NSE`, because a Fyers symbol is `EXCHANGE:NAME` and the exchange half is only ever NSE, BSE or MCX | `SEGMENT_EXCHANGES`, `split_symbol` |
+| Keep-alive | **Client sends the binary frame `00 01 0B` every 10s** — the reference client's own interval | `heartbeat_frame` on the endpoint, sent by `stream.py` |
+| Dead session | Reported **in a frame on an open socket**: the credential response's status byte is not `"K"`. A refused handshake (401/403) is classified too, for an edge in front of the socket | `_auth_frame_result`, `connect_error` |
+| Session lifetime | The token's own `exp` claim; **midnight IST** as the fallback | `token_expiry`, `session_expiry` |
+
+**Mode is LITE (76), deliberately** — a lite update is seven bytes, where full mode (70) puts the whole 21-field record on the wire on every price change for fields no consumer reads. **Consequence: a Fyers-derived `MarketTick` carries no volume.** Fyers *does* publish a genuine cumulative day volume, and it is even present in the snapshot — which is exactly why this needs saying: carrying it once and freezing it for the rest of the session is a number that stops meaning what its name says.
+
+**The price scale is not a broker constant.** Kite reads its scale from the low byte of its instrument token, Angel One keys a table on its segment field, Upstox needs none because it sends a `double`. Fyers carries `multiplier` and `precision` in the snapshot, per instrument — and the trap is sharpest precisely because a copied ÷100 *works* for NSE cash (`precision=2, multiplier=1`). It fails on a currency contract (`precision=4`), which means it fails on a real position rather than on the first tick anybody tests with.
+
+**Depth topics are refused rather than priced.** Field zero of a scrip or index record is the last traded price; field zero of a **depth** record is the best bid. Publishing one as the traded price is wrong in a way nothing downstream can detect, because it is a real, plausible, tradeable-looking number.
+
+**A frame is walked, never sampled.** One data frame carries a count and then that many records of mixed kinds. Every record is walked whether or not the adapter can price it — skipping one by guessing its length desynchronises every record after it, and the symptom is not an exception but prices decoded out of the middle of other records. Reads are bounds-checked (`_Reader`), so a truncated frame costs only the records after the damage; the reference client slices bare and decodes garbage past the end.
+
+**Instrument identity needs no catalogue — and this is the broker where that is least obvious.** Fyers' own SDK resolves symbols to feed tokens with an authenticated HTTP call to `data/symbol-token` plus a bundled segment map. This adapter needs neither: a `fyToken` is already on every synced holding and position row, and the HSM topic is derived from it locally. That is the difference between D4.10 being an adapter sprint and being a data-pipeline sprint.
+
+**Capabilities are deliberately partial:** profile, holdings, positions, funds, margins, session invalidation and `tick_stream`. No order capabilities (D4.10 is a market-data sprint and Fyers' order surface is unvalidated here), no `order_stream` (Fyers serves order updates on a separate socket, which would be a second channel), and no `session_refresh` — **Fyers issues a refresh token but redeeming it requires the user's trading PIN**, which SECURITY.md forbids this platform from holding.
+
+**Limitations, recorded rather than worked around:** no volume on a Fyers tick; no order/trading surface; no `session_refresh`; only holdings-and-positions instruments are streamed; the 5,000-instrument connection limit is enforced by trimming with a warning rather than by sharding (D5 owns sharding); no wire-level unsubscribe, `change_mode`, or channel pause/resume; series-suffix stripping covers the documented NSE cash series plus `INDEX` — **BSE single-letter group codes (`-A`, `-B`, `-X`) are deliberately not stripped**, because a one-letter suffix is indistinguishable from part of a name and stripping one wrongly renames an instrument permanently. **And one protocol requirement is knowingly unimplemented:** HSM's credential response carries an "acknowledge every N frames" count that the reference client honours by sending a ReqType-3 frame; a codec here returns a decoded event and cannot put a frame back on the wire. If the server enforces it the feed goes quiet with the socket still open — bounded by `StreamingTickProvider`'s tick-freshness backstop, so the account falls back to the delayed baseline within two minutes — and the adapter logs a named warning when the count arrives non-zero.
+
+**Live validation has not been performed.** A Fyers feed needs a per-user session obtainable only through an interactive browser login. Everything asserted about this adapter is deterministic validation against fixtures built from the reference client's own framing, plus 22 source mutations observed red. The outstanding smoke test is listed in TASK.md's D4.10 section — including **whether the acknowledgement count is ever non-zero**, which is the one open protocol question, and **holding the connection past 30 seconds**, which is the only way to prove the keep-alive.
+
+---
+
+# Dhan (DhanHQ v2) — the fifth concrete stream adapter (Sprint D4.11, ADR-040)
+
+**Dhan is the first broker that required no generic framework change at all.** D4.7 needed channels, D4.9 needed a keep-alive frame, D4.10 needed a connection scope; D4.11 needed one adapter module and one registry line. `stream.py`, `streaming.py`, `instruments.py`, `market_feed.py` and `ticks.py` are byte-for-byte unchanged by this sprint. No module outside `services/brokers/dhan.py` learned that Dhan exists, and `test_dhan_added_no_dhan_knowledge_outside_its_own_adapter` sweeps `services/` for thirteen Dhan vocabulary terms to keep that true.
+
+The protocol was read from **two independent sources set against each other**: DhanHQ's published v2 documentation and Dhan's own reference client `DhanHQ-py` (`src/dhanhq/marketfeed.py`), whose `struct` format strings are the authority on byte layout. Every binary test fixture is packed with the reference client's format strings rather than the adapter's constants — an adapter tested against fixtures built from its own offsets proves only that it is self-consistent.
+
+| Aspect | DhanHQ v2 live market feed | Where it lives |
+|---|---|---|
+| Endpoint | `wss://api-feed.dhan.co` | `DhanAdapter.stream_endpoint` |
+| Auth | **Query string** — `?version=2&token=…&clientId=…&authType=2`. Kite's style, so the URL carries a live token and only `safe_url` may ever be logged | `stream_endpoint`, `BrokerStreamEndpoint.safe_url` |
+| Subscribe frame | **JSON text on a socket that answers in binary** — the only broker here that mixes directions. `{"RequestCode": 17, "InstrumentCount": n, "InstrumentList": [...]}` | `stream_subscribe_frames` |
+| Batching | **100 instruments per message**, a *message* limit rather than a session limit — so a 250-instrument account is three frames and nothing is dropped for it | `MAX_INSTRUMENTS_PER_FRAME` |
+| Mode | **Quote (17)** — the narrowest mode that leaves nothing canonical unfilled | `REQUEST_SUBSCRIBE_QUOTE` |
+| Response header | 8 bytes, `<BHBI`: response code, message length, exchange segment enum, security id | `HEADER_FORMAT` |
+| Priceable packets | **A table keyed on the RESPONSE CODE** — Ticker (2), Quote (4), Full (8). Not a size check; see below | `PRICEABLE` |
+| Price | **IEEE `float32` in rupees at offset 8 — NO DIVISOR AT ALL** | `decode_frame` |
+| Volume | **Cumulative day volume, `int32` at offset 22.** The first of five brokers to fill `MarketTick.volume` | `PRICEABLE` |
+| Instrument identity | `"<SEGMENT NAME>\|<security id>"` — e.g. `"NSE_EQ\|1333"` | `instrument_id`, `parse_instrument_id` |
+| Exchange naming | Segment is **not** the exchange: `NSE_EQ`→`NSE`, `NSE_FNO`→`NFO`, `NSE_CURRENCY`→`CDS`, `BSE_CURRENCY`→`BCD` | `SEGMENTS` |
+| Keep-alive | **None declared.** The server sends a WebSocket *protocol* ping every 10s and the library pongs it | `stream_endpoint` |
+| Dead session | **A frame on an open socket** (response code 50, reason 806/807/808/809). Handshake 401/403 classified too, as a second line | `decode_disconnect`, `stream_connect_error` |
+| Session lifetime | The consume-consent response's `expiryTime` (**ISO, IST, no offset**); **24 hours from login** as the fallback | `_expiry_time`, `session_expiry` |
+| Catalogue needed | **No** — every synced holding and position row already carries the segment-qualified id | `stream_instruments` |
+
+**The price is used exactly as it arrives, and this is the line most likely to be "corrected" into a bug.** Kite reads its scale from the low byte of its instrument token, Angel One keys a table on its segment, Fyers carries `multiplier` and `precision` in the snapshot, Upstox sends a `double`. Dhan sends a `float32` of the rupee price and there is *no rule at all*. Applying any predecessor's divisor publishes every price at one hundredth of its true value, and nothing raises anywhere.
+
+**Prev Close is byte-for-byte shaped like Ticker, and Dhan sends one per instrument at subscribe time.** Response code 6 and response code 2 are both 16 bytes, `<BHBIfI`, with a `float32` at offset 8. A codec that priced "any frame with a float at offset 8" would publish **yesterday's close as today's price, once per holding, immediately after every connect and every reconnect** — marking a whole portfolio at stale prices with nothing raised. The response code is the only thing that separates them, which is why `PRICEABLE` is keyed on it and why an unlisted code is never priced.
+
+**Four volume-shaped fields on one packet, and only one is the volume.** `LTQ` (this trade's size, offset 12), `volume` (the day's cumulative traded quantity, offset 22), `total_sell_quantity` (26) and `total_buy_quantity` (30). Only the second is what `MarketTick.volume` means; the other three are a trade size and two order-book aggregates.
+
+**Identity is the segment NAME, where Angel One's is the segment NUMBER — same principle, opposite encoding.** A Dhan security id is unique only within its segment (NSE 1333 and BSE 1333 are different companies), so the pair is the identity. The name form is used because Dhan's subscribe frame takes the name verbatim and `/positions` already returns `exchangeSegment: "NSE_EQ"`; copying Angel One's numeric encoding would have meant translating on every subscribe.
+
+**`/holdings` reports `exchange`, not `exchangeSegment` — and the docs and the SDK disagree about what it holds.** The published sample shows `"ALL"`; the SDK's own fixture shows `"NSE"`. Both are handled. A row naming a real exchange is a delivery holding and can only be cash, so the segment follows. A row saying `"ALL"` names no exchange, and **defaulting it to `NSE_EQ` was rejected**: right most of the time and wrong *silently*, subscribing a BSE-only holding as whatever NSE numbers that id and publishing another company's price under the user's stock's name. Such a row keeps its symbol — it is a real holding everywhere else — carries no instrument id, and the count is WARNed rather than swallowed.
+
+**The partner consent flow, not the app flow the reference SDK uses.** `/app/generate-consent` requires the user's `dhanClientId` **before they log in**, which a multi-tenant platform by definition does not have — learning who the user is at Dhan is the point of the login. `/partner/*` takes no client id and returns one on consume. The partner secret is a **request header** and appears in no URL, which matters because the consent login URL is shown to the user. Login is therefore genuinely two steps: `generate_consent()` mints a short-lived `consentId` and returns the browser URL; `get_login_url()` reports `requires_consent` rather than inventing a URL that would not work.
+
+**No keep-alive is declared, and that is a finding rather than an omission.** Dhan's server pings *us* every 10 seconds and closes a connection unanswered for 40; a WebSocket protocol ping is answered by the library in both peers without either application seeing it. Angel One is the exact contrast — it does not count protocol pings at all and closes a socket that stops sending the text frame `ping`. The `ping_interval` / `ping_timeout` defaults are left in place because they are what Dhan's own reference client runs with.
+
+**Capabilities are deliberately partial:** profile, holdings, positions, funds and `tick_stream`. No order capabilities (D4.11 is a market-data sprint and Dhan's order surface is unvalidated here), no `order_stream` (Dhan serves order updates on a separate socket, which would be a second channel), **no `margins`** (Dhan's margin surface is a *calculator* pricing a hypothetical order, not a report of used and available margin), no `session_refresh` (the renewal endpoint's behaviour on a partner-issued token is unverified) and no `session_invalidate` (Dhan publishes no logout for the partner flow).
+
+**Session-expiry classification, including the one judgement call.** Codes 807/808/809 stop the stream through the existing `AUTH_EXPIRED` path. Code **806** ("Data APIs not subscribed") is also treated as fatal — an *entitlement* failure rather than an authentication one, but the closed `StreamEventKind` set offers only "stop" and "retry forever", and retrying forever cannot make an unlicensed account licensed; the carried message names the entitlement rather than claiming an expired token. Code **805** ("too many active connections") is deliberately **not** fatal: Dhan drops the oldest socket when a sixth opens, so the next attempt may succeed.
+
+**Limitations, recorded rather than worked around:** a holding reporting `"ALL"` cannot be streamed (its symbol, quantity and P&L are unaffected); code 806 moves the engine to a state that asks the user to reconnect a session that is technically valid; no order/trading surface; no `margins`, `session_refresh` or `session_invalidate`; only holdings-and-positions instruments are streamed; the 5,000-instrument connection ceiling is enforced by trimming **with a warning naming the number** rather than by sharding (D5 owns sharding); no wire-level unsubscribe; and **no series-suffix stripping** — both official samples and the SDK fixtures show bare symbols, and inventing a strip rule for a suffix this broker does not appear to send would risk renaming an instrument permanently.
+
+**One broker-neutral debt was found and named rather than fixed: DB-5.** The transport resets its reconnect backoff after any connection that *completed*, so a socket a broker accepts and immediately closes reconnects roughly every 1.5s indefinitely — which Dhan's code 805 is simply the first protocol to expose, against a broker whose own documentation warns that further requests may get the user blocked. The fix is to reset the backoff only after a connection that lasted a minimum duration, which **is flap suppression**, which is D5's.
+
+**Live validation has not been performed.** A Dhan feed needs a per-user access token obtainable only through an interactive browser consent login. Everything asserted about this adapter is deterministic validation against fixtures packed with the reference client's own `struct` formats, plus 27 source mutations of which 25 were observed red. The outstanding smoke test is listed in TASK.md's D4.11 section — including **whether a real `/holdings` row returns `"ALL"` or a real exchange**, which decides how much of the holdings limitation actually bites, and **holding the connection past 40 seconds**, which is the only way to prove the library's pong satisfies Dhan's ping.
 
 ---
 
@@ -497,6 +590,7 @@ Values are read at call time and never cached, so credential rotation does not r
 | Zerodha | `KITE_API_KEY`, `KITE_API_SECRET`, `KITE_REDIRECT_URL` | key + secret |
 | Upstox | `UPSTOX_API_KEY`, `UPSTOX_API_SECRET`, `UPSTOX_REDIRECT_URL` | key + secret + redirect (Upstox will not issue a token without one) |
 | Angel One | `ANGELONE_API_KEY`, `ANGELONE_REDIRECT_URL` | key + redirect. **No secret**: SmartAPI's publisher login returns the session tokens on the redirect, so there is no server-side exchange to sign — declaring a secret this broker does not use would report a correctly configured deployment as unconfigured. |
+| Fyers | `FYERS_APP_ID`, `FYERS_SECRET_ID`, `FYERS_REDIRECT_URL` | app id + secret. The secret signs the `appIdHash` on the token exchange and is never transmitted itself. |
 
 `is_configured()` is one implementation derived from the declared spec, rather than three lines re-written per adapter.
 

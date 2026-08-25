@@ -5799,3 +5799,2742 @@ def test_all_three_streaming_brokers_reach_the_market_gateway_through_the_identi
         assert adapter.supports(BrokerCapability.TICK_STREAM)
         channels = [c for c in adapter.stream_channels() if StreamEventKind.TICKS in c.delivers]
         assert len(channels) == 1, f"{broker} must have exactly one tick-carrying channel"
+
+
+# ==================================================================
+# D4.10 — Fyers API v3: the FOURTH concrete stream adapter
+#
+# The protocol below is transcribed from Fyers' own reference client
+# (`fyers-apiv3` 3.1.16, `fyers_apiv3/FyersWebsocket/data_ws.py`) and the
+# segment/field tables it ships in `map.json` — not inferred from Kite, not from
+# Upstox, and not from SmartAPI.
+#
+# Fyers is the first broker here that disagrees with the *framework* rather than
+# only with its predecessors, in two ways that share one cause:
+#
+#   * it authenticates with a FRAME on the data channel, not in the handshake,
+#     so the first thing the feed sends is a per-session credential;
+#   * its steady-state frames are DELTAS against a snapshot, keyed by a topic id
+#     the server mints per connection, so a frame is not decodable on its own.
+#
+# Both need a scope the contract did not have: one connection. D4.10's single
+# generic addition is `BrokerStreamChannel.open()`, which returns `self` by
+# default and is therefore invisible to the three brokers that came before.
+#
+# Every test below was run against a deliberately broken implementation first;
+# the mutations are listed in TASK.md's D4.10 falsification table.
+# ==================================================================
+
+
+def _fyers():
+    return broker_registry.require("fyers")
+
+
+def _fyers_channel():
+    channels = _fyers().stream_channels()
+    assert len(channels) == 1, "Fyers' market-data surface is one socket"
+    return channels[0]
+
+
+def _fy_token(hsm_key="HSM-KEY-1", exp=4_102_444_800):
+    """A Fyers access token: a JWT whose payload carries the feed key.
+
+    Built rather than mocked because the *shape* is the protocol fact — the
+    market feed's credential is folded inside the REST token rather than issued
+    beside it, and an adapter that reached for a separate `feed_token` field
+    would find nothing and authenticate with nothing.
+    """
+    import base64 as _b64
+
+    def seg(obj):
+        return _b64.urlsafe_b64encode(json.dumps(obj).encode()).decode().rstrip("=")
+
+    payload = {"exp": exp} if hsm_key is None else {"hsm_key": hsm_key, "exp": exp}
+    return f"{seg({'alg': 'HS256'})}.{seg(payload)}.signature"
+
+
+def _fy_session(hsm_key="HSM-KEY-1", exp=4_102_444_800):
+    return {"access_token": _fy_token(hsm_key, exp), "account_id": "XY01234"}
+
+
+def _fy_conn(session=None):
+    """A Fyers codec scoped to one connection, exactly as the transport mints it."""
+    return _fyers_channel().open(session if session is not None else _fy_session())
+
+
+# -- HSM wire fixtures, built from the published request/response framing -------
+
+
+def _fy_snapshot(topic_id=1, name="sf|nse_cm|2885", values=(265075,),
+                 multiplier=1, precision=2, strings=("NSE", "2885", "SBIN-EQ")):
+    """One snapshot record — the only record kind that describes itself."""
+    body = bytearray([83])
+    body += struct.pack("<H", topic_id)
+    body.append(len(name))
+    body += name.encode("ascii")
+    body.append(len(values))
+    for value in values:
+        body += struct.pack(">i", value)
+    body += b"\x00\x00"                      # the two unnamed bytes the client skips
+    body += struct.pack(">H", multiplier)
+    body.append(precision)
+    for text in strings:
+        body.append(len(text))
+        body += text.encode("ascii")
+    return bytes(body)
+
+
+def _fy_lite(topic_id=1, ltp=265075):
+    """One lite update: a topic id and a price. Nothing else — that is the point."""
+    return bytes([76]) + struct.pack("<H", topic_id) + struct.pack(">i", ltp)
+
+
+def _fy_full(topic_id=1, values=(265075, 100000)):
+    body = bytearray([85])
+    body += struct.pack("<H", topic_id)
+    body.append(len(values))
+    for value in values:
+        body += struct.pack(">i", value)
+    return bytes(body)
+
+
+def _fy_frame(*records, message_number=7, record_count=None):
+    """One HSM data frame carrying `records`, which may be of mixed kinds."""
+    count = len(records) if record_count is None else record_count
+    body = bytes([6]) + struct.pack(">I", message_number) + struct.pack(">H", count) + b"".join(records)
+    return struct.pack(">H", len(body)) + body
+
+
+def _fy_control(response_type, status="K", trailer=b""):
+    body = bytes([response_type, 1, 1]) + struct.pack(">H", 1) + status.encode("ascii") + trailer
+    return struct.pack(">H", len(body)) + body
+
+
+def _fy_auth_ok(acknowledge_every=0):
+    """An accepted credential frame, optionally asking to be acknowledged."""
+    return _fy_control(1, "K", bytes([2]) + struct.pack(">H", 4) + struct.pack(">I", acknowledge_every))
+
+
+def _fy_ticks(*records, session=None):
+    """The canonical `BrokerTick` dicts one connection makes of `records`.
+
+    Takes records rather than a frame so a test can express "the snapshot, then
+    the update" — which is the only order in which this feed is decodable at all.
+    """
+    connection = _fy_conn(session)
+    ticks = []
+    for record in records:
+        ticks.extend(tick.as_dict() for tick in connection.decode(_fy_frame(record)).ticks)
+    return ticks
+
+
+def _fy_map():
+    """An account's instrument map as Fyers identifies instruments."""
+    return InstrumentMap.from_portfolio(
+        [
+            {"symbol": "RELIANCE", "exchange": "NSE", "instrument_token": "sf|nse_cm|2885"},
+            {"symbol": "TCS", "exchange": "NSE", "instrument_token": "sf|nse_cm|11536"},
+        ]
+    )
+
+
+def _fy_canonical(price=265075, topic="sf|nse_cm|2885"):
+    return canonical_ticks(_fy_ticks(_fy_snapshot(name=topic, values=(price,))), _fy_map(), broker="fyers")
+
+
+def _fy_feed(user_id="u1", symbols=("RELIANCE",)):
+    from services.brokers.market_feed import feed_provider_name
+    from services.market_engine.providers import provider_registry
+
+    run(_attach(user_id, "fyers", list(symbols)))
+    return provider_registry.get(feed_provider_name(user_id, "fyers"))
+
+
+# -- authentication and session ------------------------------------------------
+
+
+def test_the_fyers_login_flow_is_a_browser_redirect_and_holds_no_user_secret(monkeypatch):
+    monkeypatch.setenv("FYERS_APP_ID", "APP-100")
+    monkeypatch.setenv("FYERS_SECRET_ID", "SECRET-XYZ")
+    monkeypatch.setenv("FYERS_REDIRECT_URL", "https://app.example/api/brokers/fyers/callback")
+    login = _fyers().get_login_url("u1")
+
+    assert login["configured"] is True
+    assert login["url"].startswith("https://api-t1.fyers.in/api/v3/generate-authcode?")
+    assert "client_id=APP-100" in login["url"] and "uid%3Du1" in login["url"]
+    # The app SECRET is never in a URL a browser follows — only its digest ever
+    # travels, and only on the server-to-server exchange.
+    assert "SECRET-XYZ" not in login["url"]
+
+    monkeypatch.setenv("FYERS_SECRET_ID", "")
+    assert _fyers().get_login_url("u1")["configured"] is False
+
+
+def test_the_fyers_callback_reads_auth_code_and_not_the_status_named_code():
+    """Fyers puts an HTTP-style STATUS in `code` and the grant in `auth_code`.
+
+    The inherited OAuth2 parser reads `code`, so it would take the string
+    `"200"` for an authorization code, report the callback a success, and post
+    `"200"` to `validate-authcode`. The user's login worked; the connect fails
+    with a broker message about an invalid auth code. This is the whole reason
+    `parse_callback_params` is a per-adapter hook.
+    """
+    adapter = _fyers()
+    parsed = adapter.parse_callback_params({"s": "ok", "code": "200", "auth_code": "GRANT-9", "state": "uid=u1"})
+    assert parsed == {"auth_code": "GRANT-9"}
+
+    # And the shape the default parser would have accepted must NOT authenticate.
+    assert adapter.parse_callback_params({"s": "ok", "code": "200"}) is None
+    assert adapter.parse_callback_params({"s": "error", "code": "-99", "auth_code": "G"}) is None
+    assert adapter.parse_callback_params({}) is None
+
+
+def test_completing_fyers_auth_signs_the_exchange_and_verifies_the_token(monkeypatch):
+    """`appIdHash` is SHA256("app:secret") — the secret itself is never sent."""
+    import hashlib
+
+    monkeypatch.setenv("FYERS_APP_ID", "APP-100")
+    monkeypatch.setenv("FYERS_SECRET_ID", "SECRET-XYZ")
+    token = _fy_token(exp=4_102_444_800)
+    expected = hashlib.sha256(b"APP-100:SECRET-XYZ").hexdigest()
+
+    calls = []
+
+    async def fake_request(self, method, url, headers=None, data=None, json_body=None, timeout=12.0):
+        calls.append((url, json_body, headers))
+        if url.endswith("/validate-authcode"):
+            return {"s": "ok", "code": 200, "access_token": token, "refresh_token": "R1"}
+        return {"s": "ok", "code": 200, "data": {"fy_id": "XY01234", "name": "Ada", "email_id": "a@b.c"}}
+
+    with patch.object(BrokerAdapter, "_request", new=fake_request):
+        session = run(_fyers().exchange_token({"auth_code": "GRANT-9"}))
+
+    assert calls[0][1]["appIdHash"] == expected
+    assert "SECRET-XYZ" not in json.dumps(calls[0][1])
+    assert session["access_token"] == token and session["account_id"] == "XY01234"
+    # The token's own `exp` wins over the calendar rule — the two differ exactly
+    # where it matters, for a token minted minutes before the daily cut-off.
+    assert session["expires_at"] == datetime(2100, 1, 1, tzinfo=timezone.utc).isoformat()
+
+
+def test_a_fyers_token_with_no_readable_expiry_falls_back_to_midnight_ist():
+    from services.brokers.base import IST
+
+    adapter = _fyers()
+    expiry = adapter.session_expiry(datetime(2026, 8, 24, 10, 0, tzinfo=timezone.utc))
+    assert expiry.astimezone(IST).hour == 0 and expiry.astimezone(IST).minute == 0
+    assert expiry > datetime(2026, 8, 24, 10, 0, tzinfo=timezone.utc)
+
+
+def test_the_fyers_feed_credential_is_folded_inside_the_session_token():
+    """A second per-session credential, arriving by a route no predecessor used.
+
+    SmartAPI issues its feed token *beside* the auth token; Fyers hides its
+    `hsm_key` inside the JWT. An adapter that looked for a separate field would
+    find nothing and authenticate the socket with nothing.
+    """
+    from services.brokers.fyers import hsm_key
+
+    assert hsm_key(_fy_token("HSM-KEY-1")) == "HSM-KEY-1"
+    assert hsm_key(_fy_token(hsm_key=None)) is None
+    for junk in (None, "", "not-a-jwt", "a.b", "a.!!!!.c", 12345, _fy_token()[:10]):
+        assert hsm_key(junk) is None
+
+
+def test_the_fyers_endpoint_puts_no_credential_in_the_url_or_in_a_header():
+    """A fourth auth style, and the first that puts nothing in the handshake."""
+    endpoint = _fyers_channel().endpoint(_fy_session(), {"api_key": "APP-100"})
+
+    assert endpoint.url == "wss://socket.fyers.in/hsm/v1-5/prod"
+    assert "?" not in endpoint.url and endpoint.safe_url == endpoint.url
+    assert endpoint.headers == {}, "HSM authenticates in a frame; a header here would be a leak"
+    blob = f"{endpoint.url} {json.dumps(endpoint.headers)}"
+    for secret in ("HSM-KEY-1", "APP-100", _fy_token()):
+        assert secret not in blob
+
+
+def test_the_fyers_feed_declares_the_application_keepalive_the_protocol_ping_is_not():
+    """Third broker in a row whose liveness check is not `ping_interval`.
+
+    And the first whose keep-alive is *binary*: the contract field is typed to
+    carry either because what the frame is stays broker knowledge.
+    """
+    endpoint = _fyers_channel().endpoint(_fy_session())
+    assert endpoint.heartbeat_frame == bytes([0, 1, 11])
+    assert isinstance(endpoint.heartbeat_frame, bytes)
+    assert endpoint.heartbeat_interval == 10.0
+    # The protocol's own ping is still configured, and is still a different thing.
+    assert endpoint.ping_interval == 20.0
+
+
+# -- the request framing --------------------------------------------------------
+
+
+def test_the_fyers_opening_frames_are_credential_then_mode_then_subscription():
+    """Order is protocol, not preference.
+
+    The credential must precede everything (the server has been told nothing
+    yet), and the *mode* must precede the subscription — subscribing first opens
+    a window in which full records arrive for instruments asked for in lite mode.
+    """
+    frames = _fy_conn().subscribe_frames(["sf|nse_cm|2885"])
+
+    assert len(frames) == 3
+    assert all(isinstance(f, bytes) for f in frames), "HSM is binary end to end"
+    assert [f[2] for f in frames] == [1, 12, 4], "auth, mode, subscribe"
+
+
+def test_the_fyers_auth_frame_matches_the_reference_clients_bytes():
+    """Byte-for-byte against `data_ws.py.__access_token_msg`, for one key.
+
+    Written out as a literal rather than recomputed with the adapter's own
+    helpers: a test that rebuilds the frame the way the code does agrees with any
+    bug the code has.
+    """
+    frame = _fy_conn(_fy_session("KEY123")).subscribe_frames()[0]
+    assert frame == bytes.fromhex(
+        "0025"              # declared length 37 = 18 + len(key) + len(source) - 2
+        "01" "04"           # ReqType 1, four fields
+        "01" "0006" "4b4559313233"                      # 1: the feed key, "KEY123"
+        "02" "0001" "50"                                # 2: connection mode "P"
+        "03" "0001" "01"                                # 3: literal 1
+        "04" "000f" "53746f636b41737369737441492d31"    # 4: "StockAssistAI-1"
+    )
+    assert len(frame) == 39
+
+
+def test_the_fyers_mode_frame_narrows_this_connection_to_lite_records():
+    """Channel 11 as a BIT in a 64-bit mask, and mode 76 — the smallest record.
+
+    Full mode (70) would put the whole 21-field record on the wire on every
+    price change, for fields no consumer in this platform reads.
+    """
+    frame = _fy_conn().subscribe_frames()[1]
+    assert frame == bytes.fromhex(
+        "0000"              # the reference client declares 0 here; reproduced, not "fixed"
+        "0c" "02"
+        "01" "0008" "0000000000000800"   # channel bit 11 -> 0x800
+        "02" "0001" "4c"                 # 0x4c = 76 = lite
+    )
+
+
+def test_the_fyers_subscription_carries_hsm_topics_as_length_prefixed_ascii():
+    frame = _fy_conn().subscribe_frames(["sf|nse_cm|2885", "sf|nse_cm|11536"])[2]
+    assert frame[2] == 4 and frame[3] == 2
+    scrips = frame[7:7 + struct.unpack(">H", frame[5:7])[0]]
+    assert struct.unpack(">H", scrips[:2])[0] == 2
+    assert b"sf|nse_cm|11536" in scrips and b"sf|nse_cm|2885" in scrips
+    assert frame[-1] == 11, "the subscription names the channel it belongs to"
+
+
+@pytest.mark.parametrize("bad", [None, "", "2885", 2885, "sf|2885", "sf|nse_cm|", "sf|mars_cm|1",
+                                 "dp|nse_cm|2885", "sf|nse_cm|0", "sf|nse_cm|abc", True, {"t": 1}])
+def test_a_malformed_fyers_topic_never_reaches_the_wire(bad):
+    """Including `dp|…`: this adapter does not subscribe depth, and a depth
+    record's field zero is a bid rather than a traded price."""
+    assert _fy_conn().subscribe_frames([bad]) == _fy_conn().subscribe_frames([])
+
+
+def test_a_fyers_subscription_with_no_instruments_still_authenticates():
+    """No instruments is not no conversation: the credential frame is not optional."""
+    frames = _fy_conn().subscribe_frames([])
+    assert [f[2] for f in frames] == [1, 12]
+
+
+def test_a_fyers_session_whose_token_carries_no_feed_key_sends_nothing(caplog):
+    """No frames rather than a malformed one — an unusable credential is not a guess."""
+    caplog.set_level(logging.WARNING)
+    assert _fy_conn({"access_token": "not-a-jwt"}).subscribe_frames(["sf|nse_cm|2885"]) == []
+    assert "reconnect" in caplog.text.lower()
+
+
+def test_a_duplicate_fyers_instrument_is_subscribed_once():
+    frame = _fy_conn().subscribe_frames(["sf|nse_cm|2885", "sf|nse_cm|2885"])[2]
+    assert struct.unpack(">H", frame[7:9])[0] == 1
+
+
+def test_an_over_quota_fyers_subscription_is_trimmed_rather_than_rejected(caplog):
+    from services.brokers.fyers import MAX_SUBSCRIBED_INSTRUMENTS, SUBSCRIBE_BATCH_SIZE
+
+    caplog.set_level(logging.WARNING)
+    topics = [f"sf|nse_cm|{n}" for n in range(1, MAX_SUBSCRIBED_INSTRUMENTS + 10)]
+    frames = _fy_conn().subscribe_frames(topics)
+
+    subscriptions = [f for f in frames if f[2] == 4]
+    assert len(subscriptions) == -(-MAX_SUBSCRIBED_INSTRUMENTS // SUBSCRIBE_BATCH_SIZE)
+    subscribed = sum(struct.unpack(">H", f[7:9])[0] for f in subscriptions)
+    assert subscribed == MAX_SUBSCRIBED_INSTRUMENTS
+    assert "exceeds" in caplog.text
+
+
+def test_a_large_fyers_subscription_is_split_into_wire_sized_batches():
+    """One frame per 1,500 topics — the reference client's own batch size."""
+    from services.brokers.fyers import SUBSCRIBE_BATCH_SIZE
+
+    topics = [f"sf|nse_cm|{n}" for n in range(1, SUBSCRIBE_BATCH_SIZE + 2)]
+    subscriptions = [f for f in _fy_conn().subscribe_frames(topics) if f[2] == 4]
+    assert len(subscriptions) == 2
+    assert [struct.unpack(">H", f[7:9])[0] for f in subscriptions] == [SUBSCRIBE_BATCH_SIZE, 1]
+
+
+# -- the connection scope: D4.10's whole subject --------------------------------
+
+
+def test_a_fyers_snapshot_decodes_to_one_canonical_broker_tick():
+    ticks = _fy_ticks(_fy_snapshot(values=(265075,)))
+    assert ticks == [{
+        "instrument_token": "sf|nse_cm|2885", "last_price": 2650.75, "symbol": None,
+        "exchange": "NSE", "volume": 0, "timestamp": None,
+    }]
+
+
+def test_a_fyers_update_is_only_decodable_after_the_snapshot_that_named_it():
+    """THE protocol fact that cost a contract change.
+
+    A lite update is seven bytes: a topic id the *server* minted and a price. It
+    carries no instrument name, no exchange and no price scale. Everything that
+    makes it meaningful was established by an earlier frame on the same socket.
+    """
+    connection = _fy_conn()
+
+    orphan = connection.decode(_fy_frame(_fy_lite(1, 266000)))
+    assert orphan.kind is StreamEventKind.IGNORE, "an update was priced with no snapshot behind it"
+
+    connection.decode(_fy_frame(_fy_snapshot(topic_id=1, values=(265075,))))
+    named = connection.decode(_fy_frame(_fy_lite(1, 266000)))
+    assert [t.as_dict()["last_price"] for t in named.ticks] == [2660.0]
+    assert [t.as_dict()["instrument_token"] for t in named.ticks] == ["sf|nse_cm|2885"]
+
+
+def test_two_fyers_connections_never_share_a_topic_table():
+    """Topic ids are per connection, so a shared codec is a cross-user defect.
+
+    Two accounts subscribe different instruments and the server numbers each
+    from its own sequence. If the topic table lived on the channel — a registry
+    singleton shared by every user of the broker — topic 1 would mean whichever
+    account connected last, and the *other* account's ticks would be filed under
+    the wrong company. Nothing raises; the price is simply attributed wrongly.
+    """
+    alice = _fy_conn()
+    bob = _fy_conn()
+    alice.decode(_fy_frame(_fy_snapshot(topic_id=1, name="sf|nse_cm|2885")))
+    bob.decode(_fy_frame(_fy_snapshot(topic_id=1, name="sf|nse_cm|11536")))
+
+    def resolved(connection, topic_id, price):
+        event = connection.decode(_fy_frame(_fy_lite(topic_id, price)))
+        return [t.as_dict()["instrument_token"] for t in event.ticks]
+
+    assert resolved(alice, 1, 266000) == ["sf|nse_cm|2885"]
+    assert resolved(bob, 1, 400000) == ["sf|nse_cm|11536"]
+    # And the channel they were both opened from learned nothing from either.
+    assert _fyers_channel().decode(_fy_frame(_fy_lite(1, 266000))).kind is StreamEventKind.IGNORE
+
+
+def test_a_reconnecting_fyers_stream_decodes_against_an_empty_topic_table():
+    """The transport must mint a fresh codec per connection, not per stream.
+
+    The server renumbers topics on every connection. A table carried across a
+    reconnect maps the new connection's numbers onto the previous connection's
+    instruments — which is the same cross-attribution as the shared-singleton
+    case above, arriving through time instead of through users.
+    """
+    stream = BrokerStream("u1", "fyers", _fy_session(), channel="market")
+    seen = []
+
+    async def scenario(records):
+        socket = _FakeSocket([_fy_frame(*records)])
+
+        async def collect(user_id, broker, batch):
+            seen.append(batch)
+
+        stream.on_tick = collect
+        with patch.object(BrokerStream, "_connect", AsyncMock(return_value=socket)):
+            await stream._run_websocket()
+
+    # Connection 1 learns topic 1 = RELIANCE and ticks it.
+    run(scenario([_fy_snapshot(topic_id=1, name="sf|nse_cm|2885"), _fy_lite(1, 266000)]))
+    assert [t["instrument_token"] for batch in seen for t in batch] == ["sf|nse_cm|2885"] * 2
+
+    # The socket ended. Connection 2 receives the SAME topic id with no snapshot.
+    seen.clear()
+    assert stream._connection is None, "the dead connection's codec outlived its socket"
+    run(scenario([_fy_lite(1, 266000)]))
+    assert seen == [], "a reconnect decoded against the previous connection's topic table"
+
+
+def test_the_fyers_transport_decodes_through_the_connection_and_not_the_channel():
+    """The wiring itself, asserted where it can actually fail.
+
+    `BrokerStreamChannel.open()` returning `self` is the default and is right for
+    three of the four brokers, so a transport that never called `open()` would
+    pass every other test in this file. Here it would deliver the snapshot and
+    then silently drop every update — a feed that looks alive, ticks once per
+    instrument per session, and never moves again.
+    """
+    ticks, orders, expired, socket = drive_stream(
+        _fyers(),
+        [_fy_auth_ok(), _fy_frame(_fy_snapshot(topic_id=4)), _fy_frame(_fy_lite(4, 266000))],
+        instruments=["sf|nse_cm|2885"],
+        session=_fy_session(),
+        channel="market",
+    )
+    prices = [tick["last_price"] for _, _, batch in ticks for tick in batch]
+    assert prices == [2650.75, 2660.0], "the update after the snapshot was lost"
+
+
+# -- decoding ------------------------------------------------------------------
+
+
+def test_a_fyers_full_mode_record_decodes_through_the_same_topic_table():
+    """Full records are deltas too — this adapter subscribes lite, not blind."""
+    connection = _fy_conn()
+    connection.decode(_fy_frame(_fy_snapshot(topic_id=1)))
+    event = connection.decode(_fy_frame(_fy_full(1, (268000, 5, 0))))
+    assert [t.as_dict()["last_price"] for t in event.ticks] == [2680.0]
+
+
+def test_a_fyers_depth_topic_is_refused_rather_than_priced():
+    """Field zero of a depth record is the best BID, not the traded price.
+
+    Publishing one as the last traded price is wrong in a way nothing
+    downstream can detect: it is a real, plausible, tradeable-looking number.
+    """
+    connection = _fy_conn()
+    event = connection.decode(_fy_frame(_fy_snapshot(topic_id=3, name="dp|nse_cm|2885", values=(264900,))))
+    assert event.kind is StreamEventKind.IGNORE
+    assert connection.decode(_fy_frame(_fy_lite(3, 264950))).kind is StreamEventKind.IGNORE
+
+
+def test_a_fyers_topic_from_an_unmapped_segment_is_dropped():
+    connection = _fy_conn()
+    assert connection.decode(_fy_frame(_fy_snapshot(name="sf|xxx_cm|2885"))).kind is StreamEventKind.IGNORE
+
+
+def test_a_fyers_absent_field_never_becomes_a_price():
+    """HSM's "no value" sentinel is INT32_MIN, not zero.
+
+    A decoder that treated it as a number would publish −21,474,836.48 as a
+    price, which the canonical boundary would refuse — but only after the codec
+    had claimed a tick existed.
+    """
+    connection = _fy_conn()
+    connection.decode(_fy_frame(_fy_snapshot(topic_id=1)))
+    assert connection.decode(_fy_frame(_fy_lite(1, -2147483648))).kind is StreamEventKind.IGNORE
+    assert _fy_conn().decode(_fy_frame(_fy_snapshot(values=(-2147483648,)))).kind is StreamEventKind.IGNORE
+
+
+def test_a_fyers_instrument_with_an_unusable_scale_is_dropped_not_divided_by_zero():
+    assert _fy_conn().decode(_fy_frame(_fy_snapshot(multiplier=0))).kind is StreamEventKind.IGNORE
+
+
+def test_a_truncated_fyers_frame_keeps_the_records_it_had_already_read():
+    """A frame is a batch. One short record must not cost the prices before it.
+
+    The reference client walks these frames with bare slicing, so a short frame
+    there reads past the end, produces zero-length strings, and carries on
+    decoding garbage into the next record. Every read here is bounds-checked.
+    """
+    connection = _fy_conn()
+    frame = _fy_frame(_fy_snapshot(topic_id=1, name="sf|nse_cm|2885", values=(265075,)),
+                      _fy_snapshot(topic_id=2, name="sf|nse_cm|11536", values=(399010,)))
+    event = connection.decode(frame[:-6])
+    assert [t.as_dict()["last_price"] for t in event.ticks] == [2650.75]
+
+
+def test_a_fyers_frame_that_promises_more_records_than_it_carries_does_not_invent_them():
+    connection = _fy_conn()
+    event = connection.decode(_fy_frame(_fy_snapshot(topic_id=1), record_count=5))
+    assert [t.as_dict()["last_price"] for t in event.ticks] == [2650.75]
+
+
+def test_an_unknown_fyers_record_kind_stops_the_frame_without_guessing_its_length():
+    """An unknown record has an unknown length, so there is no safe next offset.
+
+    Guessing one would not raise — it would decode a price out of the middle of
+    whatever followed.
+    """
+    connection = _fy_conn()
+    frame = _fy_frame(_fy_snapshot(topic_id=1), b"\x63\xff\xff\xff\xff", _fy_lite(1, 999999))
+    event = connection.decode(frame)
+    assert [t.as_dict()["last_price"] for t in event.ticks] == [2650.75]
+
+
+@pytest.mark.parametrize("junk", [b"", b"\x00", b"\x00\x02", "text", None, 42,
+                                  b"\x00\x09\x06\x00\x00\x00\x01\xff\xff"])
+def test_a_malformed_fyers_frame_yields_no_invented_tick(junk):
+    assert _fy_conn().decode(junk).kind in (StreamEventKind.IGNORE, StreamEventKind.ERROR)
+
+
+def test_fyers_control_frames_are_classified_and_none_of_them_is_a_tick():
+    connection = _fy_conn()
+    assert connection.decode(_fy_auth_ok()).kind is StreamEventKind.IGNORE
+    assert connection.decode(_fy_control(4, "K")).kind is StreamEventKind.IGNORE
+    assert connection.decode(_fy_control(12, "K")).kind is StreamEventKind.IGNORE
+    assert connection.decode(_fy_control(99, "K")).kind is StreamEventKind.IGNORE
+
+
+def test_a_rejected_fyers_subscription_does_not_drop_a_working_socket():
+    """HSM rejects a request, not a connection.
+
+    Dropping the socket would turn one bad instrument into a total outage for
+    every instrument the account holds.
+    """
+    connection = _fy_conn()
+    event = connection.decode(_fy_control(4, "N"))
+    assert event.kind is StreamEventKind.ERROR and "Fyers" in event.message
+
+    ticks, orders, expired, socket = drive_stream(
+        _fyers(),
+        [_fy_auth_ok(), _fy_control(4, "N"), _fy_frame(_fy_snapshot())],
+        instruments=["sf|nse_cm|2885"], session=_fy_session(), channel="market",
+    )
+    assert len(ticks) == 1, "a rejected subscription cost the socket its other prices"
+    assert expired == []
+
+
+def test_a_refused_fyers_credential_frame_expires_the_session():
+    """The first broker here that reports a dead session ON AN OPEN SOCKET.
+
+    Kite, Upstox and Angel One are all refused at the handshake, so the codec
+    never sees the rejection. HSM accepts every connection and rejects the
+    credential afterwards — left unclassified, an expired token would be
+    indistinguishable from a broker outage and would reconnect on the backoff
+    schedule forever while the account's feed stayed registered. Fyers tokens
+    die daily, so that is every connected user, every day.
+    """
+    assert _fy_conn().decode(_fy_control(1, "N")).kind is StreamEventKind.AUTH_EXPIRED
+
+    ticks, orders, expired, socket = drive_stream(
+        _fyers(), [_fy_control(1, "N")], instruments=["sf|nse_cm|2885"],
+        session=_fy_session(), channel="market",
+    )
+    assert expired == [("user-1", "fyers")]
+
+
+def test_a_fyers_server_asking_to_be_acknowledged_says_so_in_the_log(caplog):
+    """The one protocol requirement D4.10 does NOT implement, made visible.
+
+    HSM's auth response carries an "acknowledge every N frames" count and the
+    reference client honours it. A codec here returns a decoded event and cannot
+    put a frame back on the wire, and extending the contract for a detail never
+    observed non-zero would be a second generic change built on a guess. If the
+    server does enforce it the feed goes quiet, `StreamingTickProvider` expires
+    the ticks within two minutes and the baseline resumes — bounded, but
+    mysterious without this line.
+    """
+    caplog.set_level(logging.WARNING)
+    _fy_conn().decode(_fy_auth_ok(acknowledge_every=50))
+    assert "acknowledgement every 50" in caplog.text
+
+    caplog.clear()
+    _fy_conn().decode(_fy_auth_ok(acknowledge_every=0))
+    assert "acknowledgement" not in caplog.text
+
+
+def test_a_codec_that_raises_does_not_terminate_a_live_fyers_stream():
+    """This adapter declines damaged frames rather than raising, so a resilience
+    test built only on damaged bytes cannot tell a transport that swallows a
+    codec exception from one that re-raises it. This forces the raise."""
+    from services.brokers.fyers import FyersFeedConnection
+
+    with patch.object(FyersFeedConnection, "decode", side_effect=RuntimeError("codec exploded")):
+        ticks, orders, expired, socket = drive_stream(
+            _fyers(), [_fy_frame(_fy_snapshot())], instruments=["sf|nse_cm|2885"],
+            session=_fy_session(), channel="market")
+    assert ticks == [] and expired == [] and socket.closed
+
+
+# -- price ---------------------------------------------------------------------
+
+
+def test_a_fyers_price_scale_is_carried_on_the_wire_and_a_copied_divisor_would_be_wrong():
+    """The trap that is sharpest precisely because it usually works.
+
+    Fyers has no divisor: `multiplier` and `precision` arrive in the snapshot,
+    per instrument. NSE cash quotes at `precision=2, multiplier=1`, so a
+    hardcoded ÷100 — Kite's rule, Angel One's default — is **correct for the
+    instrument anybody would test with**. It is wrong for a currency contract,
+    and it fails on a real position rather than on the first tick.
+    """
+    from services.brokers.zerodha import price_divisor as _kite_divisor  # noqa: F401
+
+    equity = _fy_ticks(_fy_snapshot(name="sf|nse_cm|2885", values=(265075,), precision=2, multiplier=1))
+    assert equity[0]["last_price"] == 2650.75
+
+    currency = _fy_ticks(_fy_snapshot(name="sf|cde_fo|1234", values=(875300,), precision=4, multiplier=1))
+    assert currency[0]["last_price"] == 87.53
+    assert currency[0]["last_price"] != 875300 / 100.0, "a constant paise divisor priced a currency 100x wrong"
+
+    scaled = _fy_ticks(_fy_snapshot(name="sf|mcx_fo|999", values=(720000,), precision=2, multiplier=10))
+    assert scaled[0]["last_price"] == 720.0
+
+
+@pytest.mark.parametrize("raw,precision,expected", [
+    (1, 2, 0.01), (99, 2, 0.99), (100, 2, 1.0), (265075, 2, 2650.75),
+    (100000000, 2, 1000000.0), (12345, 4, 1.2345), (5, 0, 5.0),
+])
+def test_fyers_decimal_precision_survives_the_codec(raw, precision, expected):
+    ticks = _fy_ticks(_fy_snapshot(values=(raw,), precision=precision, multiplier=1))
+    assert ticks[0]["last_price"] == pytest.approx(expected)
+
+
+def test_a_fyers_zero_or_negative_price_never_becomes_a_market_tick():
+    for raw in (0, -1, -265075):
+        ticks = _fy_ticks(_fy_snapshot(values=(raw,)))
+        assert canonical_ticks(ticks, _fy_map(), broker="fyers") == []
+
+
+def test_an_impossible_fyers_price_is_refused_at_the_canonical_boundary():
+    absurd = int((MAX_STOCK_PRICE + 1000) * 100)
+    ticks = _fy_ticks(_fy_snapshot(values=(absurd,)))
+    assert ticks and ticks[0]["last_price"] > MAX_STOCK_PRICE
+    assert canonical_ticks(ticks, _fy_map(), broker="fyers") == []
+
+
+def test_a_fyers_lite_tick_carries_no_volume_rather_than_a_fabricated_one():
+    """Fourth broker, same limitation, reached independently each time.
+
+    Fyers *does* publish a real cumulative day volume (`vol_traded_today`), and
+    it is even present in the snapshot — which is exactly why this needs saying.
+    Carrying it once and then freezing it for the rest of the session is a
+    number that stops meaning what its name says, which is worse than absent.
+    """
+    ticks = _fy_ticks(_fy_snapshot(values=(265075, 4_512_000, 0, 1_724_236_800)))
+    assert ticks[0]["volume"] == 0
+    assert canonical_ticks(ticks, _fy_map(), broker="fyers")[0]["volume"] is None
+
+
+# -- instrument identity --------------------------------------------------------
+
+
+def test_a_fyers_instrument_becomes_a_canonical_symbol_through_the_shared_map():
+    assert _fy_canonical()[0]["symbol"] == "RELIANCE"
+    assert _fy_canonical()[0]["exchange"] == "NSE"
+    assert _fy_canonical(price=399010, topic="sf|nse_cm|11536")[0]["symbol"] == "TCS"
+
+
+def test_a_fyers_exchange_token_alone_is_not_an_identity():
+    """The Angel-One-shaped mistake, which Fyers punishes differently.
+
+    A bare exchange token is not what Fyers subscribes with and not what its
+    snapshot returns — the HSM topic is. Storing the token would produce a
+    subscription the server does not recognise and a tick that resolves against
+    nothing, so the account's feed would connect and stay empty.
+    """
+    from services.brokers.fyers import instrument_id, parse_instrument_id
+
+    assert instrument_id("101000000014428") == "sf|nse_cm|14428"
+    assert parse_instrument_id("sf|nse_cm|14428") == ("sf", "nse_cm", "14428")
+    assert parse_instrument_id("14428") is None
+    bare = InstrumentMap.from_portfolio([{"symbol": "RELIANCE", "exchange": "NSE", "instrument_token": "2885"}])
+    assert canonical_ticks(_fy_ticks(_fy_snapshot()), bare, broker="fyers") == []
+
+
+@pytest.mark.parametrize("bad", [None, "", "abc", "1010", "1010000000", "9999000000012", True, -1, 0])
+def test_a_malformed_fytoken_produces_no_instrument_identity(bad):
+    from services.brokers.fyers import instrument_id
+
+    assert instrument_id(bad) is None
+
+
+def test_the_fyers_exchange_is_the_exchange_and_not_the_segment():
+    """Copying SmartAPI's segment table here produces a feed that mislabels.
+
+    SmartAPI's segments ARE its exchange names, so `NFO` and `CDS` are what its
+    rows carry. Fyers is the other design: a symbol is `EXCHANGE:NAME`, and the
+    exchange half is only ever NSE, BSE or MCX — a futures contract is
+    `NSE:NIFTY25AUGFUT`, a currency contract is `NSE:USDINR25AUGFUT`. A tick
+    reporting `NFO` would carry an exchange the account's own holding row never
+    uses, and the canonical tick would be qualified with a name the rest of the
+    platform does not use for that instrument.
+    """
+    from services.brokers.fyers import split_symbol, topic_exchange
+
+    assert topic_exchange("sf|nse_fo|123") == "NSE" != "NFO"
+    assert topic_exchange("sf|cde_fo|123") == "NSE" != "CDS"
+    assert topic_exchange("sf|bse_fo|123") == "BSE"
+    assert topic_exchange("sf|mcx_fo|123") == "MCX"
+
+    # And the two sides of the boundary agree, which is the property that matters.
+    assert split_symbol("NSE:NIFTY25AUGFUT")[1] == topic_exchange("sf|nse_fo|123")
+    assert split_symbol("MCX:GOLD25AUGFUT")[1] == topic_exchange("sf|mcx_fo|123")
+
+
+@pytest.mark.parametrize("symbol,expected", [
+    ("NSE:SBIN-EQ", ("SBIN", "NSE")),
+    ("NSE:RELIANCE-EQ", ("RELIANCE", "NSE")),
+    ("BSE:SBIN-EQ", ("SBIN", "BSE")),
+    ("NSE:NIFTY50-INDEX", ("NIFTY50", "NSE")),
+    ("NSE:IDEA-BE", ("IDEA", "NSE")),
+    ("NSE:NIFTY25AUGFUT", ("NIFTY25AUGFUT", "NSE")),
+    ("NSE:NIFTY2582124000CE", ("NIFTY2582124000CE", "NSE")),
+    ("MCX:GOLD25AUGFUT", ("GOLD25AUGFUT", "MCX")),
+    ("BSE:SOMECO-A", ("SOMECO-A", "BSE")),
+    ("", (None, None)),
+    (None, (None, None)),
+])
+def test_the_fyers_symbol_is_split_into_a_canonical_name_and_its_exchange(symbol, expected):
+    """`BSE:SOMECO-A` is deliberately NOT stripped: a one-letter suffix is
+    indistinguishable from part of a name, and stripping one wrongly renames an
+    instrument permanently. Recorded as a limitation rather than guessed at."""
+    from services.brokers.fyers import split_symbol
+
+    assert split_symbol(symbol) == expected
+
+
+def test_a_fyers_series_suffix_left_attached_would_split_a_users_portfolio():
+    """The reason stripping happens at all, stated as the failure it prevents."""
+    from services.brokers.fyers import split_symbol
+
+    assert split_symbol("NSE:SBIN-EQ")[0] == "SBIN"
+    assert split_symbol("NSE:SBIN-EQ")[0] == trading_symbol_of_angelone("SBIN-EQ")
+
+
+def trading_symbol_of_angelone(value):
+    from services.brokers.angelone import trading_symbol
+
+    return trading_symbol(value)
+
+
+def test_an_unknown_fyers_instrument_is_dropped_rather_than_named():
+    """A topic the account has no row for is unresolvable, and the topic string
+    is never used as a symbol — `sf|nse_cm|9999` in `db.holdings` would be an
+    instrument name in the AI's context and on the user's screen."""
+    ticks = _fy_ticks(_fy_snapshot(name="sf|nse_cm|9999"))
+    assert ticks and ticks[0]["instrument_token"] == "sf|nse_cm|9999"
+    assert canonical_ticks(ticks, _fy_map(), broker="fyers") == []
+
+
+def test_a_fyers_identity_that_round_tripped_through_mongo_still_reaches_the_wire():
+    stored = {"symbol": "RELIANCE", "exchange": "NSE", "instrument_token": "sf|nse_cm|2885"}
+    assert _fyers().stream_instruments([stored]) == ["sf|nse_cm|2885"]
+    assert canonical_ticks(_fy_ticks(_fy_snapshot()), InstrumentMap.from_portfolio([stored]),
+                           broker="fyers")[0]["symbol"] == "RELIANCE"
+
+
+def test_fyers_needs_no_instrument_catalogue():
+    """Fyers' own SDK resolves symbols to feed tokens over HTTP and consults a
+    bundled segment map. This adapter needs neither — the fyToken is already on
+    every synced row — which is the difference between D4.10 being an adapter
+    sprint and a data-pipeline sprint."""
+    holdings = [{"symbol": "RELIANCE", "exchange": "NSE", "instrument_token": "sf|nse_cm|2885"}]
+
+    with patch.object(BrokerAdapter, "_request", new=AsyncMock(side_effect=AssertionError("network call"))):
+        assert _fyers().stream_instruments(holdings) == ["sf|nse_cm|2885"]
+        assert _fy_conn().subscribe_frames(["sf|nse_cm|2885"])
+
+
+def test_the_fyers_holdings_row_carries_the_identity_the_feed_subscribes():
+    """One expression, both directions: the row the sync writes is the row the
+    subscription reads and the row an arriving tick resolves against."""
+    payload = {"s": "ok", "code": 200, "holdings": [
+        {"fyToken": "10100000002885", "symbol": "NSE:RELIANCE-EQ", "exchange": 10,
+         "quantity": 5, "costPrice": 2400.0, "ltp": 2650.75, "marketVal": 13253.75,
+         "pl": 1253.75, "isin": "INE002A01018", "holdingType": "HLD"},
+        # `fytoken` lower-case, as some Fyers responses spell it.
+        {"fytoken": "101000000011536", "symbol": "NSE:TCS-EQ", "quantity": 1,
+         "costPrice": 3900.0, "ltp": 3990.1},
+    ]}
+    with patch.object(BrokerAdapter, "_request", new=AsyncMock(return_value=payload)):
+        holdings = run(_fyers().get_holdings({"access_token": "t"}))
+
+    assert [h["symbol"] for h in holdings] == ["RELIANCE", "TCS"]
+    assert [h["exchange"] for h in holdings] == ["NSE", "NSE"]
+    assert [h["instrument_token"] for h in holdings] == ["sf|nse_cm|2885", "sf|nse_cm|11536"]
+    assert _fyers().stream_instruments(holdings) == ["sf|nse_cm|11536", "sf|nse_cm|2885"]
+
+    resolved = canonical_ticks(_fy_ticks(_fy_snapshot()), InstrumentMap.from_portfolio(holdings), broker="fyers")
+    assert resolved[0]["symbol"] == "RELIANCE"
+
+
+def test_a_fyers_position_carries_the_same_identity_a_holding_does():
+    payload = {"s": "ok", "code": 200, "netPositions": [
+        {"fyToken": "10100000002885", "symbol": "NSE:RELIANCE-EQ", "netQty": -3,
+         "netAvg": 2600.0, "ltp": 2650.75, "pl": -152.25, "productType": "INTRADAY",
+         "buyQty": 0, "sellQty": 3, "realized_profit": 0, "unrealized_profit": -152.25},
+    ]}
+    with patch.object(BrokerAdapter, "_request", new=AsyncMock(return_value=payload)):
+        positions = run(_fyers().get_positions({"access_token": "t"}))
+    assert positions[0]["instrument_token"] == "sf|nse_cm|2885"
+    assert positions[0]["side"] == "SHORT" and positions[0]["symbol"] == "RELIANCE"
+
+
+# -- canonicalization -----------------------------------------------------------
+
+
+def test_no_raw_fyers_payload_escapes_the_adapter():
+    connection = _fy_conn()
+    event = connection.decode(_fy_frame(_fy_snapshot()))
+    assert event.kind is StreamEventKind.TICKS
+    assert all(type(tick).__name__ == "BrokerTick" for tick in event.ticks)
+
+    blob = json.dumps(_fy_canonical()[0]).lower()
+    for forbidden in ("fyers", "hsm", "fytoken", "topic", "nse_cm", "sf|", "2885", "multiplier", "precision"):
+        assert forbidden not in blob, f"{forbidden} reached a canonical market tick"
+
+
+def test_four_brokers_speak_four_protocols_and_produce_identical_canonical_ticks():
+    """THE D4.10 acceptance criterion: a fourth wire, the same canonical output.
+
+    Four brokers agree on nothing at the wire — bespoke big-endian binary vs
+    protobuf vs little-endian fixed packets vs a stateful topic protocol; an
+    integer token vs a compound key vs a segment pair vs an HSM topic; four price
+    rules, one of which is not a rule at all but a value on the wire; four auth
+    styles, one of which is not in the handshake — and what reaches the Market
+    Engine from each is the same canonical `MarketTick`.
+    """
+    kite = canonical_ticks(_kite_ticks(_kite_frame((738561, 265075))), _kite_map(), broker="zerodha")
+    upstox = canonical_ticks(
+        _upstox_ticks(_upstox_frame(ltpc={"NSE_EQ|INE002A01018": 2650.75})), _upstox_map(), broker="upstox")
+    angel = _angel_canonical(price=265075, token="2885")
+    fyers = _fy_canonical(price=265075)
+
+    wires = [_kite_frame((738561, 265075)),
+             _upstox_frame(ltpc={"NSE_EQ|INE002A01018": 2650.75}),
+             _angel_packet(price=265075),
+             _fy_frame(_fy_snapshot(values=(265075,)))]
+    assert len({bytes(w) for w in wires}) == 4, "two of the four wires are identical"
+
+    shaped = [[{k: v for k, v in tick.items() if k != "ingested_at"} for tick in batch]
+              for batch in (kite, upstox, angel, fyers)]
+    assert shaped[0] == shaped[1] == shaped[2] == shaped[3] == [
+        {"symbol": "RELIANCE", "price": 2650.75, "exchange": "NSE", "volume": None}
+    ]
+
+
+# -- transport -----------------------------------------------------------------
+
+
+def test_a_fyers_stream_runs_through_the_generic_transport_unchanged():
+    """Real HSM bytes over the real transport: auth, mode, subscribe, tick, close.
+
+    The three opening frames must reach the socket verbatim *as bytes* — the
+    transport cannot know what encoding this broker expects, so it must not
+    re-encode what the codec handed it.
+    """
+    frames = [_fy_auth_ok(), _fy_control(4, "K"), _fy_frame(_fy_snapshot(topic_id=6)), _fy_frame(_fy_lite(6, 266000))]
+    ticks, orders, expired, socket = drive_stream(
+        _fyers(), frames, instruments=["sf|nse_cm|2885"], session=_fy_session(), channel="market")
+
+    assert len(socket.sent) == 3 and all(isinstance(f, bytes) for f in socket.sent)
+    assert [f[2] for f in socket.sent] == [1, 12, 4]
+    assert [tick["last_price"] for _, _, batch in ticks for tick in batch] == [2650.75, 2660.0]
+    assert all(broker == "fyers" for _, broker, _ in ticks)
+    assert orders == [] and expired == [] and socket.closed
+
+
+def test_fyers_declares_one_named_channel_served_by_the_one_generic_transport():
+    from services.brokers.fyers import FyersFeedConnection, FyersMarketFeedChannel
+    from services.brokers.stream import PROTOCOL_RUNNERS, resolve_transport
+
+    channel = _fyers_channel()
+    assert isinstance(channel, FyersMarketFeedChannel)
+    assert channel.name == "market" and channel.name != DEFAULT_STREAM_CHANNEL
+    assert channel.delivers == frozenset({StreamEventKind.TICKS})
+    assert channel.protocol == _fyers().stream_protocol == "fyers_hsm_v1_5"
+    assert PROTOCOL_RUNNERS == {}
+    assert resolve_transport(channel) is BrokerStream._run_websocket
+    assert isinstance(channel.open(_fy_session()), FyersFeedConnection)
+
+
+def test_the_keepalive_reaches_a_live_fyers_socket_and_stops_when_it_closes():
+    """The wiring, not just the timer — driven through the real transport pass.
+
+    HSM closes a connection that stops sending its ReqType-11 frame, so a
+    keep-alive that is built and never sent produces a socket that connects,
+    delivers for a few seconds and is closed — repeatedly, on the reconnect
+    schedule, which from outside reads as a flapping feed rather than a missing
+    frame. Driven through `_run_websocket` rather than by calling
+    `_start_heartbeat`, because the latter proves the helper works and nothing
+    about whether the transport uses it.
+    """
+    with patch("services.brokers.fyers.HEARTBEAT_INTERVAL", 0.01):
+        socket = _PacedSocket([_fy_auth_ok(), _fy_frame(_fy_snapshot())], pause=0.05)
+        stream = BrokerStream(
+            "u1", "fyers", _fy_session(), credentials={"api_key": "APP-100"},
+            instrument_tokens=["sf|nse_cm|2885"], channel="market",
+        )
+
+        async def scenario():
+            with patch.object(BrokerStream, "_connect", AsyncMock(return_value=socket)):
+                await stream._run_websocket()
+            sent_at_close = list(socket.sent)
+            await asyncio.sleep(0.05)
+            return sent_at_close
+
+        sent_at_close = run(scenario())
+
+    assert sent_at_close.count(bytes([0, 1, 11])) >= 2, \
+        f"the keep-alive never reached the socket: {sent_at_close}"
+    assert [f[2] for f in sent_at_close[:3]] == [1, 12, 4], "the opening frames must go first"
+    assert socket.closed
+    assert socket.sent == sent_at_close, "the keep-alive outlived the connection it belonged to"
+
+
+# -- error classification ------------------------------------------------------
+
+
+class _FyersHandshakeRefused(Exception):
+    def __init__(self, status_code):
+        super().__init__(f"server rejected WebSocket connection: HTTP {status_code}")
+        self.status_code = status_code
+
+
+class _FyersHandshakeRefused14(Exception):
+    def __init__(self, status_code):
+        super().__init__("server rejected WebSocket connection")
+        self.response = type("Response", (), {"status_code": status_code})()
+
+
+@pytest.mark.parametrize("refusal", [_FyersHandshakeRefused, _FyersHandshakeRefused14])
+@pytest.mark.parametrize("status", [401, 403])
+def test_fyers_refusing_the_handshake_expires_the_session(refusal, status):
+    stream = BrokerStream("u1", "fyers", _fy_session(), channel="market")
+
+    async def scenario():
+        with patch.object(BrokerStream, "_connect", AsyncMock(side_effect=refusal(status))):
+            with pytest.raises(_AuthExpired) as excinfo:
+                await stream._run_websocket()
+        assert "reconnect" in str(excinfo.value).lower()
+
+    run(scenario())
+
+
+def test_an_ordinary_fyers_connection_failure_still_reconnects():
+    assert _fyers().stream_connect_error(OSError("connection reset")) is None
+    assert _fyers().stream_connect_error(_FyersHandshakeRefused(500)) is None
+
+
+def test_an_expired_fyers_rest_session_is_reported_as_an_auth_failure():
+    """Fyers answers HTTP 200 with `{"s": "error"}` for application failures, so
+    the transport-level 401 handling cannot see them — an unchecked caller would
+    read a missing `holdings` key as an empty portfolio."""
+    from services.brokers.errors import BrokerAuthError, BrokerError
+
+    dead = {"s": "error", "code": -16, "message": "Could not authenticate the user"}
+    with patch.object(BrokerAdapter, "_request", new=AsyncMock(return_value=dead)):
+        with pytest.raises(BrokerAuthError):
+            run(_fyers().get_holdings({"access_token": "t"}))
+
+    other = {"s": "error", "code": -50, "message": "Something else"}
+    with patch.object(BrokerAdapter, "_request", new=AsyncMock(return_value=other)):
+        with pytest.raises(BrokerError) as excinfo:
+            run(_fyers().get_holdings({"access_token": "t"}))
+    assert not isinstance(excinfo.value, BrokerAuthError)
+
+
+# -- readiness, promotion, failover ---------------------------------------------
+
+
+def test_a_connected_fyers_stream_is_not_ready_until_a_real_packet_arrives():
+    """CONNECTED != READY, driven by Fyers' own bytes.
+
+    Every milestone short of data is reached — registered, link up, credential
+    accepted, subscription accepted, an error frame, a damaged frame, an update
+    with no snapshot behind it — and the baseline still serves the quote.
+    """
+    from services.brokers.market_feed import set_market_feed_link
+    from services.market_engine.providers import Capability, ResolutionContext, YahooPollingAdapter
+
+    with _clean_provider_registry() as registry:
+        registry.clear()
+        baseline = YahooPollingAdapter()
+        registry.register(baseline)
+        run(baseline.connect())
+        manager = SourceManager(registry)
+        ctx = ResolutionContext(user_id="u1", symbol="RELIANCE")
+
+        feed = _fy_feed("u1", symbols=("RELIANCE",))
+        run(set_market_feed_link("u1", "fyers", up=True))
+        assert manager.resolve(Capability.QUOTES, context=ctx) is baseline
+
+        connection = _fy_conn()
+        for noise in (_fy_auth_ok(), _fy_control(4, "K"), _fy_control(4, "N"),
+                      b"\xff\xff", _fy_frame(_fy_lite(1, 266000))):
+            run(feed.on_raw(canonical_ticks(
+                [t.as_dict() for t in connection.decode(noise).ticks], _fy_map(), broker="fyers")))
+        assert not feed.is_ready
+        assert manager.resolve(Capability.QUOTES, context=ctx) is baseline
+
+        run(feed.on_raw(_fy_canonical()))
+        assert feed.is_ready
+        assert manager.resolve(Capability.QUOTES, context=ctx) is feed
+        assert run(feed.fetch_quote("RELIANCE"))["price"] == 2650.75
+        # Make-before-break: the baseline was never unregistered or disconnected.
+        assert registry.get(baseline.name) is baseline and baseline.is_connected
+
+
+def test_a_fyers_feed_is_promoted_over_the_baseline_and_falls_back_on_link_loss():
+    from services.brokers.market_feed import set_market_feed_link
+    from services.market_engine.providers import Capability, ResolutionContext, YahooPollingAdapter
+
+    with _clean_provider_registry() as registry:
+        registry.clear()
+        baseline = YahooPollingAdapter()
+        registry.register(baseline)
+        manager = SourceManager(registry)
+        ctx = ResolutionContext(user_id="u1", symbol="RELIANCE")
+
+        feed = _fy_feed("u1", symbols=("RELIANCE",))
+        run(set_market_feed_link("u1", "fyers", up=True))
+        run(feed.on_raw(_fy_canonical()))
+        assert manager.resolve(Capability.QUOTES, context=ctx) is feed
+
+        run(set_market_feed_link("u1", "fyers", up=False, reason="socket closed"))
+        assert manager.resolve(Capability.QUOTES, context=ctx) is baseline
+        assert registry.get(feed.name) is feed, "a dropped socket unregistered the feed"
+
+
+def test_a_reconnected_fyers_feed_cannot_answer_from_the_dead_links_prices():
+    """The D4.8 stale-evidence hardening, re-checked on the fourth broker."""
+    from services.brokers.market_feed import set_market_feed_link
+    from services.market_engine.providers import Capability, ResolutionContext, YahooPollingAdapter
+
+    with _clean_provider_registry() as registry:
+        registry.clear()
+        baseline = YahooPollingAdapter()
+        registry.register(baseline)
+        manager = SourceManager(registry)
+
+        feed = _fy_feed("u1", symbols=("RELIANCE", "TCS"))
+        run(set_market_feed_link("u1", "fyers", up=True))
+        run(feed.on_raw(_fy_canonical(price=265075, topic="sf|nse_cm|2885")))
+        run(feed.on_raw(_fy_canonical(price=399010, topic="sf|nse_cm|11536")))
+        assert feed.covers("RELIANCE") and feed.covers("TCS")
+
+        run(set_market_feed_link("u1", "fyers", up=False, reason="dropped"))
+        run(set_market_feed_link("u1", "fyers", up=True))
+        assert not feed.is_ready, "readiness survived the link that earned it"
+
+        run(feed.on_raw(_fy_canonical(price=266000, topic="sf|nse_cm|2885")))
+        assert feed.is_ready and feed.covers("RELIANCE")
+        assert not feed.covers("TCS"), "a price from the previous connection survived the reconnect"
+        assert manager.resolve(
+            Capability.QUOTES, context=ResolutionContext(user_id="u1", symbol="TCS")) is baseline
+
+
+def test_a_fyers_feed_that_never_ticks_leaves_the_baseline_primary():
+    from services.brokers.market_feed import set_market_feed_link
+    from services.market_engine.providers import Capability, ResolutionContext, YahooPollingAdapter
+
+    with _clean_provider_registry() as registry:
+        registry.clear()
+        baseline = YahooPollingAdapter()
+        registry.register(baseline)
+        manager = SourceManager(registry)
+
+        _fy_feed("u1", symbols=("RELIANCE",))
+        run(set_market_feed_link("u1", "fyers", up=True))
+        assert manager.resolve(
+            Capability.QUOTES, context=ResolutionContext(user_id="u1", symbol="RELIANCE")) is baseline
+
+
+def test_fyers_registers_through_the_existing_provider_framework():
+    """No Fyers-specific provider, gateway, registry or Source Manager exists."""
+    from services.brokers.market_feed import feed_provider_name
+    from services.market_engine.providers import StreamingTickProvider
+
+    with _clean_provider_registry() as registry:
+        registry.clear()
+        name = run(_attach("u1", "fyers", ["RELIANCE"]))
+        assert name == feed_provider_name("u1", "fyers") == "brokerfeed:fyers:u1"
+        provider = registry.get(name)
+        assert type(provider) is StreamingTickProvider, "a broker-specific provider class appeared"
+        assert provider.owner_user_id == "u1"
+
+
+def test_removing_the_fyers_tick_capability_removes_its_market_feed():
+    adapter = _fyers()
+    narrowed = adapter.capabilities - {BrokerCapability.TICK_STREAM}
+    with _clean_provider_registry() as registry:
+        registry.clear()
+        with patch.object(type(adapter), "capabilities", narrowed):
+            assert run(_attach("u1", "fyers", ["RELIANCE"])) is None
+        assert registry.get("brokerfeed:fyers:u1") is None
+
+
+# -- isolation ------------------------------------------------------------------
+
+
+def test_five_users_on_five_providers_stay_on_their_own():
+    """Fyers, Angel One, Zerodha, Upstox and the shared baseline, at once.
+
+    The one test that exercises every streaming broker the platform has plus the
+    fallback, and the property is per user: each resolves to their own feed, and
+    one broker's failure moves exactly one user.
+    """
+    from services.brokers.market_feed import set_market_feed_link
+    from services.market_engine.providers import Capability, ResolutionContext, YahooPollingAdapter
+
+    with _clean_provider_registry() as registry:
+        registry.clear()
+        baseline = YahooPollingAdapter()
+        registry.register(baseline)
+        manager = SourceManager(registry)
+
+        feeds = {
+            "userA": _angel_feed("userA", symbols=("RELIANCE",)),
+            "userB": _attach_and_get("userB", "zerodha"),
+            "userC": _upstox_feed("userC", symbols=("RELIANCE",)),
+            "userD": _fy_feed("userD", symbols=("RELIANCE",)),
+        }
+        for user, broker in (("userA", "angelone"), ("userB", "zerodha"),
+                             ("userC", "upstox"), ("userD", "fyers")):
+            run(set_market_feed_link(user, broker, up=True))
+        run(feeds["userA"].on_raw(_angel_canonical()))
+        run(feeds["userB"].on_raw(canonical_ticks(
+            _kite_ticks(_kite_frame((738561, 265075))), _kite_map(), broker="zerodha")))
+        run(feeds["userC"].on_raw(_upstox_canonical()))
+        run(feeds["userD"].on_raw(_fy_canonical()))
+
+        def resolved(user):
+            return manager.resolve(Capability.QUOTES, context=ResolutionContext(user_id=user, symbol="RELIANCE"))
+
+        for user in feeds:
+            assert resolved(user) is feeds[user]
+        assert resolved("userE") is baseline, "a user with no broker was served another user's feed"
+
+        # Fyers drops. Only user D moves.
+        run(set_market_feed_link("userD", "fyers", up=False, reason="socket closed"))
+        assert resolved("userD") is baseline
+        for user in ("userA", "userB", "userC"):
+            assert resolved(user) is feeds[user]
+        assert resolved("userE") is baseline
+
+
+def test_a_fyers_quote_carries_no_broker_identity_and_no_other_users_data():
+    from services.brokers.market_feed import set_market_feed_link
+    from services.market_engine.providers import YahooPollingAdapter
+
+    with _clean_provider_registry() as registry:
+        registry.clear()
+        registry.register(YahooPollingAdapter())
+        feed = _fy_feed("u1", symbols=("RELIANCE",))
+        run(set_market_feed_link("u1", "fyers", up=True))
+        run(feed.on_raw(_fy_canonical()))
+        quote = run(feed.fetch_quote("RELIANCE"))
+
+    blob = json.dumps(quote).lower()
+    for forbidden in ("fyers", "hsm", "brokerfeed", "u1", "nse_cm", "2885", "fytoken"):
+        assert forbidden not in blob, f"{forbidden} reached a consumer-facing quote"
+
+
+# -- the engine seam -------------------------------------------------------------
+
+
+def test_the_engine_carries_fyers_bytes_all_the_way_into_the_registered_feed():
+    """The real join: the engine's instrument map, the canonical boundary, the push."""
+    from services.market_engine.providers import Capability, ResolutionContext, YahooPollingAdapter
+
+    holdings = [{"symbol": "RELIANCE", "exchange": "NSE", "instrument_token": "sf|nse_cm|2885"}]
+    engine = BrokerEngine()
+    engine.configure(FakeDB())
+
+    with _clean_provider_registry() as registry:
+        registry.clear()
+        baseline = YahooPollingAdapter()
+        registry.register(baseline)
+        manager = SourceManager(registry)
+        ctx = ResolutionContext(user_id="u1", symbol="RELIANCE")
+
+        with patch("services.brokers.stream.stream_manager.start_stream", new=AsyncMock()) as started, \
+                patch.object(BrokerEngine, "get_session", new=AsyncMock(return_value=_fy_session())), \
+                patch("services.brokers.gateway.broker_gateway.get_holdings", new=AsyncMock(return_value=holdings)), \
+                patch("services.brokers.gateway.broker_gateway.get_positions", new=AsyncMock(return_value=[])):
+            run(engine.start_stream("u1", "fyers"))
+
+        assert started.await_count == 1
+        assert started.await_args.kwargs["instrument_tokens"] == ["sf|nse_cm|2885"]
+        assert started.await_args.kwargs["channel"] == "market"
+
+        feed = registry.get("brokerfeed:fyers:u1")
+        assert feed is not None and feed.subscribed_symbols == ("RELIANCE",)
+        run(feed.mark_link_up())
+        assert manager.resolve(Capability.QUOTES, context=ctx) is baseline
+
+        with patch.object(BrokerEngine, "_push", new=AsyncMock()):
+            run(engine._on_stream_tick("u1", "fyers", _fy_ticks(_fy_snapshot(values=(265050,)))))
+
+        assert feed.describe()["accepted_records"] == 1
+        assert manager.resolve(Capability.QUOTES, context=ctx) is feed
+        assert run(feed.fetch_quote("RELIANCE"))["price"] == 2650.5
+
+
+def test_an_expired_fyers_session_detaches_the_market_feed():
+    engine = BrokerEngine()
+    engine.configure(FakeDB())
+
+    with _clean_provider_registry() as registry:
+        registry.clear()
+        _fy_feed("u1", symbols=("RELIANCE",))
+        assert registry.get("brokerfeed:fyers:u1") is not None
+        with patch.object(BrokerEngine, "_push", new=AsyncMock()), \
+                patch("services.brokers.stream.stream_manager.stop_stream", new=AsyncMock()):
+            run(engine._on_stream_expired("u1", "fyers", "market"))
+        assert registry.get("brokerfeed:fyers:u1") is None
+
+
+# -- security --------------------------------------------------------------------
+
+
+def test_no_fyers_credential_reaches_a_log_line(caplog):
+    """The whole transport pass, at DEBUG, with a live-looking session.
+
+    Fyers is the case where this could fail most quietly: the credential is not
+    in the URL and not in a header — it is inside a binary frame the transport
+    sends — so a log line that dumped a *sent frame* would leak it in a form no
+    URL-shaped check would notice.
+    """
+    caplog.set_level(logging.DEBUG)
+    token = _fy_token("SECRET-HSM-KEY")
+    ticks, orders, expired, socket = drive_stream(
+        _fyers(),
+        [_fy_auth_ok(), _fy_frame(_fy_snapshot()), _fy_control(4, "N")],
+        instruments=["sf|nse_cm|2885"],
+        session={"access_token": token, "account_id": "SECRET-CLIENT"},
+        channel="market",
+    )
+    emitted = "\n".join(r.getMessage() for r in caplog.records)
+    assert emitted, "nothing was logged — the sweep could not have failed"
+    for secret in ("SECRET-HSM-KEY", "SECRET-CLIENT", token, "nova-key"):
+        assert secret not in emitted, f"{secret} reached a log line"
+    # And the credential really was on the wire, so the sweep had something to find.
+    assert b"SECRET-HSM-KEY" in socket.sent[0]
+
+
+def test_the_fyers_session_token_is_encrypted_at_rest_like_every_other_secret():
+    """This broker's feed credential lives INSIDE the access token, so the field
+    already covered by SECURITY.md's encryption-at-rest rule carries both — but
+    only if the token itself is encrypted, which is what this pins."""
+    from services.broker_engine import TOKEN_FIELDS
+    from services.brokers.crypto import is_encrypted
+
+    engine = BrokerEngine()
+    engine.configure(FakeDB())
+    token = _fy_token("SECRET-HSM-KEY")
+    run(engine._save_account("u1", "fyers", {"access_token": token, "account_id": "XY01234"}))
+
+    stored = run(engine.db.broker_accounts.find_one({"user_id": "u1", "broker": "fyers"}))
+    assert stored["access_token"] != token and is_encrypted(stored["access_token"])
+    assert "SECRET-HSM-KEY" not in json.dumps(stored, default=str)
+    assert run(engine._load_account("u1", "fyers"))["access_token"] == token
+    assert "access_token" in TOKEN_FIELDS
+
+
+def test_disconnecting_a_fyers_account_clears_every_session_secret():
+    from services.broker_engine import TOKEN_FIELDS
+
+    engine = BrokerEngine()
+    engine.configure(FakeDB())
+    run(engine._save_account("u1", "fyers", {
+        "access_token": _fy_token("SECRET-HSM-KEY"), "refresh_token": "R1", "account_id": "XY01234"}))
+
+    with patch("services.brokers.gateway.broker_gateway.invalidate_session", new=AsyncMock()), \
+            patch("services.brokers.stream.stream_manager.stop_stream", new=AsyncMock()), \
+            patch.object(BrokerEngine, "_push", new=AsyncMock()), \
+            patch.object(BrokerEngine, "_publish_connection", new=AsyncMock()):
+        run(engine.disconnect("fyers", "u1"))
+
+    stored = run(engine.db.broker_accounts.find_one({"user_id": "u1", "broker": "fyers"}))
+    assert stored["connected"] is False
+    for field in TOKEN_FIELDS:
+        assert stored.get(field) == "", f"{field} survived a disconnect"
+
+
+# -- architecture ----------------------------------------------------------------
+
+
+def test_fyers_added_no_fyers_knowledge_outside_its_own_adapter():
+    """D4.10's central acceptance criterion, swept rather than asserted by eye."""
+    fyers_words = ("fyers", "hsm", "fytoken", "socket.fyers", "api-t1",
+                   "appidhash", "auth_code", "nse_cm", "cde_fo", "generate-authcode")
+    allowed = {
+        "services/brokers/fyers.py",      # the adapter — the only owner
+        "services/brokers/__init__.py",   # the registry entry — one line
+    }
+    offenders = {}
+    scanned = 0
+    for path in sorted((BACKEND / "services").rglob("*.py")):
+        rel = path.relative_to(BACKEND).as_posix()
+        if rel in allowed:
+            continue
+        scanned += 1
+        source = _strip_source(path.read_text(encoding="utf-8")).lower()
+        hit = [w for w in fyers_words if re.search(w, source)]
+        if hit:
+            offenders[rel] = hit
+    assert scanned > 50, "the sweep found almost no modules — it could not have failed"
+    assert not offenders, offenders
+
+
+def test_the_market_layer_is_untouched_by_the_fourth_broker():
+    """Everything D4.10 promised would not move, re-checked with four brokers live."""
+    market_modules = [
+        "services/market_engine/gateway.py",
+        "services/market_engine/source_manager.py",
+        "services/market_engine/ticks.py",
+        "services/market_engine/providers/streaming.py",
+        "services/market_engine/providers/registry.py",
+        "services/market_engine/providers/base.py",
+    ]
+    for relative in market_modules:
+        source = _strip_source((BACKEND / relative).read_text(encoding="utf-8")).lower()
+        for name in ("fyers", "hsm", r"angel(?!og)", "upstox", "zerodha", "kite",
+                     "broker_gateway", "broker_registry"):
+            assert not re.search(name, source), f"{relative} names {name!r} in executable code"
+
+
+def test_the_fourth_broker_added_no_broker_knowledge_to_the_transport():
+    """`stream.py` grew a connection scope and still cannot tell one broker apart.
+
+    D4.10 changed this module — that is the honest finding of the sprint, as
+    D4.7's channel concept and D4.9's keep-alive timer were — but what it added
+    is three lines that ask a channel for a value and hold it for a socket's
+    lifetime. The property that matters survives.
+    """
+    source = _strip_source((BACKEND / "services/brokers/stream.py").read_text(encoding="utf-8")).lower()
+    for name in ("fyers", "hsm", "fytoken", r"angel(?!og)", "smartapi", "upstox",
+                 "zerodha", "kite", "protobuf", "snapshot", "topic"):
+        assert not re.search(name, source), f"stream.py names {name!r} in executable code"
+
+
+def test_the_connection_scope_is_free_for_every_broker_that_does_not_need_one():
+    """`open()` returning `self` is what makes D4.10 invisible to three brokers.
+
+    Asserted rather than assumed: if the default ever stopped being the identity,
+    every stateless adapter would silently start decoding against something other
+    than itself.
+    """
+    for broker in ("zerodha", "upstox", "angelone"):
+        for channel in broker_registry.require(broker).stream_channels():
+            assert channel.open({"access_token": "t"}) is channel, f"{broker}/{channel.name}"
+
+    class Bare(BrokerStreamChannel):
+        pass
+
+    bare = Bare()
+    assert bare.open({}) is bare and bare.open(None, None) is bare
+
+
+def test_all_four_streaming_brokers_reach_the_market_gateway_through_the_identical_seam():
+    """One seam, four brokers, no branch anywhere on the path."""
+    import inspect
+
+    from services.brokers import market_feed
+
+    source = _strip_source(inspect.getsource(market_feed)).lower()
+    for name in ("fyers", "hsm", r"angel(?!og)", "smartapi", "upstox", "zerodha", "kite"):
+        assert not re.search(name, source), f"market_feed.py names {name!r} in executable code"
+
+    for relative in ("services/brokers/market_feed.py", "services/brokers/stream.py",
+                     "services/market_engine/source_manager.py"):
+        text = _strip_prose((BACKEND / relative).read_text(encoding="utf-8"))
+        for comparison in ("broker ==", "broker!=", "broker !=", "broker in ("):
+            assert comparison not in text, f"{relative} branches on a broker name: {comparison!r}"
+
+    for broker in ("zerodha", "upstox", "angelone", "fyers"):
+        adapter = broker_registry.require(broker)
+        assert adapter.supports(BrokerCapability.TICK_STREAM)
+        channels = [c for c in adapter.stream_channels() if StreamEventKind.TICKS in c.delivers]
+        assert len(channels) == 1, f"{broker} must have exactly one tick-carrying channel"
+
+
+def test_the_fyers_adapter_registers_with_no_change_to_the_framework():
+    """Developer Rule 9: one adapter plus one registry entry, and nothing else."""
+    adapter = _fyers()
+    BrokerRegistry.validate(adapter)      # would raise if the declaration were unhonoured
+    assert adapter.credential_spec.api_key_env == "FYERS_APP_ID"
+    assert adapter.credential_spec.required == ("api_key", "api_secret")
+    assert not adapter.supports(BrokerCapability.PLACE_ORDER)
+    assert not adapter.supports(BrokerCapability.ORDER_STREAM)
+    assert not adapter.supports(BrokerCapability.SESSION_REFRESH)
+
+
+# ==================================================================
+# D4.11 — Dhan (DhanHQ v2): the FIFTH concrete stream adapter
+#
+# The protocol below is transcribed from TWO independent sources, read against
+# each other rather than one trusted:
+#
+#   * DhanHQ's published v2 documentation (Live Market Feed, Annexure,
+#     Authentication, Portfolio, Funds);
+#   * Dhan's own reference client, `DhanHQ-py` (`src/dhanhq/marketfeed.py`),
+#     whose `struct` format strings are the authority on byte layout.
+#
+# Every binary fixture below is packed with the REFERENCE CLIENT'S OWN format
+# strings — `<BHBIfHIfIIIffff` for a quote, `<BHBIfI` for a ticker, `<BHBIH` for
+# a disconnect — rather than with offsets copied out of the adapter. That is the
+# point: an adapter tested against fixtures built from its own constants proves
+# only that it is self-consistent. Here the fixture and the decoder are derived
+# from different documents, so a wrong offset in the adapter shows up as a wrong
+# number rather than as agreement.
+#
+# Nothing here was inferred from Kite, Upstox, SmartAPI or Fyers. Dhan differs
+# from all four on endpoint, auth style, framing, identity, price encoding and
+# volume semantics — and agrees with none of them on any of the six.
+#
+# THE THREE FINDINGS THAT DROVE THESE TESTS
+# ------------------------------------------
+#   1. The price is an unscaled float32 in rupees. Four brokers, four divisors,
+#      and Dhan has none — applying one publishes a price 1/100th of the truth.
+#   2. Prev Close (response code 6) is BYTE-FOR-BYTE identical in shape to
+#      Ticker (code 2), and Dhan sends one per instrument at subscribe time.
+#      Only the response code separates yesterday's close from today's price.
+#   3. `/holdings` reports `exchange`, not `exchangeSegment`, and the docs and
+#      the SDK disagree on what it holds. A row saying `"ALL"` names no segment,
+#      and a security id without a segment is two different companies.
+#
+# Every test below was run against a deliberately broken implementation first;
+# the mutations are listed in TASK.md's D4.11 falsification table.
+# ==================================================================
+
+
+def _dhan():
+    return broker_registry.require("dhan")
+
+
+def _dhan_channel():
+    channels = _dhan().stream_channels()
+    assert len(channels) == 1, "Dhan's market-data surface is one socket"
+    return channels[0]
+
+
+def _dhan_session(token="live-dhan-jwt-token", client_id="1000000009"):
+    return {"access_token": token, "account_id": client_id}
+
+
+# -- wire fixtures, packed with the reference client's own format strings -------
+
+
+def _dhan_quote(security_id=1333, price=2650.75, segment=1, volume=1_234_567,
+                last_quantity=10, trade_time=1_724_236_800):
+    """One Quote packet (response code 4). `<BHBIfHIfIIIffff`, 50 bytes.
+
+    `last_quantity` and `volume` are deliberately different numbers so a decoder
+    that read the wrong one is visibly wrong rather than coincidentally right.
+    """
+    return struct.pack(
+        "<BHBIfHIfIIIffff",
+        4, 42, segment, security_id, price, last_quantity, trade_time,
+        2649.0, volume, 500, 700, 2600.0, 2610.0, 2700.0, 2590.0,
+    )
+
+
+def _dhan_ticker(security_id=1333, price=2650.75, segment=1, trade_time=1_724_236_800):
+    """One Ticker packet (response code 2). `<BHBIfI`, 16 bytes. NO volume field."""
+    return struct.pack("<BHBIfI", 2, 8, segment, security_id, price, trade_time)
+
+
+def _dhan_prev_close(security_id=1333, price=2400.0, segment=1):
+    """One Prev Close packet (code 6) — the SAME 16-byte shape as a Ticker.
+
+    Dhan sends one of these per instrument the moment a subscription lands. It
+    exists in this file solely to prove it is never priced.
+    """
+    return struct.pack("<BHBIfI", 6, 8, segment, security_id, price, 0)
+
+
+def _dhan_full(security_id=1333, price=2650.75, segment=1, volume=1_234_567):
+    """One Full packet (code 8). `<BHBIfHIfIIIIIIffff100s`, 162 bytes."""
+    return struct.pack(
+        "<BHBIfHIfIIIIIIffff100s",
+        8, 154, segment, security_id, price, 10, 1_724_236_800,
+        2649.0, volume, 500, 700, 0, 0, 0, 2600.0, 2610.0, 2700.0, 2590.0, b"\x00" * 100,
+    )
+
+
+def _dhan_oi(security_id=1333, segment=1):
+    return struct.pack("<BHBII", 5, 4, segment, security_id, 99_000)
+
+
+def _dhan_market_status():
+    return struct.pack("<BHBI", 7, 0, 0, 0)
+
+
+def _dhan_disconnect(code=807, security_id=1333, segment=1):
+    """One feed-disconnect packet (code 50). `<BHBIH`, 10 bytes."""
+    return struct.pack("<BHBIH", 50, 2, segment, security_id, code)
+
+
+def _dhan_ticks(frame):
+    """The canonical `BrokerTick` dicts one raw Dhan frame decodes to."""
+    event = _dhan().decode_stream_frame(frame)
+    return [tick.as_dict() for tick in event.ticks]
+
+
+def _dhan_map():
+    """An account's instrument map as Dhan identifies instruments."""
+    return InstrumentMap.from_portfolio(
+        [
+            {"symbol": "RELIANCE", "exchange": "NSE", "instrument_token": "NSE_EQ|1333"},
+            {"symbol": "TCS", "exchange": "NSE", "instrument_token": "NSE_EQ|11536"},
+        ]
+    )
+
+
+def _dhan_canonical(price=2650.75, security_id=1333, segment=1, volume=1_234_567):
+    return canonical_ticks(
+        _dhan_ticks(_dhan_quote(security_id=security_id, price=price, segment=segment, volume=volume)),
+        _dhan_map(), broker="dhan",
+    )
+
+
+def _dhan_feed(user_id="u1", symbols=("RELIANCE",)):
+    """Attach a Dhan market feed for `user_id` on the real registry."""
+    return _attach_and_get(user_id, "dhan", symbols)
+
+
+# -- price encoding: the finding most likely to be "corrected" into a bug -------
+
+
+def test_the_dhan_price_is_an_unscaled_float32_in_rupees():
+    """No divisor. Not Kite's token-carried scale, not SmartAPI's 100, not Fyers'.
+
+    Dhan puts an IEEE-754 `float32` of the rupee price straight on the wire. The
+    fixture is packed with `struct.pack("<f", 2650.75)` — a float, not an integer
+    — so a decoder that divided by anything would produce 26.5075, and a decoder
+    that read the field as an int would produce a nine-digit number. Both are
+    visible here; neither raises anywhere in production.
+    """
+    (tick,) = _dhan_ticks(_dhan_quote(price=2650.75))
+    assert tick["last_price"] == pytest.approx(2650.75)
+
+    # A price with no exact float32 representation still round-trips within the
+    # tolerance float32 actually offers — the point being that the wire value is
+    # a float and is used as one.
+    (penny,) = _dhan_ticks(_dhan_quote(price=1.05))
+    assert penny["last_price"] == pytest.approx(1.05, rel=1e-6)
+
+
+def test_a_dhan_frame_whose_price_is_not_finite_is_refused_at_the_wire():
+    """NaN and infinity are rejected by the codec, not merely by MarketTick.
+
+    A `float32` read out of a truncated or misaligned packet is genuinely capable
+    of being either. `MarketTick` would refuse both — NaN fails every range
+    comparison — but refusing them here keeps a nonsense number out of
+    `BrokerTick`, out of the logs and out of every diagnostic that prints one.
+    """
+    for bad in (float("nan"), float("inf"), float("-inf"), 0.0, -5.0):
+        assert _dhan_ticks(_dhan_quote(price=bad)) == [], f"{bad} was priced"
+
+
+def test_a_dhan_previous_close_is_never_published_as_a_live_price():
+    """THE sharpest edge in this protocol, and the reason PRICEABLE is a table.
+
+    A Prev Close packet (code 6) and a Ticker packet (code 2) are the same 16
+    bytes with the same `float32` at the same offset. Dhan sends one Prev Close
+    per instrument the moment a subscription lands, so a codec that priced "any
+    frame with a float at offset 8" would publish **yesterday's close as today's
+    price**, once per holding, immediately after every connect and every
+    reconnect — marking a whole portfolio at stale prices with nothing raised.
+
+    The two fixtures below differ in exactly one byte.
+    """
+    priced = _dhan_prev_close(price=2400.0)
+    live = _dhan_ticker(price=2650.75)
+    assert len(priced) == len(live) == 16
+    assert sum(a != b for a, b in zip(priced, live)) > 0
+    assert priced[1:8] == live[1:8], "the fixtures differ by more than the response code"
+
+    assert _dhan_ticks(priced) == [], "a previous close was published as a live tick"
+    assert [t["last_price"] for t in _dhan_ticks(live)] == [2650.75]
+
+
+def test_dhan_frames_that_are_not_prices_are_ignored_rather_than_decoded():
+    """OI, market status, index and depth packets are normal traffic, not errors.
+
+    A codec that raised on them would fill the log with noise from a perfectly
+    healthy connection; one that priced them would invent a rupee value out of an
+    open-interest count.
+    """
+    for frame in (_dhan_oi(), _dhan_market_status(), b"", b"\x02", b"\x01\x00\x00\x00"):
+        event = _dhan().decode_stream_frame(frame)
+        assert event.kind is StreamEventKind.IGNORE, f"{frame!r} was decoded"
+
+
+def test_a_truncated_dhan_quote_is_dropped_rather_than_read_short():
+    """A 50-byte packet arriving as 30 bytes must not be priced from what fits."""
+    for length in (8, 15, 30, 49):
+        assert _dhan_ticks(_dhan_quote()[:length]) == [], f"a {length}-byte quote was priced"
+
+
+# -- volume semantics ----------------------------------------------------------
+
+
+def test_dhan_publishes_cumulative_day_volume_and_not_the_last_trade_quantity():
+    """One packet, four volume-shaped fields, and only one of them is the volume.
+
+    A Quote packet carries `LTQ` (this trade's size, int16 at offset 12),
+    `volume` (the day's cumulative traded quantity, int32 at offset 22),
+    `total_sell_quantity` (offset 26) and `total_buy_quantity` (offset 30). Only
+    the second is what `MarketTick.volume` means; the other three are a trade
+    size and two order-book aggregates, and any of them would publish a number
+    that means something else entirely.
+
+    Every one is a distinct value in the fixture, so reading the wrong field is a
+    wrong number rather than a coincidence.
+    """
+    (tick,) = _dhan_ticks(_dhan_quote(volume=1_234_567, last_quantity=10))
+    assert tick["volume"] == 1_234_567
+    assert tick["volume"] not in (10, 500, 700)
+
+    (canonical,) = _dhan_canonical(volume=1_234_567)
+    assert canonical["volume"] == 1_234_567
+
+
+def test_a_dhan_ticker_packet_makes_no_volume_claim_at_all():
+    """Ticker mode has no volume FIELD. `0` there would assert nothing traded today.
+
+    `BrokerTick.volume` is an `int` and cannot be absent, so a codec expresses
+    "this feed does not say" as `0` — and the canonical boundary is what turns
+    that into `MarketTick.volume is None`, which is a genuinely different claim
+    from "zero shares changed hands".
+    """
+    (tick,) = _dhan_ticks(_dhan_ticker())
+    assert tick["volume"] == 0
+    (canonical,) = canonical_ticks(_dhan_ticks(_dhan_ticker()), _dhan_map(), broker="dhan")
+    assert canonical["volume"] is None
+
+
+# -- instrument identity -------------------------------------------------------
+
+
+def test_a_dhan_security_id_is_only_an_identity_when_paired_with_its_segment():
+    """NSE id 1333 and BSE id 1333 are different companies.
+
+    Dhan numbers instruments per exchange segment, the frame carries the segment
+    as a byte and the id as an int32, and `InstrumentMap` matches ONE value — so
+    the pair has to be that value. A map keyed on the bare id would resolve a BSE
+    tick onto an NSE holding and mark the position at another company's price.
+    """
+    from services.brokers.dhan import instrument_id, parse_instrument_id
+
+    assert instrument_id("NSE_EQ", 1333) == "NSE_EQ|1333"
+    assert instrument_id("BSE_EQ", 1333) == "BSE_EQ|1333"
+    assert instrument_id("NSE_EQ", 1333) != instrument_id("BSE_EQ", 1333)
+    assert parse_instrument_id("NSE_EQ|1333") == ("NSE_EQ", "1333")
+
+    # The same security id on the two segments decodes to two distinct handles.
+    (nse,) = _dhan_ticks(_dhan_quote(security_id=1333, segment=1))
+    (bse,) = _dhan_ticks(_dhan_quote(security_id=1333, segment=4))
+    assert nse["instrument_token"] == "NSE_EQ|1333"
+    assert bse["instrument_token"] == "BSE_EQ|1333"
+    assert nse["exchange"] == "NSE" and bse["exchange"] == "BSE"
+
+    # And the account that holds only the NSE line resolves only the NSE tick.
+    assert [t["symbol"] for t in canonical_ticks([nse], _dhan_map(), broker="dhan")] == ["RELIANCE"]
+    assert canonical_ticks([bse], _dhan_map(), broker="dhan") == []
+
+
+def test_a_dhan_instrument_id_refuses_everything_that_is_not_a_usable_pair():
+    from services.brokers.dhan import instrument_id, parse_instrument_id
+
+    for segment, security_id in (
+        (None, 1333), ("", 1333), ("NASDAQ", 1333), (True, 1333), ("NSE", 1333),
+        ("NSE_EQ", None), ("NSE_EQ", ""), ("NSE_EQ", 0), ("NSE_EQ", -1),
+        ("NSE_EQ", "abc"), ("NSE_EQ", True),
+    ):
+        assert instrument_id(segment, security_id) is None, f"{segment!r}|{security_id!r} was accepted"
+
+    for value in (None, "", "1333", "NSE_EQ", "NSE_EQ|", "|1333", "NASDAQ|1", "NSE_EQ|0", True):
+        assert parse_instrument_id(value) is None, f"{value!r} was accepted"
+
+
+def test_an_unmapped_dhan_instrument_is_never_renamed_into_a_symbol():
+    """`"NSE_EQ|999999"` must never reach a holding, a watchlist or the AI's context."""
+    (tick,) = _dhan_ticks(_dhan_quote(security_id=999_999))
+    assert tick["instrument_token"] == "NSE_EQ|999999"
+    assert canonical_ticks([tick], _dhan_map(), broker="dhan") == []
+
+
+def test_a_dhan_segment_this_adapter_cannot_name_is_dropped_not_defaulted():
+    """Segment 9 is not in Dhan's Annexure. It is dropped, not treated as NSE."""
+    for segment in (6, 9, 200, 255):
+        assert _dhan_ticks(_dhan_quote(segment=segment)) == [], f"segment {segment} was priced"
+
+
+def test_the_dhan_segment_tables_are_one_table_read_two_ways():
+    """The subscribe NAME and the frame ENUM cannot drift, because they are derived.
+
+    The subscribe frame takes `"NSE_EQ"`; every response frame carries `1`. Two
+    hand-written tables would eventually disagree by one row, and the symptom
+    would be a subscription for one instrument and ticks attributed to another.
+    """
+    from services.brokers.dhan import SEGMENT_EXCHANGES, SEGMENT_NAMES, SEGMENTS
+
+    assert SEGMENT_NAMES == {enum: name for name, (enum, _e) in SEGMENTS.items()}
+    assert SEGMENT_EXCHANGES == {name: exchange for name, (_n, exchange) in SEGMENTS.items()}
+    assert len(SEGMENT_NAMES) == len(SEGMENTS), "two segments share an enum value"
+    # The Annexure's own values, written out so a silent renumbering is visible.
+    assert {name: enum for name, (enum, _e) in SEGMENTS.items()} == {
+        "IDX_I": 0, "NSE_EQ": 1, "NSE_FNO": 2, "NSE_CURRENCY": 3,
+        "BSE_EQ": 4, "MCX_COMM": 5, "BSE_CURRENCY": 7, "BSE_FNO": 8,
+    }
+    # Not SmartAPI's table. Copying a predecessor's segment numbers is the exact
+    # mutation D4.10 caught, and Dhan's differ from Angel One's on every row.
+    from services.brokers.angelone import EXCHANGE_TYPES
+
+    assert {name: enum for name, (enum, _e) in SEGMENTS.items()} != EXCHANGE_TYPES
+
+
+# -- the holdings finding: an exchange field that is not always an exchange -----
+
+
+def _dhan_adapter_with(holdings=None, positions=None, funds=None, profile=None):
+    """Patch the adapter's one HTTP method with a path-routed fake response."""
+    routes = {
+        "/holdings": holdings if holdings is not None else [],
+        "/positions": positions if positions is not None else [],
+        "/fundlimit": funds if funds is not None else {},
+        "/profile": profile if profile is not None else {},
+    }
+
+    async def fake(method, url, headers=None, data=None, json_body=None, timeout=12.0):
+        for path, payload in routes.items():
+            if url.endswith(path):
+                return payload
+        raise AssertionError(f"unexpected Dhan call: {url}")
+
+    return patch.object(type(_dhan()), "_request", side_effect=fake)
+
+
+def test_a_dhan_holding_that_names_no_exchange_yields_no_instrument_identity(caplog):
+    """The docs say `"ALL"`; the SDK's own fixture says `"NSE"`. Both are handled.
+
+    `/holdings` reports `exchange`, not `exchangeSegment`, and Dhan's published
+    sample and its reference client's test fixture disagree about what that field
+    contains. A row naming a real exchange is a delivery holding and can only be
+    cash, so the segment follows. A row saying `"ALL"` names no exchange at all —
+    and defaulting it to NSE_EQ would be right most of the time and **wrong
+    silently**: a BSE-only holding would be subscribed as whatever NSE numbers
+    that id, and that company's price would be published under the user's stock's
+    name.
+
+    So the row keeps its symbol — it is a real holding everywhere else — and
+    carries no instrument id, and the count is WARNed rather than swallowed.
+    """
+    rows = [
+        {"exchange": "NSE", "tradingSymbol": "RELIANCE", "securityId": "1333",
+         "isin": "INE002A01018", "totalQty": 10, "avgCostPrice": 2400.0, "lastTradedPrice": 2650.75},
+        {"exchange": "BSE", "tradingSymbol": "TCS", "securityId": "11536",
+         "totalQty": 5, "avgCostPrice": 3200.0, "lastTradedPrice": 3300.0},
+        {"exchange": "ALL", "tradingSymbol": "HDFC", "securityId": "1330",
+         "totalQty": 1000, "avgCostPrice": 2655.0, "lastTradedPrice": 2700.0},
+    ]
+    with caplog.at_level(logging.WARNING, logger="services.brokers.dhan"):
+        with _dhan_adapter_with(holdings=rows):
+            holdings = run(_dhan().get_holdings(_dhan_session()))
+
+    by_symbol = {row["symbol"]: row for row in holdings}
+    assert by_symbol["RELIANCE"]["instrument_token"] == "NSE_EQ|1333"
+    assert by_symbol["RELIANCE"]["exchange"] == "NSE"
+    assert by_symbol["TCS"]["instrument_token"] == "BSE_EQ|11536"
+    assert by_symbol["TCS"]["exchange"] == "BSE"
+
+    # The consolidated row survives as a holding and cannot be subscribed.
+    assert by_symbol["HDFC"]["instrument_token"] is None
+    assert by_symbol["HDFC"]["exchange"] is None
+    assert by_symbol["HDFC"]["quantity"] == 1000
+
+    assert any("no exchange segment" in record.getMessage()
+               for record in caplog.records), "an unsubscribable holding was dropped in silence"
+
+    # And it is absent from the subscription rather than subscribed as a guess.
+    assert _dhan().stream_instruments(holdings=holdings) == ["BSE_EQ|11536", "NSE_EQ|1333"]
+
+
+def test_dhan_positions_carry_their_own_segment_and_map_completely():
+    """`/positions` DOES return `exchangeSegment`, so an intraday position maps fully."""
+    rows = [
+        {"tradingSymbol": "TCS", "securityId": "11536", "positionType": "LONG",
+         "exchangeSegment": "NSE_EQ", "productType": "CNC", "buyAvg": 3345.8, "buyQty": 40,
+         "costPrice": 3215.0, "sellAvg": 0.0, "sellQty": 0, "netQty": 40,
+         "realizedProfit": 0.0, "unrealizedProfit": 6122.0},
+    ]
+    with _dhan_adapter_with(positions=rows):
+        positions = run(_dhan().get_positions(_dhan_session()))
+
+    assert positions[0]["instrument_token"] == "NSE_EQ|11536"
+    assert positions[0]["symbol"] == "TCS"
+    assert positions[0]["exchange"] == "NSE"
+    assert positions[0]["side"] == "LONG"
+    assert positions[0]["pnl"] == 6122.0
+
+
+def test_dhan_stream_instruments_are_deduplicated_and_stably_ordered():
+    """A resubscribe after a portfolio sync must produce the same list, in order."""
+    holdings = [{"instrument_token": "NSE_EQ|9"}, {"instrument_token": "NSE_EQ|10"},
+                {"instrument_token": "NSE_EQ|9"}, {"instrument_token": "BSE_EQ|2"},
+                {"instrument_token": None}, {"instrument_token": "NASDAQ|1"}, "not a row"]
+    positions = [{"instrument_token": "NSE_EQ|10"}]
+    assert _dhan().stream_instruments(holdings=holdings, positions=positions) == [
+        "BSE_EQ|2", "NSE_EQ|9", "NSE_EQ|10",
+    ]
+
+
+# -- subscriptions -------------------------------------------------------------
+
+
+def test_a_dhan_subscription_is_split_into_frames_of_one_hundred_instruments():
+    """Dhan rejects a message carrying more than 100 instruments.
+
+    This is a MESSAGE limit, not a session limit, so nothing is dropped for it —
+    a 250-instrument account is three frames. `stream_subscribe_frames` has always
+    returned a list precisely so a broker can say this, which is why Dhan needed
+    no framework change to say it.
+    """
+    instruments = [f"NSE_EQ|{n}" for n in range(1, 251)]
+    frames = _dhan().stream_subscribe_frames(instruments)
+
+    assert len(frames) == 3
+    assert all(isinstance(frame, str) for frame in frames), "the subscribe frame is text, not bytes"
+    decoded = [json.loads(frame) for frame in frames]
+    assert [len(f["InstrumentList"]) for f in decoded] == [100, 100, 50]
+    # `InstrumentCount` describes THIS message, not the whole subscription.
+    assert [f["InstrumentCount"] for f in decoded] == [100, 100, 50]
+    assert {f["RequestCode"] for f in decoded} == {17}
+
+    # Every instrument asked for is on the wire exactly once, and nothing else is.
+    sent = [f"{i['ExchangeSegment']}|{i['SecurityId']}" for f in decoded for i in f["InstrumentList"]]
+    assert sorted(sent, key=lambda v: int(v.split("|")[1])) == instruments
+
+
+def test_the_dhan_subscribe_frame_names_the_segment_by_name_not_by_its_enum():
+    """The response frames carry `1`; the subscribe frame must carry `"NSE_EQ"`."""
+    (frame,) = _dhan().stream_subscribe_frames(["NSE_EQ|1333", "BSE_FNO|7"])
+    payload = json.loads(frame)
+    assert [i["ExchangeSegment"] for i in payload["InstrumentList"]] == ["NSE_EQ", "BSE_FNO"]
+    assert [i["SecurityId"] for i in payload["InstrumentList"]] == ["1333", "7"]
+    assert "1" not in {i["ExchangeSegment"] for i in payload["InstrumentList"]}
+
+
+def test_a_dhan_subscription_past_the_connection_limit_is_trimmed_out_loud(caplog):
+    """5,000 per connection is a real ceiling. Trimming it silently is what is banned.
+
+    Sharding the remainder across a second connection is D5's subject and is
+    deliberately not attempted here — but a user must not be told they are
+    watching an instrument the wire was never asked for.
+    """
+    from services.brokers.dhan import MAX_INSTRUMENTS_PER_CONNECTION
+
+    instruments = [f"NSE_EQ|{n}" for n in range(1, MAX_INSTRUMENTS_PER_CONNECTION + 26)]
+    with caplog.at_level(logging.WARNING, logger="services.brokers.dhan"):
+        frames = _dhan().stream_subscribe_frames(instruments)
+
+    total = sum(len(json.loads(frame)["InstrumentList"]) for frame in frames)
+    assert total == MAX_INSTRUMENTS_PER_CONNECTION
+    assert any("exceeds" in record.message for record in caplog.records), \
+        "instruments were trimmed in silence"
+
+
+def test_a_dhan_subscription_of_nothing_subscribable_sends_no_frame():
+    assert _dhan().stream_subscribe_frames([]) == []
+    assert _dhan().stream_subscribe_frames(None) == []
+    assert _dhan().stream_subscribe_frames(["NASDAQ|1", None, "", 738561]) == []
+
+
+# -- endpoint, auth and the keep-alive -----------------------------------------
+
+
+def test_the_dhan_endpoint_authenticates_by_query_string_and_hides_it_from_logs():
+    """Dhan's style is Kite's, not Upstox's header or Fyers' in-band frame.
+
+    The credential is in the URL because the protocol puts it there, so the ONLY
+    form that may ever be logged is `safe_url`.
+    """
+    endpoint = _dhan().stream_endpoint(_dhan_session(token="SECRET-DHAN-TOKEN", client_id="1000000009"))
+
+    assert endpoint.url.startswith("wss://api-feed.dhan.co?")
+    assert "SECRET-DHAN-TOKEN" in endpoint.url, "the credential never reached the wire"
+    assert endpoint.safe_url == "wss://api-feed.dhan.co"
+    assert "SECRET-DHAN-TOKEN" not in endpoint.safe_url
+    assert "1000000009" not in endpoint.safe_url
+
+    from urllib.parse import parse_qs, urlparse
+
+    query = parse_qs(urlparse(endpoint.url).query)
+    assert query["version"] == ["2"] and query["authType"] == ["2"]
+    assert query["clientId"] == ["1000000009"]
+    assert endpoint.headers == {}, "Dhan authenticates in the query string, not in a header"
+
+
+def test_dhan_declares_no_application_keepalive_because_it_does_not_need_one():
+    """A protocol finding, not an omission — and the opposite of Angel One's.
+
+    Dhan's server sends a WebSocket PROTOCOL ping every 10 seconds and closes a
+    connection unanswered for 40. A protocol ping is answered by the `websockets`
+    library in both peers without either application seeing it, so the keep-alive
+    D4.9 added `heartbeat_frame` for is already satisfied. Angel One is the
+    contrast: it does not count protocol pings at all and closes a socket that
+    stops sending the text frame `ping`.
+    """
+    endpoint = _dhan().stream_endpoint(_dhan_session())
+    assert endpoint.heartbeat_frame is None and endpoint.heartbeat_interval is None
+    # The library's own ping is left enabled — the same defaults Dhan's reference
+    # client runs with, since it calls `websockets.connect(url)` with no overrides.
+    assert endpoint.ping_interval and endpoint.ping_timeout
+
+    angel = _angelone().stream_endpoint(_angel_session())
+    assert angel.heartbeat_frame is not None, "the contrast this test rests on has gone"
+
+
+def test_dhan_session_expiry_is_a_duration_and_not_a_calendar_cutoff():
+    """24 hours from generation — unlike Kite, SmartAPI and Fyers, which die at a fixed hour."""
+    connected = datetime(2026, 8, 25, 9, 30, tzinfo=timezone.utc)
+    assert _dhan().session_expiry(connected) == connected + timedelta(hours=24)
+
+
+def test_a_naive_dhan_expiry_timestamp_is_read_as_ist_and_not_as_utc():
+    """Dhan documents `expiryTime` as an ISO timestamp in IST with no offset.
+
+    Reading it as UTC would place every session's expiry five and a half hours
+    late, so a dead token would be treated as live for a whole trading morning.
+    """
+    from services.brokers.dhan import _expiry_time
+
+    parsed = _expiry_time("2026-08-26T09:30:00")
+    assert parsed == datetime(2026, 8, 26, 4, 0, tzinfo=timezone.utc)
+    # An explicit offset is honoured, and unparseable input falls back to None.
+    assert _expiry_time("2026-08-26T09:30:00+00:00") == datetime(2026, 8, 26, 9, 30, tzinfo=timezone.utc)
+    assert _expiry_time("not a timestamp") is None and _expiry_time(None) is None
+
+
+def test_the_dhan_callback_reads_tokenid_because_dhan_does_not_send_code():
+    """The inherited OAuth2 parser looks for `code` and would report a failed login."""
+    assert _dhan().parse_callback_params({"tokenId": "TID-123"}) == {"token_id": "TID-123"}
+    assert _dhan().parse_callback_params({"code": "abc"}) is None
+    assert _dhan().parse_callback_params({}) is None
+    assert _dhan().parse_callback_params(None) is None
+
+
+# -- session expiry, reported in a frame rather than at the handshake ----------
+
+
+def test_a_dhan_disconnect_frame_for_a_dead_token_stops_the_stream():
+    """Dhan reports a dead session IN A FRAME — the opposite of Angel One and Fyers.
+
+    The token rides in the connection's query string, so the socket opens first
+    and the rejection arrives on it as response code 50. Left unclassified the
+    frame would fall through as an unknown packet and be ignored, leaving a
+    stream that reconnects forever into a session Dhan has already ended.
+    """
+    for code in (806, 807, 808, 809):
+        event = _dhan().decode_stream_frame(_dhan_disconnect(code))
+        assert event.kind is StreamEventKind.AUTH_EXPIRED, f"code {code} did not stop the stream"
+        assert str(code) not in event.message, "the raw wire code leaked into a user-facing message"
+        assert event.message, f"code {code} stopped the stream with no reason"
+
+    ticks, _orders, expired, _socket = drive_stream(
+        _dhan(), [_dhan_quote(), _dhan_disconnect(807), _dhan_quote(price=9999.0)],
+        instruments=["NSE_EQ|1333"], session=_dhan_session())
+    assert expired == [("user-1", "dhan")]
+    # The tick before the disconnect is delivered; nothing after it is.
+    assert [t["last_price"] for _u, _b, batch in ticks for t in batch] == [2650.75]
+
+
+def test_a_transient_dhan_disconnect_does_not_end_the_users_session():
+    """805 is "too many connections", which the next attempt may well survive.
+
+    Dhan drops the OLDEST socket when a sixth opens, so permanently killing a
+    user's feed because they opened Dhan's own app would be the wrong trade. It is
+    reported and left to the transport's backoff — a genuinely different outcome
+    from an expired token, and the distinction is the adapter's to make.
+    """
+    event = _dhan().decode_stream_frame(_dhan_disconnect(805))
+    assert event.kind is StreamEventKind.ERROR
+    assert "too many active connections" in event.message
+
+    ticks, _orders, expired, socket = drive_stream(
+        _dhan(), [_dhan_disconnect(805), _dhan_quote()],
+        instruments=["NSE_EQ|1333"], session=_dhan_session())
+    assert expired == [], "a transient disconnect ended the user's session"
+    assert [t["last_price"] for _u, _b, batch in ticks for t in batch] == [2650.75]
+    assert socket.closed
+
+
+def test_an_unknown_dhan_disconnect_code_is_reported_rather_than_guessed():
+    event = _dhan().decode_stream_frame(_dhan_disconnect(999))
+    assert event.kind is StreamEventKind.ERROR and "999" in event.message
+
+
+def test_a_refused_dhan_handshake_is_classified_as_a_dead_session():
+    """The second line of defence, and it matters because the token is in the URL.
+
+    Dhan's documented behaviour is to accept the socket and then disconnect, but a
+    gateway in front of the feed may reject a malformed token at the HTTP upgrade
+    — and an unclassified 401 is indistinguishable from a broker outage to the
+    generic transport, which would then reconnect forever.
+    """
+    class Refused(Exception):
+        def __init__(self, status):
+            self.status_code = status
+
+    class Wrapped(Exception):
+        def __init__(self, status):
+            self.response = type("R", (), {"status_code": status})()
+
+    for status in (401, 403):
+        assert _dhan().stream_connect_error(Refused(status))
+        assert _dhan().stream_connect_error(Wrapped(status))
+    assert _dhan().stream_connect_error(Refused(503)) is None
+    assert _dhan().stream_connect_error(OSError("connection refused")) is None
+
+
+def test_a_dead_dhan_rest_session_is_classified_and_an_ordinary_error_is_not():
+    """`DH-901` means reconnect. Nothing else does, and mislabelling one would lie."""
+    from services.brokers.errors import BrokerAuthError, BrokerError
+
+    with _dhan_adapter_with(holdings={"errorCode": "DH-901", "errorMessage": "Invalid Authentication"}):
+        with pytest.raises(BrokerAuthError):
+            run(_dhan().get_holdings(_dhan_session()))
+
+    with _dhan_adapter_with(holdings={"errorCode": "DH-904", "errorMessage": "Too many requests"}):
+        with pytest.raises(BrokerError) as caught:
+            run(_dhan().get_holdings(_dhan_session()))
+    assert not isinstance(caught.value, BrokerAuthError), "a rate limit was reported as a dead session"
+
+
+# -- the canonical boundary ----------------------------------------------------
+
+
+def test_a_dhan_tick_becomes_a_canonical_market_tick_and_nothing_else():
+    """Raw Dhan bytes to `MarketTick`, with no Dhan field surviving the trip."""
+    (canonical,) = _dhan_canonical()
+    assert set(canonical) == {"symbol", "price", "exchange", "volume", "ingested_at"}
+    assert canonical["symbol"] == "RELIANCE"
+    assert canonical["price"] == pytest.approx(2650.75)
+    assert canonical["exchange"] == "NSE"
+    assert canonical["volume"] == 1_234_567
+
+    blob = json.dumps(canonical).lower()
+    for forbidden in ("nse_eq", "1333", "securityid", "dhan", "instrument_token", "requestcode"):
+        assert forbidden not in blob, f"{forbidden} crossed the canonical boundary"
+
+
+def test_a_raw_dhan_payload_cannot_reach_a_tick_consumer():
+    """The transport type-checks the codec's return value; a raw frame does not pass."""
+    with patch.object(type(_dhan()), "decode_stream_frame", lambda self, frame: {"raw": frame}):
+        ticks, _orders, _expired, _socket = drive_stream(
+            _dhan(), [_dhan_quote()], instruments=["NSE_EQ|1333"], session=_dhan_session())
+    assert ticks == [], "a codec returning a raw payload leaked it upward"
+
+
+def test_a_malformed_dhan_frame_does_not_terminate_a_live_dhan_stream():
+    """One bad packet must not cost the socket the prices it is otherwise delivering."""
+    frames = [_dhan_quote(price=2650.75), b"\x04\x00", _dhan_prev_close(),
+              b"", _dhan_oi(), _dhan_quote(price=2660.0)]
+    ticks, _orders, expired, socket = drive_stream(
+        _dhan(), frames, instruments=["NSE_EQ|1333"], session=_dhan_session())
+    assert [t["last_price"] for _u, _b, batch in ticks for t in batch] == [2650.75, 2660.0]
+    assert expired == [] and socket.closed
+
+
+# -- the transport -------------------------------------------------------------
+
+
+def test_a_dhan_stream_runs_through_the_generic_transport_unchanged():
+    """Real Dhan bytes over the real transport: subscribe, tick, close.
+
+    The subscribe frames must reach the socket verbatim **as text** — the
+    transport cannot know what encoding this broker expects, so it must not
+    re-encode what the codec handed it.
+    """
+    frames = [_dhan_prev_close(), _dhan_quote(price=2650.75), _dhan_market_status(),
+              _dhan_quote(security_id=11536, price=3300.0)]
+    ticks, orders, expired, socket = drive_stream(
+        _dhan(), frames, instruments=["NSE_EQ|1333", "NSE_EQ|11536"], session=_dhan_session())
+
+    assert len(socket.sent) == 1 and isinstance(socket.sent[0], str)
+    assert json.loads(socket.sent[0])["RequestCode"] == 17
+    assert [t["last_price"] for _u, _b, batch in ticks for t in batch] == [2650.75, 3300.0]
+    assert all(broker == "dhan" for _u, broker, _b in ticks)
+    assert orders == [] and expired == [] and socket.closed
+
+
+def test_dhan_declares_one_default_channel_served_by_the_one_generic_transport():
+    from services.brokers.base import AdapterStreamChannel
+    from services.brokers.stream import PROTOCOL_RUNNERS, resolve_transport
+
+    channel = _dhan_channel()
+    assert isinstance(channel, AdapterStreamChannel), \
+        "Dhan needed a bespoke channel class — the default no longer covers a plain WebSocket broker"
+    assert channel.name == DEFAULT_STREAM_CHANNEL
+    assert channel.delivers == frozenset({StreamEventKind.TICKS})
+    assert channel.protocol == _dhan().stream_protocol == "dhan_feed_v2"
+    assert PROTOCOL_RUNNERS == {}, "Dhan added a protocol runner — its feed is an ordinary WebSocket"
+    assert resolve_transport(channel) is BrokerStream._run_websocket
+
+
+def test_dhan_needs_no_connection_scope():
+    """Every Dhan frame is decodable on its own, so `open()` stays the identity.
+
+    D4.10 added a per-connection scope for a feed whose steady-state frames are
+    deltas against a snapshot. Dhan's are not: every frame carries the segment,
+    the security id and the price, so nothing an earlier frame established is
+    needed to read a later one. Asserted rather than assumed — a channel that
+    quietly acquired state would be per-broker rather than per-connection, and one
+    user's reconnect would renumber another user's instruments.
+    """
+    channel = _dhan_channel()
+    assert channel.open(_dhan_session()) is channel
+    assert channel.open(_dhan_session("other-token", "2000000002")) is channel
+
+    # And the proof that matters: the SAME frame decodes identically with no
+    # preceding frames, and after another account's traffic.
+    first = _dhan_ticks(_dhan_quote(price=2650.75))
+    _dhan().decode_stream_frame(_dhan_quote(security_id=99, price=1.5, segment=4))
+    assert _dhan_ticks(_dhan_quote(price=2650.75)) == first
+
+
+def test_a_dhan_codec_declaring_no_tick_capability_delivers_nothing():
+    """The capability model stays the authority; a codec may not widen it."""
+    adapter = _dhan()
+    narrowed = adapter.capabilities - {BrokerCapability.TICK_STREAM}
+    with patch.object(type(adapter), "capabilities", narrowed):
+        ticks, _orders, _expired, _socket = drive_stream(
+            adapter, [_dhan_quote()], instruments=["NSE_EQ|1333"], session=_dhan_session())
+    assert ticks == []
+
+
+# -- readiness and failover ----------------------------------------------------
+
+
+def test_a_dhan_feed_is_promoted_only_by_a_canonical_tick_on_the_current_link():
+    """Not on connect, not on subscribe, not on a timer. D4.5's rule, unchanged.
+
+    Dhan sends no acknowledgement of a subscription at all, which makes the point
+    concretely: there is nothing on this wire that could be mistaken for evidence
+    except an actual price.
+    """
+    from services.brokers.market_feed import set_market_feed_link
+    from services.market_engine.providers import Capability, ResolutionContext, YahooPollingAdapter
+
+    with _clean_provider_registry() as registry:
+        registry.clear()
+        baseline = YahooPollingAdapter()
+        registry.register(baseline)
+        manager = SourceManager(registry)
+        ctx = ResolutionContext(user_id="u1", symbol="RELIANCE")
+
+        feed = _dhan_feed("u1", symbols=("RELIANCE",))
+        assert feed is not None
+        assert manager.resolve(Capability.QUOTES, context=ctx) is baseline, "registering promoted the feed"
+
+        run(set_market_feed_link("u1", "dhan", up=True))
+        assert manager.resolve(Capability.QUOTES, context=ctx) is baseline, "connecting promoted the feed"
+
+        run(feed.on_raw(_dhan_canonical()))
+        assert manager.resolve(Capability.QUOTES, context=ctx) is feed
+
+        # The link drops: the baseline serves immediately, and it never left.
+        run(set_market_feed_link("u1", "dhan", up=False, reason="socket closed"))
+        assert manager.resolve(Capability.QUOTES, context=ctx) is baseline
+        assert baseline.name in registry, "the baseline was released before the feed was ready"
+
+        # A reconnect re-earns readiness rather than inheriting it.
+        run(set_market_feed_link("u1", "dhan", up=True))
+        assert manager.resolve(Capability.QUOTES, context=ctx) is baseline, \
+            "a reconnect promoted the feed on the previous connection's evidence"
+        run(feed.on_raw(_dhan_canonical()))
+        assert manager.resolve(Capability.QUOTES, context=ctx) is feed
+
+        # A LINK-UP WITH NO INTERVENING LINK-DOWN, which is a different path and
+        # a separately-guarded one. `mark_link_down` discards the dead link's
+        # evidence, so the sequence above cannot tell whether `mark_link_up`
+        # discards it too — and it must, because the transport's link callback
+        # is best-effort and a swallowed `down` would otherwise leave a fresh
+        # socket serving prices that arrived on a socket that is gone. Found by
+        # mutation: removing the discard in `mark_link_up` alone left every
+        # other assertion in this test green.
+        run(set_market_feed_link("u1", "dhan", up=True))
+        assert manager.resolve(Capability.QUOTES, context=ctx) is baseline, \
+            "a new link inherited the previous link's evidence"
+        run(feed.on_raw(_dhan_canonical()))
+        assert manager.resolve(Capability.QUOTES, context=ctx) is feed
+
+
+def test_dhan_registers_through_the_existing_provider_framework():
+    """No Dhan-specific provider, gateway, registry or Source Manager exists."""
+    from services.brokers.market_feed import feed_provider_name
+    from services.market_engine.providers import StreamingTickProvider
+
+    with _clean_provider_registry() as registry:
+        registry.clear()
+        name = run(_attach("u1", "dhan", ["RELIANCE"]))
+        assert name == feed_provider_name("u1", "dhan") == "brokerfeed:dhan:u1"
+        provider = registry.get(name)
+        assert type(provider) is StreamingTickProvider, "a broker-specific provider class appeared"
+        assert provider.owner_user_id == "u1"
+
+
+def test_removing_the_dhan_tick_capability_removes_its_market_feed():
+    adapter = _dhan()
+    narrowed = adapter.capabilities - {BrokerCapability.TICK_STREAM}
+    with _clean_provider_registry() as registry:
+        registry.clear()
+        with patch.object(type(adapter), "capabilities", narrowed):
+            assert run(_attach("u1", "dhan", ["RELIANCE"])) is None
+        assert registry.get("brokerfeed:dhan:u1") is None
+
+
+# -- multi-broker isolation ----------------------------------------------------
+
+
+def test_five_brokers_speak_five_protocols_and_produce_one_canonical_tick():
+    """THE D4.11 acceptance criterion: a fifth wire, the same canonical output.
+
+    Five brokers agree on nothing at the wire — bespoke big-endian binary vs
+    protobuf vs little-endian fixed packets vs a stateful topic protocol vs a
+    little-endian float packet; an integer token vs a compound key vs a numeric
+    segment pair vs an HSM topic vs a named segment pair; **five price rules, two
+    of which are not rules at all** — one value carried on the wire, and one that
+    is simply the price. What reaches the Market Engine from each is the same
+    canonical `MarketTick`.
+    """
+    kite = canonical_ticks(_kite_ticks(_kite_frame((738561, 265075))), _kite_map(), broker="zerodha")
+    upstox = canonical_ticks(
+        _upstox_ticks(_upstox_frame(ltpc={"NSE_EQ|INE002A01018": 2650.75})), _upstox_map(), broker="upstox")
+    angel = _angel_canonical(price=265075, token="2885")
+    fyers = _fy_canonical(price=265075)
+    dhan = _dhan_canonical(price=2650.75, volume=1_234_567)
+
+    wires = [_kite_frame((738561, 265075)),
+             _upstox_frame(ltpc={"NSE_EQ|INE002A01018": 2650.75}),
+             _angel_packet(price=265075),
+             _fy_frame(_fy_snapshot(values=(265075,))),
+             _dhan_quote(price=2650.75)]
+    assert len({bytes(wire) for wire in wires}) == 5, "two of the five wires are identical"
+
+    identity = [[{k: v for k, v in tick.items() if k not in ("ingested_at", "volume")} for tick in batch]
+                for batch in (kite, upstox, angel, fyers, dhan)]
+    assert identity[0] == identity[1] == identity[2] == identity[3] == identity[4] == [
+        {"symbol": "RELIANCE", "price": 2650.75, "exchange": "NSE"}
+    ]
+
+    # Volume is where the five legitimately differ, and the difference is a
+    # protocol fact rather than an inconsistency: Dhan's Quote packet is the only
+    # one of the five that carries a cumulative day volume, so it is the only one
+    # that fills the field. The other four say nothing, and say it as `None`
+    # rather than as a zero that would claim nothing traded.
+    assert dhan[0]["volume"] == 1_234_567
+    assert [batch[0]["volume"] for batch in (kite, upstox, angel, fyers)] == [None, None, None, None]
+
+
+def test_six_users_on_six_providers_stay_on_their_own():
+    """Dhan, Fyers, Angel One, Zerodha, Upstox and the shared baseline, at once.
+
+    The one test that exercises every streaming broker the platform has plus the
+    fallback, and the property is per user: each resolves to their own feed, a
+    user with no broker gets the baseline, and one broker's failure moves exactly
+    one user.
+    """
+    from services.brokers.market_feed import set_market_feed_link
+    from services.market_engine.providers import Capability, ResolutionContext, YahooPollingAdapter
+
+    with _clean_provider_registry() as registry:
+        registry.clear()
+        baseline = YahooPollingAdapter()
+        registry.register(baseline)
+        manager = SourceManager(registry)
+
+        feeds = {
+            "userA": _angel_feed("userA", symbols=("RELIANCE",)),
+            "userB": _attach_and_get("userB", "zerodha"),
+            "userC": _upstox_feed("userC", symbols=("RELIANCE",)),
+            "userD": _fy_feed("userD", symbols=("RELIANCE",)),
+            "userE": _dhan_feed("userE", symbols=("RELIANCE",)),
+        }
+        assert len({id(feed) for feed in feeds.values()}) == 5, "two users share one provider"
+
+        for user, broker in (("userA", "angelone"), ("userB", "zerodha"), ("userC", "upstox"),
+                             ("userD", "fyers"), ("userE", "dhan")):
+            run(set_market_feed_link(user, broker, up=True))
+        run(feeds["userA"].on_raw(_angel_canonical()))
+        run(feeds["userB"].on_raw(canonical_ticks(
+            _kite_ticks(_kite_frame((738561, 265075))), _kite_map(), broker="zerodha")))
+        run(feeds["userC"].on_raw(_upstox_canonical()))
+        run(feeds["userD"].on_raw(_fy_canonical()))
+        run(feeds["userE"].on_raw(_dhan_canonical()))
+
+        def resolved(user):
+            return manager.resolve(Capability.QUOTES, context=ResolutionContext(user_id=user, symbol="RELIANCE"))
+
+        for user in feeds:
+            assert resolved(user) is feeds[user]
+        assert resolved("guest") is baseline, "a user with no broker was served another user's feed"
+
+        # Dhan drops. Only user E moves, and the other four brokers are untouched.
+        run(set_market_feed_link("userE", "dhan", up=False, reason="socket closed"))
+        assert resolved("userE") is baseline
+        for user in ("userA", "userB", "userC", "userD"):
+            assert resolved(user) is feeds[user]
+        assert resolved("guest") is baseline
+
+        # And Dhan's reconnect does not disturb anybody else's subscription.
+        run(set_market_feed_link("userE", "dhan", up=True))
+        run(feeds["userE"].on_raw(_dhan_canonical()))
+        assert resolved("userE") is feeds["userE"]
+        for user in ("userA", "userB", "userC", "userD"):
+            assert resolved(user) is feeds[user]
+            assert feeds[user].subscribed_symbols == ("RELIANCE",)
+
+
+def test_two_dhan_users_of_the_SAME_broker_never_share_a_feed():
+    """Two accounts at one broker, resolved the way a consumer actually resolves.
+
+    WHY THIS TEST RESOLVES THROUGH THE SOURCE MANAGER
+    --------------------------------------------------
+    The obvious version of this test attaches two feeds, keeps the two objects
+    the attach returned, and asserts they differ. That version passes against a
+    registry key with the user id removed from it — which is a real bug and a
+    severe one — because each attach still *constructs* its own provider and
+    still returns the one it just registered; the collision is invisible until
+    somebody looks a feed up by name, which is what every consumer does and what
+    the attach itself never does. Found by mutation, and the fix is to ask the
+    question the platform asks: given this user, which provider serves them?
+
+    Every other broker's isolation test in this file puts one user on each
+    broker, so the same key would have stayed unique there too. Two users on ONE
+    broker is the arrangement that can see this at all.
+    """
+    from services.brokers.market_feed import feed_provider_name
+    from services.market_engine.providers import (
+        Capability,
+        ResolutionContext,
+        YahooPollingAdapter,
+        provider_registry,
+    )
+
+    assert feed_provider_name("userX", "dhan") != feed_provider_name("userY", "dhan"), \
+        "two accounts at one broker share a provider name"
+
+    with _clean_provider_registry() as registry:
+        provider_registry.clear()
+        baseline = YahooPollingAdapter()
+        registry.register(baseline)
+        manager = SourceManager(registry)
+
+        first = _dhan_feed("userX", symbols=("RELIANCE",))
+        second = _dhan_feed("userY", symbols=("TCS",))
+        assert first is not second
+        assert first.owner_user_id == "userX" and second.owner_user_id == "userY"
+        assert first.subscribed_symbols == ("RELIANCE",)
+        assert second.subscribed_symbols == ("TCS",)
+
+        # Both are still resolvable AT THE SAME TIME — the property the object
+        # comparison above cannot see, because registering the second must not
+        # have evicted the first.
+        assert registry.get(feed_provider_name("userX", "dhan")) is first
+        assert registry.get(feed_provider_name("userY", "dhan")) is second
+
+        run(first.mark_link_up())
+        run(second.mark_link_up())
+        run(first.on_raw(_dhan_canonical()))
+        assert second.describe()["accepted_records"] == 0, "one user's ticks reached another's feed"
+
+        def resolved(user, symbol):
+            return manager.resolve(Capability.QUOTES, context=ResolutionContext(user_id=user, symbol=symbol))
+
+        assert resolved("userX", "RELIANCE") is first
+        # userY has been told nothing yet, so the baseline serves them — and
+        # crucially they are NOT served userX's feed.
+        assert resolved("userY", "TCS") is baseline
+
+        run(second.on_raw(canonical_ticks(
+            _dhan_ticks(_dhan_quote(security_id=11536, price=3300.0)), _dhan_map(), broker="dhan")))
+        assert resolved("userY", "TCS") is second
+        assert resolved("userX", "RELIANCE") is first, "the second account displaced the first"
+
+        # And a drop on one account leaves the other exactly where it was.
+        run(first.mark_link_down("socket closed"))
+        assert resolved("userX", "RELIANCE") is baseline
+        assert resolved("userY", "TCS") is second
+
+    # The channel is stateless across sessions: two different accounts' endpoints
+    # differ only in their own credentials, and neither leaves a trace.
+    channel = _dhan_channel()
+    one = channel.endpoint(_dhan_session("token-x", "1111111111"))
+    two = channel.endpoint(_dhan_session("token-y", "2222222222"))
+    assert "token-x" in one.url and "token-x" not in two.url
+    assert channel.endpoint(_dhan_session("token-x", "1111111111")).url == one.url
+
+
+def test_a_dhan_quote_carries_no_broker_identity_and_no_other_users_data():
+    from services.brokers.market_feed import set_market_feed_link
+    from services.market_engine.providers import YahooPollingAdapter
+
+    with _clean_provider_registry() as registry:
+        registry.clear()
+        registry.register(YahooPollingAdapter())
+        feed = _dhan_feed("u1", symbols=("RELIANCE",))
+        run(set_market_feed_link("u1", "dhan", up=True))
+        run(feed.on_raw(_dhan_canonical()))
+        quote = run(feed.fetch_quote("RELIANCE"))
+
+    blob = json.dumps(quote).lower()
+    for forbidden in ("dhan", "brokerfeed", "u1", "nse_eq", "1333", "securityid"):
+        assert forbidden not in blob, f"{forbidden} reached a consumer-facing quote"
+
+
+# -- the engine seam -----------------------------------------------------------
+
+
+def test_the_engine_carries_dhan_bytes_all_the_way_into_the_registered_feed():
+    """The real join: the engine's instrument map, the canonical boundary, the push."""
+    from services.market_engine.providers import Capability, ResolutionContext, YahooPollingAdapter
+
+    holdings = [{"symbol": "RELIANCE", "exchange": "NSE", "instrument_token": "NSE_EQ|1333"}]
+    engine = BrokerEngine()
+    engine.configure(FakeDB())
+
+    with _clean_provider_registry() as registry:
+        registry.clear()
+        baseline = YahooPollingAdapter()
+        registry.register(baseline)
+        manager = SourceManager(registry)
+        ctx = ResolutionContext(user_id="u1", symbol="RELIANCE")
+
+        with patch("services.brokers.stream.stream_manager.start_stream", new=AsyncMock()) as started, \
+                patch.object(BrokerEngine, "get_session", new=AsyncMock(return_value=_dhan_session())), \
+                patch("services.brokers.gateway.broker_gateway.get_holdings", new=AsyncMock(return_value=holdings)), \
+                patch("services.brokers.gateway.broker_gateway.get_positions", new=AsyncMock(return_value=[])):
+            run(engine.start_stream("u1", "dhan"))
+
+        assert started.await_count == 1
+        assert started.await_args.kwargs["instrument_tokens"] == ["NSE_EQ|1333"]
+        assert started.await_args.kwargs["channel"] == DEFAULT_STREAM_CHANNEL
+
+        feed = registry.get("brokerfeed:dhan:u1")
+        assert feed is not None and feed.subscribed_symbols == ("RELIANCE",)
+        run(feed.mark_link_up())
+        assert manager.resolve(Capability.QUOTES, context=ctx) is baseline
+
+        with patch.object(BrokerEngine, "_push", new=AsyncMock()):
+            run(engine._on_stream_tick("u1", "dhan", _dhan_ticks(_dhan_quote(price=2650.5))))
+
+        assert feed.describe()["accepted_records"] == 1
+        assert manager.resolve(Capability.QUOTES, context=ctx) is feed
+        assert run(feed.fetch_quote("RELIANCE"))["price"] == pytest.approx(2650.5)
+
+
+# -- security ------------------------------------------------------------------
+
+
+def test_no_dhan_credential_reaches_a_log_line_from_the_real_transport(caplog):
+    """Driven through `_run_websocket`, not by reading `safe_url` — the wiring is the risk.
+
+    Dhan authenticates by query string, so the endpoint object legitimately holds
+    a live access token. The transport's "connected" line is the most natural
+    place in this platform for one to escape, which is exactly why this test drives
+    the transport rather than asserting on the endpoint.
+    """
+    secret = "DHAN-LIVE-TOKEN-9f3a2b"
+    socket = _FakeSocket([_dhan_quote()])
+    stream = BrokerStream("u1", "dhan", _dhan_session(token=secret, client_id="1000000009"),
+                          credentials={"api_key": "PARTNER-ID"}, instrument_tokens=["NSE_EQ|1333"])
+
+    async def scenario():
+        with patch.object(BrokerStream, "_connect", AsyncMock(return_value=socket)):
+            await stream._run_websocket()
+
+    with caplog.at_level(logging.DEBUG):
+        run(scenario())
+
+    logged = "\n".join(record.getMessage() for record in caplog.records)
+    assert logged, "nothing was logged — this test could not have failed"
+    assert "api-feed.dhan.co" in logged, "the connection was never logged, so the sweep proves nothing"
+    for forbidden in (secret, "token=", "authType", "clientId="):
+        assert forbidden not in logged, f"{forbidden!r} reached the application log"
+
+
+def test_no_dhan_credential_survives_into_a_tick_a_frame_or_an_exception():
+    """A live-looking credential is followed through every artefact it could reach."""
+    secret = "DHAN-LIVE-TOKEN-9f3a2b"
+    session = _dhan_session(token=secret, client_id="1000000009")
+
+    artefacts = [
+        json.dumps(_dhan_ticks(_dhan_quote())),
+        json.dumps(_dhan_canonical()),
+        json.dumps(_dhan().stream_subscribe_frames(["NSE_EQ|1333"])),
+        repr(_dhan().stream_endpoint(session).safe_url),
+        repr(_dhan().credentials),
+        repr(_dhan_channel()),
+        json.dumps(_dhan().describe()),
+    ]
+    for artefact in artefacts:
+        assert secret not in artefact, f"the access token reached {artefact[:60]!r}"
+
+    # The one place it MUST appear is the wire, and only there.
+    assert secret in _dhan().stream_endpoint(session).url
+
+    # A codec failure must not print the frame's context back with the session in it.
+    try:
+        _dhan()._headers({})
+    except Exception as error:  # noqa: BLE001 - the message is the subject
+        assert secret not in str(error)
+
+
+def test_the_dhan_partner_secret_never_appears_in_a_url(monkeypatch):
+    """The consent flow sends it as a HEADER. A query parameter would be shown to the user."""
+    import inspect
+
+    from services.brokers import dhan as dhan_module
+
+    source = _strip_prose(inspect.getsource(dhan_module))
+    for line in source.splitlines():
+        if "urlencode" in line or "?" in line and "https://" in line:
+            assert "partner_secret" not in line and "api_secret" not in line, \
+                f"the partner secret was put in a URL: {line.strip()!r}"
+    assert "partner_secret" in source, "the sweep found no partner secret at all — it proves nothing"
+
+    monkeypatch.setenv("DHAN_PARTNER_ID", "PID-1")
+    monkeypatch.setenv("DHAN_PARTNER_SECRET", "PSECRET-1")
+    monkeypatch.setenv("DHAN_REDIRECT_URL", "https://app.example/callback")
+    login = _dhan().get_login_url("u1")
+    assert login["configured"] is True
+    assert "PSECRET-1" not in json.dumps(login)
+
+
+def test_the_dhan_adapter_holds_no_credential_in_its_source():
+    """No key, secret, token or client id is hard-coded. Only env var NAMES appear."""
+    source = (BACKEND / "services" / "brokers" / "dhan.py").read_text(encoding="utf-8")
+    spec = _dhan().credential_spec
+    assert spec.api_key_env == "DHAN_PARTNER_ID"
+    assert spec.api_secret_env == "DHAN_PARTNER_SECRET"
+    assert spec.redirect_url_env == "DHAN_REDIRECT_URL"
+    assert re.search(r"(?i)\b(eyJ[A-Za-z0-9_-]{10,}|sk_live|Bearer\s+[A-Za-z0-9]{10,})", source) is None
+    assert "os.environ" not in source, "the adapter read the environment directly"
+    assert "os.getenv" not in source
+
+
+# -- the boundary sweeps -------------------------------------------------------
+
+
+def test_dhan_added_no_dhan_knowledge_outside_its_own_adapter():
+    """D4.11's central acceptance criterion, swept rather than asserted by eye."""
+    dhan_words = ("dhan", "api-feed", "securityid", "exchangesegment", "dhanclientid",
+                  "consentid", "consume-consent", "generate-consent", "fundlimit",
+                  "availabelbalance", "nse_eq", "idx_i", "requestcode")
+    allowed = {
+        "services/brokers/dhan.py",       # the adapter — the only owner
+        "services/brokers/__init__.py",   # the registry entry — one line
+    }
+    offenders = {}
+    scanned = 0
+    for path in sorted((BACKEND / "services").rglob("*.py")):
+        rel = path.relative_to(BACKEND).as_posix()
+        if rel in allowed:
+            continue
+        scanned += 1
+        source = _strip_source(path.read_text(encoding="utf-8")).lower()
+        hit = [word for word in dhan_words if re.search(word, source)]
+        if hit:
+            offenders[rel] = hit
+    assert scanned > 50, "the sweep found almost no modules — it could not have failed"
+    assert not offenders, offenders
+
+
+def test_the_market_layer_is_untouched_by_the_fifth_broker():
+    """Everything D4.11 promised would not move, re-checked with five brokers live."""
+    market_modules = [
+        "services/market_engine/gateway.py",
+        "services/market_engine/source_manager.py",
+        "services/market_engine/ticks.py",
+        "services/market_engine/providers/streaming.py",
+        "services/market_engine/providers/registry.py",
+        "services/market_engine/providers/base.py",
+    ]
+    for relative in market_modules:
+        source = _strip_source((BACKEND / relative).read_text(encoding="utf-8")).lower()
+        for name in ("dhan", "fyers", "hsm", r"angel(?!og)", "upstox", "zerodha", "kite",
+                     "broker_gateway", "broker_registry"):
+            assert not re.search(name, source), f"{relative} names {name!r} in executable code"
+
+
+def test_the_fifth_broker_added_no_broker_knowledge_to_the_transport():
+    """`stream.py` is byte-for-byte unchanged by D4.11, and still names no broker."""
+    source = _strip_source((BACKEND / "services/brokers/stream.py").read_text(encoding="utf-8")).lower()
+    for name in ("dhan", "api-feed", "fyers", "hsm", "fytoken", r"angel(?!og)", "smartapi",
+                 "upstox", "zerodha", "kite", "protobuf", "securityid", "requestcode"):
+        assert not re.search(name, source), f"stream.py names {name!r} in executable code"
+
+
+def test_no_core_module_branches_on_the_dhan_broker_name():
+    """The literal-preserving sweep: `if broker == "dhan"` survives an identifier sweep.
+
+    `_strip_source` removes string literals, so a comparison against a broker's
+    NAME is invisible to every sweep above by construction. This is the one that
+    catches it, and it earned its place in D4.9 when exactly that mutation
+    survived.
+    """
+    modules = [
+        "services/brokers/stream.py",
+        "services/brokers/market_feed.py",
+        "services/brokers/gateway.py",
+        "services/broker_engine.py",
+        "services/market_engine/source_manager.py",
+        "services/market_engine/gateway.py",
+        "services/market_engine/providers/streaming.py",
+        "services/market_engine/providers/base.py",
+        "services/market_engine/providers/registry.py",
+    ]
+    for relative in modules:
+        path = BACKEND / relative
+        assert path.exists(), f"{relative} moved — this sweep proves nothing"
+        text = _strip_prose(path.read_text(encoding="utf-8"))
+        assert '"dhan"' not in text and "'dhan'" not in text, f"{relative} names Dhan in executable code"
+        for comparison in ("broker ==", "broker!=", "broker !=", "broker in ("):
+            assert comparison not in text, f"{relative} branches on a broker name: {comparison!r}"
+
+    # Non-vacuity: the planted branch this sweep exists to catch.
+    planted = 'def promote(broker):\n    if broker == "dhan":\n        return True\n'
+    assert '"dhan"' in _strip_prose(planted)
+    assert '"dhan"' not in _strip_source(planted), \
+        "the identifier sweep can see a string literal — this test is redundant"
+
+
+def test_all_five_streaming_brokers_reach_the_market_gateway_through_the_identical_seam():
+    """One seam, five brokers, no branch anywhere on the path."""
+    for broker in ("zerodha", "upstox", "angelone", "fyers", "dhan"):
+        adapter = broker_registry.require(broker)
+        assert adapter.supports(BrokerCapability.TICK_STREAM)
+        channels = [c for c in adapter.stream_channels() if StreamEventKind.TICKS in c.delivers]
+        assert len(channels) == 1, f"{broker} must have exactly one tick-carrying channel"
+
+    # And the pre-Dhan brokers still open their connection scope the same way.
+    for broker in ("zerodha", "upstox", "angelone", "dhan"):
+        for channel in broker_registry.require(broker).stream_channels():
+            assert channel.open({"access_token": "t"}) is channel, f"{broker}/{channel.name}"
+
+
+def test_the_dhan_adapter_registers_with_no_change_to_the_framework():
+    """Developer Rule 9: one adapter plus one registry entry, and nothing else."""
+    adapter = _dhan()
+    BrokerRegistry.validate(adapter)      # would raise if the declaration were unhonoured
+    assert adapter.credential_spec.api_key_env == "DHAN_PARTNER_ID"
+    assert adapter.credential_spec.required == ("api_key", "api_secret")
+    assert adapter.supports(BrokerCapability.TICK_STREAM)
+    for absent in (BrokerCapability.PLACE_ORDER, BrokerCapability.ORDER_STREAM,
+                   BrokerCapability.SESSION_REFRESH, BrokerCapability.SESSION_INVALIDATE,
+                   BrokerCapability.MARGINS, BrokerCapability.ORDERS, BrokerCapability.TRADES):
+        assert not adapter.supports(absent), f"Dhan declares {absent.value} it has not validated"
+
+
+def test_the_four_existing_brokers_are_unchanged_by_the_fifth():
+    """A regression net over every predecessor's protocol, run after Dhan landed."""
+    # Zerodha: a Kite binary frame still decodes with its token-carried divisor.
+    assert canonical_ticks(_kite_ticks(_kite_frame((738561, 265075))), _kite_map(),
+                           broker="zerodha")[0]["price"] == 2650.75
+    # Upstox: the protobuf feed still decodes its double.
+    assert _upstox_canonical()[0]["price"] == 2650.75
+    # Angel One: the segment divisor and the text keep-alive both survive.
+    assert _angel_canonical()[0]["price"] == 2650.75
+    assert _angelone().stream_endpoint(_angel_session()).heartbeat_frame == "ping"
+    # Fyers: the wire-carried scale and the connection scope both survive.
+    assert _fy_canonical()[0]["price"] == 2650.75
+    from services.brokers.fyers import FyersFeedConnection
+
+    assert isinstance(_fyers_channel().open(_fy_session()), FyersFeedConnection)
+    # And every broker still owns exactly the channels it declared.
+    assert [c.name for c in _fyers().stream_channels()] == ["market"]
+    assert [c.name for c in _dhan().stream_channels()] == [DEFAULT_STREAM_CHANNEL]

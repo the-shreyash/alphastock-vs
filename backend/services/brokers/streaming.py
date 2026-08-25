@@ -425,6 +425,61 @@ class BrokerStreamChannel:
         """Where to connect for this channel, and how to authenticate."""
         raise NotImplementedError
 
+    def open(self, session: dict, credentials: Dict[str, str] = None) -> "BrokerStreamChannel":
+        """The view of this channel scoped to ONE connection (D4.10).
+
+        Returns `self` by default, which is exactly the behaviour every channel
+        written before D4.10 had: a channel object is a registry singleton, its
+        `subscribe_frames` and `decode` are pure functions of their arguments,
+        and one instance serves every user of the broker simultaneously. Three
+        brokers were built that way and none of them notice this method exists.
+
+        WHY A CONNECTION SCOPE HAD TO BECOME EXPRESSIBLE
+        ------------------------------------------------
+        Two assumptions were folded into that singleton, and Fyers' HSM feed
+        breaks both:
+
+        * **that a frame can be decoded on its own.** Kite, Upstox and Angel One
+          each put an instrument's identity and its price in the same frame. The
+          HSM feed sends one *snapshot* per instrument carrying the topic name,
+          the price scale and a small numeric topic id, and every update after
+          it carries the topic id and the changed values alone. A steady-state
+          update is not decodable without state the earlier frames established —
+          and that state belongs to one socket: it is invalidated by a reconnect
+          (the server re-numbers topics) and it is per user (two accounts hold
+          different instruments behind the same numbers). Held on the singleton,
+          one user's reconnect would renumber another user's instruments, and a
+          tick would be resolved to the wrong company's holding. Nothing raises;
+          the price is simply attributed to the wrong stock.
+
+        * **that the frames sent after connecting need no session.**
+          :meth:`subscribe_frames` takes instruments and nothing else, because
+          every previous broker authenticates in the *handshake* — a query
+          string, a bearer header, four headers. HSM authenticates with a frame
+          **on the data channel**, after the socket is open, so the first thing
+          this feed sends is a credential the channel had no way to reach.
+
+        WHY THIS SHAPE AND NOT A WIDER SIGNATURE
+        -----------------------------------------
+        The obvious alternative — add `session` to `subscribe_frames` and a
+        decoder-state argument to `decode` — changes the signature every adapter
+        and every test double implements, so a channel that had not been updated
+        would fail at the first frame of a live connection rather than at
+        import. That is the same trade `AdapterStreamChannel` refused in D4.7,
+        refused again here for the same reason: a broker that has never heard of
+        connection scope *is* a stateless broker, which is what it always was.
+
+        The transport calls this once per connection, uses what it returns for
+        that connection's `subscribe_frames` and `decode`, and drops it when the
+        socket ends — so a reconnect necessarily starts from a clean decoder,
+        which is not an optimisation but the correctness requirement above.
+        `endpoint`, `connect_error` and :attr:`delivers` are deliberately NOT
+        routed through it: they are properties of the channel rather than of a
+        connection, and `endpoint` is what decides whether there is a connection
+        at all.
+        """
+        return self
+
     def subscribe_frames(self, instruments: Sequence[Any] = None) -> List[Any]:
         """Frames to send immediately after connecting, in order. May be none."""
         return []
