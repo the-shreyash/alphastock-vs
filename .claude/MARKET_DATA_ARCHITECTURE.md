@@ -3,7 +3,7 @@
 
 Version: 1.1
 
-Status: Approved Design — Phase 1 Implemented (Sprint D1, 2026-08-19); Phase 2 Implemented in backend (Sprint D2, 2026-08-20, frontend tier indicator outstanding); Phase 3 re-scoped to the Broker Provider Framework and Implemented (Sprint D3, 2026-08-20, ADR-031); Phase 4 Implemented through 4.11 (Sprints D4.1–D4.11, 2026-08-21…25, ADR-032…040 — Zerodha Kite, Upstox v3, Angel One SmartAPI, Fyers HSM and Dhan DhanHQ v2 are the five concrete stream adapters, and Dhan is the first that required no generic framework change at all; **live validation not yet performed for any of them**); remaining broker adapters, Phase 5 and Phase 6 pending
+Status: Approved Design — Phase 1 Implemented (Sprint D1, 2026-08-19); Phase 2 Implemented in backend (Sprint D2, 2026-08-20, frontend tier indicator outstanding); Phase 3 re-scoped to the Broker Provider Framework and Implemented (Sprint D3, 2026-08-20, ADR-031); Phase 4 Implemented through 4.11 (Sprints D4.1–D4.11, 2026-08-21…25, ADR-032…040 — Zerodha Kite, Upstox v3, Angel One SmartAPI, Fyers HSM and Dhan DhanHQ v2 are the five concrete stream adapters, and Dhan is the first that required no generic framework change at all; **live validation not yet performed for any of them**); Phase 5 started (Sprint D5.1, 2026-08-25, ADR-041 — reconnect flap suppression, closing DB-5); remaining broker adapters, the rest of Phase 5 and Phase 6 pending
 
 Priority: Critical
 
@@ -897,13 +897,17 @@ Nothing changed in the Market Engine, the Market Gateway, the Source Manager, `S
 
 **One limitation is a market-data coverage gap rather than a tick-field gap.** Dhan's `/holdings` reports `exchange`, not `exchangeSegment`, and its documentation and its own SDK disagree about what that field contains — the docs show a consolidated `"ALL"`, the SDK fixture shows `"NSE"`. A row naming no exchange yields no instrument identity and is not subscribed, because a security id without a segment identifies two different companies; defaulting it would publish another company's price under the user's stock's name. The holding is unaffected everywhere else in the platform, and the count is warned.
 
-**One broker-neutral debt was found and named: DB-5.** The stream transport resets its reconnect backoff after any connection that *completed*, so a socket a broker accepts and immediately closes reconnects roughly every 1.5s indefinitely. Dhan's "too many connections" code is the first protocol to expose it. The fix is to reset the backoff only after a connection that lasted a minimum duration, which **is flap suppression** — Phase 5's, below, and deliberately not done here.
+**One broker-neutral debt was found and named: DB-5.** The stream transport resets its reconnect backoff after any connection that *completed*, so a socket a broker accepts and immediately closes reconnects roughly every 1.5s indefinitely. Dhan's "too many connections" code is the first protocol to expose it. The fix is to reset the backoff only after a connection that lasted a minimum duration, which **is flap suppression** — Phase 5's, below, and deliberately not done here. ✅ **CLOSED in D5.1 (2026-08-25, ADR-041).**
 
 **Live validation has not been performed for Dhan either**, and for the same reason as the other four: the feed needs a per-user session obtainable only through an interactive browser login. A live smoke test is now outstanding for **all five** streaming brokers. See BROKER_INTEGRATION.md §"Dhan (DhanHQ v2)" and **ADR-040**.
 
 **Phase 4.12 — the remaining broker adapters.** Groww, INDmoney — each one adapter and nothing else, per Developer Rule 9.
 
 **Phase 5 — Hardening.** Latency scoring, flap suppression, probation windows, multi-connection sharding, chaos tests (kill connections in staging, verify silent failover).
+
+**Phase 5.1 — Reconnect flap suppression. Implemented (Sprint D5.1, 2026-08-25, ADR-041).** Closes DB-5. Reconnect pacing moved out of the run loop into `services/brokers/reliability.py`, which imports nothing from `services.` and names no broker. `ConnectionStability` classifies each attempt as STABLE / SHORT_LIVED / NEVER_ESTABLISHED from link timestamps alone, and the ladder resets **only** for a connection that lasted `STABLE_CONNECTION_SECONDS`. That constant is 30 seconds and is deliberately *this document's* probation window, so the transport and the provider layer share one meaning of "stable" instead of drifting into two; Phase 5's probation work consumes the same constant rather than declaring a second. One model per (user, broker, channel), so no user's flapping session paces another's reconnects.
+
+Still outstanding in Phase 5: probation windows, latency scoring, active stale-feed demotion, richer failure classification (including a broker-neutral representation of *entitlement* failure), broker health's process-local scope (DB-1), instrument sharding, and chaos tests.
 
 **Phase 6 (future) — Enterprise feeds** as entitlements and licensing arrive.
 

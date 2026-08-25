@@ -1922,4 +1922,85 @@ At the sixth streaming broker, or at the first live Dhan session — whichever c
 
 ---
 
+# ADR-041
+
+Title
+
+Flap Suppression: The Reconnect Backoff Resets After a Connection That Lasted, Not After One That Happened (Sprint D5.1, closes DB-5)
+
+Date
+
+2026-08-25
+
+Status
+
+Accepted — implemented; **live validation not performed** (see Consequences)
+
+Context
+
+D4.11 named DB-5 and deliberately left it. The stream transport's run loop reset its reconnect ladder immediately after the transport coroutine returned:
+
+    await runner(self)
+    delay = RECONNECT_BASE_DELAY   # clean close → quick reconnect
+
+The comment asserts a clean close. The code cannot observe one. A socket the broker accepted and closed one frame later reaches that assignment exactly as readily as a socket that streamed all session, so a broker-side "stop doing this" produced connect → accept → close → reset → reconnect ~1.5s later, indefinitely — a reconnect storm against a broker whose own documentation warns that continuing may get the user blocked.
+
+Three facts made this worth a slice of its own rather than a two-line patch:
+
+  * It is **broker-neutral**. One of the five current protocols has a disconnect code that means "too many connections", and that code is what first exposed the loop; nothing about the defect belongs to that broker. All five adapters ride the same loop, and any broker that closes a socket promptly — rate limiting, maintenance, a duplicate session, an unsupported subscription — reproduces it.
+  * It is **invisible in the logs**. Every individual line of the storm reads as a routine reconnect. It survived four broker integrations for exactly that reason.
+  * The obvious fix is **wrong**. Raising `RECONNECT_BASE_DELAY` suppresses the storm and simultaneously makes every genuine blip cost every healthy user a slower recovery — a constant tax to pay for a rare pathology.
+
+Decision
+
+**The ladder resets after a connection that *lasted*.** One condition, expressed as a small generic model in a new module, `services/brokers/reliability.py`.
+
+**A new module rather than more lines in `stream.py`.** `stream.py` is mechanism — open the socket, send the adapter's frames, hand frames back to the codec. *How fast to retry* and *what evidence a connection owes* are policy, and D5 adds several more of them (probation, stale-feed demotion, failure classification). Keeping policy beside the run loop is how a run loop acquires an embedded policy engine, which is what D3 spent a sprint removing from this same file. `reliability.py` imports nothing from `services.` at all — pinned by a test — so it cannot acquire broker knowledge by accident.
+
+**Three outcomes, one ladder.** `ConnectionStability` classifies each attempt as `STABLE` (link up for at least the stability window → reset the ladder, clear the flap streak), `SHORT_LIVED` (came up, died young → keep the ladder, count one flap) or `NEVER_ESTABLISHED` (never reached link-up → keep the ladder). The ladder doubles on every attempt regardless, capped and jittered exactly as before. A feed that runs for an hour and drops still reconnects in ~1–2 seconds; a feed that keeps dying young climbs 2 → 4 → 8 → 16 → 32 → 60 and stays there.
+
+**`NEVER_ESTABLISHED` is not counted as a flap**, though it escalates identically. The distinction costs nothing operationally and matters for the next slice: "the broker will not talk to us" and "the broker keeps hanging up on us" are different diagnoses, and `consecutive_short_connections` is the evidence D5's failure-classification slice will read.
+
+**The stability window is 30 seconds, and the number is not invented here.** MARKET_DATA_ARCHITECTURE.md already fixes the platform's definition of a provider that has proved itself — "a provider that just recovered must deliver clean data for a probation window (e.g. 30 seconds of valid messages) before it is eligible to become primary again — this prevents flapping". A connection that dies before that window has, by the platform's own published definition, never got far enough to be trusted, so it has no claim on a reset backoff either. One constant serves both layers; D5's probation slice consumes it rather than declaring a second that drifts.
+
+**The model is driven from `_notify_link`, not from the run loop.** That method is already change-gated — it reports one transition per real transition — so it is the one place that knows a connection began and ended exactly once. A transport added to `PROTOCOL_RUNNERS` later therefore inherits flap suppression by reporting link state, which it must do anyway, instead of by remembering to opt in.
+
+**"Established" keeps the transport's existing meaning**: the socket is open *and* the subscribe frames are away. A broker that accepts a connection and closes it before anything was asked of it is `NEVER_ESTABLISHED`, which is the truthful reading — nothing was established to flap.
+
+**One `ConnectionStability` per `BrokerStream`**, i.e. per (user, broker, channel). Per-connection rather than per-broker: two users on the same broker hold two ladders, so one user's rejected session cannot slow another user's reconnect, and a broker's order socket flapping cannot slow its market feed — which would silently recouple the independence D4.7 established.
+
+Alternatives Considered
+
+**Raise `RECONNECT_BASE_DELAY`.** Rejected, and pinned against by `test_a_stable_connection_resets_the_ladder_and_a_short_one_does_not`. It suppresses the storm by taxing the healthy path, which is what the D5 brief rules out.
+
+**Give up after N consecutive short connections.** Rejected as the wrong layer. "This will never work, stop" is a *classification* judgement — entitlement failure, permanent misconfiguration — and this module sees timestamps, not frames; it has no way to tell a permanently unlicensed account from a broker having a bad ten minutes. Escalating to the 60-second ceiling is the honest response until the failure-classification slice can express the difference. The evidence it will need is exposed as `consecutive_short_connections` rather than left in log lines.
+
+**Have the transport demote the market-data provider when it detects flapping.** Rejected: failover policy would then live in two places. Whether a flapping feed may be the *primary* quote source is the provider layer's question, answered by `StreamingTickProvider`'s readiness gate, and D5's probation slice sharpens it there.
+
+**Track stability per broker rather than per connection.** Rejected — it fails Rule 6 of the D5 brief. Pinned by `test_one_users_flapping_broker_does_not_pace_another_users_reconnects` and by a mutation that made the ladder a per-broker singleton and turned that test red.
+
+**Leave `RECONNECT_BASE_DELAY`, `RECONNECT_MAX_DELAY` and `reconnect_pause` in `stream.py`.** Rejected, but only just: moving names is churn. They are reconnect *policy*, which is exactly what the new module is for, and leaving them behind would have meant `reliability.py` importing from the transport it is supposed to be independent of. They are re-exported from `stream.py` unchanged, so every existing caller and every existing test imports them under the name it always did.
+
+Consequences
+
+• **DB-5 is closed.** A broker that accepts and immediately closes now backs off to the 60-second ceiling instead of reconnecting every ~1.5 seconds forever. `test_a_broker_that_accepts_and_immediately_closes_does_not_reconnect_forever_at_the_base_delay` drives the real run loop and is red against the pre-D5.1 line.
+
+• **The healthy path is unchanged.** A long-lived connection that drops reconnects within the base delay, as it did in D4. This is asserted rather than assumed.
+
+• **No broker was touched.** All five adapters, `streaming.py`, `instruments.py`, `market_feed.py`, `ticks.py`, the Source Manager, the Market Gateway, `StreamingTickProvider`, the readiness gate, the failover path and the frontend are byte-for-byte unchanged. The whole sprint is one new module, one new test module, and 82 changed lines in `stream.py` — most of them documentation.
+
+• **Ten mutations, ten red.** Reinstating DB-5's assignment; suppressing flapping by never resetting; inverting the threshold comparison; freezing the ladder; removing the ceiling; counting a never-established attempt as a flap; deleting the flap warning; making the ladder a per-broker singleton; unwiring the transport hook; and handing broker identity to the model. Every one was observed red against the targeted suites and restored.
+
+• **The broker-agnostic sweep found a breach in this sprint's own prose, and it was fixed rather than exempted.** `test_the_reliability_module_names_no_broker` runs against the source *with comments and strings left in*, so the docstring explaining DB-5 could not name the protocol that exposed it. That is a stricter bar than the D3/D4 sweeps, which strip comments — deliberately so, because a reliability module is the one place where "we handled that broker's case" would start as a comment.
+
+• **LIVE VALIDATION WAS NOT PERFORMED**, and cannot be in this environment: reproducing a flap requires a broker that actually hangs up, which requires a live authenticated session. Every claim rests on the deterministic run-loop tests and the mutation results. **The outstanding smoke test**: connect a real session, hold it past 30 seconds, drop it, and confirm one reconnect at ~1–2s; then induce repeated immediate closes (a duplicate session on a broker that caps concurrent connections is the cheapest trigger) and confirm the interval climbs to the ceiling and that the flap warning names a rising streak.
+
+• **Deliberately still open after D5.1**: probation windows, latency scoring, stale-feed demotion, richer failure classification (including a broker-neutral representation of entitlement failure), broker health's process-local scope (DB-1), and instrument sharding. Each is its own D5 slice; none was started.
+
+Review Date
+
+At D5.2, when probation is designed on top of this — the specific claim to re-test is that `STABLE_CONNECTION_SECONDS` is genuinely the same concept at both layers, rather than two ideas that happened to want the same number.
+
+---
+
 # End of Decisions Documentation

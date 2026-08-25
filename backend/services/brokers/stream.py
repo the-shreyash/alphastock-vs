@@ -157,18 +157,42 @@ and every test double implements, so an unmigrated broker fails on a live socket
 rather than at import. A broker that has never heard of connection scope *is* a
 stateless broker, which is what it always was.
 
-Still out of scope, deliberately (D5+): probation windows, latency scoring,
-flap suppression, and sharding one subscription across several connections —
-which is a different thing from a broker needing several connections, and is
-still not done here.
+WHAT D5.1 CHANGED — WHEN THE BACKOFF IS ALLOWED TO RESET
+---------------------------------------------------------
+One condition, and it closes DB-5. This loop used to reset its reconnect delay
+after any connection that *completed*, with a comment reading "clean close →
+quick reconnect" — but the code could not see a clean close. A socket a broker
+accepted and closed one frame later reached that line exactly as a socket that
+had streamed all session, so a broker saying "stop doing this" produced a
+reconnect roughly every 1.5 seconds, indefinitely, against a broker whose own
+documentation warns that continuing may get the user blocked.
+
+The ladder and the flap detector that now gates it live in `reliability.py`;
+what changed here is that the reset is driven by `_notify_link` — the one place
+that already knows a link transition happened exactly once — instead of by the
+transport having returned. A connection that lasted resets the ladder, and every
+other outcome leaves it climbing. The healthy path is byte-for-byte unchanged in
+behaviour: a long-lived feed that drops still reconnects in ~1–2 seconds.
+
+Still out of scope, deliberately (D5.2+): probation windows, latency scoring,
+stale-feed demotion, failure classification beyond auth expiry, and sharding one
+subscription across several connections — which is a different thing from a
+broker needing several connections, and is still not done here.
 """
 
 import asyncio
 import contextlib
 import logging
-import random
 
 from services.brokers.errors import BrokerContractError
+from services.brokers.reliability import (  # noqa: F401  (re-exported: see below)
+    RECONNECT_BASE_DELAY,
+    RECONNECT_MAX_DELAY,
+    STABLE_CONNECTION_SECONDS,
+    ConnectionOutcome,
+    ConnectionStability,
+    reconnect_pause,
+)
 from services.brokers.streaming import (
     DEFAULT_STREAM_CHANNEL,
     BrokerStreamEndpoint,
@@ -178,30 +202,12 @@ from services.brokers.streaming import (
 
 logger = logging.getLogger(__name__)
 
-RECONNECT_BASE_DELAY = 2  # seconds
-RECONNECT_MAX_DELAY = 60  # seconds
-
-
-def reconnect_pause(delay: float) -> float:
-    """Equal-jitter backoff: half the current ceiling, plus a random half.
-
-    The ceiling still doubles deterministically; only the *sleep* is randomized.
-
-    Without this every stream reconnects in lockstep, and the reason is
-    structural rather than unlucky: one broker-side blip disconnects every
-    connected user's socket in the same instant, so an unjittered schedule has
-    all of them retry in the same instant too — then again 2s later, 4s later,
-    8s later, as a synchronized herd that grows with the user count and hits the
-    broker hardest at exactly the moment it is least able to answer.
-
-    Equal jitter rather than full jitter (`uniform(0, delay)`) because full
-    jitter can roll a near-zero pause, which turns a still-down broker into a
-    tight retry loop for whichever stream got the low number. Keeping a floor at
-    half the ceiling preserves the backoff's purpose while still decorrelating
-    the herd.
-    """
-    half = delay / 2.0
-    return half + random.uniform(0.0, half)
+# The reconnect ladder and its jitter moved to `reliability.py` in D5.1, where
+# the flap detector that now drives them lives — they are reconnect *policy*,
+# and splitting policy from the run loop is the reason that module exists. They
+# are re-exported here unchanged because this is the name every caller and every
+# test has always imported them under, and renaming a constant is not a fix for
+# anything.
 
 
 class BrokerStream:
@@ -267,6 +273,11 @@ class BrokerStream:
         #: channel that has no such state returns itself here, so for three of
         #: the four brokers this attribute simply holds the channel.
         self._connection = None
+        #: This connection's reconnect ladder and flap detector (D5.1). One per
+        #: stream — that is, per (user, broker, channel) — so one user's
+        #: flapping session cannot pace another user's reconnects, and a
+        #: broker's order socket blinking cannot slow its market feed.
+        self._stability = ConnectionStability()
 
     # -- lifecycle -----------------------------------------------------------
     def start(self):
@@ -284,12 +295,47 @@ class BrokerStream:
         if up == self._link_up:
             return
         self._link_up = up
+        # The reconnect ladder is driven from here rather than from the run loop
+        # because this is the one place that already knows a transition happened
+        # exactly once (D5.1). A transport added to `PROTOCOL_RUNNERS` later
+        # therefore gets flap suppression by reporting its link state, which it
+        # must do anyway, instead of by remembering to opt in.
+        if up:
+            self._stability.link_up()
+        else:
+            self._note_connection_ended(self._stability.link_down())
         if not self.on_link_state:
             return
         try:
             await self.on_link_state(self.user_id, self.broker, up, reason, self.channel)
         except Exception as e:  # pragma: no cover - defensive
             logger.warning("%s %s stream link-state callback failed: %s", self.broker, self.channel, e)
+
+    def _note_connection_ended(self, outcome: ConnectionOutcome):
+        """Say out loud when a connection died before it proved stable (D5.1).
+
+        Logged at warning because this is the failure that reads as nothing at
+        all: before D5.1 the loop reset its backoff after any connection that
+        completed, so a broker accepting and immediately closing a socket
+        produced a reconnect roughly every 1.5 seconds forever, and every
+        individual line of that storm looked like a routine reconnect. Naming
+        the streak is what makes the pattern visible in the logs rather than
+        only in the broker's rate limiter.
+
+        Carries no credential, no session and no frame — a broker name, a
+        channel name, a user id and two counters (SECURITY.md).
+        """
+        if outcome is not ConnectionOutcome.SHORT_LIVED:
+            return
+        logger.warning(
+            "%s %s stream for user %s closed after less than %.0fs — "
+            "treating it as a flap (%d in a row); next reconnect backs off further",
+            self.broker,
+            self.channel,
+            self.user_id,
+            STABLE_CONNECTION_SECONDS,
+            self._stability.consecutive_short_connections,
+        )
 
     async def stop(self):
         self._stopped = True
@@ -331,7 +377,6 @@ class BrokerStream:
         return None
 
     async def _run(self):
-        delay = RECONNECT_BASE_DELAY
         while not self._stopped:
             try:
                 codec = self._codec
@@ -354,7 +399,6 @@ class BrokerStream:
                     # added later cannot leave the consumer believing a link is
                     # up that has in fact ended.
                     await self._notify_link(False, "stream ended")
-                delay = RECONNECT_BASE_DELAY  # clean close → quick reconnect
             except asyncio.CancelledError:
                 raise
             except _AuthExpired:
@@ -372,8 +416,13 @@ class BrokerStream:
                 logger.warning("%s %s stream error for user %s: %s", self.broker, self.channel, self.user_id, e)
             if self._stopped:
                 return
-            await asyncio.sleep(reconnect_pause(delay))
-            delay = min(delay * 2, RECONNECT_MAX_DELAY)
+            # The ladder was reset by `_notify_link` if — and only if — the
+            # connection that just ended had lasted (D5.1, DB-5). It used to be
+            # reset unconditionally right here, on the strength of the transport
+            # having *returned*, which a socket the broker accepted and closed
+            # one frame later does exactly as readily as a socket that ran all
+            # session.
+            await asyncio.sleep(self._stability.next_pause())
 
     async def _connect(self, endpoint: BrokerStreamEndpoint):
         import websockets
