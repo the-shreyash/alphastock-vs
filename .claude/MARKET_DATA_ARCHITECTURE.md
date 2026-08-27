@@ -3,7 +3,7 @@
 
 Version: 1.1
 
-Status: Approved Design — Phase 1 Implemented (Sprint D1, 2026-08-19); Phase 2 Implemented in backend (Sprint D2, 2026-08-20, frontend tier indicator outstanding); Phase 3 re-scoped to the Broker Provider Framework and Implemented (Sprint D3, 2026-08-20, ADR-031); Phase 4 Implemented through 4.11 (Sprints D4.1–D4.11, 2026-08-21…25, ADR-032…040 — Zerodha Kite, Upstox v3, Angel One SmartAPI, Fyers HSM and Dhan DhanHQ v2 are the five concrete stream adapters, and Dhan is the first that required no generic framework change at all; **live validation not yet performed for any of them**); Phase 5 started (Sprint D5.1, 2026-08-25, ADR-041 — reconnect flap suppression, closing DB-5); remaining broker adapters, the rest of Phase 5 and Phase 6 pending
+Status: Approved Design — Phase 1 Implemented (Sprint D1, 2026-08-19); Phase 2 Implemented in backend (Sprint D2, 2026-08-20, frontend tier indicator outstanding); Phase 3 re-scoped to the Broker Provider Framework and Implemented (Sprint D3, 2026-08-20, ADR-031); Phase 4 Implemented through 4.11 (Sprints D4.1–D4.11, 2026-08-21…25, ADR-032…040 — Zerodha Kite, Upstox v3, Angel One SmartAPI, Fyers HSM and Dhan DhanHQ v2 are the five concrete stream adapters, and Dhan is the first that required no generic framework change at all; **live validation not yet performed for any of them**); Phase 5 implemented through 5.5 (Sprints D5.1–D5.5, 2026-08-25…27, ADR-041…045 — flap suppression, probation, stale-feed demotion, delivery latency, entitlement-failure classification); remaining broker adapters, the rest of Phase 5 (sharding, chaos tests, DB-1) and Phase 6 pending
 
 Priority: Critical
 
@@ -284,7 +284,7 @@ Every provider — current and future — is wrapped in an adapter that implemen
 | `disconnect()` | Tear down cleanly. Idempotent. |
 | `subscribe(symbols)` | Begin delivering data for symbols (streaming: WS subscribe; polling: add to poll set) |
 | `unsubscribe(symbols)` | Stop delivering data for symbols |
-| `health()` | Returns connection state, last message age, error counts, measured latency |
+| `health()` | Returns connection state, last message age, error counts. **Not latency** — `health()` is counter-based evidence from past *calls*, and a pushed feed makes no calls; delivery latency lives on `delivery_latency` instead (D5.4, ADR-044) |
 | `on_raw(payload)` | Emits raw provider payloads to the Market Gateway — adapters never normalize |
 
 **Adapter rules:**
@@ -343,6 +343,8 @@ The gateway asks the Source Manager which provider serves a given user/symbol co
 • Stamps every event with `ingested_at`; computes `latency_ms` where the provider supplies an exchange timestamp
 • Maintains rolling p50/p95 latency per provider, fed to the Source Manager's scoring
 
+**As implemented (D5.4, ADR-044).** The conditional clause above is the operative one and **its condition is not met by any provider**: no exchange timestamp reaches the canonical boundary, so no `latency_ms` is computed and none is faked. What the platform measures instead is *delivery latency* — the median of a provider's last nine intervals between accepted canonical batches, on its own monotonic clock — which is exact and broker-neutral, and which answers "how long does this feed make a consumer wait" rather than "how stale was this price when it arrived". p50 only; p95 needs a sample larger than any warm-up worth waiting through. The score lives on the provider and is read by the Source Manager as its third ranking term; it is not held here.
+
 **8. Automatic Failover (execution)**
 
 • The Source Manager decides *when* to fail over; the gateway executes it: tear down/deprioritize the failed connection, activate the fallback adapter, replay current subscriptions onto it
@@ -400,6 +402,8 @@ The Source Manager is a dedicated service that decides, for every user and every
 • Consumes the gateway's per-provider latency and health metrics
 • Maintains a health score per provider per user: `score = f(connection_state, message_freshness, error_rate, p95_latency)`
 
+**As implemented (D5.4, ADR-044).** Ranking is a three-element sort key — `(health, probation, delivery_latency)` — rather than a continuous score, for the same reason health bands rather than scores: a scalar `f(...)` hides which term decided, and the terms are not commensurable. Latency ranks *third and last*, which is what makes "latency can never promote an unproven or a stale feed" true by construction. An unestablished latency sorts last within its own health/probation group, never first — see the Phase 5 notes. `p95_latency` is not implemented; the platform measures p50 delivery latency and does not measure exchange latency at all.
+
 **6. Publish provider status**
 
 • Publishes `provider.status` events on every state change: which logical tier is active (`streaming` / `delayed`), health, and transitions
@@ -455,7 +459,7 @@ Priority 3   Yahoo Finance
 4. Pick the highest-priority survivor.
 5. If two candidates share a priority tier (user has two brokers connected), pick the one with the better health score; break ties by most recently used (stability over churn).
 
-**As implemented (D2).** Steps 1–3 are `ProviderRegistry.candidates_for(capability, context)`; steps 4–5 are `SourceManager.resolve_feed()`, which returns the winner *and the ordered remainder as a failover chain*. Health ranks in two bands rather than as a continuous score — full latency scoring is Phase 5:
+**As implemented (D2, extended in D5.2 and D5.4).** Steps 1–3 are `ProviderRegistry.candidates_for(capability, context)`; steps 4–5 are `SourceManager.resolve_feed()`, which returns the winner *and the ordered remainder as a failover chain*. Health ranks in two bands rather than as a continuous score; since D5.2 probation is the second ranking term and since D5.4 delivery latency is the third, so rule 5's "better health score, break ties by stability" is now `(health, probation, latency)` over the already priority-ordered candidate list:
 
 | Band | States | Meaning |
 |---|---|---|
@@ -903,7 +907,7 @@ Nothing changed in the Market Engine, the Market Gateway, the Source Manager, `S
 
 **Phase 4.12 — the remaining broker adapters.** Groww, INDmoney — each one adapter and nothing else, per Developer Rule 9.
 
-**Phase 5 — Hardening.** Latency scoring, flap suppression, probation windows, multi-connection sharding, chaos tests (kill connections in staging, verify silent failover).
+**Phase 5 — Hardening.** Latency scoring (D5.4 ✅ — delivery latency; exchange latency is not measurable, see ADR-044), flap suppression (D5.1 ✅), probation windows (D5.2 ✅) and their decay (D5.3 ✅), entitlement-failure classification (D5.5 ✅, ADR-045), multi-connection sharding, chaos tests (kill connections in staging, verify silent failover).
 
 **Phase 5.1 — Reconnect flap suppression. Implemented (Sprint D5.1, 2026-08-25, ADR-041).** Closes DB-5. Reconnect pacing moved out of the run loop into `services/brokers/reliability.py`, which imports nothing from `services.` and names no broker. `ConnectionStability` classifies each attempt as STABLE / SHORT_LIVED / NEVER_ESTABLISHED from link timestamps alone, and the ladder resets **only** for a connection that lasted `STABLE_CONNECTION_SECONDS`. That constant is 30 seconds and is deliberately *this document's* probation window, so the transport and the provider layer share one meaning of "stable" instead of drifting into two; Phase 5's probation work consumes the same constant rather than declaring a second. One model per (user, broker, channel), so no user's flapping session paces another's reconnects.
 
@@ -925,7 +929,34 @@ Nothing changed in the Market Engine, the Market Gateway, the Source Manager, `S
   * **Recovery is immediate on the same link.** Evidence resuming restores stability without re-serving the probation window — the link never dropped, so nothing was discarded. Requiring it to be re-proved would demote a feed for trading an illiquid instrument rather than for being unreliable. A link that actually dropped is the other case, and the per-link evidence reset already owns it.
   * **Demotion is never an outage.** Staleness ranks and filters the quote capability only; the baseline is never released, `status()["state"]` stays `available`, and a stale feed still answers the link-level tick capability its socket genuinely serves.
 
-Still outstanding in Phase 5: latency scoring, richer failure classification (including a broker-neutral representation of *entitlement* failure), broker health's process-local scope (DB-1), instrument sharding, and chaos tests.
+**D5.4 — provider latency scoring (ADR-044).** The third and last ranking term, and the sprint that had to correct this document before it could implement it.
+
+  * **The latency §7 describes cannot be measured here, and the clause that says so is §7's own.** "Computes `latency_ms` **where the provider supplies an exchange timestamp**" — and none does. The canonical `MarketTick` deliberately carries no exchange instant (a broker's timestamp is a verbatim string precisely because brokers disagree on format and timezone); three of the five brokers put none on the wire in the mode the platform subscribes; and the two that do use different units on an exchange clock whose offset from ours has never been measured. `now − broker_timestamp` would be an artefact of clock skew wearing the name of a measurement, so it was not implemented and not faked.
+  * **What is measured instead: delivery latency.** The median of the last `LATENCY_WINDOW_SAMPLES` (9) intervals between *accepted canonical batches*, on the provider's own monotonic clock. It answers the question selection actually asks — of two feeds that are equally healthy, fresh and proven, which delivers sooner — and it is exact, because both ends of every interval are instants this platform recorded itself. **It is not exchange-to-ingest latency and must never be presented as such.**
+  * **Established, or absent — never estimated.** A score exists only while the feed is ready, the window is full, and the feed has fresh evidence. Otherwise it is `None`, which sorts **last within its own health/probation group** and nowhere else. Last rather than first is load-bearing: the polled baseline can never establish a delivery latency (it is not pushed into, so it has no delivery event to time), so "unknown wins ties" would have promoted the permanent fallback above every live feed. This does not recreate ADR-029's UNKNOWN-health deadlock, because a pushed feed accumulates intervals whether or not it is currently the primary — evidence arrives without selection.
+  * **Ranked third, which is the whole guarantee.** The key is `(health, probation, latency)`. A probationary feed — which since D5.3 includes every feed whose data has gone stale — loses on the second element before the third is compared, so no median can promote it. There is no branch that enforces this; there is only the position of the element.
+  * **It creates nothing and filters nothing.** Latency cannot make a provider ready, cannot make one eligible, and cannot remove one. It reorders candidates that have already survived entitlement, capability, health, readiness and coverage.
+  * **Freshness and latency cannot disagree**, which is the reconciliation D5.3 asked for. They are read off one series of arrival instants: freshness asks whether the *current* gap is inside the coverage window, latency asks what the typical *completed* gap is. A feed delivering every 90 seconds is simultaneously fresh and slower than one delivering every 200ms — two true answers to two questions, not a contradiction.
+  * **Decay without a decay constant.** The bounded window forgets by eviction (nine newer intervals remove every older one), and the whole score expires with the feed's freshness — `DEFAULT_TICK_MAX_AGE_SECONDS` asked for the third time in three sprints. No half-life, no timer, no scheduler.
+  * **A reconnect discards it**, with the ticks and probation timestamps that already reset there. That also means the gap *spanning* a disconnection is never recorded as one enormous fictitious sample.
+  * **Per feed, structurally.** The window is an instance attribute of the provider, and there is one provider per `(user, broker)`. Two users on one broker score independently; sharing would require a module-level accumulator, and none exists.
+  * **Diagnostics only.** `describe()` gains `delivery_latency_seconds` (`null` when unestablished — never `0`, which would read as instantaneous). `status()`, every normalized event and every API response are unchanged and still carry a `source_tier` and no provider identity.
+
+**D5.5 — entitlement-failure classification and safe recovery (ADR-045).** The third lifecycle outcome a feed can have, and the first widening of the closed `StreamEventKind` set since it was written.
+
+  * **The gap.** The transport had two answers to a broker that stopped serving — end the account's *session* (`AUTH_EXPIRED`) or keep reconnecting (everything else) — and an account that is **not entitled** to a feed fits neither. Its token is valid, so ending the session destroys a working trading surface and tells the user something untrue; and reconnecting cannot make an unlicensed account licensed, so the alternative is churn the reconnect ladder paces and never stops. The fifth adapter's "data APIs not subscribed" code had been approximated as an expired session since D4.11, knowingly and on the record.
+
+  * **`NOT_ENTITLED` is a statement about a capability, not about a login.** It is terminal for **one channel of one user's stream** and for nothing else: the transport stops that channel and does not reconnect, and the session, the account's other channels, every other broker, every other user and the guest/baseline floor are untouched. Coming back requires a deliberate lifecycle event, never the loop's own schedule.
+
+  * **Recovery is unregistration, not demotion.** The account's provider is removed from the registry, so the baseline serves the very next resolution — and there is then no state (READY, STABLE, primary) in which a feed that has lost its entitlement can stay selected. `detach_market_feed`, the path an ended entitlement has taken since D4.4, is reused unchanged; a demotion would have left the feed a candidate the moment nothing steadier remained.
+
+  * **It is never inferred.** A socket that opens, a subscribe frame the broker accepted, a timeout, silence and a malformed frame are all *absence of evidence*; only an explicit broker refusal may produce it. An inferred entitlement failure permanently stops a feed that may be working perfectly, and nothing in the system would ever contradict it.
+
+  * **Broker vocabulary stays in the adapter.** A refusal is classified from a frame (`decode_stream_frame`) or from a handshake (`stream_connect_error`, which may now return a terminal event as well as a reason string). The transport, the engine, the provider layer and the Source Manager see one broker-neutral kind, and no generic module gained a broker name or an identity branch.
+
+  * **No change to `MarketTick`, no timer, no new consumer surface.** The user-scoped `provider.status` the unregistration already publishes is the whole of what a consumer sees, unchanged in shape.
+
+Still outstanding in Phase 5: p95 latency and latency inside `health()` (D5.4 delivers p50 on the provider only — see LIM-D5.4-3), exchange-timestamp latency (LIM-D5.4-1, which needs a decoded exchange instant, a field on `MarketTick` to carry it, and a defensible clock-offset estimate before the subtraction means anything), broker health's process-local scope (DB-1), instrument sharding, and chaos tests.
 
 **Phase 6 (future) — Enterprise feeds** as entitlements and licensing arrive.
 

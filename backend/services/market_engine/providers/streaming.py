@@ -220,6 +220,65 @@ The evidence is still, and only, an accepted canonical tick. Nothing here reads
 the socket, the session, or how many times the link has flapped: transport
 health and provider evidence stay the two separate facts D4.5 made them.
 
+═══════════════════════════════════════════════════════════════════════
+D5.4 — DELIVERY LATENCY, AND THE LATENCY THIS PLATFORM CANNOT MEASURE
+═══════════════════════════════════════════════════════════════════════
+
+MARKET_DATA_ARCHITECTURE.md has asked for latency scoring since Phase 5 was
+written, and its own sentence carries the precondition that decides what is
+possible here: "computes `latency_ms` **where the provider supplies an exchange
+timestamp**". The D5.4 audit tested that precondition instead of assuming it,
+and **no provider supplies one at this boundary**. A canonical tick has five
+fields and none of them is an exchange instant — `ticks.py` states why, and the
+reason is still good: brokers disagree on format and timezone, and a wrong
+parse is worse than no parse. Below the canonical line the picture is worse
+still: three of the five brokers put no timestamp on the wire at all in the
+mode the platform subscribes, and the two that do use different units on an
+exchange clock whose offset from ours has never been measured.
+
+So `now − broker_timestamp` is not available, and manufacturing it would be a
+number rather than a measurement. What *is* available, exactly and on one clock,
+is how long a consumer of this feed waits between usable prices:
+
+    delivery latency  =  median of the last LATENCY_WINDOW_SAMPLES intervals
+                         between accepted canonical batches, on this
+                         provider's own monotonic clock
+
+Stated plainly because it will otherwise be assumed to mean the other thing:
+**this is not exchange-to-ingest latency and must never be presented as such.**
+It answers the question selection actually asks — of two feeds that are equally
+healthy, equally fresh and equally proven, which one delivers sooner — and it is
+the only latency question this platform can answer truthfully today. ADR-044
+records the gap as LIM-D5.4-1.
+
+Four properties follow from the shape of the statistic rather than from anything
+this class remembers to do:
+
+* **One outlier cannot demote a feed.** A median of nine tolerates four bad
+  samples before the statistic itself moves, so a feed must be slow *most* of
+  the time to be scored slow. A mean or an EWMA is moved arbitrarily far by one
+  600-second gap, which is what a broker's midday hiccup looks like.
+* **Old evidence expires, twice.** The window forgets by eviction — nine newer
+  intervals remove every older one — and the whole score expires when the feed
+  loses fresh evidence, reusing `tick_max_age_seconds` for the third time in
+  three sprints rather than declaring a decay constant.
+* **Nothing schedules anything.** Samples are produced only by arriving data.
+* **A reconnect starts over**, in `_discard_evidence`, with the ticks and the
+  probation timestamps that already reset there. Intervals measured on a link
+  that no longer exists describe a connection the platform cannot ask anything
+  of — and clearing `_last_evidence_at` also means the gap *spanning* a
+  disconnection is never recorded as one enormous fictitious sample.
+
+Latency creates nothing. It is the third element of a sort key applied to
+candidates that have already survived entitlement, capability, health, readiness
+and coverage; it cannot make a feed ready, cannot make one eligible, and ranks
+*below* probation so it can never promote an unproven feed past a proven one.
+And it cannot contradict D5.3's freshness predicate, because the two are read
+off one series of arrival instants: freshness asks whether the *current* gap is
+inside the coverage window, latency asks what the typical *completed* gap is.
+That is LIM-D5.3-3's reconciliation, and it is stronger than a precedence rule
+would have been.
+
 WHAT A TICK-DERIVED QUOTE DOES AND DOES NOT CARRY
 --------------------------------------------------
 A canonical tick carries symbol, exchange, price, volume and an ingest
@@ -234,10 +293,12 @@ not before, because a contract nothing populates is worse than an absent one.
 from __future__ import annotations
 
 import logging
+import statistics
 import time
+from collections import deque
 from dataclasses import fields as dataclass_fields
 from enum import Enum
-from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Deque, Dict, Iterable, List, Optional, Tuple
 
 from services.market_engine.providers.base import (
     Capability,
@@ -299,6 +360,33 @@ DEFAULT_TICK_MAX_AGE_SECONDS = 120.0
 #: it. A link that stays open for a silent minute is STABLE to the transport and
 #: still on probation here — see :meth:`StreamingTickProvider.stability`.
 PROBATION_WINDOW_SECONDS = 30.0
+
+#: How many recent delivery intervals a feed's latency score is the median of —
+#: and, because they are one question, how many it takes before that score
+#: counts as established at all (D5.4).
+#:
+#: ONE CONSTANT WITH TWO USES, NOT TWO CONSTANTS
+#: The deque's `maxlen` and the warm-up requirement are the same number because
+#: they are the same rule: latency is established exactly when the window is
+#: full. A separate warm-up threshold would be a second answer to one question,
+#: free to drift from the first — the mistake ADR-043 spent a sprint not making.
+#:
+#: WHY NINE, AND WHY IT IS HONESTLY A NEW NUMBER
+#: Unlike `PROBATION_WINDOW_SECONDS` and `tick_max_age_seconds`, this is not a
+#: policy the platform had already published somewhere else, so there was
+#: nothing to reuse and reaching for a health threshold because it is also
+#: roughly this size would be a false economy dressed as consistency.
+#:
+#: The justification is a property of the statistic. A median of N tolerates
+#: ⌊(N-1)/2⌋ outliers before the median itself becomes one, so at nine a feed
+#: must be slow across a *majority* of recent deliveries to be scored slow —
+#: which is the brief's "one outlier is not a permanent demotion" expressed as
+#: arithmetic rather than as a hoped-for behaviour. Odd, so the median is an
+#: observed interval rather than the average of two. Small enough that warm-up
+#: costs a real feed a fraction of a second, and irrelevant at the pathological
+#: end: a feed slow enough for nine intervals to take minutes is stale long
+#: before then, and a stale feed has no latency score at all.
+LATENCY_WINDOW_SAMPLES = 9
 
 
 class FeedReadiness(str, Enum):
@@ -446,6 +534,12 @@ class StreamingTickProvider(MarketDataProvider):
         #: D5.2 section of the module docstring).
         self._ready_since: Optional[float] = None
         self._last_evidence_at: Optional[float] = None
+        #: The most recent gaps between accepted batches on the current link,
+        #: newest last (D5.4). Bounded by `maxlen`, so this is a fixed nine
+        #: floats per feed and never grows — and so an old sample leaves by
+        #: being pushed out rather than by a decay coefficient nobody can
+        #: justify. Cleared with everything else in `_discard_evidence`.
+        self._delivery_intervals: Deque[float] = deque(maxlen=LATENCY_WINDOW_SAMPLES)
         self._readiness_listener: Optional[FeedStateListener] = None
         self._last_failure: str = ""
 
@@ -500,6 +594,51 @@ class StreamingTickProvider(MarketDataProvider):
         if last_evidence is None:
             return False
         return (self._clock() - last_evidence) <= self.tick_max_age_seconds
+
+    @property
+    def delivery_latency(self) -> Optional[float]:
+        """This feed's established delivery latency in seconds, or None (D5.4).
+
+        The median of the last :data:`LATENCY_WINDOW_SAMPLES` intervals between
+        accepted canonical batches, measured on this provider's own monotonic
+        clock — see the D5.4 section of the module docstring for why that is the
+        only latency this platform can state truthfully, and why it is *not*
+        exchange-to-ingest latency.
+
+        `None` means "not established", which is a different fact from "fast"
+        and is never reported as a number. Three things establish it, and all
+        must hold:
+
+        * **The feed is ready.** The same gate `_fresh_tick` applies, for the
+          same reason: an unready feed's data may not be used, so a statistic
+          computed from it is not a measurement of anything the platform would
+          act on. Without this, a feed that connected but never subscribed —
+          which can never serve a quote — would still accumulate intervals and
+          report a cadence on `describe()`, and would carry a finite sort key
+          into the link-level (TICKS) comparison it *is* a candidate for.
+        * **The window is full.** Rule 8 of the D5.4 brief — one lucky tick may
+          not become a provider's score — enforced by there being no score at
+          all until nine intervals have been observed. Note that a *pushed* feed
+          accumulates these whether or not it is currently the primary, so
+          unlike health there is no be-selected-to-improve cycle to deadlock on.
+        * **The feed has fresh evidence.** A median assembled from gaps that all
+          closed ten minutes ago is not a current measurement of anything, and
+          reporting it as one would mislead whoever read it. This is also the
+          second of the two independent reasons a stale feed can never be
+          preferred on latency; the first is that staleness already puts it on
+          probation, which ranks above this term.
+
+        Read by :func:`services.market_engine.source_manager._selection_rank`
+        through the provider contract, and surfaced on :meth:`describe` for
+        diagnostics. It reaches no consumer payload and no market event.
+        """
+        if not self.is_ready:
+            return None
+        if len(self._delivery_intervals) < LATENCY_WINDOW_SAMPLES:
+            return None
+        if not self.has_fresh_evidence:
+            return None
+        return statistics.median(self._delivery_intervals)
 
     @property
     def stability(self) -> FeedStability:
@@ -659,6 +798,14 @@ class StreamingTickProvider(MarketDataProvider):
         self._last_tick.clear()
         self._last_evidence_at = None
         self._ready_since = None
+        # D5.4: intervals measured on a link that no longer exists describe a
+        # connection the platform cannot ask anything of — the same argument
+        # D4.5 made for coverage and D5.2 for probation. Clearing
+        # `_last_evidence_at` above also disposes of a defect that would
+        # otherwise need its own guard: the gap *spanning* the disconnection is
+        # never recorded, because the first batch after a reconnect has no
+        # predecessor to measure against.
+        self._delivery_intervals.clear()
 
     # ── Lifecycle ────────────────────────────────────────
 
@@ -898,6 +1045,7 @@ class StreamingTickProvider(MarketDataProvider):
 
         before = self.stability
         arrived_at = self._clock()
+        self._record_delivery_interval(arrived_at)
         for tick in ticks:
             self._last_tick[tick.symbol] = (tick, arrived_at)
         self._last_evidence_at = arrived_at
@@ -906,6 +1054,36 @@ class StreamingTickProvider(MarketDataProvider):
         await self._announce_stability(before)
         await self._emit(ticks)
         return len(ticks)
+
+    def _record_delivery_interval(self, arrived_at: float) -> None:
+        """Record how long this batch made a consumer wait (D5.4).
+
+        One sample per accepted *batch*, not per tick: a batch is one delivery,
+        and every tick in it is stamped with the same arrival instant, so
+        counting them individually would record eight intervals of zero for one
+        frame carrying eight instruments and score a wide subscription as fast.
+
+        Called before `_last_evidence_at` is advanced, because the value it is
+        about to replace is the other end of the interval being measured. The
+        first batch on a link produces no sample at all — there is nothing to
+        measure against — which is exactly the behaviour a reconnect needs.
+
+        A negative interval is dropped rather than recorded or clamped. The
+        clock is monotonic, so it cannot happen in production; if it does, the
+        clock is not what this class was told it was, and a negative number is
+        not a fast delivery.
+        """
+        previous = self._last_evidence_at
+        if previous is None:
+            return
+        interval = arrived_at - previous
+        if interval < 0:
+            logger.warning(
+                "Provider %s saw its clock move backwards — delivery interval dropped",
+                self.name,
+            )
+            return
+        self._delivery_intervals.append(interval)
 
     async def _announce_stability(self, previous: FeedStability) -> None:
         """Tell the gateway when this batch was the one that ended probation.

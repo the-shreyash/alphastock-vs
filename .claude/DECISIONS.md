@@ -2194,4 +2194,250 @@ At D5.4 (latency scoring), which will add a third ranking term beside health and
 
 ---
 
+# ADR-044
+
+Title
+
+Provider Latency: The Platform Can Measure Delivery Cadence Honestly and Cannot Measure Exchange Latency At All (Sprint D5.4, answers ADR-043's review question and LIM-D5.3-3)
+
+Date
+
+2026-08-27
+
+Status
+
+Accepted — implemented; **live validation not performed** (see Consequences)
+
+Context
+
+ADR-043 set D5.4's review question: *"whether the coverage window is still the right decay threshold once per-provider latency is measured — a feed whose ticks are consistently 90 seconds late is fresh by this predicate and bad by that one, and the two terms must not end up disagreeing about the same feed."*
+
+MARKET_DATA_ARCHITECTURE.md has asked for latency scoring since Phase 5 was written, in three places, and one of them carries its own precondition:
+
+    §7 Latency Monitoring
+      "Stamps every event with `ingested_at`; computes `latency_ms`
+       **where the provider supplies an exchange timestamp**"
+      "Maintains rolling p50/p95 latency per provider, fed to the
+       Source Manager's scoring"
+
+    Source Manager §5
+      "score = f(connection_state, message_freshness, error_rate, p95_latency)"
+
+The D5.4 audit's first job was to test that precondition rather than assume it. **It is not met, by any provider, at the boundary where selection happens.** That is this sprint's central finding, and everything below follows from it.
+
+**The canonical tick carries no exchange timestamp, deliberately.** `services/market_engine/ticks.py` states the rule and the reason: "`ingested_at` rather than the broker's own timestamp is deliberate. `BrokerTick.timestamp` is a verbatim broker string precisely because brokers disagree on format and timezone and a wrong parse is worse than no parse … so the canonical tick carries the one timestamp this platform can state truthfully — when *we* received it." A `MarketTick` has five fields and none of them is an exchange instant.
+
+**Three of the five brokers do not put one on the wire in the mode this platform subscribes**, and the two that do disagree about units and about which clock they are on. Read from the adapters:
+
+    Zerodha    LTP binary packet     no timestamp field at all
+                                     (`>II` = token, ltp — that is the whole packet)
+    Upstox     LTPC protobuf         `ltt` exists on the wire; the dependency-free
+                                     decoder extracts price only, so nothing carries it
+    Angel One  LTP binary            int64 epoch **milliseconds**, exchange clock
+    Fyers      lite mode             none — "Lite mode carries no volume and no
+                                     exchange timestamp", stated in the adapter
+    Dhan       ticker packet         int32 epoch **seconds**, exchange clock
+    Yahoo      polled REST           not a stream; there is no arrival event to time
+
+So `now − broker_timestamp` would be available for two brokers out of six sources, in two different units, differencing our clock against an exchange clock whose offset this platform has never measured and cannot measure. Producing a number from that and calling it latency would be exactly the fabrication the brief forbids, and it would require widening `MarketTick`, editing five adapters and decoding two more wire fields to do it. Rule 6 of the brief ("do not use broker-specific timestamp assumptions without proof") and Rule 5 ("no broker adapter modifications unless absolutely required by a protocol fact") both point the same way, and so does the architecture document's own conditional clause.
+
+Audit answers, each from the code:
+
+  **A. What is latency in StockAssist?** The interval between successive *usable prices delivered by a feed*, measured end to end on the platform's own monotonic clock. See Decision. Event-time latency is not available (above); transport-receive→provider-accept latency measures this process's own decode and dispatch cost, is sub-millisecond for every provider, discriminates nothing, and would require the transport→provider seam Rule J warns about — rejected in Alternatives. Subscription→first-tick is one sample per link and Rule 8 forbids a single tick determining a score.
+
+  **B. Can it be derived from existing canonical data without changing `MarketTick`?** Yes, entirely. `StreamingTickProvider.on_raw` already stamps `arrived_at = self._clock()` on every accepted batch and already stores it in `_last_evidence_at`. The interval between consecutive accepted batches is the difference of two values the class already holds. **No contract was widened, no field added, no adapter opened.**
+
+  **C. Are broker timestamps semantically equivalent across the six sources?** No — table above. No cross-broker latency number was invented from them.
+
+  **D. Aggregation?** Median over a bounded window of the nine most recent intervals. See Decision.
+
+  **E. Interaction with probation?** Latency ranks strictly *below* probation, so it can never promote a probationary feed past a proven one. See Decision.
+
+  **F. Interaction with freshness?** They are computed from one series of instants and therefore cannot contradict each other; and a feed that loses fresh evidence loses its latency score with it. See Decision.
+
+  **G. Latency unavailable?** `None`, which ranks last within its group and is never zero. See Decision.
+
+  **H. Decay?** Twice over, both through mechanisms that already exist. See Decision.
+
+  **I. Per `(user, feed)`?** Structurally, by living on the provider instance. See Decision.
+
+  **J. Transport information needed?** No. Zero broker-layer changes; no seam was created.
+
+Decision
+
+**Latency in this platform is *delivery latency*: the median of the nine most recent intervals between accepted canonical batches, measured on the provider's own injected monotonic clock, and established only while the feed has fresh evidence.**
+
+Stated for a reader who will be tempted to assume it means something else: **this is not exchange-to-ingest latency and must never be presented as such.** It answers "how long does a consumer of this feed wait for its next usable price", which is the question provider *selection* actually needs answered, and it is the only latency question this platform can answer truthfully today. LIM-D5.4-1 records the gap.
+
+**Clock source.** `self._clock`, already monotonic and already injectable, the same one probation and coverage measure against. No wall clock, no broker clock, no second clock. A latency measure on a clock an NTP step can move backwards would rank a provider on an artefact of time synchronisation.
+
+**Broker timestamps are not trusted, not parsed and not read.** Nothing in this sprint touches `BrokerTick.timestamp`.
+
+**Aggregation: median of a bounded rolling window, `LATENCY_WINDOW_SAMPLES = 9`.** One constant, and it carries two meanings that are the same meaning — the deque's `maxlen` *and* the warm-up requirement, because latency is established exactly when the window is full. A second warm-up threshold would be a second answer to one question, which is the mistake ADR-043 spent a sprint not making.
+
+Why a median and not a mean, an EWMA or a p95:
+
+* **A median of nine tolerates four outliers before the statistic itself moves.** That is the brief's "one outlier ≠ permanent demotion" as an arithmetic property rather than as a hoped-for behaviour: a feed has to be slow *most* of the time to be scored slow. A mean or an EWMA is moved arbitrarily far by one 600-second gap, which is precisely what a broker's midday hiccup looks like.
+* **The window forgets by eviction, not asymptotically.** Nine newer intervals remove every older one completely. An EWMA's oldest sample never quite leaves, which is the brief's "old latency ≠ permanent advantage" left to a decay coefficient nobody can justify.
+* **p50 at N=9 is a real observed sample.** Nine is odd on purpose. p95 needs a sample far larger than any warm-up worth waiting through and is unstable below it; the architecture document names p50/p95 together and p50 is the half that is honest at this sample size.
+* **Nothing schedules anything.** Samples are produced only by arriving data, so a feed nobody is talking to costs nothing and no timer exists — Rule 12.
+
+Nine is a new number and is stated as one. ADR-043's discipline is *do not invent a second answer to a question the platform has already answered*; the platform has never published a sample count, so there was nothing to reuse, and reaching for `DOWN_AFTER_FAILURES` because it is also 8-ish would be a false economy dressed as consistency. The justification is the outlier-tolerance property above, and `test_the_window_tolerates_a_minority_of_outliers` is what holds it.
+
+**Established, and what happens when it is not.** `delivery_latency` returns the median only when the window is full **and** `has_fresh_evidence` is true; otherwise `None`. `None` is not zero and is not an estimate. In `_selection_rank` it becomes the sort key `math.inf`, which places the provider last **within its own (health, probation) group** and nowhere else.
+
+Last-within-group rather than first is a decision with a specific near-miss behind it, and it is the audit's second finding. Ranking unknown latency *best* looks like the safe, generous choice and is the opposite: **Yahoo can never establish a delivery latency**, because it is polled and has no arrival event to time, so "unknown wins ties" would have promoted the permanent baseline above every streaming feed in the same health/probation group and silently undone D4.5. Ranking it last leaves Yahoo exactly where priority already puts it and can never move it. `test_the_baseline_can_never_establish_a_delivery_latency` and `test_latency_never_promotes_the_baseline_over_a_streaming_feed` are the two that hold this.
+
+Nor does last-within-group recreate ADR-029's UNKNOWN-health deadlock, and the reason is structural rather than lucky: health improves only by being *called*, so a provider that is never selected can never leave UNKNOWN — but a pushed feed accumulates delivery intervals whether or not it is the primary. Evidence arrives without selection, so there is no cycle to deadlock.
+
+**Interaction with READY: none, in both directions.** Latency creates no readiness and no eligibility. It is the third element of a sort key over candidates that have *already* survived entitlement, capability, health and coverage filtering; it cannot add a provider to that list. Conversely a feed does not need latency evidence to be ready — readiness is one valid canonical tick, exactly as D4.5 left it.
+
+**Interaction with probation: latency ranks strictly below it.** `_selection_rank` is `(health, probation, latency)`. A probationary feed is behind a stable one on the second element before the third is ever compared, so no median, however good, can promote it — Rule 10 satisfied by ordering rather than by a special case. Latency does still order two feeds that are *equally* unproven, which is not a bypass of probation: it breaks a tie inside a rank, which is what a third sort element is for, and it does so on nine observed intervals rather than on the "one tick had a low latency" the brief warns about.
+
+**Interaction with freshness: they cannot disagree, because they read one series.** This is LIM-D5.3-3's reconciliation and it is a stronger answer than a precedence rule. Freshness asks "is the *current* gap — now minus the last arrival — inside the coverage window?"; delivery latency asks "what is the typical *completed* gap?". Both are statements about the same sequence of arrival instants on the same clock, so a feed delivering every 90 seconds is simultaneously fresh (90 < 120, its data is usable) and slower than a feed delivering every 200ms — two true statements about different questions, not a contradiction. LIM-D5.3-3 anticipated the disagreement because it was written with *event-time* latency in mind, and event-time latency is the thing the audit found the platform cannot measure.
+
+The hard rule the brief demands — "stale ⇒ never preferred because of latency" — holds twice over, and deliberately so:
+
+1. Losing fresh evidence sets `is_on_probation` (D5.3), which ranks *above* latency, so a stale feed is demoted whatever its median.
+2. `delivery_latency` itself returns `None` without fresh evidence, so the stale feed's historical median is not even in the comparison.
+
+The second is not redundant defence, it is honesty: a median assembled from gaps that all closed ten minutes ago is not a current measurement of anything, and reporting it on `describe()` as though it were would mislead an operator.
+
+**Decay: two existing mechanisms, no new one.** The bounded window drops a sample once nine newer ones exist, so a fast ten minutes ago is gone after nine intervals of slow. And the freshness gate expires the whole score when the feed goes quiet, which reuses `tick_max_age_seconds` for the third time in three sprints — one staleness policy, now asked per-instrument (D4.5), per-feed (D5.3) and per-score (D5.4). No decay constant, no half-life, no timer.
+
+**Reconnect resets it**, in `_discard_evidence`, alongside the ticks and the probation timestamps that already reset there. Intervals measured on a link that no longer exists describe a connection the platform cannot ask anything of — the same argument D4.5 made for coverage and D5.2 for probation, and the third time it has been the right one. It also disposes of a bug that would otherwise need its own guard: the gap *spanning* a disconnection would be an enormous fictitious interval, and because `_last_evidence_at` is cleared the first batch after a reconnect produces no sample at all rather than that one.
+
+**Per-user isolation is structural, not enforced.** The deque is an instance attribute of `StreamingTickProvider`, and `market_feed.feed_provider_name(user_id, broker)` gives exactly one instance per `(user, broker)` in the registry. There is no map keyed by broker, no module-level accumulator and no shared state to leak through — a second user's feed is a different object, and two brokers of one user are two objects. This is the same construction D5.2 and D5.3 rely on, and it is why the answer to "prove it structurally" is that there is nothing to prove: sharing would require a global, and none was added.
+
+**The generic default is `None` on `MarketDataProvider`**, mirroring `is_on_probation`'s `False` for the same reason: a provider that is *polled* has no delivery cadence to measure, and saying so is a statement rather than a convenience. The Source Manager reads the contract, never the type, so a licensed exchange feed or a vendor feed gets this term by implementing the property and changes nothing here.
+
+**Broker-neutrality.** No broker module was imported, opened or named. The measurement's whole input is one monotonic clock and the fact that a batch was accepted, both of which the Market Engine already owned. A fictional sixth broker gets latency scoring by registering through the same seam and writing zero lines.
+
+Alternatives Considered
+
+**Exchange-timestamp latency (`now − broker_timestamp`), as MARKET_DATA_ARCHITECTURE.md §7 describes.** Rejected on the evidence in Context, and the document's own clause "where the provider supplies an exchange timestamp" is the condition that fails. Adopting it would mean widening `MarketTick` (Rule 5), editing five adapters, decoding `ltt` from Upstox and the timestamp fields from Zerodha's wider modes, and then differencing two unsynchronised clocks in two units — producing a number that would look like a measurement and be an artefact of clock skew, for the two brokers where it existed at all, while the other four had none. LIM-D5.4-1 keeps it on the record as a prerequisite rather than pretending it was done.
+
+**Transport-receive → provider-accept.** Rejected. It measures this process's own decode and dispatch, which is sub-millisecond and essentially identical for every provider, so it would rank on scheduler noise. It is also the only candidate that would require carrying a transport instant across the broker→market-engine boundary — the seam Rule J permits only if necessary, and it is not necessary for a signal that discriminates nothing.
+
+**Subscription → first tick.** Rejected as a score: one sample per link, so Rule 8 forbids it, and it is dominated by whether the market happened to be trading at that instant. Kept in mind as a diagnostic, not implemented — there is no consumer for it.
+
+**EWMA.** Rejected. Cheap and decaying, but one 600-second gap in a sub-second stream moves it by more than the true signal, so the brief's "one outlier ≠ permanent demotion" would rest on choosing an α small enough to blunt outliers and large enough to recover, which is a tuning parameter with no principled value. The median gets outlier resistance from its definition instead.
+
+**p95, as the architecture document names alongside p50.** Rejected at this sample size. p95 of nine samples is "the largest one", which is an outlier detector, not a latency score; a sample large enough for a meaningful p95 is a warm-up long enough to be a liability. p50 is the half of the document's phrase that is honest here, and LIM-D5.4-3 records that p95 remains unimplemented rather than quietly dropping it.
+
+**An absolute "slow" threshold in milliseconds, banding providers as fast/slow.** Rejected, and it was the most tempting wrong answer. A threshold has to be a number of milliseconds, and the same interval means opposite things on a liquid large-cap during the open and on an illiquid instrument at 14:30 — so the band would classify honest feeds as slow for trading quiet instruments. Comparative ranking needs no threshold: it asks only which of two candidates is faster, and when there is only one candidate the term does nothing at all.
+
+**Making latency an eligibility filter, or letting it override probation or staleness.** Rejected for the same reason PROBATION_RANK is a ranking term and not a filter (ADR-042): a filter can produce "no provider at all" from a merely-slow feed, trading a ranking blemish for an outage. Yahoo is the floor and nothing in this sprint may lower it.
+
+**A separate latency registry / scorer service.** Rejected — Rules 1–3. The state is nine floats per feed, its only reader is one sort key, and its lifecycle is exactly the feed's lifecycle. A second component would need registering, unregistering, per-user keying and reconnect invalidation, all of which the provider instance already does for free by *being* the per-feed object.
+
+Consequences
+
+• **Two equally healthy, fresh and stable feeds are now ordered by measured delivery cadence**, and every other pairing is ordered exactly as it was before D5.4. The term is inert for a single-feed user, inert for the baseline, and inert until nine intervals exist.
+
+• **`MarketTick`, the broker contract, all five adapters, `stream.py`, `reliability.py`, `market_feed.py`, `instruments.py`, the registry, the gateway, the REST quote path and the frontend are unchanged.** The sprint is three edited modules — the model in `providers/streaming.py`, one contract default in `providers/base.py`, one sort element in `source_manager.py` — plus exports and one new test module.
+
+• **Latency is a diagnostics field, never a consumer one.** `describe()` gains `delivery_latency_seconds` (an admin/diagnostics surface where provider names already live); `SourceManager.status()`, `Resolution.as_status()`, every normalized event and every API response are unchanged and still carry `source_tier` and no provider identity. `None` is emitted as `null`, never as `0` and never as `Infinity` — the sort key's `math.inf` exists only inside the comparison and is never serialised.
+
+• **Thirty-one source mutations were attempted and every relevant test went red.** The set the brief names, plus a genuinely global (cross-provider) accumulator, a cross-user accumulator, wall-clock timing, latency as a filter, latency creating readiness, and a broker-name branch in the scorer.
+
+• **LIM-D5.4-1 — exchange-to-ingest latency is still not measured, and this is not it.** The platform reports how fast a feed *delivers*, not how stale each price was when it arrived. A broker that batches 200ms of ticks and pushes them promptly and a broker that pushes each tick 200ms late are indistinguishable here. Closing this needs, in order: a decoded exchange timestamp on the two brokers whose wire carries one and on the two whose wider modes could, a field on `MarketTick` to carry it, and — the actual blocker — a defensible estimate of the offset between the exchange clock and ours, without which the subtraction is not a measurement. It is a prerequisite, recorded as one.
+
+• **LIM-D5.4-2 — the delivery interval is a per-feed aggregate over a heterogeneous subscription.** A feed's median mixes every instrument it carries, so a feed subscribed to quiet instruments scores worse than one subscribed to busy ones for a reason that is nothing to do with the feed. The comparison is fairer than it sounds — `attach_market_feed` subscribes every one of a user's brokers to the *same* holdings-and-positions universe, so two feeds being compared are usually carrying the same instruments in the same market minute — but "usually" is not "always", and the mitigation is that the term is a last-place tie-break behind health, probation and freshness rather than something that can cause an outage.
+
+• **LIM-D5.4-3 — p50 only; no p95, and no latency in `health()`.** MARKET_DATA_ARCHITECTURE.md §7 asks for rolling p50/p95 and `health()` names "measured latency". This sprint delivers p50 on the provider and leaves `ProviderHealth` untouched, because health is counter-based evidence from past *calls* and a pushed feed makes no calls — folding a push-derived statistic into it would be the transport/evidence unification ADR-043 refused, one layer along.
+
+• **LIVE VALIDATION WAS NOT PERFORMED.** No interactive broker session exists in this environment. Every number above comes from deterministic tests with an injected monotonic clock, a pass through the real `attach_market_feed` seam for all five brokers plus a fictional one, and the mutations listed. **No real latency was measured and none is claimed.** The outstanding smoke test: connect two brokers on one account to the same instrument universe, hold both past the probation window, confirm both establish a median, confirm the faster one leads the chain, then throttle or subscribe the leader to a quiet instrument and confirm the order changes only after the window refills — and, throughout, that the tier the user sees never leaves `streaming` because a *ranking* term moved.
+
+Review Date
+
+At the sprint that decodes an exchange timestamp for any broker, or at D5's chaos testing, whichever comes first. The specific claim to re-test is LIM-D5.4-2: whether the per-feed aggregate is still defensible once two feeds on one account can be observed carrying genuinely different instrument sets, and whether the tie-break should become per-symbol at that point.
+
+---
+
+
+# ADR-045
+
+Title
+
+Entitlement Failure Is Its Own Terminal Condition: One Feed Stops, the Session Does Not (Sprint D5.5, closes the D4.11 code-806 approximation)
+
+Date
+
+2026-08-27
+
+Status
+
+Accepted — implemented; **live validation not performed** (see Consequences)
+
+Context
+
+ADR-044 closed with a Review Date, and D5.4's scope note named what was still owed: *"a broker-neutral representation of entitlement failure"*, carried forward unchanged through D5.1, D5.2, D5.3 and D5.4. It originates in **ADR-040**, which considered a `NOT_ENTITLED` event kind for the fifth adapter's "data APIs not subscribed" disconnect code, rejected it as disproportionate for one broker's one code, approximated it as `AUTH_EXPIRED`, and recorded the approximation as a limitation rather than hiding it.
+
+**The audit's finding is that the approximation is not cosmetic, and that no message text can make it so.** The two conditions have different *blast radii*:
+
+  * `AUTH_EXPIRED` is a fact about the **session**. `BrokerEngine._on_stream_expired` drops the cached session, stops **every** channel of that broker, writes a `broker.session.expired` audit row and pushes `session_expired: true` to the user.
+  * A refused entitlement is a fact about **one capability on one feed**. The token is valid: REST portfolio, funds, order placement and the order stream all keep working.
+
+So the approximation tore down a working trading session and told the user their login had expired, on the strength of a statement the broker had not made. That is a functional loss *and* a false statement, and it is invisible in the message text — the state the engine moves to is the lie, not the string.
+
+The audit also established that the other existing kind cannot carry it. `ERROR` deliberately leaves the connection alone, so a broker that closes the socket after sending one drives the reconnect ladder indefinitely — **paced** by D5.1's flap suppression to the 60-second ceiling, **never stopped** by it — with the account's provider still registered and still nominally a priority-1 candidate. Retrying cannot make an unlicensed account licensed. That is the bar for widening a closed set, and it is met: the set genuinely could not express the required semantics.
+
+Decision
+
+**One new member of `StreamEventKind`: `NOT_ENTITLED`, and nothing else new anywhere.** No new contract, no new capability, no new registry, no new consumer surface, no field on `MarketTick`, and no timer.
+
+**Terminal for one channel of one user's stream, and for nothing else.** `_NotEntitled` is a distinct exception from `_AuthExpired` and deliberately **not** a subclass of it — `except _AuthExpired` is what tears down the session, and an inheritance relationship would silently restore exactly the behaviour this sprint exists to remove. The run loop `return`s on it rather than falling through to `next_pause()`, which is the substance of the sprint: every other exit from that loop reconnects.
+
+**Recovery is unregistration, not demotion, and it reuses the path that already existed.** `detach_market_feed` — the response to an ended entitlement since D4.4 — takes the account's provider out of the registry, so the baseline serves the very next resolution. Demoting instead was rejected: a demoted feed is still a candidate the moment nothing steadier remains, so a feed that has lost its entitlement could return to serving quotes. Unregistered, there is no state — READY, STABLE, primary — in which it can stay selected. That is a structural guarantee rather than a rule.
+
+**The market side is unchanged, and that is the strongest evidence the D4.4/D4.5 decomposition was right.** `StreamingTickProvider`, the readiness gate, probation, freshness, the latency term, the Source Manager's sort key, the Market Gateway and the provider registry are byte-for-byte untouched by this sprint. An entitlement failure is expressed to the Market Engine as *a provider going away*, which it has always known how to handle, and the Market Engine never learns that a broker refused anything.
+
+**Scoped by the channel's own declaration, not by a broker name.** The engine detaches the market feed only when the refused channel is the one carrying ticks — the same `_channel_carries_ticks` gate D4.7 added for link state, asked for the same reason: an entitlement refused on an *order* channel says nothing about the market feed, and detaching one because the other was refused would drop a feed delivering prices perfectly well.
+
+**Per-user isolation is structural.** One `BrokerStream` is one `(user, broker, channel)` and one provider is one `(user, broker)`, so a second user of the same broker is a different object that nothing on this path can reach. It is asserted with two users on one broker, resolved *through the registry* — the arrangement ADR-040 found was the only one in which a broker-scoped mistake is visible.
+
+**`stream_connect_error` widened its return type, not its signature.** It may now answer with a terminal `BrokerStreamEvent` as well as with a reason string, so a broker whose 403 means "not licensed" rather than "token rejected" can say which. Widening the *signature* was rejected for the reason D4.7 and D4.10 rejected it: it changes what every adapter and every test double implements, so an unmigrated broker fails on a live socket rather than at import. Every adapter written before D5.5 returns a string or `None` and is unaffected.
+
+**Entitlement is never inferred.** A socket that opens, a subscribe frame the broker accepted, a timeout, silence, and a malformed frame are all absence of evidence, and each is pinned by its own test. This is the sharpest rule in the sprint because the failure it prevents is silent and permanent: an inferred entitlement failure stops a working feed forever and nothing in the system will ever contradict it.
+
+Alternatives considered
+
+**Keep the approximation and improve the message.** Rejected — this is ADR-040's position, re-examined with the evidence ADR-040 did not have. The message was already honest; the *state* was not, and a user whose valid session is torn down does not get it back because the log line was accurate.
+
+**A reason argument on the existing `on_expired` callback instead of a second callback.** Rejected. The two outcomes have different blast radii, and a flag would have put that distinction in the hands of every consumer to remember — a consumer that forgot to branch would tear down the session, which is the exact defect being fixed, reintroduced silently one layer up. Two callbacks put the distinction in the type.
+
+**Make `_NotEntitled` a subclass of `_AuthExpired` "so existing handlers keep working".** Rejected, and it is worth naming because it is the tempting shortcut: the existing handler is the session teardown, and inheritance would mean the new condition takes the old path by default. The mutation that makes it a subclass is red.
+
+**Demote the provider (`mark_link_down`) rather than unregister it.** Rejected — see the Decision. A demoted feed remains a candidate; it also remains able to *deliver*, since the sink stays bound, so a socket the user has not disconnected could go on pushing into the gateway. `unregister_streaming_provider` disconnects, unbinds and unregisters, which is the behaviour an ended entitlement has always had.
+
+**Give the user a dedicated notification or a new `provider.status` reason.** Rejected as out of scope and unnecessary. Unregistration already publishes a user-scoped `provider.status`, whose payload shape is unchanged, and the frontend already renders the tier flip from it. A new field on a consumer payload is a frontend contract change, and D5.5 has no frontend work. Recorded as LIM-D5.5-2.
+
+**Fix DB-5-adjacent flap behaviour, or add a give-up-after-N policy for repeated non-terminal failures.** Rejected as separable and left as remaining D5 work. The audit specifically checked whether entitlement classification was inseparable from reconnect pacing and found the opposite: entitlement is terminal by classification and never reaches the ladder, so the two do not interact. DB-5 itself was closed in D5.1.
+
+Consequences
+
+• **The closed event set gained exactly one member, in the fifth sprint in which the smallest correct extension turned out to be an extension at all.** `EVENT_CAPABILITY` is unchanged — the new kind is a connection-level fact and is ungated, exactly as `AUTH_EXPIRED` is, so a broker that mis-declares what it serves cannot thereby lose the ability to say "stop".
+
+• **The blast radius is asserted from both sides.** The session survives; the account's other channels keep running; a second user of the same broker keeps a READY feed; another broker of the same user keeps serving; the guest/baseline status is byte-identical before and after; and the refused feed can no longer deliver into the gateway at all.
+
+• **Twenty source mutations were attempted and twenty went red**, including the fifteen the brief names: the classification degraded to transient and to auth expiry (at the adapter *and* at the contract constructor), terminal handling turned back into retry and into immediate reconnect, the ineligibility removed, detach downgraded to a demotion, entitlement inferred from silence and from a malformed frame, made global across users and across every provider, a broker error class put on the consumer status, a broker-name branch added to the transport, the refusal reaching Yahoo and reaching an unrelated provider of the same user, one broker special-cased in the engine, the handshake string answer ignored, `_NotEntitled` made a subclass of `_AuthExpired`, the refusal routed through the capability gate, the channel gate removed, and the finished stream left in the registry. **One earlier attempt is reported rather than hidden:** the first form of the "refusal affects Yahoo" mutation had an ambiguous anchor and did not apply; it was reformed against a unique anchor and is red.
+
+• **A broker name was caught in this sprint's own docstring by its own sweep** — the `StreamEventKind` narrative named the adapter whose code motivated the member — and was rewritten rather than exempted, as D5.1's sweep required of D5.1.
+
+• **LIM-D5.5-1 — no broker other than the fifth adapter classifies an entitlement failure today.** The mechanism is generic and is exercised by a fictional broker through the real transport, but four of the five shipped adapters have no documented entitlement code to map, so their 401/403 handling remains session expiry — which is what their documentation says it is. This is a statement about those brokers' protocols, not a gap in the mechanism; it closes for a given broker when that broker's protocol is shown to distinguish the two.
+
+• **LIM-D5.5-2 — the user is told their tier moved, not why.** The consumer surface is the existing user-scoped `provider.status`, whose `reason` vocabulary is the Source Manager's `UnavailableReason` and which reports the baseline as *available* — correctly, because it is. A user whose broker feed was refused therefore sees their tier drop to `delayed` with no explanation, and learns why only from the audit row. Closing it means a consumer-payload field and a frontend change, which D5.5 has no mandate for.
+
+• **LIM-D5.5-3 — a refused feed does not retry, and nothing re-probes it.** That is the intended behaviour and it is also a one-way door until a lifecycle event: if a user's entitlement is granted *while connected*, the feed will not come back until they reconnect the broker or the process restores sessions. A generalized re-probe is Phase 5 work that ADR-029 already owes for demoted providers, and this is the second caller for it.
+
+• **LIVE VALIDATION WAS NOT PERFORMED.** No interactive broker session exists in this environment. Every claim rests on deterministic fixtures — a disconnect packet built from the documented wire layout, a fictional broker refusing both in a frame and at the handshake, and the real `attach_market_feed` seam — plus the mutations above and a DEBUG-level pass through the real logging stack with live-looking credentials. **The outstanding smoke test:** connect an account that genuinely lacks the data-API entitlement, confirm the socket opens and the refusal arrives in a frame, confirm the feed stops after exactly one connection, confirm the user's tier falls to `delayed` **while the same account can still fetch its portfolio and place an order**, then grant the entitlement and confirm that reconnecting the broker — and only that — brings the feed back.
+
+Review Date
+
+At the sixth streaming broker, or at the first live session against an unentitled account, whichever comes first. The specific claim to re-test is the one this ADR rests on: that entitlement failure and session expiry are genuinely two conditions rather than one condition seen twice. The evidence to look for is a broker whose protocol distinguishes them *and* whose account can be observed trading normally while its feed is refused.
+
+---
+
+
 # End of Decisions Documentation

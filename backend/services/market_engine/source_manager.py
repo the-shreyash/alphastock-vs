@@ -85,6 +85,7 @@ session with a WebSocket attached actually exists to hang it on.
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
@@ -168,6 +169,30 @@ HEALTH_RANK = {
 #: before probation existed.
 PROBATION_RANK = {False: 0, True: 1}
 
+#: The sort key a provider whose delivery latency is not established gets (D5.4).
+#:
+#: Infinity, so it ranks **last within its own (health, probation) group** and
+#: nowhere else — it can never move a provider out of the band health and
+#: probation put it in. It exists only inside this comparison: nothing
+#: serialises it, and `describe()` reports the unestablished case as `None`.
+#:
+#: WHY LAST RATHER THAN FIRST, WHICH IS THE TEMPTING MISTAKE
+#: "Missing evidence should not be penalised" argues for ranking unknown latency
+#: *best*, by analogy with `HEALTH_RANK` tying UNKNOWN with UP. That analogy
+#: breaks, and breaks expensively: the polled baseline can never establish a
+#: delivery latency at all — it is not pushed into, so it has no delivery event
+#: to time — so "unknown wins ties" would have promoted Yahoo above every
+#: streaming feed sharing its health and probation rank, and silently undone
+#: D4.5. Ranked last, the term leaves the baseline exactly where priority
+#: already puts it and can never move it.
+#:
+#: Nor does this recreate ADR-029's UNKNOWN-health deadlock, and the difference
+#: is structural rather than lucky. Health improves only by the provider being
+#: *called*, so a provider that is never selected can never leave UNKNOWN. A
+#: pushed feed accumulates delivery intervals whether or not it is the primary,
+#: so evidence arrives without selection and there is no cycle to deadlock.
+LATENCY_RANK_UNKNOWN = math.inf
+
 
 class UnavailableReason(str, Enum):
     """Why no provider could be resolved.
@@ -223,17 +248,32 @@ class Resolution:
         }
 
 
-def _selection_rank(provider: MarketDataProvider) -> Tuple[int, int]:
+def _selection_rank(provider: MarketDataProvider) -> Tuple[int, int, float]:
     """Where `provider` sits among the candidates that survived filtering.
 
-    Health first, then probation — see :data:`PROBATION_RANK`. Read through the
-    provider contract rather than by type, so a licensed exchange feed, a vendor
-    feed and a broker feed are ranked by what they have demonstrated and not by
-    what they are.
+    Health, then probation, then delivery latency — see :data:`PROBATION_RANK`
+    and :data:`LATENCY_RANK_UNKNOWN`. Read through the provider contract rather
+    than by type, so a licensed exchange feed, a vendor feed and a broker feed
+    are ranked by what they have demonstrated and not by what they are.
+
+    LATENCY IS LAST, AND THAT ORDERING IS THE WHOLE GUARANTEE (D5.4)
+    Placing it third is what makes "latency can never promote an unproven or a
+    stale feed" true by construction rather than by a special case: a
+    probationary provider — which since D5.3 includes every provider whose data
+    has gone stale — loses on the second element before the third is compared,
+    so no median, however good, can lift it past a provider that is proven and
+    delivering. There is no branch here that says so, because there is nothing
+    to branch on.
+
+    Equally, this is a *tie-break* and not a filter. It changes the order of
+    candidates that have already survived entitlement, capability, health,
+    readiness and coverage; it can never remove one, and it can never add one.
     """
+    latency = provider.delivery_latency
     return (
         HEALTH_RANK[provider.health().state],
         PROBATION_RANK[bool(provider.is_on_probation)],
+        LATENCY_RANK_UNKNOWN if latency is None else float(latency),
     )
 
 

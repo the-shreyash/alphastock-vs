@@ -39,7 +39,8 @@ Three canonical types and one rule:
   * :class:`BrokerTick` — the canonical price tick. The only tick shape any code
     above the adapter sees.
   * :class:`BrokerStreamEvent` — what a decoded frame *is*: ticks, an order
-    update, a dead token, a broker-reported error, or nothing at all.
+    update, a dead token, a refused entitlement, a broker-reported error, or
+    nothing at all.
 
 The rule: **an adapter's `decode_stream_frame` is the only code entitled to see
 a raw broker frame, and the only thing it may return is one of these types.**
@@ -82,10 +83,38 @@ from services.brokers.errors import BrokerContractError
 class StreamEventKind(str, Enum):
     """What a decoded broker frame turned out to be.
 
-    Deliberately a closed set. A codec cannot invent a sixth kind, which is what
-    lets the transport's dispatch be exhaustive and the capability check below
-    be complete — a new kind would otherwise arrive with no capability gating
-    anybody remembered to add.
+    Deliberately a closed set. A codec cannot invent a kind of its own, which is
+    what lets the transport's dispatch be exhaustive and the capability check
+    below be complete — a new kind would otherwise arrive with no capability
+    gating anybody remembered to add.
+
+    WHY D5.5 ADDED ONE MEMBER, HAVING REFUSED TO IN D4.11
+    ------------------------------------------------------
+    ADR-040 considered `NOT_ENTITLED` for a fifth adapter's "data APIs not
+    subscribed" disconnect code and rejected it as disproportionate for one
+    broker's one code, approximating it as `AUTH_EXPIRED` and recording the
+    approximation as a limitation. D5.5 is the sprint that measured what the
+    approximation actually costs, and it is not cosmetic: the two conditions
+    have *different blast radii*, and no message text can fix that.
+
+      * `AUTH_EXPIRED` is a fact about the **session**. The account's token is
+        dead, so nothing it can reach works — the engine drops the session, stops
+        every channel of that broker, and tells the user to reconnect.
+      * `NOT_ENTITLED` is a fact about **one capability on one feed**. The token
+        is fine: REST portfolio, funds, order placement and the order stream all
+        keep working. Only the market-data feed this user's account is not
+        licensed for must stop.
+
+    Reported as `AUTH_EXPIRED`, an unlicensed data feed therefore tore down a
+    perfectly good trading session and told the user their login had expired,
+    which is both a functional loss and a false statement. Reported as `ERROR`
+    it would be worse in the other direction: `ERROR` deliberately leaves the
+    connection alone, so a broker that closes the socket after saying it drives
+    the reconnect ladder forever — paced by D5.1's flap suppression, never
+    stopped by it — with the account's provider still registered.
+
+    So the closed set genuinely could not express the required semantics, which
+    is the bar ADR-045 sets for widening it.
     """
 
     #: One or more price ticks. Requires `TICK_STREAM`.
@@ -95,6 +124,17 @@ class StreamEventKind(str, Enum):
     #: The broker says this session's token is dead. The transport stops the
     #: stream and notifies the engine rather than reconnecting into a rejection.
     AUTH_EXPIRED = "auth_expired"
+    #: The broker says this account is not entitled to what this feed carries —
+    #: an explicit refusal such as "data APIs not subscribed", never an
+    #: inference. The session itself is unaffected (D5.5): the transport stops
+    #: THIS channel without reconnecting and hands the fact to the engine, which
+    #: takes the account's market feed out of quote eligibility and leaves the
+    #: session, the other channels and every other user alone.
+    #:
+    #: Never produced by silence, a timeout, a socket that opens and closes, an
+    #: accepted subscribe frame that yields nothing, or a malformed frame. Those
+    #: are absence of evidence; this is a statement the broker made.
+    NOT_ENTITLED = "not_entitled"
     #: The broker reported an error that is not an auth failure. Logged, and the
     #: connection is left alone — a rejected subscription must not drop a socket
     #: that is still delivering other instruments.
@@ -111,8 +151,11 @@ class StreamEventKind(str, Enum):
 #: Read by the Broker Gateway. A broker that decodes ticks without declaring
 #: `TICK_STREAM` has them dropped — the capability model is the authority on
 #: what a broker serves, and a codec is not allowed to widen it silently.
-#: AUTH_EXPIRED, ERROR and IGNORE are connection-level facts rather than data,
-#: so they are ungated: a dead token must be actionable on any stream.
+#: AUTH_EXPIRED, NOT_ENTITLED, ERROR and IGNORE are connection-level facts
+#: rather than data, so they are ungated: a dead token — or a refused
+#: entitlement — must be actionable on any stream, including one whose broker
+#: declares no capability at all. Gating them would mean a broker could lose the
+#: ability to say "stop" by mis-declaring what it serves.
 EVENT_CAPABILITY: Dict[StreamEventKind, str] = {
     StreamEventKind.TICKS: "tick_stream",
     StreamEventKind.ORDER: "order_stream",
@@ -281,8 +324,8 @@ class BrokerStreamEvent:
     ticks: Tuple[BrokerTick, ...] = ()
     #: Canonical order dict (`BrokerOrder.as_dict()`), not the broker's frame.
     order: Optional[Dict[str, Any]] = None
-    #: Human-readable detail for ERROR / AUTH_EXPIRED. Never contains credential
-    #: material: it is the broker's own message text.
+    #: Human-readable detail for ERROR / AUTH_EXPIRED / NOT_ENTITLED. Never
+    #: contains credential material: it is the broker's own message text.
     message: str = ""
 
     def __post_init__(self) -> None:
@@ -342,6 +385,19 @@ class BrokerStreamEvent:
     @classmethod
     def auth_expired(cls, message: str = "") -> "BrokerStreamEvent":
         return cls(kind=StreamEventKind.AUTH_EXPIRED, message=str(message or ""))
+
+    @classmethod
+    def not_entitled(cls, message: str = "") -> "BrokerStreamEvent":
+        """The broker explicitly refused this account the feed's data (D5.5).
+
+        For an *explicit* refusal only — a documented disconnect code, an error
+        payload naming a subscription the account does not hold, a handshake
+        rejection the adapter can attribute to entitlement. A codec that reached
+        for this on a timeout or on silence would be inferring entitlement from
+        the absence of data, which permanently stops a feed that may be working
+        perfectly. See `StreamEventKind.NOT_ENTITLED`.
+        """
+        return cls(kind=StreamEventKind.NOT_ENTITLED, message=str(message or ""))
 
     @classmethod
     def error(cls, message: str = "") -> "BrokerStreamEvent":
@@ -484,13 +540,30 @@ class BrokerStreamChannel:
         """Frames to send immediately after connecting, in order. May be none."""
         return []
 
-    def connect_error(self, error: BaseException) -> Optional[str]:
-        """Reason string when a failed *handshake* means the session is dead.
+    def connect_error(self, error: BaseException) -> Optional[Any]:
+        """What a failed *handshake* means, when it means something terminal.
 
-        `None` — the default — leaves the failure to the transport's ordinary
-        backoff. See :meth:`services.brokers.base.BrokerAdapter.stream_connect_error`
-        for the full reasoning; it is per channel because two feeds of one
-        broker can refuse a dead token in two different ways.
+        Three possible answers, and the first two are what every channel written
+        before D5.5 returns:
+
+        * `None` — the default — leaves the failure to the transport's ordinary
+          backoff.
+        * a **reason string**, meaning the session is dead. Unchanged since
+          D4.6, and still the common case.
+        * a terminal :class:`BrokerStreamEvent` (D5.5), for a broker that can
+          tell an expired session from a refused entitlement at the handshake —
+          `BrokerStreamEvent.not_entitled(...)` or `.auth_expired(...)`. The
+          transport takes the same lifecycle decision it would have taken had the
+          identical event arrived in a frame.
+
+        Widening the *return type* rather than the signature is deliberate, and
+        it is the same trade D4.7 and D4.10 made: a channel that has never heard
+        of entitlement keeps returning a string or `None` and is unaffected,
+        rather than failing on a live socket because a signature moved under it.
+
+        See :meth:`services.brokers.base.BrokerAdapter.stream_connect_error` for
+        the full reasoning; it is per channel because two feeds of one broker can
+        refuse a dead token in two different ways.
         """
         return None
 

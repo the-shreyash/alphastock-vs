@@ -220,7 +220,7 @@ class AdapterStreamChannel(BrokerStreamChannel):
     def subscribe_frames(self, instruments: List[Any] = None) -> List[Any]:
         return self._adapter.stream_subscribe_frames(instruments)
 
-    def connect_error(self, error: BaseException) -> Optional[str]:
+    def connect_error(self, error: BaseException) -> Optional[Any]:
         return self._adapter.stream_connect_error(error)
 
     def decode(self, frame: Any) -> BrokerStreamEvent:
@@ -532,12 +532,23 @@ class BrokerAdapter(ABC):
         """
         return []
 
-    def stream_connect_error(self, error: BaseException) -> Optional[str]:
-        """Whether a failed stream *connection* means this session is dead.
+    def stream_connect_error(self, error: BaseException) -> Optional[Any]:
+        """Whether a failed stream *connection* means this session cannot recover.
 
-        Returns a human-readable reason when it does, and `None` — the default —
-        when the failure is ordinary connection weather the transport should
-        retry through its normal backoff.
+        Returns a human-readable reason when the session is dead, and `None` —
+        the default — when the failure is ordinary connection weather the
+        transport should retry through its normal backoff.
+
+        Since D5.5 it may instead return a terminal
+        :class:`~services.brokers.streaming.BrokerStreamEvent` when the broker's
+        rejection distinguishes an expired session from a **refused
+        entitlement**: `BrokerStreamEvent.not_entitled(reason)` stops this feed
+        without touching the account's session, where a reason string still means
+        the session is finished. A 403 is the case that makes the distinction
+        worth having — it is "your token is no longer accepted" at one broker and
+        "this account is not licensed for this data" at another, and only the
+        adapter knows which. Returning a string remains correct and is what every
+        adapter written before D5.5 does.
 
         WHY THIS IS A SEPARATE HOOK FROM `decode_stream_frame`
         -------------------------------------------------------
@@ -552,9 +563,14 @@ class BrokerAdapter(ABC):
 
         The interpretation is the adapter's because only the adapter knows what
         its broker's rejection looks like. What happens next stays generic — the
-        transport raises its own auth-expiry signal, and the existing expiry
-        path (stop the stream, detach the market feed, notify) runs unchanged.
-        Adapters must not act on the error themselves.
+        transport raises its own terminal signal, and the matching path (stop the
+        stream, detach the market feed, notify) runs unchanged. Adapters must not
+        act on the error themselves.
+
+        **Never infer either condition from silence.** A handshake that times
+        out, a socket that opens and closes, a subscription that yields no data
+        — none of them is a statement the broker made, and classifying one as
+        terminal permanently stops a feed that may be working.
         """
         return None
 

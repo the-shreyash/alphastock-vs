@@ -583,6 +583,7 @@ class BrokerEngine:
                 on_order_update=self._on_stream_order,
                 on_tick=self._on_stream_tick,
                 on_expired=self._on_stream_expired,
+                on_not_entitled=self._on_stream_not_entitled,
                 on_link_state=self._on_stream_link_state,
                 channel=channel.name,
             )
@@ -810,6 +811,50 @@ class BrokerEngine:
         await self._audit(user_id, "broker.session.expired", {"broker": broker})
         await self._push(user_id, {"type": "broker_status", "data": {
             "broker": broker, "connected": False, "session_expired": True}})
+
+    async def _on_stream_not_entitled(self, user_id: str, broker: str, channel: str = None):
+        """A broker refused this account the data one of its channels carries (D5.5).
+
+        WHY THIS IS NOT `_on_stream_expired` WITH A DIFFERENT MESSAGE
+        --------------------------------------------------------------
+        Everything that method does is wrong here. The session is **valid**: the
+        account can still fetch its portfolio, place orders and receive order
+        updates, so dropping the cached session, stopping every channel and
+        telling the user their login expired would destroy working functionality
+        on the strength of a statement the broker did not make. What the broker
+        said is narrower — this account may not consume *this feed* — and the
+        response is exactly as narrow.
+
+        Three things happen, and the list is deliberately short:
+
+        * **the account's market feed stops being resolvable**, when the refused
+          channel is the one carrying ticks. `detach_market_feed` unregisters the
+          provider, so the very next resolution ranks the baseline first again —
+          and it does so regardless of whether the feed was READY, STABLE or
+          primary, because an unregistered provider is not a candidate at all.
+          There is no state in which a provider that has lost its entitlement
+          stays selected;
+        * **the finished stream leaves the registry.** `discard` rather than
+          `stop_stream`, because this runs inside that stream's own task
+          (`BrokerStreamManager.discard`), and leaving it behind would retain the
+          account's session dict for the life of the process;
+        * **it is recorded.** An audit row, and the user-scoped `provider.status`
+          the unregistration already publishes through the Market Gateway.
+
+        Everything else is left alone on purpose: the session cache, this
+        broker's other channels, every other broker, every other user, and the
+        guest baseline. A second user of the same broker is a different
+        `BrokerStream` with a different provider, and nothing here can reach it.
+
+        The channel gate is the same one `_on_stream_link_state` uses and is
+        asked for the same reason: an entitlement refused on an *order* channel
+        says nothing about the market feed, and detaching it would demote a feed
+        that is delivering prices perfectly well.
+        """
+        if self._channel_carries_ticks(broker, channel):
+            await detach_market_feed(user_id, broker)
+        stream_manager.discard(user_id, broker, channel)
+        await self._audit(user_id, "broker.feed.entitlement_denied", {"broker": broker})
 
     # -- startup ---------------------------------------------------------------------------------------
     async def load_sessions(self):

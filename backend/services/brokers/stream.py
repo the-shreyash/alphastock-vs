@@ -174,15 +174,43 @@ transport having returned. A connection that lasted resets the ladder, and every
 other outcome leaves it climbing. The healthy path is byte-for-byte unchanged in
 behaviour: a long-lived feed that drops still reconnects in ~1–2 seconds.
 
-Still out of scope, deliberately (D5.2+): probation windows, latency scoring,
-stale-feed demotion, failure classification beyond auth expiry, and sharding one
-subscription across several connections — which is a different thing from a
-broker needing several connections, and is still not done here.
+WHAT D5.5 ADDED — THE SECOND TERMINAL CONDITION
+------------------------------------------------
+Until D5.5 this loop had exactly two shapes of answer to a broker that stopped
+serving: stop the account's session (`AUTH_EXPIRED`) or keep reconnecting
+(everything else). An account that is *not entitled* to a feed fits neither. Its
+token is valid — REST portfolio, funds, order placement and the order stream all
+keep working — so tearing the session down destroys working functionality and
+tells the user something untrue; and reconnecting cannot make an unlicensed
+account licensed, so the alternative is the churn D5.1 paces and never stops.
+
+`_NotEntitled` is the third exit, and it is deliberately the *narrowest* one:
+
+  * it ends **this channel** and no other. An entitlement is a statement about a
+    capability, not about a login, so a broker refusing its market feed must not
+    take down the same account's order socket;
+  * it does **not** reconnect. Coming back requires a deliberate lifecycle event
+    — `start_stream` after the user reconnects, a session restore at startup —
+    never this loop's own schedule;
+  * it says nothing about any other user. One `BrokerStream` is one
+    `(user, broker, channel)`, so the scope is structural rather than a rule
+    anybody has to enforce.
+
+Both routes into it are the adapter's classification and neither is an
+inference: a `NOT_ENTITLED` event decoded from a frame, or a `connect_error`
+that returns one for a handshake the broker refused on entitlement grounds.
+Silence, a timeout, an empty subscription and a malformed frame are all *absence
+of evidence* and none of them can produce it. See ADR-045.
+
+Still out of scope, deliberately: latency p95, instrument sharding across
+several connections — which is a different thing from a broker needing several
+connections, and is still not done here — and chaos testing.
 """
 
 import asyncio
 import contextlib
 import logging
+from typing import Optional
 
 from services.brokers.errors import BrokerContractError
 from services.brokers.reliability import (  # noqa: F401  (re-exported: see below)
@@ -223,6 +251,7 @@ class BrokerStream:
         on_order_update=None,
         on_tick=None,
         on_expired=None,
+        on_not_entitled=None,
         on_link_state=None,
         channel: str = DEFAULT_STREAM_CHANNEL,
     ):
@@ -248,6 +277,17 @@ class BrokerStream:
         self.on_order_update = on_order_update
         self.on_tick = on_tick
         self.on_expired = on_expired
+        #: Called `(user_id, broker, channel)` when the broker explicitly says
+        #: this account may not consume what THIS channel carries (D5.5).
+        #:
+        #: A separate callback from `on_expired` rather than a reason argument on
+        #: it, because the two have different blast radii and the difference is
+        #: the whole point: an expired token finishes the account's session, an
+        #: entitlement refusal finishes one feed and leaves the session — and
+        #: every other channel, and every other user — working. One callback with
+        #: a flag would have put that distinction in the hands of every consumer
+        #: to remember; two callbacks put it in the type.
+        self.on_not_entitled = on_not_entitled
         #: Called `(user_id, broker, up: bool, reason: str)` when this
         #: connection is established and when it is lost (D4.5).
         #:
@@ -402,15 +442,19 @@ class BrokerStream:
             except asyncio.CancelledError:
                 raise
             except _AuthExpired:
-                logger.info(
-                    "%s %s stream token expired for user %s; stopping stream.",
-                    self.broker, self.channel, self.user_id,
-                )
-                if self.on_expired:
-                    try:
-                        await self.on_expired(self.user_id, self.broker, self.channel)
-                    except Exception:
-                        pass
+                await self._finish_expired()
+                return
+            except _NotEntitled as refusal:
+                # Terminal for THIS channel and for nothing else (D5.5). The
+                # `return` is the substance of the sprint: every other exit from
+                # this loop falls through to `next_pause()` and reconnects, and
+                # reconnecting into an explicit "this account is not subscribed"
+                # cannot make the account subscribed — it can only produce the
+                # churn D5.1 paces but never stops, against a broker that has
+                # just said to stop. Coming back requires a deliberate lifecycle
+                # event (`start_stream` after a reconnect, a session restore),
+                # never this loop's own schedule.
+                await self._finish_not_entitled(str(refusal))
                 return
             except Exception as e:
                 logger.warning("%s %s stream error for user %s: %s", self.broker, self.channel, self.user_id, e)
@@ -423,6 +467,43 @@ class BrokerStream:
             # one frame later does exactly as readily as a socket that ran all
             # session.
             await asyncio.sleep(self._stability.next_pause())
+
+    async def _finish_expired(self):
+        """Report a dead token and stop. The account's session is finished."""
+        logger.info(
+            "%s %s stream token expired for user %s; stopping stream.",
+            self.broker, self.channel, self.user_id,
+        )
+        if self.on_expired:
+            try:
+                await self.on_expired(self.user_id, self.broker, self.channel)
+            except Exception:
+                pass
+
+    async def _finish_not_entitled(self, reason: str):
+        """Report a refused entitlement and stop THIS channel (D5.5).
+
+        A sibling of :meth:`_finish_expired` rather than a branch inside it,
+        because the two say different things to different consumers and the run
+        loop must not be the place that decides which. The reason is the
+        broker's own message text and carries no credential; the log line adds a
+        broker name, a channel name and a user id, exactly as the expiry path
+        does (SECURITY.md).
+
+        A consumer that raises is swallowed for the same reason it is on the
+        expiry path: the channel is already finished, and a bookkeeping error
+        must not turn a clean stop into an unhandled task exception.
+        """
+        logger.warning(
+            "%s %s stream is not entitled for user %s: %s — stopping this channel; "
+            "the session and every other channel are unaffected.",
+            self.broker, self.channel, self.user_id, reason,
+        )
+        if self.on_not_entitled:
+            try:
+                await self.on_not_entitled(self.user_id, self.broker, self.channel)
+            except Exception:
+                pass
 
     async def _connect(self, endpoint: BrokerStreamEndpoint):
         import websockets
@@ -462,9 +543,9 @@ class BrokerStream:
             # broker's rejection means; a `None` answer — the default — leaves
             # the exception to the normal backoff, unchanged. See
             # `BrokerAdapter.stream_connect_error`.
-            expired = codec.connect_error(exc)
-            if expired:
-                raise _AuthExpired(expired) from exc
+            refusal = _terminal_refusal(codec.connect_error(exc))
+            if refusal is not None:
+                raise refusal from exc
             raise
         # `safe_url`, never `url`: a broker that authenticates by query string
         # puts a live access token in it, and SECURITY.md forbids credentials in
@@ -587,6 +668,14 @@ class BrokerStream:
         if event.kind is StreamEventKind.AUTH_EXPIRED:
             raise _AuthExpired(event.message or "broker reported an expired session")
 
+        if event.kind is StreamEventKind.NOT_ENTITLED:
+            # Ungated by capability, exactly as AUTH_EXPIRED is: a refusal must
+            # be actionable on any stream, and a broker that mis-declared what it
+            # serves must not thereby lose the ability to say "stop". Raised
+            # rather than returned so it unwinds through the same `finally` that
+            # closes the socket and reports the link down.
+            raise _NotEntitled(event.message or "broker reported this account is not entitled")
+
         if event.kind is StreamEventKind.ERROR:
             logger.warning("%s stream reported an error: %s", self.broker, event.message)
             return
@@ -668,6 +757,49 @@ class _AuthExpired(Exception):
     """Raised inside a stream loop when the broker reports a dead token."""
 
 
+class _NotEntitled(Exception):
+    """Raised inside a stream loop when the broker refuses this account the feed.
+
+    Distinct from :class:`_AuthExpired` and deliberately not a subclass of it:
+    `except _AuthExpired` is what tears down the whole session, and an
+    entitlement refusal must never take that path. See ADR-045.
+    """
+
+
+def _terminal_refusal(classification) -> Optional[Exception]:
+    """Turn a channel's `connect_error` answer into the exception to raise, if any.
+
+    Accepts the three answers `BrokerStreamChannel.connect_error` may give and
+    normalises them here, once, so the run loop has one shape to react to and
+    a channel's return type is not a thing the transport has to know about:
+
+    * `None`/empty        → `None`; ordinary backoff, unchanged since D4.6.
+    * a reason string     → auth expiry, unchanged since D4.6.
+    * a terminal event    → whatever that event classifies it as (D5.5).
+
+    A non-terminal event (TICKS, ORDER, ERROR, IGNORE) is refused rather than
+    guessed at: a handshake that produced ticks is a codec defect, and silently
+    reading it as "keep retrying" would hide it. The failure falls through to the
+    ordinary backoff and is logged, which is what an unclassified handshake
+    failure has always done.
+    """
+    if classification is None:
+        return None
+    if isinstance(classification, BrokerStreamEvent):
+        if classification.kind is StreamEventKind.NOT_ENTITLED:
+            return _NotEntitled(classification.message or "broker refused this account the feed")
+        if classification.kind is StreamEventKind.AUTH_EXPIRED:
+            return _AuthExpired(classification.message or "broker reported an expired session")
+        logger.warning(
+            "A stream channel classified a failed handshake as %s, which is not a "
+            "terminal condition — falling back to the reconnect schedule",
+            classification.kind.value,
+        )
+        return None
+    text = str(classification).strip()
+    return _AuthExpired(text) if text else None
+
+
 class BrokerStreamManager:
     """Owns every live broker stream: start/stop/replace per (user, broker, channel).
 
@@ -692,6 +824,7 @@ class BrokerStreamManager:
         on_order_update=None,
         on_tick=None,
         on_expired=None,
+        on_not_entitled=None,
         on_link_state=None,
         channel: str = DEFAULT_STREAM_CHANNEL,
     ):
@@ -706,6 +839,7 @@ class BrokerStreamManager:
             on_order_update=on_order_update,
             on_tick=on_tick,
             on_expired=on_expired,
+            on_not_entitled=on_not_entitled,
             on_link_state=on_link_state,
             channel=channel,
         )

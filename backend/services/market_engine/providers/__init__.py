@@ -35,6 +35,7 @@ from services.market_engine.providers.registry import (
 )
 from services.market_engine.providers.streaming import (
     DEFAULT_TICK_MAX_AGE_SECONDS,
+    LATENCY_WINDOW_SAMPLES,
     PROBATION_WINDOW_SECONDS,
     STREAMING_FEED_PRIORITY,
     FeedReadiness,
@@ -46,6 +47,7 @@ from services.market_engine.providers.yahoo import YahooPollingAdapter
 __all__ = [
     "DEFAULT_TICK_MAX_AGE_SECONDS",
     "GLOBAL_CONTEXT",
+    "LATENCY_WINDOW_SAMPLES",
     "PROBATION_WINDOW_SECONDS",
     "PUSH_CAPABILITIES",
     "STREAMING_FEED_PRIORITY",

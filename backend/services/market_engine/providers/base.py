@@ -435,6 +435,38 @@ class MarketDataProvider(ABC):
         """
         return False
 
+    @property
+    def delivery_latency(self) -> Optional[float]:
+        """How long this provider makes a consumer wait for its next usable
+        price, in seconds — or None when that is not established (D5.4).
+
+        The Source Manager's third ranking term, below health and probation. It
+        is a *comparative* number and not a classification: there is no
+        threshold for "slow", because the same interval means opposite things
+        on a liquid large-cap at the open and on an illiquid instrument at
+        14:30, and a millisecond threshold would score honest feeds badly for
+        carrying quiet instruments.
+
+        WHAT IT IS NOT
+        Not exchange-to-ingest latency. No provider supplies an exchange
+        timestamp at the canonical boundary — `MarketTick` deliberately has no
+        field for one — so the platform cannot say how stale a price was when it
+        arrived, only how long it waited for the next one. ADR-044 records that
+        as LIM-D5.4-1 rather than closing the gap with an invented number.
+
+        The default is `None`, and it is a statement rather than a convenience,
+        exactly as `is_on_probation`'s `False` is. A provider that is *polled*
+        has no delivery event to time: the gateway decides when to ask it, so
+        any interval measured would be the platform's own poll schedule read
+        back. Only a provider that is pushed into has a cadence of its own.
+
+        `None` is not zero and is not an estimate. It ranks the provider last
+        within its own health/probation group and nowhere else — never first,
+        which would have promoted the permanently-unmeasurable baseline above
+        every streaming feed and silently undone D4.5.
+        """
+        return None
+
     # ── Push surface (D4.4) ──────────────────────────────
     #
     # MARKET_DATA_ARCHITECTURE.md's adapter contract, rule 5: "polling adapters
@@ -643,6 +675,10 @@ class MarketDataProvider(ABC):
             "connected": self._connected,
             "ready": self.is_ready,
             "on_probation": self.is_on_probation,
+            # D5.4. `None` when not established — never 0, which would read as
+            # instantaneous delivery, and never the sort key's infinity, which
+            # exists only inside the comparison and is not JSON.
+            "delivery_latency_seconds": self.delivery_latency,
             "subscriptions": len(self._subscribed),
             "scope": "global" if self.owner_user_id is None else "user",
             "capabilities": sorted(c.value for c in self.capabilities),

@@ -279,26 +279,34 @@ TRADE_TIME_OFFSETS: Dict[int, int] = {CODE_TICKER: 12, CODE_QUOTE: 14, CODE_FULL
 DISCONNECT_BYTES = 10
 DISCONNECT_CODE_OFFSET = 8
 
-#: Disconnect reasons that mean this session cannot stream, ever, until the user
-#: acts. Reconnecting into one of these is exactly what a dead session must not
-#: do: retry forever, stay registered as a healthy provider, and quietly burn CPU
-#: and log lines.
+#: Disconnect reasons that mean this account's **session** is finished: the token
+#: is dead and nothing it can reach works until the user reconnects.
+#: Reconnecting into one of these is exactly what a dead session must not do:
+#: retry forever, stay registered as a healthy provider, and quietly burn CPU and
+#: log lines.
 #:
-#: 806 ("Data APIs not subscribed") is in this set on purpose, and it is the one
-#: judgement call here rather than a reading of the protocol. It is an
-#: *entitlement* failure, not an authentication one — the token is fine, the
-#: account simply is not licensed for the data feed — and the closed
-#: `StreamEventKind` set offers exactly two outcomes, "stop" and "retry forever".
-#: Retrying forever cannot make an unlicensed account licensed, so stopping is
-#: the honest choice; the cost is that the user is asked to reconnect a session
-#: that is technically still valid. The message carried through says what
-#: actually happened rather than "token expired", so the log and the audit record
-#: are not misleading. Recorded as a limitation in TASK.md.
-DISCONNECT_FATAL: Dict[int, str] = {
-    806: "Dhan disconnected the market feed: this account is not subscribed to Dhan's Data APIs.",
+#: 806 is deliberately NOT here — see :data:`DISCONNECT_NOT_ENTITLED`.
+DISCONNECT_AUTH_FATAL: Dict[int, str] = {
     807: "Dhan disconnected the market feed: the access token has expired. Please reconnect.",
     808: "Dhan disconnected the market feed: the client id or access token is invalid. Please reconnect.",
     809: "Dhan disconnected the market feed: Dhan could not authenticate the session. Please reconnect.",
+}
+
+#: Disconnect reasons that mean this account is not **entitled** to the feed.
+#:
+#: 806 ("Data APIs not subscribed") is the platform's first entitlement failure
+#: and the reason `StreamEventKind.NOT_ENTITLED` exists (D5.5, ADR-045). Until
+#: D5.5 it was reported through the auth-expiry path with an honest message and a
+#: dishonest *state*: the token is fine — this account can still fetch its
+#: portfolio, place orders and receive order updates — and treating it as an
+#: expired session tore all of that down and asked the user to reconnect a login
+#: that had not expired (ADR-040 recorded the approximation as a limitation).
+#:
+#: Classified here, in the adapter, because "806" is Dhan's vocabulary; what the
+#: transport receives is a broker-neutral refusal and what it does with it is the
+#: same for every broker.
+DISCONNECT_NOT_ENTITLED: Dict[int, str] = {
+    806: "Dhan disconnected the market feed: this account is not subscribed to Dhan's Data APIs.",
 }
 
 #: Disconnect reasons the transport's ordinary backoff is the right answer to.
@@ -521,9 +529,15 @@ def decode_disconnect(payload: bytes) -> Optional[BrokerStreamEvent]:
     if len(payload) < DISCONNECT_BYTES or payload[0] != CODE_DISCONNECT:
         return None
     (reason,) = struct.unpack_from("<H", payload, DISCONNECT_CODE_OFFSET)
-    fatal = DISCONNECT_FATAL.get(reason)
+    fatal = DISCONNECT_AUTH_FATAL.get(reason)
     if fatal:
         return BrokerStreamEvent.auth_expired(fatal)
+    refused = DISCONNECT_NOT_ENTITLED.get(reason)
+    if refused:
+        # Terminal for this feed and for nothing else: the session stays, the
+        # account keeps trading, and the transport does not reconnect into a
+        # refusal it cannot argue with (D5.5).
+        return BrokerStreamEvent.not_entitled(refused)
     transient = DISCONNECT_TRANSIENT.get(reason)
     return BrokerStreamEvent.error(transient or f"Dhan disconnected the market feed (code {reason}).")
 

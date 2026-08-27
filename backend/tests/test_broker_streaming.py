@@ -7866,11 +7866,19 @@ def test_a_dhan_disconnect_frame_for_a_dead_token_stops_the_stream():
     frame would fall through as an unknown packet and be ignored, leaving a
     stream that reconnects forever into a session Dhan has already ended.
     """
-    for code in (806, 807, 808, 809):
+    for code in (807, 808, 809):
         event = _dhan().decode_stream_frame(_dhan_disconnect(code))
         assert event.kind is StreamEventKind.AUTH_EXPIRED, f"code {code} did not stop the stream"
         assert str(code) not in event.message, "the raw wire code leaked into a user-facing message"
         assert event.message, f"code {code} stopped the stream with no reason"
+
+    # 806 also stops the stream, and D5.5 stopped calling it an expired session:
+    # the token is valid and only the market-data entitlement is missing, so it
+    # takes the narrower path that leaves the account's session alone. See
+    # `test_provider_entitlement.py` and ADR-045.
+    refused = _dhan().decode_stream_frame(_dhan_disconnect(806))
+    assert refused.kind is StreamEventKind.NOT_ENTITLED
+    assert "806" not in refused.message and refused.message
 
     ticks, _orders, expired, _socket = drive_stream(
         _dhan(), [_dhan_quote(), _dhan_disconnect(807), _dhan_quote(price=9999.0)],
