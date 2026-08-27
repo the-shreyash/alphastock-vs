@@ -98,6 +98,35 @@ def run(coro):
     return asyncio.run(coro)
 
 
+@pytest.fixture
+def no_probation_window(monkeypatch):
+    """Collapse D5.2's probation window for the tests written before it existed.
+
+    Every test that takes this fixture is a D4 test: it asserts that a feed
+    reaches READY on real broker bytes and that resolution follows readiness.
+    D5.2 keeps readiness exactly as it was and adds a second, independent gate on
+    top — a READY feed must keep delivering for `PROBATION_WINDOW_SECONDS`
+    before it *outranks* a steady provider — so with the real window these tests
+    would be asserting probation rather than the thing they were written to
+    cover, and would do it by proxy, thirty-eight times over.
+
+    So the window is set to zero here and tested properly elsewhere:
+    `tests/test_provider_probation.py` exercises it at the published value,
+    including through the same real broker seam, and its falsification tests are
+    what would catch probation being removed. Zero is chosen rather than a small
+    positive number because it makes these tests deterministic — the promoting
+    tick is the promotion — instead of merely usually fast enough.
+
+    Patched on the module constant rather than on an instance: providers built
+    inside `attach_market_feed`, several layers below the test, read it at
+    construction, and reaching down to mutate them afterwards would be a test
+    knowing the shape of the code beneath the seam it is exercising.
+    """
+    from services.market_engine.providers import streaming as streaming_module
+
+    monkeypatch.setattr(streaming_module, "PROBATION_WINDOW_SECONDS", 0.0)
+
+
 # ==================================================================
 # DB-2 — connected-broker restoration
 # ==================================================================
@@ -1918,7 +1947,7 @@ def test_a_connected_feed_is_not_a_ready_feed():
     assert manager.resolve(Capability.TICKS, context=ctx()) is feed
 
 
-def test_the_make_before_break_ordering_holds_at_every_step():
+def test_the_make_before_break_ordering_holds_at_every_step(no_probation_window):
     """The ordering assertion: the baseline is released last, or never.
 
     Checked after each step rather than only at the end, because the failure
@@ -1953,7 +1982,7 @@ def test_the_make_before_break_ordering_holds_at_every_step():
     assert _quote_provider(manager, ctx("SPX")) is baseline
 
 
-def test_a_malformed_first_tick_does_not_promote_the_feed():
+def test_a_malformed_first_tick_does_not_promote_the_feed(no_probation_window):
     """Evidence means a *valid* canonical tick, not a delivered frame.
 
     A feed whose records are all rejected has demonstrated the opposite of
@@ -1993,7 +2022,7 @@ def test_a_feed_that_fails_before_promotion_leaves_the_baseline_primary():
     assert feed.describe()["last_failure"] == "connection refused"
 
 
-def test_a_feed_that_fails_after_promotion_returns_the_baseline_to_primary():
+def test_a_feed_that_fails_after_promotion_returns_the_baseline_to_primary(no_probation_window):
     """Post-promotion failure: demotion on the very next resolution.
 
     No health counter has to escalate, no timer has to fire, and nothing polls:
@@ -2014,7 +2043,7 @@ def test_a_feed_that_fails_after_promotion_returns_the_baseline_to_primary():
     assert feed.covered_symbols == ()
 
 
-def test_a_reconnected_feed_re_earns_readiness_rather_than_inheriting_it():
+def test_a_reconnected_feed_re_earns_readiness_rather_than_inheriting_it(no_probation_window):
     """Evidence is per link. A feed that ticked once, died and came back has
     proved nothing about the connection it now holds."""
     from services.market_engine.providers import FeedReadiness
@@ -2035,7 +2064,7 @@ def test_a_reconnected_feed_re_earns_readiness_rather_than_inheriting_it():
     assert _quote_provider(manager, ctx()) is feed
 
 
-def test_a_feed_that_never_subscribed_cannot_be_promoted_by_data_alone():
+def test_a_feed_that_never_subscribed_cannot_be_promoted_by_data_alone(no_probation_window):
     """A feed nobody can say what was asked of does not take the quote path.
 
     The gate has three conditions and this is the one that is easiest to leave
@@ -2054,7 +2083,7 @@ def test_a_feed_that_never_subscribed_cannot_be_promoted_by_data_alone():
     assert _quote_provider(manager, ctx()) is feed
 
 
-def test_a_promoted_feed_only_answers_for_instruments_it_actually_streams():
+def test_a_promoted_feed_only_answers_for_instruments_it_actually_streams(no_probation_window):
     """Coverage, not just readiness: the baseline keeps everything else.
 
     MARKET_DATA_ARCHITECTURE.md's per-symbol rule. A promoted feed that claimed
@@ -2072,7 +2101,7 @@ def test_a_promoted_feed_only_answers_for_instruments_it_actually_streams():
     assert feed.covered_symbols == ("RELIANCE",)
 
 
-def test_a_feed_whose_ticks_go_stale_stops_covering_them():
+def test_a_feed_whose_ticks_go_stale_stops_covering_them(no_probation_window):
     """The backstop beneath the explicit link-down signal.
 
     A link that dies without saying so stops delivering, and a price older than
@@ -2092,7 +2121,7 @@ def test_a_feed_whose_ticks_go_stale_stops_covering_them():
     assert _quote_provider(manager, ctx()) is feed
 
 
-def test_one_users_feed_failure_moves_only_that_users_feed():
+def test_one_users_feed_failure_moves_only_that_users_feed(no_probation_window):
     """User entitlement isolation across the switch.
 
     The property D4.4 established by construction (`owner_user_id`), re-asserted
@@ -2143,7 +2172,7 @@ def test_declaring_the_quote_capability_grants_nothing_on_its_own():
     assert _quote_provider(manager, ctx()) is baseline
 
 
-def test_promotion_and_demotion_are_deterministic_under_repeated_events():
+def test_promotion_and_demotion_are_deterministic_under_repeated_events(no_probation_window):
     """Duplicate readiness, duplicate disconnects, and a tick on a dead link.
 
     Repeated lifecycle events are normal on a reconnecting transport. The final
@@ -2161,16 +2190,24 @@ def test_promotion_and_demotion_are_deterministic_under_repeated_events():
     feed.bind_readiness_listener(listener)
 
     # Duplicate readiness evidence: one promotion, not three.
+    #
+    # Two transitions, not one, because the listener carries both axes of the
+    # feed's state (D5.2): readiness subscribed -> ready, and stability
+    # probation -> stable. With this test's probation window at zero the second
+    # follows the first on the same tick; at the published window it would
+    # arrive later, on the tick that completed the window. What is asserted here
+    # is the deduplication — three identical batches produce each transition
+    # once — and that holds on both axes.
     for _ in range(3):
         run(feed.on_raw([_tick()]))
-    assert transitions == [("subscribed", "ready")]
+    assert transitions == [("subscribed", "ready"), ("probation", "stable")]
     assert _quote_provider(manager, ctx()) is feed
 
     # Repeated disconnects: one demotion.
     for _ in range(3):
         run(feed.mark_link_down("socket closed"))
     assert transitions[-1] == ("ready", "failed")
-    assert len(transitions) == 2
+    assert len(transitions) == 3
     assert _quote_provider(manager, ctx()) is baseline
 
     # A tick arriving on a link already reported dead promotes nothing: the
@@ -2183,7 +2220,9 @@ def test_promotion_and_demotion_are_deterministic_under_repeated_events():
     run(feed.mark_link_up())
     run(feed.on_raw([_tick()]))
     assert _quote_provider(manager, ctx()) is feed
-    assert [t[1] for t in transitions] == ["ready", "failed", "subscribed", "ready"]
+    assert [t[1] for t in transitions] == [
+        "ready", "stable", "failed", "subscribed", "ready", "stable",
+    ]
 
 
 def test_a_feed_that_disconnects_during_promotion_does_not_end_up_primary():
@@ -2243,7 +2282,7 @@ def test_the_baseline_being_unavailable_does_not_change_the_gate():
 # ------------------------------------------------------------------
 
 
-def test_removing_the_readiness_gate_would_promote_an_unproven_feed():
+def test_removing_the_readiness_gate_would_promote_an_unproven_feed(no_probation_window):
     """The mutation the make-before-break tests exist to catch.
 
     Every "not promoted" assertion above is only worth something if the gate is
@@ -2258,7 +2297,16 @@ def test_removing_the_readiness_gate_would_promote_an_unproven_feed():
     _registry, manager, baseline, feed, ctx = _switching_fixture()
     assert _quote_provider(manager, ctx()) is baseline
 
+    # `is_on_probation` is neutralised alongside the gate because D5.2 added a
+    # second, independent hold on the same switch: a feed with the readiness
+    # gate removed is now *eligible* and still ranked behind the baseline until
+    # it has served its probation window. Removing only the readiness gate would
+    # leave this test green for the wrong reason — the feed would stay on the
+    # baseline because of probation, and the D4.5 gate could be deleted without
+    # anything here noticing. Probation's own falsification lives in
+    # tests/test_provider_probation.py.
     with patch.object(StreamingTickProvider, "is_ready", property(lambda self: True)), \
+            patch.object(StreamingTickProvider, "is_on_probation", property(lambda self: False)), \
             patch.object(StreamingTickProvider, "covers", lambda self, symbol: True):
         assert _quote_provider(manager, ctx()) is feed, (
             "with the readiness gate removed the feed still did not take the quote path — "
@@ -2268,7 +2316,7 @@ def test_removing_the_readiness_gate_would_promote_an_unproven_feed():
     assert _quote_provider(manager, ctx()) is baseline
 
 
-def test_breaking_before_making_is_what_the_ordering_test_would_catch():
+def test_breaking_before_making_is_what_the_ordering_test_would_catch(no_probation_window):
     """The wrong ordering, performed deliberately.
 
     Releasing the baseline before the feed is ready is the failure mode
@@ -2355,7 +2403,7 @@ def test_no_polling_is_introduced_by_the_switch():
 # ------------------------------------------------------------------
 
 
-def test_a_broker_feed_is_promoted_and_demoted_through_the_real_seam():
+def test_a_broker_feed_is_promoted_and_demoted_through_the_real_seam(no_probation_window):
     """End to end on the global registry: attach, tick, promote, drop, demote.
 
     The unit tests above build their own registry. This one uses the real one,
@@ -2397,7 +2445,7 @@ def test_a_broker_feed_is_promoted_and_demoted_through_the_real_seam():
             assert manager.resolve(Capability.QUOTES, context=ctx) is provider
 
 
-def test_a_promoted_feed_serves_a_quote_carrying_no_provider_identity():
+def test_a_promoted_feed_serves_a_quote_carrying_no_provider_identity(no_probation_window):
     """The quote path, through the public gateway API, after a promotion.
 
     Two properties in one drive, because they fail together: the quote is
@@ -2438,7 +2486,7 @@ def test_a_promoted_feed_serves_a_quote_carrying_no_provider_identity():
     assert other_user["source_tier"] == "delayed", "another user's request was served by this feed"
 
 
-def test_a_promotion_is_announced_only_to_the_user_who_owns_the_feed():
+def test_a_promotion_is_announced_only_to_the_user_who_owns_the_feed(no_probation_window):
     """The status event follows the entitlement.
 
     A per-user promotion published platform-wide would tell every other user's
@@ -2556,7 +2604,7 @@ def test_the_transport_reports_its_link_state_to_whoever_owns_the_feed():
     assert socket.sent, "no subscribe frame was sent — the ordering claim is untested"
 
 
-def test_the_feed_status_a_user_sees_follows_their_own_promotion():
+def test_the_feed_status_a_user_sees_follows_their_own_promotion(no_probation_window):
     """The tier indicator moves for the promoted user and nobody else.
 
     `status()` asks about the feed, not about an instrument, so it is the one
@@ -3017,7 +3065,7 @@ def _kite_map():
     )
 
 
-def test_a_connected_kite_stream_is_not_ready_until_a_real_packet_arrives():
+def test_a_connected_kite_stream_is_not_ready_until_a_real_packet_arrives(no_probation_window):
     """CONNECTED != READY, driven by the bytes rather than by a synthetic tick.
 
     Every milestone short of data is reached — registered, link up, subscribed,
@@ -3058,7 +3106,7 @@ def test_a_connected_kite_stream_is_not_ready_until_a_real_packet_arrives():
         assert manager.resolve(Capability.QUOTES, context=ctx) is feed
 
 
-def test_a_kite_feed_is_promoted_over_the_baseline_and_falls_back_on_link_loss():
+def test_a_kite_feed_is_promoted_over_the_baseline_and_falls_back_on_link_loss(no_probation_window):
     """Make-before-break, end to end, with Zerodha as the concrete feed.
 
     The baseline is never unregistered and never disconnected at any point — it
@@ -3100,7 +3148,7 @@ def test_a_kite_feed_is_promoted_over_the_baseline_and_falls_back_on_link_loss()
         assert manager.resolve(Capability.QUOTES, context=ctx) is feed
 
 
-def test_a_kite_feed_that_never_ticks_leaves_the_baseline_primary_for_everyone():
+def test_a_kite_feed_that_never_ticks_leaves_the_baseline_primary_for_everyone(no_probation_window):
     """A failure before readiness changes nothing, for the owner or anybody else."""
     from services.brokers.market_feed import set_market_feed_link
     from services.market_engine.providers import Capability, ResolutionContext, YahooPollingAdapter
@@ -3125,7 +3173,7 @@ def test_a_kite_feed_that_never_ticks_leaves_the_baseline_primary_for_everyone()
         assert feed_a is not feed_b
 
 
-def test_the_engine_carries_kite_bytes_all_the_way_into_the_registered_feed():
+def test_the_engine_carries_kite_bytes_all_the_way_into_the_registered_feed(no_probation_window):
     """The real seam: `BrokerEngine._on_stream_tick` with what the Kite codec produced.
 
     This is the join every earlier test stops short of — the engine's instrument
@@ -3199,7 +3247,7 @@ def test_no_kite_credential_or_identifier_can_reach_a_market_tick():
         assert forbidden not in blob, f"{forbidden} reached a canonical market tick"
 
 
-def test_a_kite_quote_carries_no_broker_identity_and_no_other_users_data():
+def test_a_kite_quote_carries_no_broker_identity_and_no_other_users_data(no_probation_window):
     """The public gateway surface, after a Zerodha promotion."""
     from services.market_engine.gateway import market_gateway
     from services.market_engine.providers import YahooPollingAdapter
@@ -3881,7 +3929,7 @@ def _upstox_canonical(price=2650.75, key="NSE_EQ|INE002A01018"):
     return canonical_ticks(_upstox_ticks(_upstox_frame(ltpc={key: price})), _upstox_map(), broker="upstox")
 
 
-def test_a_connected_upstox_stream_is_not_ready_until_a_real_frame_arrives():
+def test_a_connected_upstox_stream_is_not_ready_until_a_real_frame_arrives(no_probation_window):
     """CONNECTED != READY, driven by Upstox's own bytes rather than a synthetic tick.
 
     Every milestone short of data is reached — registered, link up, subscribed,
@@ -3920,7 +3968,7 @@ def test_a_connected_upstox_stream_is_not_ready_until_a_real_frame_arrives():
         assert manager.resolve(Capability.QUOTES, context=ctx) is feed
 
 
-def test_an_upstox_feed_is_promoted_over_the_baseline_and_falls_back_on_link_loss():
+def test_an_upstox_feed_is_promoted_over_the_baseline_and_falls_back_on_link_loss(no_probation_window):
     """Make-before-break, end to end, with Upstox as the concrete feed.
 
     The baseline is never unregistered and never disconnected at any point —
@@ -3956,7 +4004,7 @@ def test_an_upstox_feed_is_promoted_over_the_baseline_and_falls_back_on_link_los
         assert manager.resolve(Capability.QUOTES, context=ctx) is feed
 
 
-def test_an_upstox_order_channel_link_loss_does_not_demote_the_market_feed():
+def test_an_upstox_order_channel_link_loss_does_not_demote_the_market_feed(no_probation_window):
     """The defect the channel split would otherwise have introduced.
 
     A broker with two connections has two link signals for one account. Relaying
@@ -3999,7 +4047,7 @@ def test_an_upstox_order_channel_link_loss_does_not_demote_the_market_feed():
         assert manager.resolve(Capability.QUOTES, context=ctx) is baseline
 
 
-def test_a_reconnected_upstox_feed_cannot_answer_from_the_dead_links_prices():
+def test_a_reconnected_upstox_feed_cannot_answer_from_the_dead_links_prices(no_probation_window):
     """A price from a connection that no longer exists must never answer a quote.
 
     WHY THIS TEST EXISTS
@@ -4085,7 +4133,7 @@ def test_upstox_registers_through_the_existing_provider_framework():
         assert provider.owner_user_id == "u1"
 
 
-def test_one_users_upstox_feed_failure_moves_only_that_users_feed():
+def test_one_users_upstox_feed_failure_moves_only_that_users_feed(no_probation_window):
     """Entitlement isolation, unchanged by a second broker.
 
     A per-user feed is legally that user's own data, so B must never resolve to
@@ -4314,7 +4362,7 @@ def test_zerodha_and_upstox_speak_different_protocols_and_produce_identical_cano
     assert kite_tick["symbol"] == "RELIANCE" and kite_tick["price"] == 2650.75
 
 
-def test_both_brokers_reach_the_market_gateway_through_the_identical_seam():
+def test_both_brokers_reach_the_market_gateway_through_the_identical_seam(no_probation_window):
     """Same registration, same readiness gate, same failover — for both brokers.
 
     Run as one scenario rather than two so a divergence shows up as a difference
@@ -5363,7 +5411,7 @@ def test_an_expired_angelone_rest_session_is_reported_as_an_auth_failure():
 # -- readiness, promotion, failover ---------------------------------------------
 
 
-def test_a_connected_angelone_stream_is_not_ready_until_a_real_packet_arrives():
+def test_a_connected_angelone_stream_is_not_ready_until_a_real_packet_arrives(no_probation_window):
     """CONNECTED != READY, driven by SmartAPI's own bytes.
 
     Every milestone short of data is reached — registered, link up, subscribed,
@@ -5400,7 +5448,7 @@ def test_a_connected_angelone_stream_is_not_ready_until_a_real_packet_arrives():
         assert registry.get(baseline.name) is baseline and baseline.is_connected
 
 
-def test_an_angelone_feed_is_promoted_over_the_baseline_and_falls_back_on_link_loss():
+def test_an_angelone_feed_is_promoted_over_the_baseline_and_falls_back_on_link_loss(no_probation_window):
     """The unchanged D4.5 machinery, reached by a third broker."""
     from services.brokers.market_feed import set_market_feed_link
     from services.market_engine.providers import Capability, ResolutionContext, YahooPollingAdapter
@@ -5505,7 +5553,7 @@ def test_removing_the_angelone_tick_capability_removes_its_market_feed():
 # -- isolation ------------------------------------------------------------------
 
 
-def test_four_users_on_four_providers_stay_on_their_own(caplog):
+def test_four_users_on_four_providers_stay_on_their_own(no_probation_window, caplog):
     """Angel One, Zerodha, Upstox and the shared baseline, at once.
 
     The one test that exercises every streaming broker the platform has plus the
@@ -5578,7 +5626,7 @@ def test_an_angelone_quote_carries_no_broker_identity_and_no_other_users_data():
 # -- the engine seam -------------------------------------------------------------
 
 
-def test_the_engine_carries_angelone_bytes_all_the_way_into_the_registered_feed():
+def test_the_engine_carries_angelone_bytes_all_the_way_into_the_registered_feed(no_probation_window):
     """The real join: the engine's instrument map, the canonical boundary, the push."""
     from services.market_engine.providers import Capability, ResolutionContext, YahooPollingAdapter
 
@@ -6826,7 +6874,7 @@ def test_an_expired_fyers_rest_session_is_reported_as_an_auth_failure():
 # -- readiness, promotion, failover ---------------------------------------------
 
 
-def test_a_connected_fyers_stream_is_not_ready_until_a_real_packet_arrives():
+def test_a_connected_fyers_stream_is_not_ready_until_a_real_packet_arrives(no_probation_window):
     """CONNECTED != READY, driven by Fyers' own bytes.
 
     Every milestone short of data is reached — registered, link up, credential
@@ -6864,7 +6912,7 @@ def test_a_connected_fyers_stream_is_not_ready_until_a_real_packet_arrives():
         assert registry.get(baseline.name) is baseline and baseline.is_connected
 
 
-def test_a_fyers_feed_is_promoted_over_the_baseline_and_falls_back_on_link_loss():
+def test_a_fyers_feed_is_promoted_over_the_baseline_and_falls_back_on_link_loss(no_probation_window):
     from services.brokers.market_feed import set_market_feed_link
     from services.market_engine.providers import Capability, ResolutionContext, YahooPollingAdapter
 
@@ -6956,7 +7004,7 @@ def test_removing_the_fyers_tick_capability_removes_its_market_feed():
 # -- isolation ------------------------------------------------------------------
 
 
-def test_five_users_on_five_providers_stay_on_their_own():
+def test_five_users_on_five_providers_stay_on_their_own(no_probation_window):
     """Fyers, Angel One, Zerodha, Upstox and the shared baseline, at once.
 
     The one test that exercises every streaming broker the platform has plus the
@@ -7022,7 +7070,7 @@ def test_a_fyers_quote_carries_no_broker_identity_and_no_other_users_data():
 # -- the engine seam -------------------------------------------------------------
 
 
-def test_the_engine_carries_fyers_bytes_all_the_way_into_the_registered_feed():
+def test_the_engine_carries_fyers_bytes_all_the_way_into_the_registered_feed(no_probation_window):
     """The real join: the engine's instrument map, the canonical boundary, the push."""
     from services.market_engine.providers import Capability, ResolutionContext, YahooPollingAdapter
 
@@ -7999,7 +8047,7 @@ def test_a_dhan_codec_declaring_no_tick_capability_delivers_nothing():
 # -- readiness and failover ----------------------------------------------------
 
 
-def test_a_dhan_feed_is_promoted_only_by_a_canonical_tick_on_the_current_link():
+def test_a_dhan_feed_is_promoted_only_by_a_canonical_tick_on_the_current_link(no_probation_window):
     """Not on connect, not on subscribe, not on a timer. D4.5's rule, unchanged.
 
     Dhan sends no acknowledgement of a subscription at all, which makes the point
@@ -8120,7 +8168,7 @@ def test_five_brokers_speak_five_protocols_and_produce_one_canonical_tick():
     assert [batch[0]["volume"] for batch in (kite, upstox, angel, fyers)] == [None, None, None, None]
 
 
-def test_six_users_on_six_providers_stay_on_their_own():
+def test_six_users_on_six_providers_stay_on_their_own(no_probation_window):
     """Dhan, Fyers, Angel One, Zerodha, Upstox and the shared baseline, at once.
 
     The one test that exercises every streaming broker the platform has plus the
@@ -8179,7 +8227,7 @@ def test_six_users_on_six_providers_stay_on_their_own():
             assert feeds[user].subscribed_symbols == ("RELIANCE",)
 
 
-def test_two_dhan_users_of_the_SAME_broker_never_share_a_feed():
+def test_two_dhan_users_of_the_SAME_broker_never_share_a_feed(no_probation_window):
     """Two accounts at one broker, resolved the way a consumer actually resolves.
 
     WHY THIS TEST RESOLVES THROUGH THE SOURCE MANAGER
@@ -8279,7 +8327,7 @@ def test_a_dhan_quote_carries_no_broker_identity_and_no_other_users_data():
 # -- the engine seam -----------------------------------------------------------
 
 
-def test_the_engine_carries_dhan_bytes_all_the_way_into_the_registered_feed():
+def test_the_engine_carries_dhan_bytes_all_the_way_into_the_registered_feed(no_probation_window):
     """The real join: the engine's instrument map, the canonical boundary, the push."""
     from services.market_engine.providers import Capability, ResolutionContext, YahooPollingAdapter
 

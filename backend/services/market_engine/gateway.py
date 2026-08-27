@@ -299,7 +299,13 @@ class MarketGateway:
 
     async def _on_provider_readiness(self, provider: MarketDataProvider,
                                      previous: Any, current: Any) -> None:
-        """A pushed feed changed readiness — promote or demote its owner's feed.
+        """A pushed feed changed state — promote or demote its owner's feed.
+
+        Both axes of a feed's state arrive here: readiness (D4.5) and stability
+        (D5.2). Deliberately handled identically and not branched on, because
+        the consumer-visible fact is the same in both cases — the tier serving
+        this user may have moved — and the answer is the same too: republish the
+        owner's status and let resolution speak for itself.
 
         There is nothing to *do* here beyond announcing it, and that is the
         design rather than an omission. Promotion is not an action the gateway
@@ -314,7 +320,7 @@ class MarketGateway:
         """
         owner = provider.owner_user_id
         logger.info(
-            "Streaming feed %s readiness %s -> %s (owner=%s)",
+            "Streaming feed %s state %s -> %s (owner=%s)",
             provider.name,
             getattr(previous, "value", previous),
             getattr(current, "value", current),

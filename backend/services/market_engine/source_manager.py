@@ -11,6 +11,7 @@ The resolution path, end to end:
     capability + context
         -> registry.candidates_for()      entitlement, capability, health
         -> health ranking                 UP/UNKNOWN before DEGRADED
+        -> probation ranking              proved before merely usable (D5.2)
         -> Resolution(provider, chain)    selected + ordered failover chain
         -> Market Gateway
 
@@ -141,6 +142,32 @@ HEALTH_RANK = {
     ProviderState.DEGRADED: 1,
 }
 
+#: Selection order among providers of equal health (D5.2). Lower wins.
+#:
+#: A provider that has proved itself on its current connection is preferred over
+#: one that is merely usable — MARKET_DATA_ARCHITECTURE.md's probation window,
+#: applied where every other selection rule already lives. `is_on_probation` is
+#: a generic property of the provider contract that defaults to False, so this
+#: term is inert for the polled baseline and for any provider without a link to
+#: prove anything about.
+#:
+#: WHY IT RANKS *BELOW* HEALTH RATHER THAN ABOVE IT
+#: A DEGRADED provider has produced evidence of failure; a probationary one has
+#: merely not yet produced evidence of success. Ordering health first keeps
+#: MARKET_DATA_ARCHITECTURE.md's published rule intact — "DEGRADED demotes a
+#: provider below a healthy lower tier" — and makes probation what it is meant
+#: to be: the tie-break that decides which of two equally healthy providers is
+#: preferred, not a new way to be excluded.
+#:
+#: WHY IT IS A RANKING TERM AND NOT A FILTER
+#: A filter would let probation produce "no provider at all" whenever the only
+#: live feed happened to be young, which trades a cosmetic tier flap for an
+#: outage. Ranked instead, a probationary feed sits second in the chain behind
+#: the steady source and becomes the head the moment that source stops being a
+#: candidate — so the system is never less able to serve data than it was
+#: before probation existed.
+PROBATION_RANK = {False: 0, True: 1}
+
 
 class UnavailableReason(str, Enum):
     """Why no provider could be resolved.
@@ -196,6 +223,20 @@ class Resolution:
         }
 
 
+def _selection_rank(provider: MarketDataProvider) -> Tuple[int, int]:
+    """Where `provider` sits among the candidates that survived filtering.
+
+    Health first, then probation — see :data:`PROBATION_RANK`. Read through the
+    provider contract rather than by type, so a licensed exchange feed, a vendor
+    feed and a broker feed are ranked by what they have demonstrated and not by
+    what they are.
+    """
+    return (
+        HEALTH_RANK[provider.health().state],
+        PROBATION_RANK[bool(provider.is_on_probation)],
+    )
+
+
 class SourceManager:
     """Resolves the active market-data provider for a capability and context."""
 
@@ -249,12 +290,18 @@ class SourceManager:
             )
 
         # Stable sort: `candidates_for` already ordered by priority then
-        # registration, so sorting on health alone preserves the priority
-        # ordering *within* each health rank. That is the whole tie-break rule
-        # from MARKET_DATA_ARCHITECTURE.md — better health first, then priority,
-        # then most-recently-registered — expressed as one stable sort instead
-        # of a comparator nobody can read.
-        chain = sorted(candidates, key=lambda p: HEALTH_RANK[p.health().state])
+        # registration, so sorting on health and probation alone preserves the
+        # priority ordering *within* each rank. That is the whole tie-break rule
+        # from MARKET_DATA_ARCHITECTURE.md — better health first, then a
+        # provider that has served its probation window, then priority, then
+        # most-recently-registered — expressed as one stable sort instead of a
+        # comparator nobody can read.
+        #
+        # Recomputed on every resolution, from state the providers hold now.
+        # Nothing here is cached and no provider is marked as primary: which
+        # provider leads is the *output* of this sort and never an input to it
+        # (D4.5), which is what makes promotion and demotion atomic.
+        chain = sorted(candidates, key=_selection_rank)
         return Resolution(
             capability=capability,
             context=ctx,

@@ -127,6 +127,99 @@ recent tick for it. Two consequences, both wanted:
     beneath the explicit link-down signal, evaluated lazily at resolution time
     with no timer and no poll loop.
 
+═══════════════════════════════════════════════════════════════════════
+D5.2 — PROBATION: READY IS NOT STABLE
+═══════════════════════════════════════════════════════════════════════
+
+D4.5's gate answers one question — *can this feed produce a valid canonical
+price?* — and D5.2 exists because the platform was reading the answer as though
+it were the answer to a second, stronger one: *should this feed be preferred
+over a source that is already working?*
+
+They come apart on a flapping link, and the failure is entirely mechanical::
+
+    connect → one valid tick → READY → preferred
+            → socket dies    → demoted, baseline resumes
+            → reconnect      → one valid tick → READY → preferred
+            → socket dies    → ...
+
+Every individual step is correct. The composite is a feed whose user watches
+their tier indicator alternate between live and delayed every few seconds, with
+each promotion resting on a single packet from a connection that has repeatedly
+demonstrated it cannot survive. D5.1 fixed the transport half of this (the
+reconnect no longer comes back in 1.5s forever); the provider half is that
+readiness alone should never have outranked a steady source.
+
+So a second axis, orthogonal to readiness::
+
+    READY / PROBATION   valid data is arriving, and that is all that is known
+    READY / STABLE      valid data has kept arriving across the full window
+
+See :class:`FeedStability` for the pair and :meth:`StreamingTickProvider.stability`
+for the rule that separates them.
+
+WHAT PROBATION IS AND IS NOT ALLOWED TO DO
+-------------------------------------------
+Probation is a **ranking** term, never an eligibility filter, and the whole
+design turns on that distinction:
+
+  * a probationary feed is still eligible, still in the failover chain, and
+    still answers when nothing steadier remains — so probation can never be the
+    reason a request returns no data at all;
+  * a steady provider — including the polled baseline, which is the steady
+    provider in the ordinary single-broker case — keeps the primary position
+    while a competitor is on probation;
+  * a probationary feed that loses its link loses its probation with it, so a
+    reconnect serves the window again from the beginning.
+
+The ranking itself lives in the Source Manager, where every other selection rule
+already lives, and reads one generic property
+(:attr:`MarketDataProvider.is_on_probation`). Nothing about it knows that this
+provider is fed by a broker, and a provider that does not implement the
+readiness gate reports False and is unaffected — the polled baseline included.
+
+WHY NOT A SECOND STATE MACHINE, A TIMER, OR A STORED FLAG
+----------------------------------------------------------
+* **No second lifecycle.** Stability is a property of a feed that is already in
+  the D4.5 state machine, computed from timestamps that machine already had to
+  record. A parallel probation registry would be a second copy of provider
+  membership to keep in step with the first.
+* **No timer.** Nothing schedules a promotion. The window is evaluated at
+  resolution time, so a feed nobody asks about costs nothing, and there is no
+  scheduled callback to cancel when a link drops.
+* **No stored "is stable" flag.** For the same reason PRIMARY is not a state
+  (above): a stored flag is a lagging copy of something derivable, and the two
+  disagree exactly when it matters. Stability is derived on every read.
+
+═══════════════════════════════════════════════════════════════════════
+D5.3 — STALE-FEED DEMOTION: STABLE IS NOT PERMANENT
+═══════════════════════════════════════════════════════════════════════
+
+D5.2 left one question open: stability did not decay. Auditing it produced two
+findings, and they share a single cause — *the coverage window was only ever
+asked per-instrument*::
+
+    is_eligible_for(ctx with a symbol)  →  covers(symbol)  →  120s window ✓
+    is_eligible_for(ctx with no symbol) →  return True     →  no window at all ✗
+
+The second branch is the one `active_tier()`, `status()` and `source_tier()`
+take. So a feed whose socket stayed up but whose data stopped kept winning that
+resolution indefinitely, and the platform went on telling the user — and the AI —
+`tier: streaming` while serving them nothing but baseline prices. Meanwhile
+:meth:`StreamingTickProvider.stability` compared two past instants with no upper
+bound, so the same dead feed still reported STABLE and still outranked a feed
+that was genuinely delivering.
+
+Both are closed by one predicate, :meth:`StreamingTickProvider.has_fresh_evidence`,
+read in both places. What that buys is that D5.3 introduces **no new state, no
+new constant, no new timer and no new registry** — the demotion is the coverage
+rule the platform already published, finally asked in both of the places that
+needed to ask it. See ADR-043.
+
+The evidence is still, and only, an accepted canonical tick. Nothing here reads
+the socket, the session, or how many times the link has flapped: transport
+health and provider evidence stay the two separate facts D4.5 made them.
+
 WHAT A TICK-DERIVED QUOTE DOES AND DOES NOT CARRY
 --------------------------------------------------
 A canonical tick carries symbol, exchange, price, volume and an ingest
@@ -183,6 +276,30 @@ TICK_FIELDS = frozenset(f.name for f in dataclass_fields(MarketTick))
 #: while keeping a silently dead link from serving yesterday's price as live.
 DEFAULT_TICK_MAX_AGE_SECONDS = 120.0
 
+#: How long a feed must keep delivering valid canonical data before it may
+#: outrank a provider that is already serving reliably (D5.2).
+#:
+#: The number is not invented here and is not a second policy.
+#: MARKET_DATA_ARCHITECTURE.md fixes the platform's definition of a provider
+#: that has proved itself — "a provider that just recovered must deliver clean
+#: data for a probation window (e.g. 30 seconds of valid messages) before it is
+#: eligible to become primary again — this prevents flapping" — and D5.1's
+#: transport ladder already reads the same sentence for
+#: `STABLE_CONNECTION_SECONDS`.
+#:
+#: The two constants are separate *names* for one published policy because the
+#: layers may not import each other: the transport's reliability module is
+#: pinned to the standard library alone, and the Market Engine may not import
+#: the broker layer at all. `test_the_two_layers_share_one_stability_window`
+#: fails the moment they drift, which is the property that actually matters.
+#:
+#: What differs between the layers is the *evidence*, not the window, and that
+#: difference is correct: the transport can only observe how long a socket
+#: lasted, while this layer can observe whether data actually kept arriving on
+#: it. A link that stays open for a silent minute is STABLE to the transport and
+#: still on probation here — see :meth:`StreamingTickProvider.stability`.
+PROBATION_WINDOW_SECONDS = 30.0
+
 
 class FeedReadiness(str, Enum):
     """How far a pushed feed has got towards being usable.
@@ -217,11 +334,54 @@ LINK_UP_STATES = frozenset({
 #: displaces the baseline, and it is gated on readiness instead.
 LINK_LEVEL_CAPABILITIES = frozenset({Capability.TICKS, Capability.DEPTH})
 
-#: Called with (provider, previous_state, new_state) on every readiness
-#: transition. Bound by the Market Gateway at registration, for the same reason
-#: the tick sink is: a provider that chose its own listener could announce a
-#: promotion around the gateway.
-ReadinessListener = Callable[["StreamingTickProvider", FeedReadiness, FeedReadiness], Awaitable[None]]
+
+class FeedStability(str, Enum):
+    """Whether a feed has proved it is *reliable*, as opposed to merely valid.
+
+    The second axis of a feed's state, orthogonal to :class:`FeedReadiness` and
+    deliberately not folded into it. Readiness answers "can this feed produce a
+    canonical price"; stability answers "has it kept doing so long enough to be
+    trusted with the primary position". A feed is `READY / PROBATION` and then
+    `READY / STABLE`; it is never stable without being ready, and the pair is
+    what the D5.2 brief calls the composite state.
+
+    Two members and no third. "Not applicable" was considered for a feed that is
+    not ready at all and rejected: it would have to rank *somewhere*, and the
+    only safe place to rank an unproven feed is with the other unproven ones.
+    """
+
+    #: Serving, or able to serve, but not yet entitled to displace a steady
+    #: provider. Also the honest answer for a feed that is not ready at all.
+    PROBATION = "probation"
+    #: Has delivered valid canonical data across the full probation window on
+    #: the current link, without losing it.
+    STABLE = "stable"
+
+
+#: Either axis of a feed's state, as it travels to the listener: a
+#: :class:`FeedReadiness` or a :class:`FeedStability` member. Typed as `Any`
+#: rather than as a union because the listener's contract is "something with a
+#: `.value` that named the state before and after" — a third axis, if D5 ever
+#: grows one, must not require every binder's signature to change.
+FeedState = Any
+
+#: Called with (provider, previous_state, new_state) on every state transition —
+#: readiness (D4.5) and stability (D5.2) both, because the announcement is the
+#: same announcement: a consumer's tier moved. Bound by the Market Gateway at
+#: registration, for the same reason the tick sink is: a provider that chose its
+#: own listener could announce a promotion around the gateway.
+#:
+#: One channel rather than two binders. The gateway's handler does not branch on
+#: which axis moved — it logs the transition and republishes the owner's feed
+#: status — so a second callback would be a second copy of one path, with the
+#: standing risk that a later change is applied to one and not the other.
+FeedStateListener = Callable[
+    ["StreamingTickProvider", FeedState, FeedState], Awaitable[None]
+]
+
+#: Retained name for the D4.5 alias, which described the same callback when
+#: readiness was the only axis there was.
+ReadinessListener = FeedStateListener
 
 
 class StreamingTickProvider(MarketDataProvider):
@@ -249,6 +409,8 @@ class StreamingTickProvider(MarketDataProvider):
         owner_user_id: Optional[str] = None,
         priority: int = STREAMING_FEED_PRIORITY,
         tick_max_age_seconds: float = DEFAULT_TICK_MAX_AGE_SECONDS,
+        probation_seconds: Optional[float] = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         super().__init__()
         name = (name or "").strip()
@@ -258,6 +420,19 @@ class StreamingTickProvider(MarketDataProvider):
         self.owner_user_id = str(owner_user_id) if owner_user_id else None
         self.priority = priority
         self.tick_max_age_seconds = float(tick_max_age_seconds)
+        #: Read from the module constant at construction rather than captured as
+        #: a default argument, so the published policy is what a feed built at
+        #: runtime gets — and so a test can lower the window without reaching
+        #: into an instance.
+        self.probation_seconds = float(
+            PROBATION_WINDOW_SECONDS if probation_seconds is None else probation_seconds
+        )
+        #: Monotonic and injectable, never wall-clock. Every duration this class
+        #: measures — tick age, probation — is a duration, and a clock an NTP
+        #: step can move backwards would promote a feed that had proved nothing.
+        #: Injectable because a 30-second window is otherwise only testable by
+        #: waiting 30 seconds, and a test that sleeps is a test nobody runs.
+        self._clock = clock
         self._accepted = 0
         self._rejected = 0
         self._readiness = FeedReadiness.REGISTERED
@@ -265,7 +440,13 @@ class StreamingTickProvider(MarketDataProvider):
         #: arrived. Bounded by the subscribed instrument set, which the owner
         #: chose — this is not an unbounded cache of everything ever seen.
         self._last_tick: Dict[str, Tuple[MarketTick, float]] = {}
-        self._readiness_listener: Optional[ReadinessListener] = None
+        #: When readiness was earned *on the current link*, and when valid data
+        #: last arrived on it. Probation is the interval between them: two
+        #: timestamps, so stability stays derived rather than stored (see the
+        #: D5.2 section of the module docstring).
+        self._ready_since: Optional[float] = None
+        self._last_evidence_at: Optional[float] = None
+        self._readiness_listener: Optional[FeedStateListener] = None
         self._last_failure: str = ""
 
     # ── Readiness ────────────────────────────────────────
@@ -291,8 +472,127 @@ class StreamingTickProvider(MarketDataProvider):
         """
         return self._connected and self._readiness is FeedReadiness.READY
 
-    def bind_readiness_listener(self, listener: Optional[ReadinessListener]) -> None:
-        """Point this feed's readiness transitions at the Market Gateway.
+    @property
+    def has_fresh_evidence(self) -> bool:
+        """Whether valid canonical data has arrived recently enough to count.
+
+        The D5.3 predicate, and the *only* thing this class treats as current
+        market-data evidence. It reads one timestamp — the instant the last
+        accepted canonical tick arrived — and never the socket, the session, the
+        subscription or a reconnect counter. That is deliberate: the whole point
+        of the D4.5/D5.2 gate is that transport liveness and data evidence are
+        different facts, and a predicate that consulted both would quietly undo
+        it (see ADR-043, question E).
+
+        The window is :attr:`tick_max_age_seconds`, reused rather than reinvented.
+        The platform already publishes exactly one answer to "how old may this
+        feed's data be before falling back is strictly better" — the per-symbol
+        coverage window — and a second constant here would be a second staleness
+        policy for one question, free to drift from the first.
+
+        Equivalent to "at least one subscribed symbol is still covered", by
+        construction: every accepted batch stamps its ticks and this timestamp
+        with the same instant, so the newest entry in the coverage map is always
+        exactly this old. Kept as a scalar because it is O(1) and because the
+        *question* being asked here is about the feed, not about an instrument.
+        """
+        last_evidence = self._last_evidence_at
+        if last_evidence is None:
+            return False
+        return (self._clock() - last_evidence) <= self.tick_max_age_seconds
+
+    @property
+    def stability(self) -> FeedStability:
+        """Whether this feed has proved itself *reliable* on the current link.
+
+        Derived from two timestamps and nothing else — the instant readiness was
+        earned on this link, and the instant valid data last arrived on it. It is
+        STABLE when the second is at least a full probation window after the
+        first:
+
+            valid data at t0  …  valid data still arriving at t0 + window
+
+        which is the platform's published probation rule — "deliver clean data
+        for a probation window (e.g. 30 seconds of valid messages)" — read
+        literally. Three properties follow from reading it that way rather than
+        as a timer:
+
+        * **A silent feed never leaves probation.** One tick and then thirty
+          seconds of nothing is not thirty seconds of valid messages, and a
+          plain elapsed-time gate would promote exactly that — the same mistake
+          as promoting on `connected`, one layer along.
+        * **Nothing schedules anything.** No timer fires, no task polls; the
+          window is evaluated at resolution time from values already recorded,
+          so a feed nobody is asking about costs nothing.
+        * **A reconnect starts over.** Losing the link discards the evidence and
+          clears both timestamps, so probation is re-served on the connection
+          that actually exists. A feed that flaps therefore never accumulates a
+          claim to the primary position, which is the whole point of D5.2.
+
+        Not ready is reported as PROBATION rather than as a third state: an
+        unproven feed has to rank somewhere, and the only safe place to rank it
+        is with the other unproven ones.
+
+        D5.3 — STABILITY DECAYS, AND DECAYS THROUGH COVERAGE
+        -----------------------------------------------------
+        The rule above is a statement about two *past* instants, so on its own it
+        has no upper bound: a feed that served its window and then went silent
+        for an hour still satisfied it, and stayed STABLE — and therefore stayed
+        preferred — on the strength of data nobody could still use. D5.3 closes
+        that by adding the term that was missing, :attr:`has_fresh_evidence`, and
+        closes it *with the coverage window rather than with a new mechanism*:
+        stability is not a memory of what a feed once did, it is a claim about
+        what it is doing, and a claim with no current evidence behind it is
+        exactly what probation is for.
+
+        There is no decay state, no decay constant and no decay timer. Staleness
+        is the absence of fresh evidence, evaluated on read like everything else
+        here, so a feed that goes quiet is demoted by the next resolution that
+        asks, and a feed nobody asks about still costs nothing.
+
+        Evidence that resumes on the *same* link restores STABLE immediately
+        rather than re-serving the window. The link never dropped, so nothing was
+        discarded and the window this feed proved is still the window of the
+        connection it is still on; requiring it to be re-proved would mean an
+        instrument that trades every few minutes could never be stable, which
+        would demote honest feeds for being illiquid. A link that actually
+        dropped is the other case, and `_discard_evidence` already makes that one
+        start over.
+        """
+        if not self.is_ready:
+            return FeedStability.PROBATION
+        ready_since, last_evidence = self._ready_since, self._last_evidence_at
+        if ready_since is None or last_evidence is None:
+            return FeedStability.PROBATION
+        if (last_evidence - ready_since) < self.probation_seconds:
+            return FeedStability.PROBATION
+        if not self.has_fresh_evidence:
+            return FeedStability.PROBATION
+        return FeedStability.STABLE
+
+    @property
+    def is_stable(self) -> bool:
+        """Whether this feed may displace a provider that is already steady."""
+        return self.stability is FeedStability.STABLE
+
+    @property
+    def is_on_probation(self) -> bool:
+        """The Source Manager's ranking term — see :meth:`stability`.
+
+        Note what this is *not*: an eligibility filter. A probationary feed is
+        still a candidate, still in the failover chain, and still answers when
+        nothing steadier remains. Probation decides who is preferred, never who
+        may serve.
+        """
+        return self.stability is FeedStability.PROBATION
+
+    def bind_readiness_listener(self, listener: Optional[FeedStateListener]) -> None:
+        """Point this feed's state transitions at the Market Gateway.
+
+        Both axes travel this one callback — readiness (D4.5) and stability
+        (D5.2). Keeping the D4.5 method name is deliberate: the gateway binds by
+        name, every existing caller uses it, and renaming a working seam to
+        describe a widened payload would be churn charged to every one of them.
 
         Bound at registration and cleared at unregistration, exactly like
         :meth:`MarketDataProvider.bind_sink`. A promotion or demotion is a
@@ -314,6 +614,24 @@ class StreamingTickProvider(MarketDataProvider):
         if state is self._readiness:
             return False
         previous, self._readiness = self._readiness, state
+        if state is FeedReadiness.READY:
+            # The probation window opens at the tick that earned readiness — not
+            # at the instant this transition is processed, which is a hair later
+            # and would make the window measure "since we noticed" rather than
+            # "of valid data". Stamped on the transition rather than on every
+            # subsequent tick: re-stamping would restart probation on each
+            # arrival and no feed would ever leave it.
+            #
+            # Nothing clears it on the way *out* of READY, deliberately: every
+            # path that loses a link calls `_discard_evidence`, which is the one
+            # owner of this timestamp, and a second place that also clears it
+            # would be a second place to get it wrong — and would make the reset
+            # untestable, since removing either half would leave the other
+            # quietly covering for it.
+            self._ready_since = (
+                self._last_evidence_at if self._last_evidence_at is not None
+                else self._clock()
+            )
         self._last_failure = reason if state is FeedReadiness.FAILED else ""
         logger.info(
             "Streaming provider %s readiness %s -> %s%s",
@@ -332,8 +650,15 @@ class StreamingTickProvider(MarketDataProvider):
         connection, and prices from a connection that no longer exists must not
         answer a quote — nor let a reconnected feed skip the gate on the
         strength of what the previous one sent.
+
+        D5.2: this clears the probation evidence with it. A feed that served a
+        full window, dropped, and came back has proved nothing about the new
+        connection — inheriting the old link's window would hand a flapping feed
+        the primary position it has just demonstrated it cannot hold.
         """
         self._last_tick.clear()
+        self._last_evidence_at = None
+        self._ready_since = None
 
     # ── Lifecycle ────────────────────────────────────────
 
@@ -456,15 +781,31 @@ class StreamingTickProvider(MarketDataProvider):
         # data — every fetch path in the gateway supplies the symbol it is
         # asking about. What reaches here with no symbol is the *reporting*
         # question: `status()`, `active_tier()`, `diagnostics()` asking which
-        # feed this user is on. A ready feed is the honest answer to that, and
-        # answering `False` would report the baseline's tier to a user whose
-        # data is genuinely arriving live.
+        # feed this user is on. A ready feed *that is still receiving data* is
+        # the honest answer to that, and answering `False` while data is
+        # arriving would report the baseline's tier to a user whose data is
+        # genuinely live.
         #
         # Per-instrument truth is not lost by this: every quote that actually
         # leaves the gateway is stamped with the tier of the provider that
         # answered *it*, so an instrument the feed does not stream is still
         # labelled delayed on the payload the consumer receives.
-        return True
+        #
+        # D5.3 — WHY THIS IS NOT `return True`
+        # Until D5.3 it was, and that made the 120-second coverage backstop
+        # *per-symbol only*: it fired for `covers(symbol)` above and had no
+        # counterpart on this branch. A feed whose link stayed up but whose data
+        # stopped was therefore filtered out of every real quote — correctly —
+        # while still winning this resolution, so `active_tier()` and `status()`
+        # went on reporting `streaming` to a user who had not received a price in
+        # hours. The tier indicator and the AI's freshness context both read that
+        # path, which made it a claim about live data the platform could not
+        # support (CLAUDE.md data rules), not merely a ranking blemish.
+        #
+        # The same window governs both branches now, which is the point: one
+        # staleness policy, asked per-instrument where an instrument was named
+        # and per-feed where none was.
+        return self.has_fresh_evidence
 
     def covers(self, symbol: Any) -> bool:
         """Whether this feed holds a usable, recent price for `symbol`."""
@@ -483,7 +824,7 @@ class StreamingTickProvider(MarketDataProvider):
         if entry is None:
             return None
         tick, arrived_at = entry
-        if (time.monotonic() - arrived_at) > self.tick_max_age_seconds:
+        if (self._clock() - arrived_at) > self.tick_max_age_seconds:
             return None
         return tick
 
@@ -555,13 +896,41 @@ class StreamingTickProvider(MarketDataProvider):
                 )
             return 0
 
-        arrived_at = time.monotonic()
+        before = self.stability
+        arrived_at = self._clock()
         for tick in ticks:
             self._last_tick[tick.symbol] = (tick, arrived_at)
+        self._last_evidence_at = arrived_at
 
         await self._earn_readiness()
+        await self._announce_stability(before)
         await self._emit(ticks)
         return len(ticks)
+
+    async def _announce_stability(self, previous: FeedStability) -> None:
+        """Tell the gateway when this batch was the one that ended probation.
+
+        Announced for the same reason readiness is: leaving probation moves the
+        owner's tier from delayed to live, and a consumer that is never told
+        keeps rendering a tier that is no longer true. Nothing else happens here
+        — resolution recomputes stability from the timestamps on every request,
+        so the switch has already taken effect by the time this runs.
+
+        Only the crossings this method could be the *cause* of are announced.
+        Losing stability always accompanies a readiness transition, which
+        announces itself, so a second event here would be one fact reported
+        twice.
+        """
+        current = self.stability
+        if current is previous or current is not FeedStability.STABLE:
+            return
+        logger.info(
+            "Streaming provider %s left probation after %.0fs of valid data",
+            self.name, self.probation_seconds,
+        )
+        listener = self._readiness_listener
+        if listener is not None:
+            await listener(self, previous, current)
 
     async def _earn_readiness(self) -> None:
         """Promote to READY on valid data, if the link and subscription allow it.
@@ -623,6 +992,7 @@ class StreamingTickProvider(MarketDataProvider):
             "accepted_records": self._accepted,
             "rejected_records": self._rejected,
             "readiness": self._readiness.value,
+            "stability": self.stability.value,
             "covered_symbols": len(self.covered_symbols),
             "last_failure": self._last_failure,
         }

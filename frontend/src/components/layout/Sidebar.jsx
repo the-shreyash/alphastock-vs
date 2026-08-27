@@ -159,7 +159,7 @@ export default function Sidebar({ collapsed, setCollapsed, onClose, isMobile }) 
                 style={{
                   background: isActive ? "var(--ai-accent)" : "transparent",
                   color: isActive ? "#FFFFFF" : (isSub ? "var(--text-muted)" : "var(--text-secondary)"),
-                  boxShadow: isActive ? "0 4px 14px rgba(99, 102, 241, 0.35)" : "none",
+                  boxShadow: "none",
                 }}
                 onMouseEnter={e => { if (!isActive) e.currentTarget.style.background = "var(--hover)"; }}
                 onMouseLeave={e => { if (!isActive) e.currentTarget.style.background = "transparent"; }}

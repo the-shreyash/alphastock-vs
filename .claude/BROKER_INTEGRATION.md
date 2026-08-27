@@ -514,6 +514,8 @@ The protocol was read from **two independent sources set against each other**: D
 
 • **Each connection has its own ladder.** One per (user, broker, channel), so two users on one broker never pace each other and a broker's order socket flapping never slows its market feed.
 
+• **Reconnect pacing is not the same gate as provider promotion (D5.2/D5.3).** Both use a 30-second window and they measure different things: this ladder measures how long the *socket* lasted, while `StreamingTickProvider`'s probation window measures whether *data kept arriving* on it. A link that stays open silently for a minute resets the ladder and is still on probation as a market-data provider. An adapter needs to do nothing for either.
+
 • **Still not represented, and honestly so:** an *entitlement* failure — a valid token on an account that is not licensed for the data feed — has no generic event kind, so an adapter that meets one must approximate it with the existing "stop" or "retry" outcomes and say what actually happened in the message. See the Dhan adapter's disconnect table for the current approximation, and the D5 remainder for the intended fix.
 
 **Live validation has not been performed.** A Dhan feed needs a per-user access token obtainable only through an interactive browser consent login. Everything asserted about this adapter is deterministic validation against fixtures packed with the reference client's own `struct` formats, plus 27 source mutations of which 25 were observed red. The outstanding smoke test is listed in TASK.md's D4.11 section — including **whether a real `/holdings` row returns `"ALL"` or a real exchange**, which decides how much of the holdings limitation actually bites, and **holding the connection past 40 seconds**, which is the only way to prove the library's pong satisfies Dhan's ping.
@@ -933,13 +935,22 @@ The user does NOT need a StockAssist subscription for this. The broker already o
 
 On broker disconnect, the Source Manager falls back to Yahoo Finance automatically. The frontend never notices the switch.
 
-**How the switch is actually gated (D4.5).** The upgrade is deliberately *not* triggered by `broker.connected`, and not by the WebSocket opening either. The account's stream registers as a market-data provider (D4.4) and stays behind a readiness gate until a valid canonical tick has arrived on that link while it is subscribed. Only then does it outrank the baseline, and only for the instruments it actually streams. Yahoo is never disconnected — it moves to standby inside the same failover chain — so there is no instant at which the user has no provider.
+**How the switch is actually gated (D4.5).** The upgrade is deliberately *not* triggered by `broker.connected`, and not by the WebSocket opening either. The account's stream registers as a market-data provider (D4.4) and stays behind a readiness gate until a valid canonical tick has arrived on that link while it is subscribed. Only then is it eligible for the quote capability at all, and only for the instruments it actually streams. Yahoo is never disconnected — it moves to standby inside the same failover chain — so there is no instant at which the user has no provider.
+
+**And readiness alone no longer wins the switch (D5.2).** A newly ready feed is on **probation**: it must keep delivering valid canonical data for 30 seconds on that link before it outranks a provider that is already serving steadily. So the full sequence is *connect → subscribe → first valid tick (READY) → 30 seconds of valid ticks (STABLE) → primary*, and a feed that flaps never gets past the third step. A dropped link discards the window; the reconnected feed serves a fresh one from its own first tick. Probation only decides who is *preferred*: a probationary feed still serves immediately if no steadier provider remains, so this can delay a tier upgrade and can never cause an outage. An adapter contributes nothing to any of this and cannot influence it — see ADR-042.
+
+**And stability is not permanent (D5.3).** A feed that stops delivering loses the primary position even while its socket stays open. The full lifecycle is therefore *connect → subscribe → first valid tick (READY) → 30 seconds of valid ticks (STABLE) → primary → **no valid tick for 120 seconds → back to probation, baseline resumes***, with the tier returning to streaming on the next tick without re-serving the 30-second window (the link never dropped, so nothing was discarded). The 120 seconds is the same per-symbol coverage window a feed has always been held to; D5.3 asks it of the *feed* as well, because until then the tier-reporting path had no freshness term at all and a silently dead feed went on reporting the streaming tier indefinitely.
+
+Two consequences for an adapter author, and both are "do nothing":
+
+  * **A quiet market does not need a keep-alive tick.** Do not synthesize ticks to hold the tier. A fabricated price is a data-rules violation, and the honest outcome — falling back to the delayed baseline — is the one the platform wants.
+  * **Transport flap history is deliberately not consulted here.** `consecutive_short_connections` paces reconnects (D5.1) and is invisible to provider stability. A feed that has flapped repeatedly and is now delivering is stable; a feed whose link has never flapped and is delivering nothing is not. Market-data evidence and transport liveness stay separate facts — see ADR-043.
 
 The demotion path is the mirror image and is push-driven: `BrokerStream` reports its own transport connect/disconnect, the account's provider records it, and the next resolution ranks the baseline first again. Nothing polls, and no failure counter has to escalate first. An *ended entitlement* — disconnect, revoked token, expired session — is a different event with a different response: the provider is unregistered outright rather than merely demoted.
 
 All of this lives on the generic `MarketDataProvider` / `StreamingTickProvider` contract and names no broker. Adding a streaming broker adds one adapter and nothing else.
 
-Full design, priority algorithm, and failover rules: MARKET_DATA_ARCHITECTURE.md (authoritative). Decision record: ADR-035.
+Full design, priority algorithm, and failover rules: MARKET_DATA_ARCHITECTURE.md (authoritative). Decision records: ADR-035 (the switch), ADR-042 (probation), ADR-043 (stale-feed demotion).
 
 ---
 

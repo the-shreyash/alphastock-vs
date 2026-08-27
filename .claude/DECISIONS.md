@@ -2001,6 +2001,197 @@ Review Date
 
 At D5.2, when probation is designed on top of this — the specific claim to re-test is that `STABLE_CONNECTION_SECONDS` is genuinely the same concept at both layers, rather than two ideas that happened to want the same number.
 
+
+---
+
+# ADR-042
+
+Title
+
+Provider Probation: READY Proves a Feed Is Valid, STABLE Proves It May Outrank One That Works (Sprint D5.2, closes LIM-D5.1-3)
+
+Date
+
+2026-08-27
+
+Status
+
+Accepted — implemented; **live validation not performed** (see Consequences)
+
+Context
+
+D4.5 built the readiness gate and it does its job exactly as specified: a pushed feed becomes the primary quote source by delivering a valid canonical tick on its current link, and stops being it the instant that stops being true. The defect D5.2 closes is not in that gate. It is that the platform was reading its answer as the answer to a stronger question than it asks.
+
+    READY   this feed can produce a valid canonical price
+    STABLE  this feed has kept producing them long enough to be trusted
+            with the primary position
+
+The two come apart on a flapping link, and every individual step of the failure is correct:
+
+    connect → one valid tick → READY → preferred
+            → socket dies    → demoted, the baseline resumes
+            → reconnect      → one valid tick → READY → preferred
+            → socket dies    → …
+
+The composite is a user whose tier indicator alternates between live and delayed every few seconds, with each promotion resting on a single packet from a connection that has repeatedly demonstrated it cannot survive. D5.1 fixed the transport half — the reconnect no longer returns in ~1.5s forever — and named the provider half as LIM-D5.1-3 rather than smuggling failover policy into a run loop. This is that half.
+
+MARKET_DATA_ARCHITECTURE.md had already specified the answer and nothing had implemented it: "a provider that just recovered must deliver clean data for a probation window (e.g. 30 seconds of valid messages) before it is eligible to become primary again — this prevents flapping."
+
+Decision
+
+**A second axis on the existing state machine, not a second state machine.** A feed is `READY / PROBATION` and then `READY / STABLE`. `FeedStability` has two members; readiness is untouched; there is no second registry, no second readiness system, and no parallel provider lifecycle. Stability is derived from two timestamps the feed already had to record.
+
+**The promotion rule is evidence, not elapsed time.** A feed leaves probation when valid canonical data arrives at least `PROBATION_WINDOW_SECONDS` after the tick that earned readiness on the current link. "Thirty seconds of valid messages", read literally. The alternative reading — "thirty seconds have passed since the first tick" — promotes a feed that ticked once and went silent, which is the same class of mistake as promoting on `connected`, one layer along, and would promote it *over a baseline that is at that moment the only source actually producing prices*.
+
+**Probation ranks; it never filters.** `is_on_probation` is a term in the Source Manager's selection sort, alongside health. A probationary feed stays eligible, stays in the failover chain, and becomes the head of that chain the moment no steadier candidate remains. This is the line between "protect a working provider from unnecessary replacement" and "refuse to serve data the platform has": the second would trade a cosmetic tier flap for an outage.
+
+**Health is asked first, probation second.** A DEGRADED provider has produced evidence of failure; a probationary one has merely not yet produced evidence of success. Ordering health first preserves this document's published rule that DEGRADED demotes a provider below a healthy lower tier, and makes probation what it is meant to be — the tie-break inside a health rank.
+
+**The window is 30 seconds and is not a new number.** `PROBATION_WINDOW_SECONDS` (provider layer) and D5.1's `STABLE_CONNECTION_SECONDS` (transport) are two names for one published policy. They are two names rather than one because the layers may not import each other — `reliability.py` is pinned to the standard library alone, and the Market Engine may not import the broker layer at all — so drift is prevented by `test_the_two_layers_share_one_stability_window` instead of by an import. ADR-041 asked D5.2 to re-test whether the two are genuinely the same concept, and the honest answer is **the same window measured on different evidence**: the transport can only observe how long a socket lasted, this layer can observe whether data kept arriving on it. A link that stays open silently is STABLE to the transport and still on probation here. That is the correct relationship — each layer uses the strongest evidence it has — and it is documented rather than smoothed over.
+
+**Scope is per provider instance**, and there is exactly one instance per (user, feed). Two users of the same broker therefore serve independent probations by construction rather than by a rule someone has to remember. No new scoping code was written for this; it is the D4.4 registry key doing its job.
+
+**Nothing is scheduled.** No timer, no sweeper, no task to cancel when a link drops. The window is evaluated at resolution time from recorded values, so a feed nobody asks about costs nothing — the same discipline as the per-symbol coverage backstop.
+
+**PRIMARY is still not stored.** Stability is derived on every read, exactly as D4.5 requires of promotion: which provider leads is the output of the resolution sort and never an input to it.
+
+Alternatives Considered
+
+**Apply probation only to a feed that is *recovering*.** This is the narrowest reading of the architecture sentence ("a provider that just recovered"), and it is tempting because it would have left all thirty-eight existing D4 promotion tests untouched. Rejected: a feed's *first* promotion rests on exactly as little evidence as its tenth, and the failure mode is identical — one packet from a connection nobody has seen survive. A rule that trusts a feed more the first time is a rule that is wrong in the case it was written for.
+
+**Filter probationary providers out of the candidate list.** Rejected as the dangerous implementation. It is invisible while a baseline exists and becomes an outage the moment one does not — a user whose data is arriving perfectly well would be told no provider is available. Pinned against by `test_treating_probation_as_a_filter_would_leave_the_user_with_nothing`, which mutates the code into exactly that shape and observes the failure.
+
+**Rank probation above health.** Rejected: it silently reverses this document's published DEGRADED rule, and does so invisibly, because both orders agree in every case where the baseline is healthy — which is every ordinary case. Pinned by `test_health_outranks_probation_and_not_the_other_way_round`, which was added *because* the mutation that swapped the two terms stayed green.
+
+**A probation timer that promotes the feed when it fires.** Rejected twice over: it promotes silent feeds, and it introduces scheduled state that has to be cancelled correctly on every link-loss path — the kind of cleanup whose one missed branch promotes a dead feed.
+
+**Store an `is_stable` flag set at promotion.** Rejected for the same reason PRIMARY is not stored (ADR-035): a stored flag is a lagging copy of something derivable, and the two disagree exactly when it matters.
+
+**Give stability its own listener rather than reusing the readiness one.** Rejected: the gateway does the same thing for both — log the transition, republish the owner's status — so a second callback would be a second copy of one path with the standing risk that a later change reaches only one.
+
+Consequences
+
+• **LIM-D5.1-3 is closed.** A feed that flaps is never the preferred source. `test_a_flapping_feed_never_becomes_the_preferred_source` drives ten connect/tick/die cycles and the baseline serves throughout; the eleventh connection, which holds, is promoted on its own evidence with no penalty carried from the ten that did not.
+
+• **A promotion now takes 30 seconds of live data instead of one packet.** This is the intended cost and it is worth stating plainly: a user connecting a broker mid-session sees the delayed tier for up to a window longer than they did before D5.2. They see *data* throughout — the baseline is never released early — and what they no longer see is a live indicator that is about to become a lie.
+
+• **Thirty-eight existing D4 tests take a `no_probation_window` fixture.** They were written to assert that broker bytes reach a provider and that resolution follows readiness, and at the real window every one of them would have been asserting probation by proxy. The window is collapsed to zero for those tests and exercised at its published value in `tests/test_provider_probation.py`, including through the same real `attach_market_feed` seam. No assertion in those thirty-eight tests was weakened or deleted.
+
+• **D4.5's readiness falsification needed a second mutation.** `test_removing_the_readiness_gate_would_promote_an_unproven_feed` went red on implementation, because with the readiness gate removed the feed was *still* held back — by probation. It now neutralises both gates, which is the only way it can still prove the D4.5 gate is load-bearing. A control that starts passing for a new reason is a control that has stopped testing what it names.
+
+• **The reset on link loss turned out to be two independent controls, and the mutation found it.** `_discard_evidence` clears the window's timestamps, and `_advance` re-stamps `_ready_since` from the new link's first tick; each alone is sufficient, so removing either stays green. Both are removed together in the falsification test, and this is reported rather than tidied away — it is the same defence-in-depth pattern D4.11 found in `mark_link_up`, and pinning one of the two individually would be asserting an implementation detail instead of the property.
+
+• **Fourteen source mutations, twelve red on the first pass.** The two green ones are the halves of the reset above; the pair is red. Two further mutations — probation ranked above health, and probation shared across provider instances — were green until a test was added or the mutation was made faithful, and both are red now.
+
+• **No broker was touched.** All five adapters, `stream.py`, `streaming.py` (the broker one), `instruments.py`, `market_feed.py`, `ticks.py`, `reliability.py`, the registry, the Trading Engine, the Portfolio Engine and the frontend are unchanged. The sprint is three edited modules in the Market Engine, one new test module, and a fixture.
+
+• **Consumer surfaces are unchanged.** `provider.status` carries tier, state and reason as before. Probation is visible on `describe()`, the admin/diagnostics surface where provider names already live, because an operator looking at a live feed that is not primary needs to be able to tell probation from a bug.
+
+• **LIVE VALIDATION WAS NOT PERFORMED.** No broker session exists in this environment. Every claim above rests on deterministic tests with an injected clock at the published window, a real-elapsed-time pass through the registration seam for all five brokers plus a fictional one, and the mutations listed above. **The outstanding smoke test**: hold a real broker feed past 30 seconds of live ticks and confirm the tier flips to streaming exactly once; drop the socket at 15 seconds and confirm the reconnected feed serves a fresh window rather than being promoted on its first tick; run two accounts on one broker and confirm one flapping session does not move the other's tier.
+
+Review Date
+
+At D5.3 (stale-feed demotion), which is the slice that will want to *demote* a stable feed for going quiet — the specific claim to re-test is whether "stable" should decay, or whether coverage expiry beneath it is enough.
+
+---
+
+# ADR-043
+
+Title
+
+Stale-Feed Demotion: Stability Decays, and It Decays Through the Coverage Window That Already Existed (Sprint D5.3, answers ADR-042's review question)
+
+Date
+
+2026-08-27
+
+Status
+
+Accepted — implemented; **live validation not performed** (see Consequences)
+
+Context
+
+D5.2 shipped probation and wrote its own review question down: *"Stability does not decay. A quiet stable feed is bounded only by the 120s coverage backstop. Should STABLE decay, or is coverage expiry beneath it sufficient?"*
+
+D5.3 was required to answer that from the code rather than to assume it. The audit did, and the answer was that the premise of the question was wrong in a way nobody had noticed: **the 120-second coverage backstop was not beneath it.** Coverage was only ever consulted on one of the two branches that resolve a quote.
+
+    is_eligible_for(context carrying a symbol)  →  covers(symbol)  →  120s window ✓
+    is_eligible_for(context carrying no symbol) →  return True     →  no window at all ✗
+
+The second branch is not a corner case. It is the branch `SourceManager.active_tier()`, `SourceManager.status()` and `MarketGateway.source_tier()` resolve through — the user's freshness indicator and the AI's freshness context. Reproduced against the real resolver, a feed that had served its probation window and then gone silent for 10,000 seconds reported:
+
+    covers("RELIANCE")        False        ← the coverage backstop worked
+    resolve(QUOTES, symbol)   yahoo        ← real quotes correctly fell back
+    resolve(QUOTES, no symbol) feed:u1     ← and this one did not
+    active_tier()             STREAMING
+    status()["tier"]          "streaming"
+    stability                 STABLE
+    is_on_probation           False
+
+So the platform served the user delayed baseline prices while telling them, and telling the AI, that their data was live. That is a claim about market data the platform could not support — CLAUDE.md's data rules, not a ranking blemish.
+
+The second finding follows from the same cause. `stability` compared two *past* instants — `_last_evidence_at - _ready_since >= window` — with no upper bound on how old the newer one was. A dead feed therefore stayed STABLE forever, and since `is_on_probation` is the Source Manager's ranking term, a feed with zero fresh evidence outranked a feed that was genuinely delivering. Measured on the same fixture, the chain was `[stale feed, yahoo, live feed]`.
+
+Audit answers to the brief's five questions, each from the code:
+
+  **A. Can a once-STABLE provider stay ranked ahead of a healthier one after its data goes stale?** Yes — demonstrated above, on the symbol-less branch.
+
+  **B. Does the 120-second coverage expiry already provide sufficient stale-feed demotion?** No, and this is the sprint's central finding. It is sufficient *per instrument* and was never asked *per feed*.
+
+  **C. Does STABLE need its own decay state?** No. It needs the coverage window it was already documented as sitting on top of, asked in both places. Stale coverage does remove a feed naturally — once the question is actually put.
+
+  **D. Should `consecutive_short_connections` influence provider stability?** No. See Alternatives.
+
+  **E. Does the chosen design unify transport health and provider evidence?** No. See Decision.
+
+Decision
+
+**Stability decays, through the existing coverage window, via one derived predicate.**
+
+`StreamingTickProvider.has_fresh_evidence` — an accepted canonical tick arrived within `tick_max_age_seconds` — is read in exactly two new places: the stability rule, and the symbol-less branch of `is_eligible_for`. That is the whole implementation.
+
+**One window, not two.** The predicate reuses `tick_max_age_seconds` rather than declaring a stale-feed constant. The platform already publishes exactly one answer to "how old may this feed's data be before falling back is strictly better", and the honest reading of the audit is that the bug was never a missing *policy* — it was one policy asked in only one of the two places that needed it. A second constant would be two answers to one question, free to drift. Pinned by `test_staleness_reuses_the_coverage_window_rather_than_defining_a_second_one`, which sets the window to 7 seconds and asserts `has_fresh_evidence` and `covers()` flip on the same tick of the clock.
+
+**No new state, no new constant, no new timer, no new registry.** Decay is derived on read, like `stability` and like PRIMARY-is-not-a-state before it, for the reason D4.5 gave: a stored flag is a lagging copy of something derivable, and the two disagree exactly when it matters. A feed nobody asks about costs nothing; the demotion happens on the next resolution that asks. This also means demotion needs no timer, which Rule 13 of the brief forbids for promotion and which would be no better here.
+
+**The evidence stays market data and only market data.** `has_fresh_evidence` reads `_last_evidence_at`, which is written in exactly one place — `on_raw`, on an accepted canonical tick. It never reads `_connected`, the readiness state, the subscription, or any reconnect counter. This is the direct answer to question E: transport liveness and provider evidence remain the two separate facts D4.5 made them, and the two tests that hold that line are `test_a_connected_socket_is_never_fresh_evidence` (connect, subscribe, link-up, link-up again — none moves the predicate) and `test_transport_flap_history_is_not_consulted_by_provider_stability` (a feed that flapped 100 times and is now delivering is stable; a feed that never flapped and is delivering nothing is not).
+
+**Evidence resuming on the same link restores STABLE immediately** rather than re-serving the probation window. The link never dropped, so nothing was discarded and the window this feed proved is the window of the connection it is still on. Requiring it to be re-proved would demote a feed for trading an illiquid instrument rather than for being unreliable, and would require *storing* decay state to express. A link that actually dropped is the other case, and D5.2's `_discard_evidence` already owns it.
+
+**Nothing in the Source Manager changed.** `is_on_probation` is already a generic property of the provider contract, already read as a ranking term, and it now decays because what it is derived from decays. Zero lines in `source_manager.py`, and no broker adapter was opened.
+
+Alternatives Considered
+
+**Leave it: coverage expiry beneath STABLE is sufficient.** This was the D5.2 hypothesis and the brief explicitly permitted it — "if existing coverage expiry already guarantees this property, do not invent another decay mechanism; pin that behavior with tests instead." Rejected on evidence, not on preference: the reproduction above shows the property does not hold on the symbol-less branch, and `active_tier()` is precisely where a user sees it.
+
+**Give stale feeds a third `FeedStability` member (e.g. `STALE`).** Rejected. A third member has to rank *somewhere*, and the only safe place to rank a feed with no current evidence is with the other unproven ones — which is what PROBATION already means. The member would carry no ranking information the boolean does not, and every consumer of the enum would grow a branch for it.
+
+**Use `consecutive_short_connections` to influence provider stability.** Rejected on two independent grounds, which is question D's answer. *Architecturally*: it lives in `services/brokers/reliability.py`, and the Market Engine may not import the broker layer; carrying it across would mean a new provider-contract field whose only content is transport history, which is exactly the transport/evidence unification Rule 8 forbids and which ADR-041 already declined from the other side ("whether a flapping feed may be the primary quote source is the provider layer's question"). *Substantively*: it is unnecessary. D5.2's per-link evidence reset already means a flapping feed re-serves probation from zero on every reconnect, so flap history is already reflected in this layer's ranking — expressed in the currency this layer can actually verify, delivered data rather than socket lifetimes. D5.1 handles the transport half with backoff. The smallest broker-neutral path to carry that information is therefore *no path*, and the sprint carried none.
+
+**Demote on a timer when a feed goes quiet.** Rejected. It is a scheduled callback per feed to cancel on every link drop, for a fact that is free to compute at resolution time — and it would make the demotion's timing depend on scheduler pressure rather than on the data.
+
+**Make the stale check `bool(covered_symbols)` instead of a scalar timestamp.** Rejected as equivalent but worse. Every accepted batch stamps its ticks and `_last_evidence_at` with the same instant, so the newest coverage entry is always exactly as old as the timestamp; the scalar is O(1) and asks the per-feed question the per-feed branch is actually asking.
+
+Consequences
+
+• **The tier a user sees is now honest.** A feed that goes quiet past the coverage window moves the user to `delayed` and back to `streaming` when data resumes, on both the per-symbol and the per-feed path. `test_the_tier_a_user_sees_stops_saying_streaming_when_the_feed_goes_quiet` is red against the pre-D5.3 line.
+
+• **Demotion is never an outage.** `status()["state"]` stays `available` throughout; Yahoo is asserted present, connected and resolvable at five distinct points of the decay lifecycle; and staleness ranks rather than filters, so a stale feed still answers the link-level TICKS capability its socket genuinely serves.
+
+• **Thirteen source mutations, thirteen red.** Removing the demotion; letting a stale provider stay first; reverting the symbol-less branch; making staleness permanent; wall-clock time; socket-as-evidence; stability surviving a reconnect; a genuinely global stale timestamp; removing per-user entitlement; a broker-specific stability branch; staleness as a filter; a truncated failover chain; and a second, looser stale window. Two *earlier* attempts came back green and were investigated rather than reported as gaps — both were malformed mutations, not defence in depth and not test gaps: one assigned a class attribute that `__init__` immediately shadowed with an instance attribute, and one multiplied the probation rank by a constant, which preserves sort order. Both were reformed and both are red. Reported here because a mutation that does not mutate is the easiest way to award yourself a passing falsification run.
+
+• **No broker was touched.** All five adapters, `stream.py`, `reliability.py`, `market_feed.py`, `instruments.py`, `ticks.py`, `source_manager.py`, `gateway.py`, `base.py`, the registry and the frontend are unchanged. The sprint is one edited module — `providers/streaming.py`, three logic lines and their documentation — and one new test module.
+
+• **`MarketTick` was not modified.** Rule 5 of the brief; the audit found no reason to, because the tick already carries the only thing the predicate needs, and the arrival instant is recorded by the provider on the monotonic clock rather than read off the payload.
+
+• **Known limitation, LIM-D5.3-1: decay is lazy, so it is not announced.** Promotion out of probation fires the feed-state listener from `on_raw`; decay *into* probation happens on read, with no event, so a consumer holding a rendered tier is not proactively told until the next status publish. This is deliberate — the alternative is the per-feed timer rejected above — and it is the same lazy behaviour the per-symbol coverage backstop has had since D4.5. The gap is bounded by the platform's existing status republish cadence. If it proves visible in practice, the right fix is to evaluate staleness on the existing publish path, not to add a timer.
+
+• **LIVE VALIDATION WAS NOT PERFORMED.** No interactive broker session exists in this environment. Every claim above rests on deterministic tests with an injected monotonic clock, a pass through the real `attach_market_feed` registration seam for all five brokers plus a fictional one, and the mutations listed. **The outstanding smoke test**: hold a real broker feed to stability, stop the instrument's ticks (an illiquid symbol outside its trading burst, or a subscription the broker stops servicing) while leaving the socket up, and confirm the tier flips to `delayed` after the coverage window with the socket still open — the whole point is that the link is *not* the thing that changed; then confirm it returns to `streaming` on the next tick without re-serving the probation window.
+
+Review Date
+
+At D5.4 (latency scoring), which will add a third ranking term beside health and probation. The specific claim to re-test is whether the coverage window is still the right decay threshold once per-provider latency is measured — a feed whose ticks are consistently 90 seconds late is fresh by this predicate and bad by that one, and the two terms must not end up disagreeing about the same feed.
+
 ---
 
 # End of Decisions Documentation

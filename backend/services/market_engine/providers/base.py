@@ -414,6 +414,27 @@ class MarketDataProvider(ABC):
         """
         return True
 
+    @property
+    def is_on_probation(self) -> bool:
+        """Whether this provider is usable but has not yet *proved* it is reliable.
+
+        The READY != STABLE line (D5.2). Readiness says a provider can serve
+        right now; probation says the platform has not yet seen enough of it to
+        let it displace a provider that has been serving reliably. The Source
+        Manager reads this as a ranking term, never as an eligibility filter:
+        a probationary provider still answers when nothing steadier is left,
+        because refusing to serve is strictly worse than serving from a feed
+        that is merely young.
+
+        The default is False, and it is a statement rather than a convenience.
+        Probation is evidence about *one connection*: a provider with no link to
+        lose — the polled baseline over a stateless HTTP API — has no
+        per-connection reliability to demonstrate, and what can be said about
+        its trustworthiness is already said by health. Only a provider that
+        implements the readiness gate implements this with it.
+        """
+        return False
+
     # ── Push surface (D4.4) ──────────────────────────────
     #
     # MARKET_DATA_ARCHITECTURE.md's adapter contract, rule 5: "polling adapters
@@ -621,6 +642,7 @@ class MarketDataProvider(ABC):
             "priority": self.priority,
             "connected": self._connected,
             "ready": self.is_ready,
+            "on_probation": self.is_on_probation,
             "subscriptions": len(self._subscribed),
             "scope": "global" if self.owner_user_id is None else "user",
             "capabilities": sorted(c.value for c in self.capabilities),

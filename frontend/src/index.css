@@ -1,4 +1,4 @@
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&family=Outfit:wght@300;400;500;600;700;800&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Instrument+Serif:ital,wght@0,400;1,400&family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&family=Outfit:wght@300;400;500;600;700;800&display=swap');
 
 @tailwind base;
 @tailwind components;
@@ -12,37 +12,35 @@
   [data-theme="light"] {
     --bg: #F8F9FC;
     --bg-surface: #FFFFFF;
-    --bg-elevated: #FFFFFF;
-    --bg-card-glass: rgba(255, 255, 255, 0.72);
-    --bg-card-glass-hover: rgba(255, 255, 255, 0.85);
+    --bg-elevated: #F1F3F9;
+    --bg-card-glass: #FFFFFF;
+    --bg-card-glass-hover: #FFFFFF;
     --text-primary: #1A1D29;
     --text-secondary: #5E6278;
     --text-muted: #9CA3B8;
-    --border: rgba(0, 0, 0, 0.07);
-    --border-subtle: rgba(0, 0, 0, 0.04);
+    --border: rgba(0, 0, 0, 0.055);
+    --border-subtle: rgba(0, 0, 0, 0.03);
     --brand: #1A1D29;
     --brand-secondary: #9CA3B8;
     --gain: #00C48C;
-    --gain-bg: rgba(0, 196, 140, 0.08);
+    --gain-bg: rgba(0, 196, 140, 0.06);
     --loss: #FF6B6B;
-    --loss-bg: rgba(255, 107, 107, 0.08);
+    --loss-bg: rgba(255, 107, 107, 0.06);
     --ai-accent: #6366F1;
-    --ai-accent-soft: rgba(99, 102, 241, 0.08);
-    --ai-accent-glow: rgba(99, 102, 241, 0.15);
-    --hover: rgba(0, 0, 0, 0.03);
-    --card-shadow: 0 1px 3px rgba(0, 0, 0, 0.04), 0 1px 2px -1px rgba(0, 0, 0, 0.04);
-    --card-shadow-hover: 0 8px 25px -5px rgba(0, 0, 0, 0.08), 0 4px 10px -3px rgba(0, 0, 0, 0.04);
+    --ai-accent-soft: rgba(99, 102, 241, 0.06);
+    --ai-accent-glow: rgba(99, 102, 241, 0.1);
+    --hover: rgba(120, 120, 120, 0.05);
+    --card-shadow: 0 1px 3px rgba(0, 0, 0, 0.02);
+    --card-shadow-hover: 0 4px 12px rgba(0, 0, 0, 0.05);
     --glass-blur: 24px;
     --glass-saturate: 1.8;
     --card-radius: 16px;
     --card-radius-lg: 20px;
     --sidebar-bg: #FFFFFF;
-    --nav-bg: rgba(248, 249, 252, 0.8);
+    --nav-bg: rgba(248, 249, 252, 0.85);
 
     /* =============================================
-       TYPOGRAPHY SCALE (theme-independent — defined
-       once here, inherited by dark theme)
-       Larger, confident premium-fintech scale.
+       TYPOGRAPHY SCALE (theme-independent)
        ============================================= */
     --fs-display: clamp(2.25rem, 1.85rem + 1.8vw, 2.75rem); /* hero */
     --fs-h1: clamp(1.75rem, 1.5rem + 1.15vw, 2.125rem);     /* page title */
@@ -70,12 +68,12 @@
     --page-max-width: 1600px;
 
     /* shadcn compat */
-    --background: 0 0% 100%;
-    --foreground: 0 0% 3.9%;
+    --background: 0 0% 98%;
+    --foreground: 220 20% 10%;
     --card: 0 0% 100%;
-    --card-foreground: 0 0% 3.9%;
+    --card-foreground: 220 20% 10%;
     --popover: 0 0% 100%;
-    --popover-foreground: 0 0% 3.9%;
+    --popover-foreground: 220 20% 10%;
     --primary: 239 84% 67%;
     --primary-foreground: 0 0% 100%;
     --secondary: 240 4.8% 95.9%;
@@ -96,37 +94,34 @@
      DARK THEME
      ============================================= */
   [data-theme="dark"] {
-    /* Deep indigo/navy-tinted dark — deliberately NOT charcoal gray.
-       Surfaces carry a subtle cool undertone consistent with --ai-accent. */
-    --bg: #0A0C15;
-    --bg-surface: #12141F;
-    --bg-elevated: #181C2C;
-    --bg-card-glass: rgba(24, 28, 46, 0.65);
-    --bg-card-glass-hover: rgba(30, 35, 56, 0.82);
+    --bg: #09090e;
+    --bg-surface: #0d1117;
+    --bg-elevated: #161a22;
+    --bg-card-glass: #0d1117;
+    --bg-card-glass-hover: #111318;
     --text-primary: #F0F2F5;
-    --text-secondary: #8B8FA3;
-    --text-muted: #4B5068;
-    /* Indigo-tinted edges & hovers (was neutral white-alpha => read as gray) */
-    --border: rgba(130, 141, 235, 0.11);
-    --border-subtle: rgba(130, 141, 235, 0.06);
+    --text-secondary: #888a96;
+    --text-muted: #4a4f5e;
+    --border: rgba(255, 255, 255, 0.07);
+    --border-subtle: rgba(255, 255, 255, 0.04);
     --brand: #FFFFFF;
-    --brand-secondary: #4B5068;
-    --gain: #00D68F;
-    --gain-bg: rgba(0, 214, 143, 0.1);
-    --loss: #FF6B6B;
-    --loss-bg: rgba(255, 107, 107, 0.1);
+    --brand-secondary: #4a4f5e;
+    --gain: #4ade80;
+    --gain-bg: rgba(74, 222, 128, 0.12);
+    --loss: #f87171;
+    --loss-bg: rgba(248, 113, 113, 0.12);
     --ai-accent: #818CF8;
     --ai-accent-soft: rgba(129, 140, 248, 0.12);
     --ai-accent-glow: rgba(129, 140, 248, 0.2);
-    --hover: rgba(129, 140, 248, 0.07);
-    --card-shadow: 0 1px 3px rgba(0, 0, 0, 0.2), 0 1px 2px -1px rgba(0, 0, 0, 0.15);
-    --card-shadow-hover: 0 12px 30px -8px rgba(0, 0, 0, 0.4);
+    --hover: rgba(255, 255, 255, 0.04);
+    --card-shadow: none;
+    --card-shadow-hover: none;
     --glass-blur: 24px;
     --glass-saturate: 1.8;
     --card-radius: 16px;
     --card-radius-lg: 20px;
-    --sidebar-bg: #0D1019;
-    --nav-bg: rgba(10, 12, 21, 0.8);
+    --sidebar-bg: #09090e;
+    --nav-bg: rgba(9, 10, 14, 0.85);
 
     /* shadcn compat */
     --background: 230 28% 4%;
