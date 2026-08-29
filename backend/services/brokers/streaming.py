@@ -477,6 +477,43 @@ class BrokerStreamChannel:
     #: Which `StreamEventKind`s this channel may deliver.
     delivers: frozenset = frozenset()
 
+    #: How many instruments ONE connection of this channel may carry, or `None`
+    #: (D5.10). The single broker-neutral fact `plan_shards` consumes.
+    #:
+    #: `None` — the default, and what every channel written before D5.10 has —
+    #: means **no shardable limit is known**, and it is planned as exactly one
+    #: connection holding everything. It does not mean "unlimited", and it is
+    #: never guessed at: an invented ceiling would shard a broker that does not
+    #: need it and spend a connection the broker may not permit.
+    #:
+    #: WHY IT SAYS "PER CONNECTION" AND WHY THAT IS NOT PEDANTRY
+    #: ---------------------------------------------------------
+    #: The D5.10 audit found the existing adapters do not all cap the same
+    #: thing, and the difference decides whether sharding helps or harms:
+    #:
+    #: * a **per-connection** limit is raised by opening another connection. Four
+    #:   of the five streaming adapters have one.
+    #: * a **per-session quota**, counted across the client code rather than
+    #:   across the socket, is not. Sharding one would open a second socket the
+    #:   same quota refuses — spending one of that broker's scarce concurrent
+    #:   connections to subscribe to nothing, and converting a warning into a
+    #:   dead feed. Such a channel declares `None` here and keeps enforcing its
+    #:   quota in its own `subscribe_frames`, which is where it always was.
+    #:
+    #: * a **per-frame** limit is neither. Two adapters already split one
+    #:   subscription across several frames on one socket; that is wire framing,
+    #:   it belongs to the codec, and it is untouched by this field.
+    max_instruments_per_connection: Optional[int] = None
+
+    #: How many connections of this channel one account may hold at once, or
+    #: `None` when the broker documents no ceiling (D5.10).
+    #:
+    #: Caps the shard count. Worth a field of its own because one broker's
+    #: documented behaviour past the ceiling is to disconnect the **oldest**
+    #: connection rather than refuse the new one — so a planner that ignored it
+    #: would knock out the shard it opened first, on every plan, forever.
+    max_connections: Optional[int] = None
+
     def endpoint(self, session: dict, credentials: Dict[str, str] = None) -> BrokerStreamEndpoint:
         """Where to connect for this channel, and how to authenticate."""
         raise NotImplementedError

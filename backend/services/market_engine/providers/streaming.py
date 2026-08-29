@@ -293,6 +293,7 @@ not before, because a contract nothing populates is worse than an absent one.
 from __future__ import annotations
 
 import logging
+import math
 import statistics
 import time
 from collections import deque
@@ -302,6 +303,7 @@ from typing import Any, Awaitable, Callable, Deque, Dict, Iterable, List, Option
 
 from services.market_engine.providers.base import (
     Capability,
+    LatencyProfile,
     MarketDataProvider,
     ProviderKind,
     ResolutionContext,
@@ -387,6 +389,117 @@ PROBATION_WINDOW_SECONDS = 30.0
 #: end: a feed slow enough for nine intervals to take minutes is stale long
 #: before then, and a stale feed has no latency score at all.
 LATENCY_WINDOW_SAMPLES = 9
+
+#: How many recent delivery intervals the feed retains, and therefore how many
+#: the p95 is taken over and how many it takes before a p95 exists (D5.9).
+#:
+#: WHY THIS IS NOT ALSO NINE, WHICH IS THE WHOLE OF THE D5.9 STATISTICS PROBLEM
+#: With the nearest-rank method (below), the p95 of N samples is the
+#: ``ceil(0.95 * N)``-th smallest. For every N up to and including 19 that
+#: expression equals N, so the "p95" *is the maximum* — a single worst delivery
+#: becomes the whole statistic, which is precisely the one-outlier sensitivity
+#: `LATENCY_WINDOW_SAMPLES` was chosen to avoid for the median. Reporting a
+#: maximum under the name p95 would be the "precision it does not have" the D5.9
+#: brief forbids, and it is why ADR-044 recorded p95 as unavailable rather than
+#: computing one from nine samples.
+#:
+#: TWENTY IS DERIVED, NOT PICKED
+#: ``ceil(0.95 * N) < N`` first holds at N = 20, where the p95 is the 19th of 20
+#: — the second-largest observed interval, with exactly one worst sample
+#: excluded. So 20 is the *smallest* sample size at which a p95 is a different
+#: statistic from a maximum, and it is chosen for that and for nothing else.
+#: Unlike ADR-047's 60 seconds this is not a judgement call: any smaller number
+#: makes the statistic degenerate and any larger one buys tail resolution with
+#: warm-up the platform has no evidence it needs.
+#:
+#: TWO WINDOWS, ONE SERIES
+#: This is the deque's `maxlen`; `LATENCY_WINDOW_SAMPLES` is the newest slice of
+#: the same deque. There is one recording site, one eviction rule, one reset and
+#: one clock — a second series is what D5.9 rule 6 forbids, and none is created.
+#: The two thresholds are not the drift hazard ADR-044 warned about, because
+#: that hazard was *one* statistic with a maxlen and a separate warm-up free to
+#: disagree; here each statistic's window is its own warm-up, exactly as before.
+LATENCY_TAIL_WINDOW_SAMPLES = 20
+
+#: The percentile the tail statistic reports.
+LATENCY_TAIL_PERCENTILE = 0.95
+
+
+#: The shard id of a feed whose whole subscription fits on one connection (D5.10).
+#:
+#: Every pre-D5.10 caller means this by saying nothing, which is what makes a
+#: single-connection feed byte-for-byte unaffected by the shard ledger below:
+#: with one shard every aggregate over shards is that shard's own value.
+#:
+#: WHY THIS IS DEFINED HERE AND NOT IMPORTED
+#: The party that plans shards is the one that owns the wire, and it lives in
+#: the broker layer — which this module may not import (Developer Rule 9's
+#: dependency direction, pinned by
+#: `test_the_market_engine_never_imports_a_broker_module`). A shard id is an
+#: opaque string to this class in exactly the way a provider name is: it is
+#: minted upstream, used as a dictionary key, and never parsed. The two
+#: constants are pinned equal by a test rather than by an import, because the
+#: import is the thing that is not allowed.
+DEFAULT_FEED_SHARD = "0"
+
+
+class _ShardEvidence:
+    """What one broker connection of a feed has proved, on the link it holds now.
+
+    THE D5.10 CHANGE, IN ONE OBJECT
+    --------------------------------
+    Before D5.10 this class held four scalars — link state, the instant
+    readiness was earned, the instant valid data last arrived, and the recent
+    delivery intervals — because a feed was one socket and a scalar was the
+    whole truth. A sharded feed is several sockets that **fail independently**,
+    and every one of those four facts is a fact about *one* of them:
+
+    * a shard that drops must discard its own evidence and no one else's, or
+      losing one connection would blank a feed that is still delivering most of
+      the account's instruments (the D4.5 rule applied per link, which is what
+      it always meant);
+    * a shard that reconnects must re-earn readiness, re-serve probation and
+      re-establish latency on the connection that actually exists, without
+      inheriting anything — and without making its healthy siblings re-earn
+      anything;
+    * a shard that dies permanently must not be *masked* by its healthy
+      siblings. This is the D5.3 defect one layer along: a provider whose
+      `_last_evidence_at` was advanced by any shard would report itself live
+      forever while a third of the portfolio had no socket at all.
+
+    So the scalars became one of these per shard, and the provider's answers
+    became aggregations over them. Which aggregation each answer uses is the
+    substance of ADR-050 and is documented on each property.
+    """
+
+    __slots__ = ("link_up", "ready_since", "last_evidence_at", "intervals")
+
+    def __init__(self) -> None:
+        #: Whether this shard's transport reports a connection. Not readiness.
+        self.link_up: bool = False
+        #: When this shard first delivered valid canonical data on its current
+        #: link — the instant its probation window opens.
+        self.ready_since: Optional[float] = None
+        #: When it last did. The freshness evidence, per D5.3.
+        self.last_evidence_at: Optional[float] = None
+        #: Gaps between accepted batches on this shard's current link (D5.4 /
+        #: D5.9). Per shard rather than merged, because merging N shards each
+        #: delivering every second produces intervals of 1/N and would score a
+        #: wide subscription as fast — turning shard count into a latency
+        #: advantage the feed has not earned. See `_percentile_over`.
+        self.intervals: Deque[float] = deque(maxlen=LATENCY_TAIL_WINDOW_SAMPLES)
+
+    def discard(self) -> None:
+        """Forget everything this shard's current link produced.
+
+        Called whenever this one connection drops. `link_up` is deliberately not
+        touched here: it is set by the caller that knows which transition it is
+        reporting, and a single owner for it is what keeps "the link came back"
+        and "the evidence is gone" from being two half-applied facts.
+        """
+        self.ready_since = None
+        self.last_evidence_at = None
+        self.intervals.clear()
 
 
 class FeedReadiness(str, Enum):
@@ -542,29 +655,142 @@ class StreamingTickProvider(MarketDataProvider):
         self._rejected = 0
         self._readiness = FeedReadiness.REGISTERED
         #: Newest tick per canonical symbol, with the monotonic instant it
-        #: arrived. Bounded by the subscribed instrument set, which the owner
-        #: chose — this is not an unbounded cache of everything ever seen.
-        self._last_tick: Dict[str, Tuple[MarketTick, float]] = {}
-        #: When readiness was earned *on the current link*, and when valid data
-        #: last arrived on it. Probation is the interval between them: two
-        #: timestamps, so stability stays derived rather than stored (see the
-        #: D5.2 section of the module docstring).
-        self._ready_since: Optional[float] = None
-        self._last_evidence_at: Optional[float] = None
-        #: The most recent gaps between accepted batches on the current link,
-        #: newest last (D5.4). Bounded by `maxlen`, so this is a fixed nine
-        #: floats per feed and never grows — and so an old sample leaves by
-        #: being pushed out rather than by a decay coefficient nobody can
-        #: justify. Cleared with everything else in `_discard_evidence`.
-        self._delivery_intervals: Deque[float] = deque(maxlen=LATENCY_WINDOW_SAMPLES)
+        #: arrived and the shard that delivered it. Bounded by the subscribed
+        #: instrument set, which the owner chose — this is not an unbounded
+        #: cache of everything ever seen.
+        #:
+        #: The shard is carried (D5.10) so that a connection dropping discards
+        #: exactly the instruments *it* was covering. Without it, one shard's
+        #: loss would either blank the whole feed — throwing away prices from
+        #: connections that never dropped — or leave its instruments answering
+        #: quotes from a socket that no longer exists, which is the D4.5 rule
+        #: this ledger exists to keep.
+        self._last_tick: Dict[str, Tuple[MarketTick, float, str]] = {}
+        #: What each of this feed's broker connections has proved (D5.10).
+        #:
+        #: One entry for an unsharded feed, and that entry holds exactly the
+        #: four scalars this class carried before D5.10 — so every aggregate
+        #: below reduces to the value it used to read, which is what makes a
+        #: single-connection feed unaffected. See :class:`_ShardEvidence` and
+        #: :meth:`declare_shards`.
+        self._shards: Dict[str, _ShardEvidence] = {DEFAULT_FEED_SHARD: _ShardEvidence()}
         self._readiness_listener: Optional[FeedStateListener] = None
         self._last_failure: str = ""
+
+    # ── Shards: the feed's broker connections (D5.10) ────
+
+    def declare_shards(self, shard_ids: Iterable[str]) -> Tuple[str, ...]:
+        """Say how many broker connections this feed is spread across.
+
+        Called by whoever owns the wire, once, immediately after construction —
+        the same party that supplies the subscription, and for the same reason:
+        **a feed that never said what it is made of cannot be asked whether all
+        of it is working.** Without a declaration, "every shard has fresh
+        evidence" would be quantified over whichever connections happened to
+        have delivered something, which is vacuously true of a feed whose second
+        connection has never come up at all. That is precisely the "a healthy
+        shard masks a dead shard" failure, and a declaration is what makes the
+        conjunction mean something.
+
+        An empty or absent declaration is the single default shard, which is
+        what every feed built before D5.10 has and what an unsharded feed still
+        is. Idempotent, and safe to call with the same ids twice; ids that are
+        already declared keep their evidence, so re-declaring an unchanged plan
+        is not a reconnect.
+
+        Ids are opaque strings. This class never parses one, never orders by
+        one, and never puts one in anything a consumer reads — see
+        :meth:`describe`, which reports a *count*.
+        """
+        wanted = tuple(dict.fromkeys(str(sid) for sid in (shard_ids or ()) if str(sid).strip()))
+        if not wanted:
+            wanted = (DEFAULT_FEED_SHARD,)
+        # Rebuilt as a fresh mapping in declaration order rather than mutated,
+        # so a shard that left the plan cannot survive as a stale key that
+        # "every shard" would then quantify over forever. Retained shards keep
+        # the identical `_ShardEvidence` object: a reshard that did not touch a
+        # connection must not make it re-earn readiness or re-serve probation.
+        self._shards = {sid: self._shards.get(sid) or _ShardEvidence() for sid in wanted}
+        # Prices delivered by a shard the plan has dropped describe a connection
+        # that is being closed; they may not answer a quote, exactly as a dropped
+        # link's may not.
+        for symbol in [sym for sym, entry in self._last_tick.items() if entry[2] not in self._shards]:
+            self._last_tick.pop(symbol, None)
+        return wanted
+
+    @property
+    def shard_count(self) -> int:
+        """How many broker connections this feed is spread across. One, usually."""
+        return len(self._shards)
+
+    def _shard(self, shard: Optional[str]) -> Optional[_ShardEvidence]:
+        """The ledger for one connection, or None when it is not in the plan.
+
+        `None` is not an error to this method and is not silently created. A
+        record or a link transition naming an undeclared shard is a statement
+        about a connection this provider was never told exists — a stale batch
+        from a plan that has just been replaced, most likely — and registering
+        it on arrival would let an unplanned connection widen the "every shard"
+        conjunction for the life of the feed. The callers reject it and say so.
+        """
+        return self._shards.get(str(shard if shard is not None else DEFAULT_FEED_SHARD))
 
     # ── Readiness ────────────────────────────────────────
 
     @property
     def readiness(self) -> FeedReadiness:
         return self._readiness
+
+    @property
+    def _last_evidence_at(self) -> Optional[float]:
+        """When the feed *as a whole* last had valid data on every connection.
+
+        The **oldest** shard's last-evidence instant, and `None` if any declared
+        shard has none at all (D5.10). Every property that reads it —
+        :attr:`has_fresh_evidence`, :meth:`stability` — therefore answers about
+        the whole subscription rather than about whichever connection ticked
+        most recently, and neither of them needed a line changed.
+
+        Why the minimum and not the maximum: the maximum is the mask. A feed
+        whose second connection died an hour ago would report evidence from a
+        second ago on the strength of its first, and the symbol-less resolution
+        path — `active_tier()`, `status()`, the AI's freshness context — would
+        tell a user their data is live while a third of their portfolio had no
+        socket at all. That is the D5.3 defect exactly, arriving by a second
+        route, and the minimum is the same answer D5.3 gave it.
+
+        With one shard this is that shard's own timestamp, which is the scalar
+        this attribute was before D5.10.
+        """
+        stamps = [shard.last_evidence_at for shard in self._shards.values()]
+        if not stamps or any(stamp is None for stamp in stamps):
+            return None
+        return min(stamps)
+
+    @property
+    def _ready_since(self) -> Optional[float]:
+        """When the feed as a whole began its current probation window.
+
+        The **newest** shard's readiness instant, and `None` if any declared
+        shard has not earned readiness on its current link. Paired with the
+        minimum above, `stability`'s untouched `last_evidence - ready_since >=
+        window` test becomes "every connection has been delivering valid data
+        for a full window", which is the only reading of the published probation
+        rule that a partially-covered feed can satisfy honestly.
+
+        It is also what makes a reconnect cost the *provider* its probation
+        without costing its healthy siblings theirs: the shard that came back
+        clears its own `ready_since`, so this is `None` until it re-earns one,
+        and then it is that shard's — the latest — so the window restarts from
+        the reconnect rather than from whatever the oldest connection remembers.
+
+        With one shard this is that shard's own timestamp, which is the scalar
+        this attribute was before D5.10.
+        """
+        stamps = [shard.ready_since for shard in self._shards.values()]
+        if not stamps or any(stamp is None for stamp in stamps):
+            return None
+        return max(stamps)
 
     @property
     def is_link_up(self) -> bool:
@@ -649,13 +875,121 @@ class StreamingTickProvider(MarketDataProvider):
         through the provider contract, and surfaced on :meth:`describe` for
         diagnostics. It reaches no consumer payload and no market event.
         """
+        return self._percentile_over(LATENCY_WINDOW_SAMPLES, statistic="median")
+
+    @property
+    def delivery_latency_p95(self) -> Optional[float]:
+        """This feed's 95th-percentile delivery interval in seconds, or None (D5.9).
+
+        The same series, the same clock and the same three establishment gates
+        as :attr:`delivery_latency` — it differs only in taking the whole
+        retained window rather than its newest slice, and in reporting a tail
+        rather than a centre. Where the median answers "what does this feed
+        usually cost a consumer", this answers "what does a bad delivery on this
+        feed cost", which is the question an operator watching a feed actually
+        has and which a median cannot be stretched to answer.
+
+        `None` until `LATENCY_TAIL_WINDOW_SAMPLES` intervals have been observed
+        on the current link — a longer warm-up than the median's, deliberately,
+        because a tail statistic taken over too few samples is a maximum wearing
+        a percentile's name. See `LATENCY_TAIL_WINDOW_SAMPLES` for why 20 is the
+        smallest window at which that stops being true.
+
+        **Reported, never ranked on.** It reaches :meth:`health` and
+        :meth:`describe` and it does not appear in
+        :func:`services.market_engine.source_manager._selection_rank` — ADR-049
+        records why the selection metric stays the median.
+        """
+        return self._percentile_over(
+            LATENCY_TAIL_WINDOW_SAMPLES, statistic="p95"
+        )
+
+    @property
+    def latency_profile(self) -> LatencyProfile:
+        """This feed's cadence as `health()` reports it (D5.9).
+
+        Assembled from the two properties above rather than from the deque, so
+        there is exactly one implementation of each statistic and of the gates
+        that establish it. `samples` is the retained interval count — a size,
+        never an instant, so no monotonic reading leaves this class.
+        """
+        p50 = self.delivery_latency
+        return LatencyProfile(
+            established=p50 is not None,
+            p50_seconds=p50,
+            p95_seconds=self.delivery_latency_p95,
+            # The *least* warmed-up connection's sample count (D5.10), because
+            # that is the one the establishment gate is still waiting for. The
+            # maximum would report a full window while a statistic that needs
+            # every shard is still `None`, which reads as a bug in the gate.
+            # One shard makes this that shard's count, unchanged.
+            samples=min((len(shard.intervals) for shard in self._shards.values()), default=0),
+        )
+
+    def _percentile_over(self, window: int, *, statistic: str) -> Optional[float]:
+        """The `statistic` of the newest `window` delivery intervals, or None.
+
+        One place where the three establishment gates are applied and one place
+        where a window is sliced, so the median and the p95 cannot drift apart
+        on either. The gates are D5.4's and are unchanged:
+
+        * **the feed is ready** — an unready feed's data may not be used, so a
+          statistic over it measures nothing the platform would act on;
+        * **the window is full** — one lucky tick may not become a score, and
+          each statistic's own window is its own warm-up;
+        * **the evidence is fresh** — a percentile of gaps that all closed ten
+          minutes ago is not a current measurement of anything.
+
+        THE PERCENTILE METHOD IS NEAREST-RANK, AND IT IS PINNED
+        For the tail: sort ascending, take the `ceil(p * N)`-th value
+        (1-indexed). No interpolation, no averaging of neighbours, no
+        distribution assumption. Two reasons, both the same reason ADR-044 chose
+        an odd median window: the result is an interval this feed was actually
+        observed to deliver rather than a number between two of them, and it is
+        exactly reproducible from the retained samples, so a test can assert the
+        value and not a tolerance. At N = 20 the index is 19, so the single
+        worst sample is excluded and one catastrophic gap cannot become the
+        reported tail.
+        """
         if not self.is_ready:
-            return None
-        if len(self._delivery_intervals) < LATENCY_WINDOW_SAMPLES:
             return None
         if not self.has_fresh_evidence:
             return None
-        return statistics.median(self._delivery_intervals)
+        # D5.10 — ONE SERIES PER CONNECTION, AND THE WORST ONE IS THE ANSWER.
+        #
+        # Merging every shard's arrivals into one series would be the single
+        # most dangerous thing this sprint could do to ranking. Three
+        # connections each delivering once a second produce a merged inter-
+        # arrival gap of a third of a second, so a feed would appear to get
+        # three times faster for having been split — a latency advantage bought
+        # by owning more sockets rather than by delivering any instrument
+        # sooner. A consumer waits for *their* instrument, which arrives on
+        # exactly one shard at that shard's own cadence, so the per-shard series
+        # is the one that measures something real.
+        #
+        # Aggregated by maximum for the same reason: a quote is answered from
+        # one connection and the platform cannot know in advance which, so the
+        # only value that cannot overstate the feed is its slowest connection's.
+        # The minimum would let one fast shard speak for a slow one and rank the
+        # feed above a steadier provider it does not beat.
+        #
+        # Unestablished on any shard is unestablished for the feed. `None` is
+        # "not established" rather than "fast" (D5.4), and a feed with a
+        # connection nobody has timed yet has not been timed.
+        per_shard: List[float] = []
+        for shard in self._shards.values():
+            samples = shard.intervals
+            if len(samples) < window:
+                return None
+            recent = list(samples)[-window:]
+            if statistic == "median":
+                per_shard.append(statistics.median(recent))
+            else:
+                rank = math.ceil(LATENCY_TAIL_PERCENTILE * window)
+                per_shard.append(sorted(recent)[rank - 1])
+        if not per_shard:
+            return None
+        return max(per_shard)
 
     @property
     def stability(self) -> FeedStability:
@@ -770,24 +1104,17 @@ class StreamingTickProvider(MarketDataProvider):
         if state is self._readiness:
             return False
         previous, self._readiness = self._readiness, state
-        if state is FeedReadiness.READY:
-            # The probation window opens at the tick that earned readiness — not
-            # at the instant this transition is processed, which is a hair later
-            # and would make the window measure "since we noticed" rather than
-            # "of valid data". Stamped on the transition rather than on every
-            # subsequent tick: re-stamping would restart probation on each
-            # arrival and no feed would ever leave it.
-            #
-            # Nothing clears it on the way *out* of READY, deliberately: every
-            # path that loses a link calls `_discard_evidence`, which is the one
-            # owner of this timestamp, and a second place that also clears it
-            # would be a second place to get it wrong — and would make the reset
-            # untestable, since removing either half would leave the other
-            # quietly covering for it.
-            self._ready_since = (
-                self._last_evidence_at if self._last_evidence_at is not None
-                else self._clock()
-            )
+        # D5.10 — the probation window is no longer opened here.
+        #
+        # It used to be stamped on the READY transition, from `_last_evidence_at`,
+        # which was correct while a feed was one connection: the transition and
+        # the tick that caused it were the same event. With several connections
+        # they are not — the second shard's first tick opens *its* window without
+        # moving the provider's readiness at all — so the stamp moved to the
+        # shard that earned it (`on_raw`), and `_ready_since` reads the newest of
+        # them. The value for a single-shard feed is identical: the tick that
+        # earns readiness stamps `arrived_at`, which is exactly what
+        # `_last_evidence_at` returned here.
         self._last_failure = reason if state is FeedReadiness.FAILED else ""
         logger.info(
             "Streaming provider %s readiness %s -> %s%s",
@@ -799,10 +1126,10 @@ class StreamingTickProvider(MarketDataProvider):
             await listener(self, previous, state)
         return True
 
-    def _discard_evidence(self) -> None:
-        """Forget every tick this link produced.
+    def _discard_evidence(self, shard: Optional[str] = None) -> None:
+        """Forget every tick one connection produced — or every connection's.
 
-        Called whenever the link drops. Readiness is evidence about *this*
+        Called whenever a link drops. Readiness is evidence about *that*
         connection, and prices from a connection that no longer exists must not
         answer a quote — nor let a reconnected feed skip the gate on the
         strength of what the previous one sent.
@@ -811,18 +1138,35 @@ class StreamingTickProvider(MarketDataProvider):
         full window, dropped, and came back has proved nothing about the new
         connection — inheriting the old link's window would hand a flapping feed
         the primary position it has just demonstrated it cannot hold.
+
+        D5.4: intervals measured on a link that no longer exists describe a
+        connection the platform cannot ask anything of — the same argument D4.5
+        made for coverage and D5.2 for probation. Clearing the shard's evidence
+        timestamp also disposes of a defect that would otherwise need its own
+        guard: the gap *spanning* the disconnection is never recorded, because
+        the first batch after a reconnect has no predecessor to measure against.
+
+        D5.10 — SCOPED TO THE CONNECTION THAT DROPPED. `shard=None` still means
+        every connection, which is what `disconnect()` means and what an
+        unsharded feed's one link has always been. Naming a shard discards that
+        shard's window, its intervals and *its* cached prices, and touches
+        nothing its siblings proved: a feed of three connections that loses one
+        must go on answering for the instruments the other two are still
+        delivering, or one blip would blank a portfolio two working sockets are
+        covering perfectly well.
         """
-        self._last_tick.clear()
-        self._last_evidence_at = None
-        self._ready_since = None
-        # D5.4: intervals measured on a link that no longer exists describe a
-        # connection the platform cannot ask anything of — the same argument
-        # D4.5 made for coverage and D5.2 for probation. Clearing
-        # `_last_evidence_at` above also disposes of a defect that would
-        # otherwise need its own guard: the gap *spanning* the disconnection is
-        # never recorded, because the first batch after a reconnect has no
-        # predecessor to measure against.
-        self._delivery_intervals.clear()
+        if shard is None:
+            for evidence in self._shards.values():
+                evidence.discard()
+            self._last_tick.clear()
+            return
+        evidence = self._shard(shard)
+        if evidence is None:
+            return
+        evidence.discard()
+        key = str(shard)
+        for symbol in [sym for sym, entry in self._last_tick.items() if entry[2] == key]:
+            self._last_tick.pop(symbol, None)
 
     # ── Lifecycle ────────────────────────────────────────
 
@@ -848,10 +1192,15 @@ class StreamingTickProvider(MarketDataProvider):
         """Tear the session down. Idempotent."""
         await super().disconnect()
         self._discard_evidence()
+        for evidence in self._shards.values():
+            # Every connection of this feed is finished, not merely evidence-less
+            # (D5.10). Leaving the flags set would let a later single-shard
+            # link-down believe a sibling was still carrying the feed.
+            evidence.link_up = False
         await self._advance(FeedReadiness.DISCONNECTED)
 
-    async def mark_link_down(self, reason: str = "") -> bool:
-        """The feed's transport reports its connection lost.
+    async def mark_link_down(self, reason: str = "", shard: Optional[str] = None) -> bool:
+        """The feed's transport reports one of its connections lost.
 
         The demotion half of make-before-break, and the reason failover here
         needs no polling: the side that owns the socket already knows the moment
@@ -863,23 +1212,93 @@ class StreamingTickProvider(MarketDataProvider):
         a dropped socket that is reconnecting is not an ended entitlement, and
         unregistering on every blip would churn the registry and throw away the
         feed's diagnostics. It becomes un-resolvable, not absent.
+
+        D5.10 — WHAT ONE SHARD'S LOSS DOES, AND WHAT IT MUST NOT DO
+        ------------------------------------------------------------
+        The connection that dropped discards its evidence and its prices, and
+        the feed's *readiness* is only walked back when there is no connection
+        left. That is the failure-isolation requirement read literally: a shard
+        going down must preserve what its healthy siblings are delivering, so
+        their instruments keep answering quotes and the feed is not blanked by a
+        blip on a connection carrying a fifth of the account.
+
+        It is emphatically not "one healthy shard means the feed is fine". Every
+        provider-level claim tightens the moment a shard goes: the lost shard has
+        no evidence, so `_last_evidence_at` — the minimum — is `None`,
+        `has_fresh_evidence` is False, the symbol-less resolution that reports a
+        user's tier stops answering, latency stops being established, and
+        stability falls to PROBATION until the shard is back and has served a
+        full window again. What survives is exactly the per-instrument coverage
+        those two working sockets have actually earned, which is where partial
+        coverage has lived since D4.5.
         """
-        self._discard_evidence()
+        # Resolved once, here. `shard=None` means "this feed's only connection"
+        # to every caller of this method — never "every connection", which is
+        # what it means to `_discard_evidence` and what an unresolved `None`
+        # reaching it would silently do: blank three connections' prices while
+        # marking one of them down.
+        shard = str(shard) if shard is not None else DEFAULT_FEED_SHARD
+        evidence = self._shard(shard)
+        if evidence is None:
+            logger.warning(
+                "Provider %s was told a connection it does not have is down — ignored", self.name)
+            return False
+        before = self.stability
+        self._discard_evidence(shard)
+        evidence.link_up = False
+        if any(other.link_up for other in self._shards.values()):
+            # Still connected somewhere. Readiness does not move — the feed can
+            # still produce valid canonical data — but the aggregates above have
+            # already tightened, so announce the stability those aggregates lost.
+            await self._announce_stability(before)
+            return False
         return await self._advance(
             FeedReadiness.FAILED if reason else FeedReadiness.DISCONNECTED,
             reason=reason,
         )
 
-    async def mark_link_up(self) -> bool:
-        """The feed's transport reports its connection established (or re-established).
+    async def mark_link_up(self, shard: Optional[str] = None) -> bool:
+        """One of the feed's connections is established (or re-established).
 
         Never promotes: it moves the feed no further than CONNECTED/SUBSCRIBED,
         because "the socket is open" is the single most tempting and most wrong
         readiness signal there is. Readiness is re-earned by the next valid tick.
+
+        D5.10 — A RECONNECT INHERITS NOTHING, AND COSTS ITS SIBLINGS NOTHING
+        ---------------------------------------------------------------------
+        The connection that came back discards its own evidence first, so it
+        re-earns readiness, re-serves probation and re-establishes latency on the
+        link that actually exists — the D5.2/D5.3/D5.4 reset, applied to the one
+        connection it is about. Its siblings keep everything they proved: making
+        two healthy sockets re-serve a probation window because a third
+        reconnected would mean a feed with several connections could never be
+        stable at all.
+
+        The *provider's* readiness is only walked back to SUBSCRIBED when no
+        other connection is currently delivering. A feed still serving prices
+        from two live sockets is not demoted because a third came back — the
+        provider-level aggregates already report the reconnecting shard as
+        unproven, which is the honest statement, and demoting readiness on top of
+        it would blank the instruments the other two are covering.
         """
+        # Resolved once, here — see `mark_link_down` for why an unresolved
+        # `None` must not reach `_discard_evidence`.
+        shard = str(shard) if shard is not None else DEFAULT_FEED_SHARD
+        evidence = self._shard(shard)
+        if evidence is None:
+            logger.warning(
+                "Provider %s was told a connection it does not have is up — ignored", self.name)
+            return False
         if not self._connected:
             await super().connect()
-        self._discard_evidence()
+        before = self.stability
+        self._discard_evidence(shard)
+        evidence.link_up = True
+        if self._readiness is FeedReadiness.READY and any(
+            other.last_evidence_at is not None for other in self._shards.values()
+        ):
+            await self._announce_stability(before)
+            return False
         # A feed already in READY is demoted back to SUBSCRIBED here, not left
         # alone: a link that came back is a *new* link, its predecessor's
         # evidence has just been discarded, and readiness must be re-earned on
@@ -987,7 +1406,7 @@ class StreamingTickProvider(MarketDataProvider):
         entry = self._last_tick.get(key)
         if entry is None:
             return None
-        tick, arrived_at = entry
+        tick, arrived_at, _shard = entry
         if (self._clock() - arrived_at) > self.tick_max_age_seconds:
             return None
         return tick
@@ -1016,7 +1435,7 @@ class StreamingTickProvider(MarketDataProvider):
 
     # ── Push surface ─────────────────────────────────────
 
-    async def on_raw(self, payload: Any) -> int:
+    async def on_raw(self, payload: Any, shard: Optional[str] = None) -> int:
         """Accept one pushed payload — a canonical tick, or a batch of them.
 
         Returns how many records were accepted. Nothing raises: a feed frame is
@@ -1032,7 +1451,24 @@ class StreamingTickProvider(MarketDataProvider):
         which every record was rejected is not evidence — a feed delivering a
         shape this boundary does not recognise has demonstrated the opposite of
         readiness — so the gate stays shut and the baseline keeps the quote.
+
+        `shard` names which of this feed's connections delivered the batch
+        (D5.10). Omitting it means the feed's only connection, which is what
+        every caller written before D5.10 means and what an unsharded feed is.
+        A batch naming a connection this provider was never told about is
+        refused rather than filed under a shard invented on arrival — it
+        describes a socket from a subscription plan that has already been
+        replaced, and admitting it would let an unplanned connection widen the
+        "every shard" conjunction for the life of the feed.
         """
+        shard = str(shard) if shard is not None else DEFAULT_FEED_SHARD
+        evidence = self._shard(shard)
+        if evidence is None:
+            logger.warning(
+                "Provider %s was pushed a batch from a connection it does not have — dropped",
+                self.name,
+            )
+            return 0
         records = payload if isinstance(payload, (list, tuple)) else [payload]
         ticks: List[MarketTick] = []
         rejected = 0
@@ -1062,18 +1498,28 @@ class StreamingTickProvider(MarketDataProvider):
 
         before = self.stability
         arrived_at = self._clock()
-        self._record_delivery_interval(arrived_at)
+        self._record_delivery_interval(evidence, arrived_at)
         for tick in ticks:
-            self._last_tick[tick.symbol] = (tick, arrived_at)
-        self._last_evidence_at = arrived_at
+            # Tagged with the connection that delivered it, so that connection
+            # dropping discards exactly these prices and no others (D5.10).
+            self._last_tick[tick.symbol] = (tick, arrived_at, shard)
+        evidence.last_evidence_at = arrived_at
+        if evidence.ready_since is None:
+            # This connection's probation window opens at the tick that earned
+            # its readiness, not at the instant a transition was processed —
+            # the D5.2 rule, now stamped per connection because a sharded feed's
+            # connections earn readiness at different moments. Stamped once and
+            # never re-stamped: re-stamping would restart the window on every
+            # arrival and no feed would ever leave probation.
+            evidence.ready_since = arrived_at
 
         await self._earn_readiness()
         await self._announce_stability(before)
         await self._emit(ticks)
         return len(ticks)
 
-    def _record_delivery_interval(self, arrived_at: float) -> None:
-        """Record how long this batch made a consumer wait (D5.4).
+    def _record_delivery_interval(self, evidence: "_ShardEvidence", arrived_at: float) -> None:
+        """Record how long this batch made a consumer wait, on its own connection (D5.4).
 
         One sample per accepted *batch*, not per tick: a batch is one delivery,
         and every tick in it is stamped with the same arrival instant, so
@@ -1090,7 +1536,11 @@ class StreamingTickProvider(MarketDataProvider):
         clock is not what this class was told it was, and a negative number is
         not a fast delivery.
         """
-        previous = self._last_evidence_at
+        # Measured against THIS connection's previous arrival (D5.10), never
+        # against the feed's. Interleaving several connections into one series
+        # measures how often *any* socket spoke, which shrinks with shard count
+        # and describes nothing a consumer waits for. See `_percentile_over`.
+        previous = evidence.last_evidence_at
         if previous is None:
             return
         interval = arrived_at - previous
@@ -1100,7 +1550,7 @@ class StreamingTickProvider(MarketDataProvider):
                 self.name,
             )
             return
-        self._delivery_intervals.append(interval)
+        evidence.intervals.append(interval)
 
     async def _announce_stability(self, previous: FeedStability) -> None:
         """Tell the gateway when this batch was the one that ended probation.
@@ -1111,18 +1561,31 @@ class StreamingTickProvider(MarketDataProvider):
         — resolution recomputes stability from the timestamps on every request,
         so the switch has already taken effect by the time this runs.
 
-        Only the crossings this method could be the *cause* of are announced.
-        Losing stability always accompanies a readiness transition, which
-        announces itself, so a second event here would be one fact reported
-        twice.
+        Announced in both directions since D5.10, and only from callers that
+        did *not* also move readiness. Before sharding, losing stability always
+        accompanied a readiness transition — which announces itself — so a second
+        event here would have been one fact reported twice. One connection of a
+        sharded feed dropping is the case that breaks that: the feed stays READY
+        because its siblings are still delivering, so nothing else announces the
+        probation the provider has just fallen back into, and a consumer would
+        go on rendering a stable tier for a feed that has lost part of its
+        coverage. The callers that do move readiness return before reaching
+        here, so the "one fact, one event" property is unchanged.
         """
         current = self.stability
-        if current is previous or current is not FeedStability.STABLE:
+        if current is previous:
             return
-        logger.info(
-            "Streaming provider %s left probation after %.0fs of valid data",
-            self.name, self.probation_seconds,
-        )
+        if current is FeedStability.STABLE:
+            logger.info(
+                "Streaming provider %s left probation after %.0fs of valid data",
+                self.name, self.probation_seconds,
+            )
+        else:
+            logger.info(
+                "Streaming provider %s returned to probation — not every connection "
+                "is delivering valid data",
+                self.name,
+            )
         listener = self._readiness_listener
         if listener is not None:
             await listener(self, previous, current)
@@ -1189,5 +1652,17 @@ class StreamingTickProvider(MarketDataProvider):
             "readiness": self._readiness.value,
             "stability": self.stability.value,
             "covered_symbols": len(self.covered_symbols),
+            # D5.10 — a COUNT, never an id. How many broker connections this
+            # feed is spread across is an operational fact an admin diagnostic
+            # may state; which connection carried which price is implementation
+            # metadata that reaches nothing, here or anywhere else. A shard id
+            # appears in exactly three places — a registry key, a task name and
+            # a log line — and none of them is a payload (ADR-050).
+            "connections": self.shard_count,
+            # D5.9. The p50 is already on the base payload as
+            # `delivery_latency_seconds`; this is the tail beside it, `None`
+            # until the wider window fills. The full three-state picture with
+            # the sample count travels inside `health`.
+            "delivery_latency_p95_seconds": self.delivery_latency_p95,
             "last_failure": self._last_failure,
         }

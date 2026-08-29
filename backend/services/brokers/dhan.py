@@ -642,6 +642,24 @@ class DhanAdapter(BrokerAdapter):
     #: responses, query-string auth.
     stream_protocol = "dhan_feed_v2"
 
+    #: Dhan's two sharding facts, and they are two different limits (D5.10).
+    #:
+    #: The 5,000 is genuinely per *connection*, so the planner raises it by
+    #: opening another one instead of trimming the account's portfolio — which is
+    #: what D4.11 recorded as a limitation and what this closes.
+    #:
+    #: The five-connection ceiling is declared because ignoring it would be
+    #: actively destructive here rather than merely over-ambitious: Dhan does not
+    #: refuse a sixth connection, it **disconnects the oldest** with code 805. A
+    #: plan of six shards would therefore kill the shard it opened first, every
+    #: time, and the feed would chase its own tail with nothing raised anywhere.
+    #:
+    #: `MAX_INSTRUMENTS_PER_FRAME` is deliberately not either of these: it is how
+    #: many instruments fit in one subscribe *message* on a single socket, which
+    #: `stream_subscribe_frames` already handles by sending more frames.
+    stream_max_instruments_per_connection = MAX_INSTRUMENTS_PER_CONNECTION
+    stream_max_connections = MAX_CONNECTIONS_PER_USER
+
     # -- HTTP ----------------------------------------------------------------
     def _headers(self, session: dict = None) -> dict:
         """Dhan's header set.

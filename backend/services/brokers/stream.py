@@ -202,9 +202,30 @@ that returns one for a handshake the broker refused on entitlement grounds.
 Silence, a timeout, an empty subscription and a malformed frame are all *absence
 of evidence* and none of them can produce it. See ADR-045.
 
-Still out of scope, deliberately: latency p95, instrument sharding across
-several connections — which is a different thing from a broker needing several
-connections, and is still not done here — and chaos testing.
+WHAT D5.10 CHANGED — ALMOST NOTHING, AND THAT IS THE RESULT
+------------------------------------------------------------
+Instrument sharding — one logical subscription spread across several
+connections — is a different problem from D4.7's, which was one broker needing
+several *kinds* of connection. It landed in this file as one extra key
+dimension and a name in a log line, and that is the finding rather than a
+disclaimer: a shard is a `BrokerStream` like any other.
+
+`BrokerStreamManager` keys on `(user, broker, channel, shard)`, for the reason
+D4.7 added the third element: without the fourth, the second shard's
+`start_stream` would silently *replace* the first — half the subscription live,
+half gone, nothing raised. `stop_stream` and `discard` take `shard=None` to mean
+"every shard of this channel", so every caller written before D5.10 keeps its
+exact meaning.
+
+What is deliberately NOT here is any notion of what a shard *is*. This module
+does not plan one, does not count them, does not know a channel has more than
+one, and does not tell a consumer which shard a tick came from: the callbacks
+are unchanged, and the engine — which built the plan — binds each stream's shard
+into the callbacks it passes in. A transport that learned about sharding would
+be a transport that learned about subscription policy, which is the boundary
+D4.2 drew and every sprint since has held.
+
+Still out of scope, deliberately: exchange-timestamp latency and chaos testing.
 """
 
 import asyncio
@@ -221,6 +242,7 @@ from services.brokers.reliability import (  # noqa: F401  (re-exported: see belo
     ConnectionStability,
     reconnect_pause,
 )
+from services.brokers.sharding import DEFAULT_SHARD_ID
 from services.brokers.streaming import (
     DEFAULT_STREAM_CHANNEL,
     BrokerStreamEndpoint,
@@ -254,9 +276,22 @@ class BrokerStream:
         on_not_entitled=None,
         on_link_state=None,
         channel: str = DEFAULT_STREAM_CHANNEL,
+        shard: str = DEFAULT_SHARD_ID,
     ):
         self.user_id = user_id
         self.broker = broker
+        #: Which slice of this channel's logical subscription this connection
+        #: carries (D5.10). `"0"` — the default — is the whole of it, which is
+        #: what every stream opened before D5.10 was and what an unsharded
+        #: subscription still is.
+        #:
+        #: This module never reads it except to key the registry, name the task
+        #: and label a log line. It does not know how many shards exist, does
+        #: not plan them, and does not report the shard on any callback: the
+        #: engine built the plan and binds the shard into the callbacks it
+        #: supplies. A transport that knew about sharding would be a transport
+        #: that knew about subscription policy.
+        self.shard = str(shard or DEFAULT_SHARD_ID).strip() or DEFAULT_SHARD_ID
         #: Which of this broker's realtime channels this connection serves
         #: (D4.7). A string rather than the channel object because the object is
         #: resolved from the registry at use time, exactly as `_adapter` is:
@@ -321,7 +356,9 @@ class BrokerStream:
 
     # -- lifecycle -----------------------------------------------------------
     def start(self):
-        self._task = asyncio.create_task(self._run(), name=f"broker-stream-{self.broker}-{self.user_id}")
+        self._task = asyncio.create_task(
+            self._run(), name=f"broker-stream-{self.broker}-{self.channel}-{self.shard}-{self.user_id}"
+        )
         return self._task
 
     async def _notify_link(self, up: bool, reason: str = ""):
@@ -616,7 +653,7 @@ class BrokerStream:
                     return
 
         return asyncio.create_task(
-            beat(), name=f"broker-stream-keepalive-{self.broker}-{self.channel}-{self.user_id}"
+            beat(), name=f"broker-stream-keepalive-{self.broker}-{self.channel}-{self.shard}-{self.user_id}"
         )
 
     def _decode(self, message) -> BrokerStreamEvent:
@@ -801,7 +838,7 @@ def _terminal_refusal(classification) -> Optional[Exception]:
 
 
 class BrokerStreamManager:
-    """Owns every live broker stream: start/stop/replace per (user, broker, channel).
+    """Owns every live broker stream: start/stop/replace per (user, broker, channel, shard).
 
     Keyed on the channel as well as the account since D4.7. The key used to be
     `(user, broker)`, which was not a simplification but an assumption — that a
@@ -809,10 +846,18 @@ class BrokerStreamManager:
     multiplexes ticks and order updates onto one connection. A broker that needs
     two would have had its second `start_stream` silently *replace* the first,
     leaving one feed live, one feed gone, and nothing raised.
+
+    Keyed on the shard as well since D5.10, for exactly the same reason one step
+    down: a channel whose subscription is too large for one connection opens
+    several, and without the fourth element the second shard's `start_stream`
+    would replace the first — half the account's instruments live, half gone,
+    nothing raised. Every channel-level caller passes `shard=None` and means
+    "every shard of this channel", which is what an unsharded channel's one
+    shard has always been.
     """
 
     def __init__(self):
-        self._streams: dict = {}  # (user_id, broker, channel) -> BrokerStream
+        self._streams: dict = {}  # (user_id, broker, channel, shard) -> BrokerStream
 
     async def start_stream(
         self,
@@ -827,9 +872,15 @@ class BrokerStreamManager:
         on_not_entitled=None,
         on_link_state=None,
         channel: str = DEFAULT_STREAM_CHANNEL,
+        shard: str = DEFAULT_SHARD_ID,
     ):
         channel = (channel or DEFAULT_STREAM_CHANNEL).strip() or DEFAULT_STREAM_CHANNEL
-        await self.stop_stream(user_id, broker, channel)
+        shard = str(shard or DEFAULT_SHARD_ID).strip() or DEFAULT_SHARD_ID
+        # Scoped to THIS shard (D5.10). Replacing the whole channel here would
+        # tear down every sibling shard on every shard start, so a plan of three
+        # connections would open and destroy each other in turn and the account
+        # would end with one.
+        await self.stop_stream(user_id, broker, channel, shard)
         stream = BrokerStream(
             user_id,
             broker,
@@ -842,34 +893,59 @@ class BrokerStreamManager:
             on_not_entitled=on_not_entitled,
             on_link_state=on_link_state,
             channel=channel,
+            shard=shard,
         )
-        self._streams[(user_id, broker, channel)] = stream
+        self._streams[(user_id, broker, channel, shard)] = stream
         stream.start()
         return stream
 
-    def _keys(self, user_id: str, broker: str, channel: str = None) -> list:
-        """Every registry key for an account, or just the one channel's.
+    def get(self, user_id: str, broker: str, channel: str, shard: str = DEFAULT_SHARD_ID):
+        """The live stream for one exact connection, or None (D5.10).
+
+        Exists so a caller rebuilding a shard plan can ask whether a shard it is
+        about to open is *already open with the same subscription* — see
+        `BrokerEngine._shard_is_current`. Read-only: nothing here starts, stops
+        or mutates a stream, so a caller that misuses it cannot break one.
+        """
+        channel = (channel or DEFAULT_STREAM_CHANNEL).strip() or DEFAULT_STREAM_CHANNEL
+        shard = str(shard or DEFAULT_SHARD_ID).strip() or DEFAULT_SHARD_ID
+        return self._streams.get((user_id, broker, channel, shard))
+
+    def _keys(self, user_id: str, broker: str, channel: str = None, shard: str = None) -> list:
+        """Every registry key for an account, or just the one channel's, or one shard's.
 
         `channel=None` means "every channel of this account", which is what the
         account-level callers want — disconnect, shutdown, session expiry. They
         pass no channel and must not have to enumerate a broker's channels
         themselves; asking a broker how many sockets it has is exactly the
         knowledge this module does not hold.
+
+        `shard=None` means "every shard of the selected channel(s)" (D5.10), and
+        it is the default for the same reason: a caller stopping a channel means
+        the whole channel, and how many connections that turned out to be is
+        subscription policy it does not hold either. Every caller written before
+        D5.10 therefore keeps its exact meaning.
         """
         return [
             key
             for key in list(self._streams)
-            if key[0] == user_id and key[1] == broker and (channel is None or key[2] == channel)
+            if key[0] == user_id and key[1] == broker
+            and (channel is None or key[2] == channel)
+            and (shard is None or key[3] == shard)
         ]
 
-    async def stop_stream(self, user_id: str, broker: str, channel: str = None):
-        """Stop one channel, or every channel of an account when `channel` is None."""
-        for key in self._keys(user_id, broker, channel):
+    async def stop_stream(self, user_id: str, broker: str, channel: str = None, shard: str = None):
+        """Stop one connection, one channel, or every channel of an account.
+
+        `channel=None` stops every channel; `shard=None` — the default — stops
+        every shard of whichever channels were selected.
+        """
+        for key in self._keys(user_id, broker, channel, shard):
             stream = self._streams.pop(key, None)
             if stream:
                 await stream.stop()
 
-    def discard(self, user_id: str, broker: str, channel: str = None) -> bool:
+    def discard(self, user_id: str, broker: str, channel: str = None, shard: str = None) -> bool:
         """Forget a stream that has already ended on its own (PH3.6).
 
         Deliberately NOT `stop_stream`. The one caller is the broker's
@@ -884,12 +960,15 @@ class BrokerStreamManager:
         its callbacks, and each still listed by `status()` as a stream that
         exists but is not running.
 
-        Scoped to the calling channel since D4.7. Discarding an account's other
-        channels here would drop live streams from the registry without
+        Scoped to the calling channel since D4.7 and to the calling shard since
+        D5.10, both for the same reason: discarding an account's other
+        connections here would drop live streams from the registry without
         stopping them, leaking exactly the task `stop_stream` exists to cancel.
+        The caller that knows its own shard passes it; a caller that does not
+        pass one still means the whole channel, as it always did.
         """
         discarded = False
-        for key in self._keys(user_id, broker, channel):
+        for key in self._keys(user_id, broker, channel, shard):
             discarded = self._streams.pop(key, None) is not None or discarded
         return discarded
 
@@ -903,10 +982,16 @@ class BrokerStreamManager:
                 "user_id": user_id,
                 "broker": broker,
                 "channel": channel,
+                # Internal diagnostics only. This list is read by
+                # `BrokerEngine.get_status` for a single boolean ("is anything
+                # streaming for this account") and by the D5.6 re-probe guard;
+                # it reaches no API response and no consumer payload, which is
+                # the condition on a shard id existing at all (ADR-050).
+                "shard": shard,
                 "running": stream.running,
                 "subscribed_instruments": len(stream.instrument_tokens),
             }
-            for (user_id, broker, channel), stream in self._streams.items()
+            for (user_id, broker, channel, shard), stream in self._streams.items()
         ]
 
 

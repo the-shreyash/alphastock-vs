@@ -55,6 +55,7 @@ from unittest.mock import patch
 import pytest
 
 from services.market_engine.providers import (
+    DEFAULT_FEED_SHARD,
     DEFAULT_TICK_MAX_AGE_SECONDS,
     PROBATION_WINDOW_SECONDS,
     Capability,
@@ -751,7 +752,11 @@ def test_making_a_socket_connection_count_as_evidence_would_promote_a_dead_feed(
     assert _quote_provider(manager) is baseline
 
     # The mutation, applied by hand: stamp the clock the way a link-up would.
-    feed._last_evidence_at = clock.now
+    # Written onto the connection's own ledger since D5.10 — `_last_evidence_at`
+    # is now the *oldest* connection's stamp, derived rather than stored, so the
+    # only way to fake socket-derived evidence is to fake it where a mutated
+    # `mark_link_up` would have written it.
+    feed._shards[DEFAULT_FEED_SHARD].last_evidence_at = clock.now
     assert feed.has_fresh_evidence, "the mutation did not take"
     assert feed.readiness is not FeedReadiness.READY, (
         "socket-derived evidence alone reached READY — the readiness gate is not "

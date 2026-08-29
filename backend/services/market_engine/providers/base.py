@@ -68,7 +68,7 @@ from __future__ import annotations
 
 import logging
 from abc import ABC
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Tuple
@@ -283,6 +283,62 @@ DEGRADED_AFTER_FAILURES = 3
 DOWN_AFTER_FAILURES = 8
 
 
+@dataclass(frozen=True)
+class LatencyProfile:
+    """What a provider can say about its own delivery cadence (D5.9).
+
+    The value :meth:`MarketDataProvider.health` carries so that an operator can
+    see latency next to the counters it belongs with, without any caller having
+    to know that latency is a streaming-only concept.
+
+    THREE STATES, NOT TWO
+    `p50_seconds` and `p95_seconds` are independently `None`, and each `None`
+    means "this statistic is not established" — never "fast" and never zero.
+    They establish at different sample counts on purpose, because they are
+    different statistics with different sample requirements (see
+    :data:`services.market_engine.providers.streaming.LATENCY_WINDOW_SAMPLES`
+    and ``LATENCY_TAIL_WINDOW_SAMPLES``), so a feed legitimately spends a period
+    with a median and no tail figure. `established` is the D5.4 predicate
+    unchanged — the selection metric exists — and is exactly `p50_seconds is not
+    None`; it is stated rather than inferred because a reader of a payload must
+    not have to know that convention.
+
+    WHAT IS DELIBERATELY ABSENT
+    No provider name, no broker, no session, no token, no raw monotonic instant.
+    `samples` is a count of retained intervals, not a clock reading. The
+    infinity the Source Manager sorts unestablished latency with is a sort key
+    that exists only inside that comparison and is never represented here.
+
+    Local by construction. Only a *pushed* feed has a delivery cadence, and a
+    pushed feed's health is per-socket and never shared (D5.8,
+    :attr:`MarketDataProvider.health_is_shared`), so nothing in this structure
+    can reach the shared health store.
+    """
+
+    #: Whether the D5.4 selection metric is established. `p50_seconds is not None`.
+    established: bool = False
+
+    #: Median delivery interval in seconds, or None. The Source Manager's third
+    #: ranking term, unchanged by D5.9.
+    p50_seconds: Optional[float] = None
+
+    #: 95th-percentile delivery interval in seconds, or None until the wider
+    #: tail window is full. Reported, never ranked on — see ADR-049.
+    p95_seconds: Optional[float] = None
+
+    #: How many delivery intervals are currently retained. Bounded by the tail
+    #: window; 0 for every provider that is polled rather than pushed.
+    samples: int = 0
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "established": self.established,
+            "p50_seconds": self.p50_seconds,
+            "p95_seconds": self.p95_seconds,
+            "samples": self.samples,
+        }
+
+
 @dataclass
 class ProviderHealth:
     """Rolling health of one provider, owned by the adapter, read by the
@@ -303,6 +359,17 @@ class ProviderHealth:
     last_error_at: Optional[str] = None
     last_error_class: Optional[str] = None
 
+    #: Delivery cadence, refreshed by :meth:`MarketDataProvider.health` on every
+    #: read (D5.9). DERIVED, never accumulated here: the intervals live in the
+    #: provider that measured them, and this is a snapshot of what they add up
+    #: to at the moment health was asked for. That is what keeps it out of the
+    #: D5.8 shared record — `apply_shared_health` names the fields it adopts one
+    #: by one and this is not among them, and the store's Lua writes named
+    #: counters rather than a serialised health object, so there are two
+    #: independent reasons a latency figure can never be written to or read from
+    #: Redis. Both are pinned by tests.
+    latency: "LatencyProfile" = field(default_factory=lambda: LatencyProfile())
+
     def as_dict(self) -> Dict[str, Any]:
         return {
             "state": self.state.value,
@@ -313,6 +380,7 @@ class ProviderHealth:
             "last_success_at": self.last_success_at,
             "last_error_at": self.last_error_at,
             "last_error_class": self.last_error_class,
+            "latency": self.latency.as_dict(),
         }
 
 
@@ -483,6 +551,19 @@ class MarketDataProvider(ABC):
         """
         return None
 
+    @property
+    def latency_profile(self) -> LatencyProfile:
+        """This provider's delivery cadence as :meth:`health` reports it (D5.9).
+
+        The default is the empty profile, and it is the same statement
+        :attr:`delivery_latency`'s `None` is: a provider that is *polled* has no
+        delivery event to time, so it has no cadence — not a fast one, and not
+        an unknown one that might later turn out to be fast. Only a provider
+        that is pushed into overrides this, and it overrides it by reading the
+        one interval series it already keeps rather than by starting a second.
+        """
+        return LatencyProfile()
+
     # ── Push surface (D4.4) ──────────────────────────────
     #
     # MARKET_DATA_ARCHITECTURE.md's adapter contract, rule 5: "polling adapters
@@ -557,7 +638,23 @@ class MarketDataProvider(ABC):
     # ── Health ───────────────────────────────────────────
 
     def health(self) -> ProviderHealth:
-        """Current health. Read by the Source Manager during resolution."""
+        """Current health, including this provider's delivery cadence (D5.9).
+
+        The counters are accumulated evidence from past *calls*; the latency
+        block is derived from the arrival intervals the provider is holding
+        right now, and is recomputed on every read rather than stored. ADR-044
+        declined to fold latency into the counters for exactly the reason that
+        recomputation preserves: a pushed feed makes no calls, so a
+        push-derived statistic must not become a counter alongside them or the
+        two kinds of evidence get averaged into one number that means neither.
+        ADR-049 puts the two side by side in one payload without merging them.
+
+        Refreshing here rather than at each mutation is what makes the block
+        honest for a feed whose latency has *lapsed* — gone stale, or been
+        discarded by a reconnect — without anything having to remember to clear
+        it.
+        """
+        self._health.latency = self.latency_profile
         return self._health
 
     def record_success(self, *, empty: bool = False) -> Optional[ProviderState]:
@@ -732,7 +829,9 @@ class MarketDataProvider(ABC):
             "subscriptions": len(self._subscribed),
             "scope": "global" if self.owner_user_id is None else "user",
             "capabilities": sorted(c.value for c in self.capabilities),
-            "health": self._health.as_dict(),
+            # D5.9: through `health()`, so the latency block is the refreshed
+            # one rather than whatever was last left on the counters object.
+            "health": self.health().as_dict(),
         }
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid

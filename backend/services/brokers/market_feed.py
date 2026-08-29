@@ -69,6 +69,7 @@ from typing import Any, Optional, Sequence
 
 from services.brokers.capabilities import BrokerCapability
 from services.brokers.gateway import broker_gateway
+from services.brokers.sharding import DEFAULT_SHARD_ID
 from services.market_engine.gateway import market_gateway
 from services.market_engine.providers import StreamingTickProvider, provider_registry
 
@@ -97,6 +98,7 @@ async def attach_market_feed(
     user_id: Any,
     broker: str,
     symbols: Optional[Sequence[str]] = None,
+    shards: Optional[Sequence[str]] = None,
 ) -> Optional[str]:
     """Register this account's broker stream as a market-data provider.
 
@@ -117,6 +119,23 @@ async def attach_market_feed(
     yields a feed that serves TICKS and never displaces the baseline — the
     correct behaviour for an account with nothing to stream.
 
+    `shards` is how many broker connections this account's subscription needed
+    and what they are called (D5.10) — the plan `services/brokers/sharding.py`
+    produced, passed here for the same reason `symbols` is. A feed that never
+    said what it is made of cannot be asked whether *all* of it is working, and
+    "every connection has fresh evidence" quantified over nothing is vacuously
+    true — which is exactly how a healthy connection would come to mask a dead
+    one. Omitting it is one connection, which is what every caller written
+    before D5.10 means and what an unsharded feed is.
+
+    ONE PROVIDER, HOWEVER MANY CONNECTIONS. This function does not gain a loop:
+    the account still gets exactly one `StreamingTickProvider` under exactly one
+    registry name, because a shard is not a provider. Registering one per shard
+    would put N feeds of one account into the Source Manager's ranking, each
+    covering a slice of the portfolio, each earning readiness and probation
+    separately and each able to displace the others — a second market-data
+    architecture, which is the one thing D5.10 must not build.
+
     Idempotent. A reconnecting stream re-registers under the same name and
     replaces the provider bound to the socket that died.
     """
@@ -132,6 +151,7 @@ async def attach_market_feed(
 
     name = feed_provider_name(user_id, broker)
     provider = StreamingTickProvider(name, owner_user_id=str(user_id))
+    provider.declare_shards(shards or ())
     await market_gateway.register_streaming_provider(provider)
     if symbols:
         await provider.subscribe(symbols)
@@ -139,8 +159,8 @@ async def attach_market_feed(
 
 
 async def set_market_feed_link(user_id: Any, broker: str, *, up: bool,
-                               reason: str = "") -> bool:
-    """Relay this account's transport connect/disconnect to its provider.
+                               reason: str = "", shard: str = DEFAULT_SHARD_ID) -> bool:
+    """Relay one of this account's transport connect/disconnects to its provider.
 
     True when the provider's readiness actually changed. False — not an error —
     when no provider is registered for the account, which is the normal state
@@ -157,13 +177,21 @@ async def set_market_feed_link(user_id: Any, broker: str, *, up: bool,
 
     Entitlement termination is a different event with a different handler —
     :func:`detach_market_feed`.
+
+    `shard` names which of the account's connections moved (D5.10). Relaying it
+    is what lets one connection drop without blanking the instruments the others
+    are still delivering, and — the other half, which matters more — what stops
+    a healthy connection from covering for a dead one: the provider discards the
+    lost connection's evidence and its prices, and every provider-level claim
+    (freshness, the tier a user is told they are on, latency, stability)
+    tightens immediately. See `StreamingTickProvider.mark_link_down`.
     """
     provider = provider_registry.get(feed_provider_name(user_id, broker))
     if provider is None:
         return False
     if up:
-        return await provider.mark_link_up()
-    return await provider.mark_link_down(reason)
+        return await provider.mark_link_up(shard)
+    return await provider.mark_link_down(reason, shard)
 
 
 async def detach_market_feed(user_id: Any, broker: str) -> bool:
@@ -179,7 +207,8 @@ async def detach_market_feed(user_id: Any, broker: str) -> bool:
     return await market_gateway.unregister_streaming_provider(feed_provider_name(user_id, broker))
 
 
-async def publish_market_ticks(user_id: Any, broker: str, ticks: Sequence[Any]) -> int:
+async def publish_market_ticks(user_id: Any, broker: str, ticks: Sequence[Any],
+                               shard: str = DEFAULT_SHARD_ID) -> int:
     """Push a batch of canonical ticks into this account's provider.
 
     `ticks` are `MarketTick` dicts, exactly as `instruments.canonical_ticks`
@@ -194,10 +223,16 @@ async def publish_market_ticks(user_id: Any, broker: str, ticks: Sequence[Any]) 
     rather than in a map kept here. A second registry would have to be kept in
     step with the first across register, unregister, replace and process
     restart, and would answer differently the moment one of those was missed.
+
+    `shard` names which of the account's connections delivered them (D5.10), so
+    the provider can attribute coverage, freshness and delivery cadence to the
+    socket that actually earned them. Merging them would make a feed appear to
+    get faster for having been split, and would let one connection's ticks stand
+    as evidence that another is alive.
     """
     if not ticks:
         return 0
     provider = provider_registry.get(feed_provider_name(user_id, broker))
     if provider is None:
         return 0
-    return await provider.on_raw(list(ticks))
+    return await provider.on_raw(list(ticks), shard)

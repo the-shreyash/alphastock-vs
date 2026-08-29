@@ -957,6 +957,13 @@ class FyersFeedConnection(BrokerStreamChannel):
 class FyersMarketFeedChannel(BrokerStreamChannel):
     """Fyers' market-data connection — where to reach it and how to scope it.
 
+    Declares HSM's per-connection instrument ceiling (D5.10), which the shard
+    planner raises by opening another connection instead of trimming the
+    account's portfolio. `SUBSCRIBE_BATCH_SIZE` is deliberately NOT that number:
+    it is how many topics fit in one subscribe *frame*, a wire-framing fact this
+    channel already handles on a single socket, and confusing the two would
+    open four connections where one would do.
+
     Everything that survives a connection lives here (the URL, the keep-alive
     declaration, the handshake classification); everything that belongs to one
     connection lives in :class:`FyersFeedConnection`, which :meth:`open` mints.
@@ -971,6 +978,10 @@ class FyersMarketFeedChannel(BrokerStreamChannel):
     name = MARKET_CHANNEL
     protocol = STREAM_PROTOCOL
     delivers = frozenset({StreamEventKind.TICKS})
+    #: Instruments one HSM connection may hold. Per connection, so sharding
+    #: raises it. No concurrent-connection ceiling is documented for this broker
+    #: in the repository, so none is declared (LIM-D5.10-1).
+    max_instruments_per_connection = MAX_SUBSCRIBED_INSTRUMENTS
 
     def endpoint(self, session: dict, credentials: Dict[str, str] = None) -> BrokerStreamEndpoint:
         """The HSM socket — no credential in the URL, and none in a header.

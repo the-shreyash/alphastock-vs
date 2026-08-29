@@ -44,11 +44,15 @@ import pathlib
 import re
 import statistics
 import time
+from collections import deque
 
 import pytest
 
+from services.market_engine.providers.streaming import _ShardEvidence
 from services.market_engine.providers import (
+    DEFAULT_FEED_SHARD,
     DEFAULT_TICK_MAX_AGE_SECONDS,
+    LATENCY_TAIL_WINDOW_SAMPLES,
     LATENCY_WINDOW_SAMPLES,
     PROBATION_WINDOW_SECONDS,
     Capability,
@@ -75,6 +79,21 @@ from tests.test_broker_streaming import (
 from tests.test_provider_probation import FakeClock, _tick
 
 BACKEND = pathlib.Path(__file__).resolve().parent.parent
+
+
+def _intervals(feed, shard=DEFAULT_FEED_SHARD):
+    """The delivery-interval series of one of a feed's broker connections.
+
+    D5.10 moved the series from a single deque on the provider onto one
+    `_ShardEvidence` per connection, because merging several connections'
+    arrivals into one series measures how often *any* socket spoke — a number
+    that shrinks with shard count and describes nothing a consumer waits for.
+    Every assertion in this module is about a single-connection feed, which is
+    what `DEFAULT_FEED_SHARD` names, so each one still reads exactly the series
+    it read before.
+    """
+    return feed._shards[shard].intervals
+
 
 #: A delivery cadence a real feed would be proud of, and one it would not.
 FAST = 0.05
@@ -171,12 +190,12 @@ def test_the_first_delivery_records_no_interval_because_it_has_nothing_to_measur
     """
     feed, clock = _feed()
     run(feed.on_raw([_tick()]))
-    assert len(feed._delivery_intervals) == 0
+    assert len(_intervals(feed)) == 0
     assert feed.delivery_latency is None
 
     clock.advance(FAST)
     run(feed.on_raw([_tick()]))
-    assert list(feed._delivery_intervals) == [pytest.approx(FAST)]
+    assert list(_intervals(feed)) == [pytest.approx(FAST)]
 
 
 def test_latency_is_not_established_until_the_window_is_full():
@@ -192,7 +211,7 @@ def test_latency_is_not_established_until_the_window_is_full():
     for observed in range(1, LATENCY_WINDOW_SAMPLES):
         clock.advance(FAST)
         run(feed.on_raw([_tick()]))
-        assert len(feed._delivery_intervals) == observed
+        assert len(_intervals(feed)) == observed
         assert feed.delivery_latency is None, (
             f"latency was established on {observed} samples, before the window was full"
         )
@@ -505,13 +524,13 @@ def test_latency_does_not_survive_a_reconnect():
 
     run(feed.mark_link_down("socket closed"))
     assert feed.delivery_latency is None
-    assert len(feed._delivery_intervals) == 0
+    assert len(_intervals(feed)) == 0
 
     clock.advance(600.0)  # a long outage
     run(feed.mark_link_up())
     _deliver(feed, clock, FAST, count=1)
 
-    assert list(feed._delivery_intervals) == [], (
+    assert list(_intervals(feed)) == [], (
         "the first batch after a reconnect recorded the outage as a delivery interval"
     )
 
@@ -527,7 +546,7 @@ def test_a_disconnect_also_clears_the_window():
     feed, clock = _feed()
     _establish(feed, clock, FAST)
     run(feed.disconnect())
-    assert len(feed._delivery_intervals) == 0
+    assert len(_intervals(feed)) == 0
     assert feed.delivery_latency is None
 
 
@@ -560,11 +579,27 @@ def test_old_latency_cannot_dominate_indefinitely():
         "a majority of slow samples did not move the median"
     )
 
+    # Enough slow deliveries to replace the median's whole window. Asserted on
+    # the newest `LATENCY_WINDOW_SAMPLES` — the slice the median actually reads —
+    # rather than on the whole buffer, which since D5.9 is
+    # `LATENCY_TAIL_WINDOW_SAMPLES` long and still legitimately holds the older
+    # fast samples for the p95 to read.
     _deliver(feed, clock, SLOW, count=LATENCY_WINDOW_SAMPLES)
-    assert list(feed._delivery_intervals) == [pytest.approx(SLOW)] * LATENCY_WINDOW_SAMPLES
-    assert len(feed._delivery_intervals) == LATENCY_WINDOW_SAMPLES, (
+    median_window = list(_intervals(feed))[-LATENCY_WINDOW_SAMPLES:]
+    assert median_window == [pytest.approx(SLOW)] * LATENCY_WINDOW_SAMPLES
+    assert feed.delivery_latency == pytest.approx(SLOW)
+    assert len(_intervals(feed)) <= LATENCY_TAIL_WINDOW_SAMPLES, (
         "the window is not bounded — old samples accumulate forever"
     )
+
+    # And the eviction completes for the tail too, just later: it takes the
+    # wider window, which is exactly what makes the p95 a slower-moving figure
+    # than the median rather than a differently-computed one.
+    _deliver(feed, clock, SLOW, count=LATENCY_TAIL_WINDOW_SAMPLES)
+    assert list(_intervals(feed)) == (
+        [pytest.approx(SLOW)] * LATENCY_TAIL_WINDOW_SAMPLES
+    )
+    assert feed.delivery_latency_p95 == pytest.approx(SLOW)
 
 
 def test_the_window_tolerates_a_minority_of_outliers():
@@ -627,8 +662,8 @@ def test_one_batch_records_one_interval_however_many_instruments_it_carries():
         clock.advance(FAST)
         run(feed.on_raw([_tick(s) for s in symbols]))
 
-    assert len(feed._delivery_intervals) == 3
-    assert list(feed._delivery_intervals) == [pytest.approx(FAST)] * 3
+    assert len(_intervals(feed)) == 3
+    assert list(_intervals(feed)) == [pytest.approx(FAST)] * 3
 
 
 def test_a_batch_that_is_entirely_rejected_records_no_interval():
@@ -640,12 +675,12 @@ def test_a_batch_that_is_entirely_rejected_records_no_interval():
     """
     feed, clock = _feed()
     _deliver(feed, clock, FAST, count=2)
-    before = list(feed._delivery_intervals)
+    before = list(_intervals(feed))
 
     clock.advance(FAST)
     assert run(feed.on_raw([{"symbol": "RELIANCE", "not_a_tick_field": 1}])) == 0
 
-    assert list(feed._delivery_intervals) == before
+    assert list(_intervals(feed)) == before
 
 
 # ==================================================================
@@ -661,7 +696,7 @@ def test_latency_state_is_per_provider_instance():
 
     assert a.delivery_latency == pytest.approx(FAST)
     assert b.delivery_latency is None, "a second feed inherited the first one's window"
-    assert a._delivery_intervals is not b._delivery_intervals
+    assert _intervals(a) is not _intervals(b)
 
     _establish(b, b_clock, SLOW)
     assert a.delivery_latency == pytest.approx(FAST), "b's samples reached a"
@@ -909,13 +944,13 @@ def test_a_backwards_clock_never_produces_a_fast_sample():
     """
     feed, clock = _feed()
     _deliver(feed, clock, FAST, count=3)
-    before = list(feed._delivery_intervals)
+    before = list(_intervals(feed))
 
     clock.advance(-60.0)
     run(feed.on_raw([_tick()]))
 
-    assert list(feed._delivery_intervals) == before, "a negative interval was recorded"
-    assert all(sample >= 0 for sample in feed._delivery_intervals)
+    assert list(_intervals(feed)) == before, "a negative interval was recorded"
+    assert all(sample >= 0 for sample in _intervals(feed))
 
 
 def test_the_score_is_derived_on_read_and_never_cached():
@@ -949,12 +984,20 @@ def test_the_score_is_the_median_and_not_the_mean():
 
 def test_the_window_is_bounded_and_never_grows():
     """Rule: bounded state per feed. A deque without a maxlen would be an
-    unbounded per-user accumulator on a stream that runs all day."""
+    unbounded per-user accumulator on a stream that runs all day.
+
+    D5.9 widened the bound from `LATENCY_WINDOW_SAMPLES` to
+    `LATENCY_TAIL_WINDOW_SAMPLES` so a p95 could be taken over a sample where it
+    is not simply the maximum. The property under test is unchanged — the buffer
+    is fixed-size and one series — and only the size it is pinned at moved. The
+    median still reads the newest `LATENCY_WINDOW_SAMPLES` of it, which
+    `test_the_score_is_the_median_and_not_the_mean` and the D5.9 file both hold.
+    """
     feed, clock = _feed()
-    for _ in range(LATENCY_WINDOW_SAMPLES * 50):
+    for _ in range(LATENCY_TAIL_WINDOW_SAMPLES * 50):
         _deliver(feed, clock, FAST, count=1)
-    assert feed._delivery_intervals.maxlen == LATENCY_WINDOW_SAMPLES
-    assert len(feed._delivery_intervals) == LATENCY_WINDOW_SAMPLES
+    assert _intervals(feed).maxlen == LATENCY_TAIL_WINDOW_SAMPLES
+    assert len(_intervals(feed)) == LATENCY_TAIL_WINDOW_SAMPLES
 
 
 # ==================================================================
@@ -1024,13 +1067,26 @@ def test_no_credential_or_wire_data_can_reach_the_latency_path():
     receives no payload, no token, no broker identity and no wire bytes, so
     there is nothing for it to leak — and a future change that fed it any of
     those would have to add a parameter this signature does not have.
+
+    D5.10 added exactly one parameter, and it is asserted here rather than
+    merely allowed: the connection's own ledger. `_ShardEvidence` is a closed
+    set of four slots holding two optional floats, a bool and a deque of
+    floats — so the widened signature still cannot carry a payload, a token or
+    a wire byte, and the slots are checked so a later field that could would
+    fail here.
     """
     import inspect
 
     signature = inspect.signature(StreamingTickProvider._record_delivery_interval)
-    assert list(signature.parameters) == ["self", "arrived_at"]
+    assert list(signature.parameters) == ["self", "evidence", "arrived_at"]
     # `from __future__ import annotations` makes these strings, so compare as one.
     assert signature.parameters["arrived_at"].annotation in (float, "float")
+    assert set(_ShardEvidence.__slots__) == {"link_up", "ready_since", "last_evidence_at", "intervals"}
+    ledger = _ShardEvidence()
+    assert all(
+        isinstance(getattr(ledger, slot), (bool, float, type(None), deque))
+        for slot in _ShardEvidence.__slots__
+    )
 
 
 def test_the_real_logging_stack_emits_no_latency_or_credential_detail(caplog):

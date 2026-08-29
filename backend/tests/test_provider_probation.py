@@ -902,39 +902,42 @@ def test_removing_the_window_would_promote_a_feed_on_its_first_tick():
 
 
 def test_keeping_the_evidence_across_a_reconnect_would_promote_a_flapping_feed():
-    """The reset on link loss — and the discovery that it is two controls.
+    """The reset on link loss — and how D5.10 turned two controls into one.
 
-    A reconnect cannot inherit a completed window because of *two* independent
-    lines, and neither is redundant with the other in the way that phrase
-    usually means — each one alone is sufficient, so removing either leaves the
-    behaviour correct:
+    D5.2 found this was defended by *two* independent lines, each alone
+    sufficient, so a falsification removing only one stayed green and proved
+    nothing:
 
-      * `_discard_evidence` clears the window's timestamps when the link drops;
-      * `_advance` re-stamps `_ready_since` from the *new* link's first tick
-        every time the feed enters READY.
+      * `_discard_evidence` cleared the window's timestamps when the link
+        dropped;
+      * `_advance` re-stamped `_ready_since` from the *new* link's first tick
+        every time the feed entered READY.
 
-    A falsification that removed only one would therefore stay green and prove
-    nothing — which is what this test found on its first run, and the reason it
-    removes both. That is genuine defence in depth rather than a gap, and it is
-    recorded rather than tidied away: pinning one of the two lines individually
-    would be asserting an implementation detail instead of the property.
+    **D5.10 removed the second, deliberately and not as a regression.** That
+    line stamped a single provider-level timestamp on a readiness transition,
+    which a sharded feed cannot have: its connections earn readiness at
+    different moments, and the second connection's first tick opens *its* window
+    without moving provider readiness at all. The stamp therefore moved to the
+    connection that earned it (`on_raw` stamps `_ShardEvidence.ready_since` once,
+    when it is `None`), and `_ready_since` reads the newest of them.
 
-    With both gone, a feed that served a full window, died and came back is
+    So the reset is now one control, and this test mutates exactly it: with
+    `_discard_evidence` reduced to forgetting ticks, the shard's `ready_since`
+    survives the reconnect, `on_raw` sees it is not `None` and does not
+    re-stamp, and a feed that served a full window, died and came back is
     promoted by its first tick on a connection that has proved nothing.
+
+    (One asymmetric half-control does remain inside `_ShardEvidence.discard`:
+    clearing `last_evidence_at` alone would still restart the window, because
+    `stability` reads `None` evidence as probation. Clearing `ready_since` alone
+    would not. It is recorded rather than asserted, for the reason D5.2 gave —
+    pinning one line individually asserts an implementation detail instead of
+    the property.)
     """
     _registry, manager, baseline, feed, clock = _fixture()
 
-    def only_forget_ticks(self):
+    def only_forget_ticks(self, shard=None):
         self._last_tick.clear()
-
-    real_advance = StreamingTickProvider._advance
-
-    async def advance_without_restarting_the_window(self, state, *, reason=""):
-        kept_ready_since = self._ready_since
-        changed = await real_advance(self, state, reason=reason)
-        if kept_ready_since is not None:
-            self._ready_since = kept_ready_since
-        return changed
 
     # Unmutated, for the control: the reconnect serves its window again.
     _serve_probation(feed, clock)
@@ -943,16 +946,15 @@ def test_keeping_the_evidence_across_a_reconnect_would_promote_a_flapping_feed()
     run(feed.on_raw([_tick()]))
     assert _quote_provider(manager) is baseline, "the reconnect was already inheriting probation"
 
-    with patch.object(StreamingTickProvider, "_discard_evidence", only_forget_ticks), \
-            patch.object(StreamingTickProvider, "_advance", advance_without_restarting_the_window):
+    with patch.object(StreamingTickProvider, "_discard_evidence", only_forget_ticks):
         _serve_probation(feed, clock)
         assert _quote_provider(manager) is feed
         run(feed.mark_link_down("socket closed"))
         run(feed.mark_link_up())
         run(feed.on_raw([_tick()]))
         assert _quote_provider(manager) is feed, (
-            "with both halves of the reset removed a reconnect still did not inherit "
-            "probation — the reconnect tests above are not testing the reset"
+            "with the reset removed a reconnect still did not inherit probation — "
+            "the reconnect tests above are not testing the reset"
         )
 
 

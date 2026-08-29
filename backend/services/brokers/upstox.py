@@ -382,6 +382,18 @@ class UpstoxMarketFeedChannel(BrokerStreamChannel):
     #: not speak the same wire format, and these two do not.
     protocol = "upstox_market_feed_v3"
     delivers = frozenset({StreamEventKind.TICKS})
+    #: `ltpc` mode carries at most this many instrument keys on ONE socket
+    #: (D5.10). Declared on the market channel rather than on the adapter
+    #: because it is a fact about *this* feed: the order channel beside it has
+    #: no instrument subscription for a limit to apply to. Upstox rejects an
+    #: over-limit subscribe request as a whole rather than trimming it, so
+    #: before D5.10 exceeding it cost the account every instrument unless the
+    #: adapter trimmed first — which it still does, as the backstop for a plan
+    #: this ceiling has already capped.
+    #:
+    #: No concurrent-connection ceiling: the repository documents none for this
+    #: broker and D5.10 does not invent one (LIM-D5.10-1).
+    max_instruments_per_connection = MAX_SUBSCRIBED_INSTRUMENTS
 
     def endpoint(self, session: dict, credentials: Dict[str, str] = None) -> BrokerStreamEndpoint:
         """The v3 feed, authenticated by bearer header.

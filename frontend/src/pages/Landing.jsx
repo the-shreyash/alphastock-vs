@@ -22,7 +22,7 @@ const LANDING_CSS = `
     --sa-surface-elevated: #F1F3F9;
     --sa-border: rgba(0, 0, 0, 0.055);
     --sa-text-primary: #1A1D29;
-    --sa-text-secondary: #5E6278;
+    --sa-text-secondary: #515568ff;
     --sa-text-muted: #9CA3B8;
     --sa-accent: #6366F1;
     --sa-accent-soft: rgba(99, 102, 241, 0.06);
@@ -86,10 +86,11 @@ const LANDING_CSS = `
   .sa-nav-links { display: flex; align-items: center; gap: 2rem; }
   .sa-nav-link {
     font-family: 'Inter', sans-serif;
-    font-size: 13px; font-weight: 400; color: var(--sa-text-secondary);
-    text-decoration: none; transition: color 0.2s;
+    font-size: 14px; font-weight: 400; color: var(--sa-text-secondary);
+    text-decoration: none;
+    transition: color 1s, transform 0.2s ease-in-out;
   }
-  .sa-nav-link:hover { color: var(--sa-text-primary); }
+  .sa-nav-link:hover { color: var(--sa-text-primary); transform: translateX(2px); }
   .sa-nav-actions { display: flex; align-items: center; gap: 12px; }
   .sa-btn-ghost {
     font-family: 'Inter', sans-serif;
@@ -116,7 +117,7 @@ const LANDING_CSS = `
   }
   .sa-theme-toggle:hover {
     color: var(--sa-text-primary);
-    background: rgba(120, 120, 120, 0.08);
+    background: rgba(46, 45, 45, 0.08);
   }
 
   /* HERO */
@@ -127,13 +128,13 @@ const LANDING_CSS = `
   .sa-hero-headline {
     font-family: 'Instrument Serif', serif;
     font-size: clamp(3rem, 6vw, 5.5rem);
-    font-weight: 400; font-style: normal;
+    font-weight: 550; font-style: normal;
     line-height: 1.08; letter-spacing: -0.025em;
-    color: var(--sa-text-primary); text-align: center;
+    color: var(--sa-text-secondary); text-align: center;
     margin-bottom: 1.5rem;
   }
   .sa-hero-headline em {
-    font-style: italic; color: var(--sa-text-secondary);
+    font-style: italic; color: var(--sa-text-primary);
   }
   .sa-hero-sub {
     font-family: 'Inter', sans-serif;

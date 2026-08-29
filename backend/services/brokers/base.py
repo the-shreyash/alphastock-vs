@@ -213,6 +213,14 @@ class AdapterStreamChannel(BrokerStreamChannel):
             if delivers is not None
             else frozenset(event for capability, event in CAPABILITY_EVENTS.items() if adapter.supports(capability))
         )
+        # D5.10. Read off the adapter for the same reason `protocol` is: a
+        # single-channel broker states its facts on itself, and its one free
+        # channel is that adapter wrapped. Both default to `None` on
+        # `BrokerAdapter`, so a broker that has never heard of sharding gets the
+        # single connection it has always had.
+        self.max_instruments_per_connection = getattr(
+            adapter, "stream_max_instruments_per_connection", None)
+        self.max_connections = getattr(adapter, "stream_max_connections", None)
 
     def endpoint(self, session: dict, credentials: Dict[str, str] = None) -> BrokerStreamEndpoint:
         return self._adapter.stream_endpoint(session, credentials)
@@ -268,6 +276,24 @@ class BrokerAdapter(ABC):
     #: `stream.py` dispatches on this instead of on the broker's name, which is
     #: what stops a `if broker == ...` chain from growing there per broker.
     stream_protocol: str = ""
+
+    #: How many instruments ONE of this broker's tick connections may carry, and
+    #: how many such connections one account may hold — or `None` for either
+    #: when the broker documents none (D5.10).
+    #:
+    #: Stated on the adapter rather than only on a channel because a
+    #: single-channel broker's one channel *is* this adapter wrapped
+    #: (`AdapterStreamChannel`), so this is where its author already states
+    #: `stream_protocol` and everything else about its socket. A multi-channel
+    #: broker states them per channel, where they belong: two feeds of one
+    #: broker need not share a ceiling.
+    #:
+    #: **Declare a per-connection limit only.** A per-session quota and a
+    #: per-frame limit are different facts that sharding cannot raise — see
+    #: :attr:`~services.brokers.streaming.BrokerStreamChannel.max_instruments_per_connection`
+    #: for what each one does to a feed if they are confused.
+    stream_max_instruments_per_connection: Optional[int] = None
+    stream_max_connections: Optional[int] = None
 
     def __init__(self) -> None:
         self.health = BrokerHealth(broker=self.name)

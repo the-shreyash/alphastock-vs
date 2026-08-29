@@ -435,6 +435,19 @@ class ZerodhaAdapter(BrokerAdapter):
         """Canonicalize a Kite ticker order frame (same shape as the REST book)."""
         return self._normalize_order(payload or {})
 
+    #: Kite subscribes at most 3,000 instruments on one ticker connection
+    #: (D5.10). Recorded as a limitation in D4.6 and enforced by nobody: an
+    #: over-cap subscription was sent whole, and what Kite did with the excess
+    #: was not this platform's decision to make. It is a genuinely
+    #: *per-connection* cap, so the planner raises it by opening another socket
+    #: rather than by trimming the account's portfolio.
+    #:
+    #: No concurrent-connection ceiling is declared, because the repository
+    #: documents none for this broker and D5.10 does not invent one — see
+    #: LIM-D5.10-1. `None` means "unknown", and the honest consequence is that a
+    #: portfolio far beyond one connection is planned into as many as it needs.
+    stream_max_instruments_per_connection = 3000
+
     def stream_instruments(self, holdings: list = None, positions: list = None) -> List[Any]:
         """Kite instrument tokens for every instrument in the user's portfolio.
 

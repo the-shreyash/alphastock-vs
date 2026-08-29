@@ -58,10 +58,43 @@ from services.brokers.recovery import (
     RecoveryService,
     recovery_register,
 )
+from services.brokers.sharding import DEFAULT_SHARD_ID, InstrumentShard, plan_shards
 from services.brokers.stream import stream_manager
 from services.brokers.streaming import DEFAULT_STREAM_CHANNEL, StreamEventKind
 
 logger = logging.getLogger(__name__)
+
+
+def _bind_shard(handler, shard: str):
+    """A stream callback that already knows which connection it belongs to (D5.10).
+
+    WHY THE SHARD IS BOUND HERE RATHER THAN CARRIED BY THE TRANSPORT
+    ------------------------------------------------------------------
+    The obvious alternative is to widen the transport's callbacks —
+    `on_tick(user, broker, ticks, shard)` — which is what D4.7 did for the
+    channel. It is the wrong trade this time, for two reasons that point the
+    same way:
+
+    * the transport would have to *know about shards*. It currently counts a
+      list of opaque identifiers and hands it back; a shard is subscription
+      policy, and a transport that reported one would be a transport that knew
+      how subscriptions are planned. Bound here, `stream.py` gains a dictionary
+      key and a log label and nothing else — which is the D5.10 result rather
+      than an accident of it.
+    * every existing callback signature, in this engine and in every test
+      double, would move. D4.7 and D4.10 both refused that trade for the same
+      reason (`BrokerStreamChannel.open`, `AdapterStreamChannel`): a signature
+      that moves under an unmigrated implementation fails on a live socket
+      rather than at import.
+
+    The engine is the right owner because the engine is what *built the plan*.
+    It knows which shard it is opening at the moment it opens it, so binding the
+    answer costs one partial application and no contract change anywhere.
+    """
+    from functools import partial
+
+    return partial(handler, shard=shard)
+
 
 #: Session fields that are SECRETS, and are therefore encrypted at rest and
 #: cleared on disconnect.
@@ -609,6 +642,7 @@ class BrokerEngine:
         #: readiness, probation and latency evidence to re-ask a question about
         #: a different channel.
         started_tick_channel = False
+        feed_shards: tuple = ()
         for channel in broker_gateway.stream_channels(broker):
             # D5.6: `channels=None` — every existing caller — opens every
             # channel, byte-identically to before. A re-probe passes the one
@@ -618,19 +652,33 @@ class BrokerEngine:
             # question about the market feed.
             if channels is not None and channel.name not in channels:
                 continue
-            started_tick_channel = started_tick_channel or self._channel_carries_ticks(
-                broker, channel.name)
-            await stream_manager.start_stream(
-                user_id, broker, session,
-                credentials=credentials,
-                instrument_tokens=instrument_tokens,
-                on_order_update=self._on_stream_order,
-                on_tick=self._on_stream_tick,
-                on_expired=self._on_stream_expired,
-                on_not_entitled=self._on_stream_not_entitled,
-                on_link_state=self._on_stream_link_state,
+            carries_ticks = self._channel_carries_ticks(broker, channel.name)
+            started_tick_channel = started_tick_channel or carries_ticks
+            # D5.10: one logical subscription, as many connections as the
+            # broker's own per-connection limit requires. A channel that
+            # declares no limit — every channel written before D5.10, and every
+            # broker whose cap is a session quota rather than a socket ceiling —
+            # plans exactly one shard holding everything, which is byte for byte
+            # what this loop did before. See `services/brokers/sharding.py`.
+            plan = plan_shards(
+                instrument_tokens,
+                max_instruments_per_connection=getattr(
+                    channel, "max_instruments_per_connection", None),
+                max_connections=getattr(channel, "max_connections", None),
+                broker=broker,
                 channel=channel.name,
             )
+            if carries_ticks:
+                feed_shards = plan.ids or (DEFAULT_SHARD_ID,)
+            # A channel with nothing to subscribe still opens one connection:
+            # an order stream subscribes to no instruments and must not be
+            # planned out of existence by an empty instrument list.
+            shards = plan.shards or (
+                InstrumentShard(id=DEFAULT_SHARD_ID, instruments=tuple(instrument_tokens)),
+            )
+            await self._reshard_channel(
+                user_id, broker, channel.name, shards,
+                session=session, credentials=credentials)
         if streams["ticks"] and started_tick_channel:
             # D4.4: this account's tick stream becomes a registered market-data
             # provider. Best-effort on purpose — the stream itself is already
@@ -644,9 +692,87 @@ class BrokerEngine:
             # arrives on it — the symbols are what it is allowed to become ready
             # *for*.
             try:
-                await attach_market_feed(user_id, broker, feed_symbols)
+                await attach_market_feed(user_id, broker, feed_symbols, feed_shards)
             except Exception as e:
                 logger.warning(f"Registering the {broker} market feed failed: {e}")
+
+    async def _reshard_channel(self, user_id: str, broker: str, channel: str,
+                               shards: "Sequence[InstrumentShard]", *,
+                               session: dict, credentials: dict):
+        """Bring one channel's connections into line with its shard plan (D5.10).
+
+        Three things happen, in this order, and the order is the whole of
+        make-before-break at this layer:
+
+        1. **a connection whose subscription has not changed is left alone.**
+           Not stopped and restarted — untouched, still holding its socket, still
+           delivering, still holding the readiness and probation window it has
+           earned. `start_stream` has always stopped a stream before replacing
+           it, so without this a portfolio sync that added one instrument would
+           tear down every connection the account had and re-earn everything on
+           all of them, and a re-probe of a broken shard would blip the working
+           ones. Never leaving an instrument uncovered "merely because the
+           planner is rebuilding" is exactly this step.
+        2. **connections that are new or whose membership changed are opened**,
+           replacing whatever held their shard id before.
+        3. **connections the plan no longer has are stopped**, last, so the
+           shrink half of a reshard never runs before the connections that are
+           taking over their instruments exist.
+
+        A shard is compared on what actually determines what a connection
+        delivers: its instrument list, its session and its credentials. A
+        connection that is not *running* is always rebuilt, whatever it holds —
+        which is what makes this method the whole of D5.6's re-probe for a
+        sharded channel: the broken connection is re-opened and its healthy
+        siblings are not asked anything.
+        """
+        planned = {shard.id: shard for shard in shards}
+        for shard in shards:
+            if self._shard_is_current(user_id, broker, channel, shard,
+                                      session=session, credentials=credentials):
+                continue
+            await stream_manager.start_stream(
+                user_id, broker, session,
+                credentials=credentials,
+                instrument_tokens=list(shard.instruments),
+                on_order_update=self._on_stream_order,
+                on_tick=_bind_shard(self._on_stream_tick, shard.id),
+                on_expired=_bind_shard(self._on_stream_expired, shard.id),
+                on_not_entitled=_bind_shard(self._on_stream_not_entitled, shard.id),
+                on_link_state=_bind_shard(self._on_stream_link_state, shard.id),
+                channel=channel,
+                shard=shard.id,
+            )
+        for row in stream_manager.status():
+            if (row["user_id"], row["broker"], row["channel"]) != (user_id, broker, channel):
+                continue
+            if row["shard"] not in planned:
+                await stream_manager.stop_stream(user_id, broker, channel, row["shard"])
+
+    def _shard_is_current(self, user_id: str, broker: str, channel: str,
+                          shard: "InstrumentShard", *, session: dict, credentials: dict) -> bool:
+        """Whether this exact connection is already open and already correct.
+
+        Compared on everything that decides what the connection delivers and
+        nothing that does not: it must be running, and its instruments, session
+        and credential material must be the ones the new plan calls for. A
+        session or credential that moved is a connection that has to be reopened
+        however unchanged its instruments are — the old socket is authenticated
+        with material the account no longer uses.
+
+        Deliberately conservative in one direction only: anything this cannot
+        prove is unchanged is rebuilt, so the failure mode of a wrong answer
+        here is the pre-D5.10 behaviour (a reconnect) rather than a stale
+        subscription nobody notices.
+        """
+        stream = stream_manager.get(user_id, broker, channel, shard.id)
+        if stream is None or not stream.running:
+            return False
+        return (
+            list(stream.instrument_tokens) == list(shard.instruments)
+            and stream.session == session
+            and stream.credentials == dict(credentials or {})
+        )
 
     async def _on_stream_order(self, user_id: str, broker: str, order: dict):
         """Order update from the broker's realtime feed."""
@@ -728,7 +854,8 @@ class BrokerEngine:
     def _forget_instrument_map(self, user_id: str, broker: str) -> None:
         self._instrument_maps.pop((str(user_id), broker), None)
 
-    async def _on_stream_tick(self, user_id: str, broker: str, ticks: list):
+    async def _on_stream_tick(self, user_id: str, broker: str, ticks: list,
+                              *, shard: str = DEFAULT_SHARD_ID):
         """Broker ticks arrive here as `BrokerTick` dicts and leave canonical.
 
         This is the D4.3 boundary. Everything below it — the app WebSocket, the
@@ -759,7 +886,7 @@ class BrokerEngine:
         # conversion happens here: it is the identical list, and a second
         # conversion path is a second place for two shapes to drift.
         try:
-            await publish_market_ticks(user_id, broker, ticks)
+            await publish_market_ticks(user_id, broker, ticks, shard)
         except Exception as e:
             logger.warning(f"Market feed publish from {broker} ticks failed: {e}")
         await self._push(user_id, {"type": "broker_price_tick", "data": {
@@ -783,7 +910,7 @@ class BrokerEngine:
             logger.warning(f"Live trade recompute from {broker} ticks failed: {e}")
 
     async def _on_stream_link_state(self, user_id: str, broker: str, up: bool, reason: str = "",
-                                    channel: str = None):
+                                    channel: str = None, *, shard: str = DEFAULT_SHARD_ID):
         """The broker transport's connection came up or went down (D4.5).
 
         Relayed to this account's market-data provider, which is where the
@@ -813,7 +940,7 @@ class BrokerEngine:
         if not self._channel_carries_ticks(broker, channel):
             return
         try:
-            await set_market_feed_link(user_id, broker, up=up, reason=reason)
+            await set_market_feed_link(user_id, broker, up=up, reason=reason, shard=shard)
         except Exception as e:
             logger.warning(f"Market feed link update from {broker} failed: {e}")
 
@@ -837,14 +964,21 @@ class BrokerEngine:
             return True
         return False
 
-    async def _on_stream_expired(self, user_id: str, broker: str, channel: str = None):
+    async def _on_stream_expired(self, user_id: str, broker: str, channel: str = None,
+                                 *, shard: str = DEFAULT_SHARD_ID):
         """A broker reported this account's token dead on one of its channels.
 
-        The token is the account's, not the channel's, so every channel of this
-        broker is finished — the others are reconnecting into the same rejection
-        right now. The one that reported it is `discard`ed (we are inside its
-        task; see `BrokerStreamManager.discard`) and the rest are stopped
-        properly, which cancels their tasks rather than merely forgetting them.
+        The token is the account's, not the channel's and not the connection's,
+        so every channel and every shard of this broker is finished — the others
+        are reconnecting into the same rejection right now. The one that
+        reported it is `discard`ed (we are inside its task; see
+        `BrokerStreamManager.discard`) and the rest are stopped properly, which
+        cancels their tasks rather than merely forgetting them.
+
+        D5.10 scopes the `discard` to the reporting *connection* as well as its
+        channel, for the reason D4.7 scoped it to the channel: discarding a
+        sibling shard here would drop a live stream from the registry without
+        stopping it, leaking exactly the task the `stop_stream` below cancels.
         """
         self._sessions.pop((user_id, broker), None)
         # D5.6. Recorded, and recorded as SESSION rather than merely left out:
@@ -868,7 +1002,7 @@ class BrokerEngine:
         # BrokerStream — and the expired access token inside its `session` — for
         # the life of the process. `discard` rather than `stop_stream` because we
         # are running inside that task; see BrokerStreamManager.discard.
-        stream_manager.discard(user_id, broker, channel)
+        stream_manager.discard(user_id, broker, channel, shard)
         # The remaining channels are separate tasks, so stopping them here is
         # safe — the calling channel has just been removed from the registry, so
         # this cannot await the task it is running inside.
@@ -877,7 +1011,8 @@ class BrokerEngine:
         await self._push(user_id, {"type": "broker_status", "data": {
             "broker": broker, "connected": False, "session_expired": True}})
 
-    async def _on_stream_not_entitled(self, user_id: str, broker: str, channel: str = None):
+    async def _on_stream_not_entitled(self, user_id: str, broker: str, channel: str = None,
+                                      *, shard: str = DEFAULT_SHARD_ID):
         """A broker refused this account the data one of its channels carries (D5.5).
 
         WHY THIS IS NOT `_on_stream_expired` WITH A DIFFERENT MESSAGE
@@ -918,7 +1053,18 @@ class BrokerEngine:
         """
         if self._channel_carries_ticks(broker, channel):
             await detach_market_feed(user_id, broker)
-        stream_manager.discard(user_id, broker, channel)
+        # D5.10 — THE REFUSAL ENDS EVERY CONNECTION OF THIS CHANNEL, AND ONLY
+        # THIS CHANNEL. An entitlement is a statement about a *capability*, and
+        # every shard of one channel serves the same capability with the same
+        # credential, so a refusal on one is a refusal on all: the transport
+        # stops only the connection that saw it, and leaving the siblings up
+        # would hold live sockets open against a broker that has just said to
+        # stop, feeding a provider that has just been unregistered. The
+        # reporting connection is `discard`ed because we are inside its task;
+        # the rest are stopped properly, which cancels theirs — the same split
+        # `_on_stream_expired` makes one scope out.
+        stream_manager.discard(user_id, broker, channel, shard)
+        await stream_manager.stop_stream(user_id, broker, channel)
         # D5.6, and the whole of what this sprint adds to this method. The
         # refusal stays exactly as terminal as D5.5 made it — the loop does not
         # reconnect and nothing here restarts it — but the withdrawal is now

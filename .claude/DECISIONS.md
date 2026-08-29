@@ -2727,6 +2727,180 @@ MARKET_DATA_ARCHITECTURE.md
 
 ---
 
+# ADR-049
+
+Title
+
+p95 Delivery Latency Is the Same Series Read Over a Wider Window, and Latency Enters `health()` Without Entering Ranking (Sprint D5.9, closes LIM-D5.4-3)
+
+Date
+
+2026-08-29
+
+Status
+
+Accepted — implemented; **live validation not performed** (see Consequences)
+
+Context
+
+ADR-044 delivered delivery latency as a median and recorded LIM-D5.4-3: no p95, and no latency in `health()`. It gave a reason for the first half — *"p95 needs a sample larger than any warm-up worth waiting through"* — and a reason for the second: health is counter-based evidence from past *calls*, a pushed feed makes no calls, and folding a push-derived statistic into the counters would be the transport/evidence unification ADR-043 refused.
+
+**The audit's central finding is that the first reason is arithmetic, and the conclusion was one step short of it.** Under the nearest-rank method the p95 of `N` samples is the `ceil(0.95 * N)`-th smallest. That expression equals `N` for every `N` up to and including 19 — so a p95 over D5.4's nine-sample window **is the maximum**, which is precisely the one-outlier sensitivity `LATENCY_WINDOW_SAMPLES = 9` was chosen to avoid. ADR-044 was right that nine cannot carry a p95. It did not go on to ask what can: `ceil(0.95 * N) < N` first holds at **`N = 20`**.
+
+That turns the sample size from a judgement into a derivation, which is the difference between this sprint being possible and it producing a number with precision it does not have.
+
+**The audit's second finding is that the second reason survives, and shapes the answer.** ADR-044's objection was to latency becoming *a counter* — accumulated on the same object, by the same arithmetic, as evidence from calls. It was never an objection to health *reporting* cadence. A block that is **derived on every read** and never stored is not a counter, cannot drift from the intervals it summarises, and cannot cache a cadence that has since lapsed.
+
+**The audit's third finding is that D5.9 needed no change to D5.8's shared state, and the reason is structural rather than careful.** Only a provider that is *pushed into* has a delivery cadence, and exactly those providers declare `health_is_shared = False` (ADR-048). The set of providers with latency and the set whose health is shared are disjoint by construction, so there is no code path along which a cadence could reach Redis.
+
+Decision
+
+1. **One series, two windows.** The deque widens from `LATENCY_WINDOW_SAMPLES` (9) to `LATENCY_TAIL_WINDOW_SAMPLES` (20). The **median reads the newest 9 of it** and the p95 reads all 20. One recording site, one eviction rule, one reset, one monotonic clock — no second series, which D5.9's rule 6 forbids and which would have been the obvious way to get a p95 wrong.
+
+   The consequence that matters is that **ADR-044's definition is unchanged**: `delivery_latency` is still the median of the last nine intervals, establishes at nine, and is bit-identical to what a nine-long deque produced. Widening the buffer added older samples *behind* the ones the median reads. This is deliberate: the D5.9 brief states the D5.4 definition must remain, and the only reading under which both that requirement and a defensible p95 hold is a wider buffer whose newest slice is the old window.
+
+2. **Twenty is derived, and that is the whole justification.** It is the smallest `N` at which `ceil(0.95 * N) < N` — the smallest sample size at which a p95 is a different statistic from a maximum. At 20 the rank is 19, so exactly one worst sample is excluded and one catastrophic gap cannot become the reported tail. Unlike ADR-047's 60 seconds this is not a judgement about operational cost: any smaller window makes the statistic degenerate and any larger one buys tail resolution with warm-up nothing has asked for. Pinned by a test that recomputes the derivation rather than restating the constant.
+
+3. **The percentile method is nearest-rank, and it is documented and pinned rather than assumed.** Sort ascending, take the `ceil(p * N)`-th value, one-indexed. No interpolation, no distribution assumption. Two reasons, both ADR-044's reasons for an odd median window: the result is an interval this feed was *observed* to deliver rather than a number between two of them, and it is exactly reproducible from the retained samples, so a test asserts a value and not a tolerance. Falsified against the mean, against linear interpolation, against the maximum and against an off-by-one rank.
+
+4. **Two windows means two warm-ups, and that is not the drift hazard ADR-044 warned about.** That hazard was *one* statistic with a `maxlen` and a separate warm-up free to disagree. Here **each statistic's window is its own warm-up**, exactly as before — there is no second answer to one question, there are two questions. A feed therefore legitimately spends the interval between its 9th and 20th delivery with a median and no tail figure, and `health()` is built to say so.
+
+5. **`health()` carries a derived `LatencyProfile`, not a counter.** Four fields: `established`, `p50_seconds`, `p95_seconds`, `samples`. Each statistic's `None` is its own "not established" — never `0`, which would read as instantaneous delivery and is the inversion `LATENCY_RANK_UNKNOWN` exists to prevent, and never `math.inf`, which is a sort key that exists only inside that comparison and is not JSON. `established` is stated rather than left to be inferred from `p50_seconds is not None`, because a reader of a payload must not have to know that convention. No name, no broker, no session, no token, no raw monotonic instant: `samples` is a count, not a clock reading.
+
+   Recomputed on every read. That is what makes a *lapsed* cadence — stale, or discarded by a reconnect — report itself honestly without anything having to remember to clear it, and it is what makes the field impossible to corrupt from the shared-health path.
+
+6. **The three introspection contracts stay separate.** `status()` is the consumer payload and gains nothing — a latency figure there would be a provider-shaped fact on a consumer surface, breaching Developer Rule 4. `health()` gains the cadence and remains identity-free. `describe()` remains the named admin surface and gains the p95 beside the p50 D5.4 already put there. Swept in all three directions.
+
+7. **Ranking is unchanged: the selection metric stays the median.** This is the sprint's central scope decision and it is a refusal. §7's `score = f(connection_state, message_freshness, error_rate, p95_latency)` is a *continuous score*, and ADR-044 rejected that form wholesale in favour of a three-element sort key because a scalar `f(...)` hides which term decided and the terms are not commensurable. There is therefore no surviving specification asking for p95 in ranking — only a formula the platform already declined. Adding a fourth sort element would also be new selection policy with real failover surface, on evidence nobody has: the platform has never observed a case where two feeds tie on median and the tail should break it. The p95 is reported so that operators can *see* tail behaviour; a sprint that finds it should decide selection can have that argument with data. Falsified in both directions — a mutation making p95 the selection metric and a mutation appending it as a fourth element are each caught.
+
+8. **Nothing is added to the D5.8 shared store.** Not by restraint but by construction: latency exists only on providers whose health is not shared. Both halves are pinned — a mutation that makes a pushed feed declare its health shareable is caught, and so is a mutation that teaches the store a latency field.
+
+Alternatives Considered
+
+• **Compute a p95 over the existing nine samples.** Rejected, and it is the mistake this ADR exists to avoid. It returns the maximum under a percentile's name. It would have "closed" LIM-D5.4-3 with a number whose only property is being the worst thing that happened, and the closure would have been false.
+
+• **One window of twenty for both statistics.** The tidier option — one constant, one establishment point, no state in which a median exists without a tail. Rejected because it silently redefines the platform's selection metric: the median would become the median of twenty, latency would establish after twenty deliveries instead of nine, and every D5.4 ranking property would have to be re-argued. D5.9 is a reporting sprint; buying tidiness with a change to what selection means is the wrong trade, and the brief says the D5.4 definition must remain.
+
+• **A second deque for the tail.** Rejected — rule 6, and correctly. Two buffers means two eviction rules, two reset paths and two chances for a reconnect to clear one and not the other. Pinned structurally: `StreamingTickProvider` contains exactly one `deque(` and exactly one `_delivery_intervals.append`.
+
+• **Store the profile on `ProviderHealth` and update it when an interval is recorded.** Rejected. It makes the cadence a counter, which is ADR-044's objection restated, and it introduces the one bug this design cannot have: a feed that goes stale or reconnects records nothing, so nothing updates the block, so `health()` keeps reporting a cadence the feed no longer has. Derivation on read has no such state.
+
+• **Share the latency summary in Redis so an operator sees one figure per provider.** Rejected — ADR-048's boundary, and the case it was drawn for. A cadence is evidence about *one socket in one worker*; a shared figure would average or overwrite across links that have nothing to do with each other, and would let a dead socket's tail describe the fresh link a different worker opened.
+
+• **Make p95 an eligibility filter or a demotion trigger.** Rejected for ADR-042's and ADR-044's shared reason: a filter can produce "no provider at all" from a merely-slow feed, trading a ranking blemish for an outage. Yahoo is the floor and nothing in this sprint may lower it.
+
+Consequences
+
+• **LIM-D5.4-3 is closed**, and both halves are actually implemented: a p95 that is a percentile rather than a maximum, and latency inside `health()`.
+
+• **LIM-D5.4-1 remains open and is restated deliberately**: exchange-to-ingest latency is still unmeasured, because no provider supplies an exchange timestamp at the canonical boundary and there is no defensible clock-offset estimate. Nothing in this sprint moves toward it, and the p95 must never be presented as it. `MarketTick` is unchanged.
+
+• **A feed's warm-up to a full cadence is longer than its warm-up to a median** — 20 deliveries rather than 9. On any real feed that is a fraction of a second; on a feed slow enough for it to matter, the feed is stale long before, and a stale feed reports no cadence at all.
+
+• **The rounding mode in the nearest-rank index is inert at the published window**, because `0.95 * 20` is exactly 19.0 and `floor` and `ceil` agree. Found by falsification and recorded rather than smoothed over: the choice is pinned at a window where the two differ, so the general method stays falsifiable even though the shipped configuration cannot distinguish them.
+
+• **Selection behaviour is unchanged.** The sort key is the same three elements with the same values, and the 949 D4/D5 tests pass under five shuffled file orderings.
+
+• **Nothing on any consumer surface changed.** `status()` gains no field; no provider identity, broker vocabulary, credential or monotonic instant reaches `health()` or `describe()`; verified against the real logging stack at DEBUG with live-looking fake credentials, and against a live Redis key/value sweep.
+
+Requires Approval
+
+None.
+
+Review Date
+
+At the sprint that has evidence about tail behaviour from a real feed — which is the first point at which "should p95 influence selection?" can be answered with data rather than with a formula the platform already declined. Also at the first sprint to obtain an exchange timestamp, which would make LIM-D5.4-1 addressable and would change what "latency" means on this platform for the first time since D5.4.
+
+Authoritative document
+
+MARKET_DATA_ARCHITECTURE.md
+
+---
+
+
+
+
+# ADR-050
+
+Title
+
+A Shard Is Not a Provider: One Logical Streaming Feed May Own Several Broker Connections (Sprint D5.10, instrument sharding)
+
+Date
+
+2026-08-29
+
+Status
+
+Accepted — implemented; **live validation not performed** (see Consequences)
+
+Context
+
+Every streaming broker caps how many instruments one connection may carry, and until D5.10 every adapter answered an over-cap subscription the same way: take a deterministic prefix, log a warning, and leave the account's feed quietly narrower than its portfolio. That was recorded as a limitation five times over — ADR-036, ADR-037, D4.9, D4.10, ADR-040 — each time with the same note, *"D5 owns sharding"*. This is that sprint.
+
+**The audit's first finding is that the brokers do not all cap the same thing, and the numbers are not interchangeable.** Four adapters cap **instruments per connection**, which another connection genuinely raises. One caps **tokens per session**, counted across the client code — a quota sharding cannot raise, and declaring it as a per-connection limit would open a second socket the same quota refuses, spending one of that broker's three permitted connections to subscribe to nothing. Two more numbers already in the adapters are **per-frame** limits, which are wire framing on a single socket and are not sharding at all. Treating any of the three as the other would have made a working broker worse.
+
+**The audit's second finding is that the transport was already almost right.** D4.7 generalised `BrokerStreamManager` from `(user, broker)` to `(user, broker, channel)` because a broker's realtime surface can be more than one socket. Sharding is the same generalisation one scope further in — several sockets of *one* channel — and the transport needed one key element and nothing else.
+
+**The audit's third finding is where the work actually was.** `StreamingTickProvider` held four scalars — link state, the instant readiness was earned, the instant valid data last arrived, and the recent delivery intervals — because a feed was one socket and a scalar was the whole truth. Every one of those is a fact about **one connection**, and with several connections the scalars answer the wrong question in a way that is invisible: a provider whose `_last_evidence_at` is advanced by any shard reports itself live forever while a third of the portfolio has no socket at all. That is ADR-043's stale-feed defect arriving by a second route.
+
+**The two requirements pull against each other, and that is the substance of this ADR.** The sprint brief asks both that a failing shard preserve the data its healthy siblings deliver, and that a healthy shard never mask a dead one. No single predicate does both.
+
+Decision
+
+1. **A shard is not a provider, and this is the invariant everything else serves.** One `StreamingTickProvider` per account per broker, however many connections it holds. No shard has a registry entry, is ranked by the Source Manager, earns a readiness a consumer can observe, appears in a market event, or appears in a consumer-facing payload. `MarketTick`, `InstrumentMap`, the Market Gateway, the Source Manager, the provider registry, the fallback chain and the readiness state machine are untouched and unduplicated.
+
+2. **The planner is broker-neutral arithmetic, in its own module.** `services/brokers/sharding.py` splits `N` instruments into `ceil(N / L)` contiguous batches in input order, de-duplicating first. It imports nothing from the platform, names no broker, and is asserted to contain no broker name in *comments as well as code* — a stricter sweep than `stream.py`'s, because this module is new and nothing forces its prose to discuss a broker. Its first draft named two in a docstring, which is exactly the drift a stripped sweep would have let through.
+
+3. **The limit is a declared capability, and it says "per connection" for a reason.** `BrokerStreamChannel.max_instruments_per_connection` and `max_connections`, both defaulting to `None`. `None` means *no shardable limit known*, never "unlimited", and it plans exactly one connection — so every channel written before D5.10 is byte-for-byte unaffected. A broker whose cap is a session quota declares `None` and keeps trimming in its own `subscribe_frames`, where it always did.
+
+4. **The evidence ledger becomes one `_ShardEvidence` per connection, and the provider's answers become aggregations over it.** Which aggregation each answer uses is the whole design:
+
+   * `_last_evidence_at` = the **minimum** over declared shards, `None` if any has none. So `has_fresh_evidence` — and through it `stability` — mean "**every** connection is delivering". Neither predicate needed a line changed. The maximum is the mask, and it is what this refuses.
+   * `_ready_since` = the **maximum**, `None` if any shard has not earned readiness. Probation is therefore re-served whenever any connection reconnects, and never re-served by connections that did not drop.
+   * `delivery_latency` / `delivery_latency_p95` = per-shard series, aggregated by **maximum**, `None` if any shard is untimed. Merging shard arrivals into one series would make three connections delivering once a second read as a third of a second — a latency advantage bought by owning more sockets rather than by delivering any instrument sooner. A consumer waits for *their* instrument, which arrives on exactly one connection.
+   * `_last_tick` carries the delivering shard, so a connection dropping discards exactly the prices it was covering.
+
+5. **The two requirements are resolved along the seam the architecture already had.** `READY` and per-symbol `covers()` — the *serving* gate — stay "at least one connection is delivering", which is the faithful reading of what READY has always meant. Partial coverage has lived in `covers()` since ADR-035 and it is exact. Every provider-level *claim* becomes "every connection". A feed of three that loses one goes on answering for the instruments the other two deliver, and stops claiming to be a live feed.
+
+6. **The shard is bound into the engine's callbacks, not carried by the transport.** `stream.py` gains a key element, a task-name label and a log label, and learns nothing about sharding. The engine built the plan, so it knows which shard it is opening at the moment it opens it, and binds the answer with a partial application. Widening the transport's callbacks instead would have moved every existing signature — the trade D4.7 and D4.10 both refused, refused again.
+
+7. **Resharding is make-before-break, and reuses connections it does not need to change.** A connection whose instruments, session and credentials are unchanged and which is running is left alone — not stopped and restarted. New and changed connections are opened, and connections the plan no longer has are stopped **last**. No instrument is left uncovered because the planner was rebuilding, and a portfolio sync that adds one instrument no longer tears down every connection the account had.
+
+8. **No second recovery ladder, and no second health model.** D5.1 owns reconnect, D5.3 owns evidence freshness, D5.5 classifies entitlement, D5.6's register stays keyed on `(user, broker, channel)` — an entitlement is a statement about a capability, identical on every connection of one channel, so a refusal ends the whole channel and the re-probe re-opens whichever of its connections are down. D5.8's boundary is untouched: `health_is_shared` is already `False` for exactly the reason that applies to a shard, and the Source Manager contains no occurrence of the word.
+
+Consequences
+
+• **Five limitations recorded across D4.6–D4.11 are closed for four brokers**: an over-cap subscription now opens another connection instead of trimming the account's portfolio.
+
+• **LIM-D5.10-1 — no concurrent-connection ceiling is declared for four of the five brokers**, because the repository documents one for only one of them and D5.10 does not invent numbers. The honest consequence is that a portfolio far beyond one connection is planned into as many connections as it needs, and a broker that refuses the excess will refuse it at the handshake, where D5.1's ladder paces the retry.
+
+• **LIM-D5.10-2 — one broker's 1,000-token session quota is still enforced by trimming with a warning.** Sharding cannot raise a quota, and this is the correct outcome rather than an unfinished one.
+
+• **LIM-D5.10-3 — a partially failed sharded feed is ranked below the delayed baseline for every instrument**, including the ones its healthy connections are still delivering, until the lost connection is restored and has served a full probation window. This follows mechanically: `stability` reads `has_fresh_evidence` (ADR-043), and ADR-042 ranks a probationary provider below a steady one. The feed's data is genuinely preserved — it stays eligible, keeps its coverage, and answers whenever nothing steadier remains — but it is not preferred. The alternative, a per-shard stability term, is a second ranking system, and it would let a feed with a permanently dead connection hold the primary position indefinitely.
+
+• **The reconnect reset went from two independent controls to one, deliberately.** ADR-042 found `_discard_evidence` and `_advance`'s re-stamp each sufficient alone. The second stamped a single provider-level timestamp on a readiness transition, which a sharded feed cannot have — its connections earn readiness at different moments — so it moved to the connection that earned it. Recorded rather than tidied away, and the D5.2 test now mutates the single control that exists.
+
+• **A single-connection feed is unaffected.** Every aggregate over one shard is that shard's own value; every widened signature defaults to the single connection; the full suite matches its pre-sprint baseline exactly.
+
+• **35 falsification mutations were applied and all 35 observed RED.** Five were malformed or green on the first pass and were reformed — three of them by adding the test coverage they proved was missing, including the end-to-end attribution of a tick to the connection it arrived on.
+
+• **Live validation not performed.** No interactive broker session exists, and no account in this repository holds a portfolio that exceeds any broker's per-connection limit. A smoke-test checklist is in BROKER_INTEGRATION.md.
+
+Requires Approval
+
+None.
+
+Review Date
+
+At the first sprint with a live broker session against an account large enough to shard — which is the first point at which any of this is observed rather than derived. Also at the first broker whose per-connection limit is small enough that a retail portfolio reaches it, which would move sharding from a ceiling-raiser to an everyday path and would make LIM-D5.10-3's ranking cost a product decision rather than a footnote.
+
+Authoritative document
+
+MARKET_DATA_ARCHITECTURE.md
+
+---
+
 
 
 # End of Decisions Documentation

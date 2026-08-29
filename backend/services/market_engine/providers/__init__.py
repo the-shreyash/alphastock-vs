@@ -24,6 +24,7 @@ from services.market_engine.providers.base import (
     PUSH_CAPABILITIES,
     MarketDataProvider,
     ProviderContractError,
+    LatencyProfile,
     ProviderHealth,
     ProviderKind,
     ProviderState,
@@ -43,7 +44,10 @@ from services.market_engine.providers.registry import (
     validate_provider,
 )
 from services.market_engine.providers.streaming import (
+    DEFAULT_FEED_SHARD,
     DEFAULT_TICK_MAX_AGE_SECONDS,
+    LATENCY_TAIL_PERCENTILE,
+    LATENCY_TAIL_WINDOW_SAMPLES,
     LATENCY_WINDOW_SAMPLES,
     PROBATION_WINDOW_SECONDS,
     STREAMING_FEED_PRIORITY,
@@ -54,10 +58,13 @@ from services.market_engine.providers.streaming import (
 from services.market_engine.providers.yahoo import YahooPollingAdapter
 
 __all__ = [
+    "DEFAULT_FEED_SHARD",
     "DEFAULT_TICK_MAX_AGE_SECONDS",
     "HEALTH_PROBE_BASE_DELAY",
     "HEALTH_PROBE_MAX_DELAY",
     "GLOBAL_CONTEXT",
+    "LATENCY_TAIL_PERCENTILE",
+    "LATENCY_TAIL_WINDOW_SAMPLES",
     "LATENCY_WINDOW_SAMPLES",
     "PROBATION_WINDOW_SECONDS",
     "PUSH_CAPABILITIES",
@@ -72,6 +79,7 @@ __all__ = [
     "ProbeClaims",
     "MarketDataProvider",
     "ProviderContractError",
+    "LatencyProfile",
     "ProviderHealth",
     "ProviderHealthRecovery",
     "ProviderKind",

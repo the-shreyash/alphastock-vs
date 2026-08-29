@@ -374,7 +374,7 @@ Zerodha is the platform's first real streaming broker. **It is not the market-da
 
 **Mode is LTP, deliberately.** The tick feed marks holdings and open trades and answers streamed quotes; all three need a last price and nothing else. The decision lives in one named constant (`STREAM_MODE`) rather than a literal. **Consequence: a Kite-derived `MarketTick` carries no volume**, because an LTP packet has none. The decoder reads only the first eight bytes of each packet, which every tradable mode fills identically, so widening the mode later is a subscribe-frame change rather than a decoder rewrite.
 
-**Limitations, recorded rather than worked around:** no volume on a Kite tick; only holdings-and-positions instruments are streamed (a full Kite instrument dump is a catalog with its own storage and refresh semantics, and is a sprint of its own); no wire-level unsubscribe, because a portfolio sync restarts the stream and nothing else changes a subscription incrementally; Kite's 3,000-instrument-per-connection cap is neither enforced nor sharded (D5 owns sharding).
+**Limitations, recorded rather than worked around:** no volume on a Kite tick; only holdings-and-positions instruments are streamed (a full Kite instrument dump is a catalog with its own storage and refresh semantics, and is a sprint of its own); no wire-level unsubscribe, because a portfolio sync restarts the stream and nothing else changes a subscription incrementally. **Kite's 3,000-instrument-per-connection cap is sharded as of D5.10** — a larger subscription opens as many ticker connections as it needs (ADR-050); no concurrent-connection ceiling is declared, because this repository documents none for Kite and D5.10 does not invent numbers (LIM-D5.10-1).
 
 **Live validation has not been performed.** A Kite ticker connection needs a per-user `access_token`, obtainable only through an interactive browser login. Everything asserted about this adapter is deterministic validation against fixtures built from the Kite Connect v3 binary specification.
 
@@ -411,7 +411,7 @@ Angel One is the **independent test of the channel model** D4.7 introduced. Upst
 
 **The engine's session-secret list grew one generic name.** Angel One's feed authenticates with a second per-session credential, so `feed_token` joined `TOKEN_FIELDS` — encrypted at rest, cleared on disconnect, alongside `access_token`, `refresh_token` and `public_token`. It is a generic session-credential name, not a per-broker registry entry: an adapter's `exchange_token` decides which of them its broker issues.
 
-**Limitations, recorded rather than worked around:** no volume on an Angel One tick; no order/trading surface; no `session_refresh`; only holdings-and-positions instruments are streamed; the 1,000-token session quota is enforced by trimming with a warning rather than by sharding (D5 owns sharding — SmartAPI allows three sockets per client code, which is the headroom any sharding must fit inside); no wire-level unsubscribe; series-suffix stripping covers the documented NSE/BSE cash series only.
+**Limitations, recorded rather than worked around:** no volume on an Angel One tick; no order/trading surface; no `session_refresh`; only holdings-and-positions instruments are streamed; **the 1,000-token quota is still enforced by trimming with a warning, and that is D5.10's finding for this broker rather than an omission (LIM-D5.10-2)**: the quota is documented per *session*, counted across the client code, so sharding cannot raise it — a second socket would spend one of SmartAPI's three permitted connections to subscribe to nothing. This adapter therefore declares no per-connection limit (ADR-050); no wire-level unsubscribe; series-suffix stripping covers the documented NSE/BSE cash series only.
 
 **Live validation has not been performed.** An Angel One feed needs a per-user session obtainable only through an interactive SmartAPI browser login. Everything asserted about this adapter is deterministic validation against fixtures built from SmartAPI's published byte layout, plus 20 source mutations observed red. The outstanding smoke test is listed in TASK.md's D4.9 section — including **holding the connection past 60 seconds**, which is the only way to prove the keep-alive, and **confirming whether the redirect carries a `refresh_token`**, which decides `session_refresh`.
 
@@ -452,7 +452,7 @@ Fyers is the first broker that disagreed with the **framework** rather than only
 
 **Capabilities are deliberately partial:** profile, holdings, positions, funds, margins, session invalidation and `tick_stream`. No order capabilities (D4.10 is a market-data sprint and Fyers' order surface is unvalidated here), no `order_stream` (Fyers serves order updates on a separate socket, which would be a second channel), and no `session_refresh` — **Fyers issues a refresh token but redeeming it requires the user's trading PIN**, which SECURITY.md forbids this platform from holding.
 
-**Limitations, recorded rather than worked around:** no volume on a Fyers tick; no order/trading surface; no `session_refresh`; only holdings-and-positions instruments are streamed; the 5,000-instrument connection limit is enforced by trimming with a warning rather than by sharding (D5 owns sharding); no wire-level unsubscribe, `change_mode`, or channel pause/resume; series-suffix stripping covers the documented NSE cash series plus `INDEX` — **BSE single-letter group codes (`-A`, `-B`, `-X`) are deliberately not stripped**, because a one-letter suffix is indistinguishable from part of a name and stripping one wrongly renames an instrument permanently. **And one protocol requirement is knowingly unimplemented:** HSM's credential response carries an "acknowledge every N frames" count that the reference client honours by sending a ReqType-3 frame; a codec here returns a decoded event and cannot put a frame back on the wire. If the server enforces it the feed goes quiet with the socket still open — bounded by `StreamingTickProvider`'s tick-freshness backstop, so the account falls back to the delayed baseline within two minutes — and the adapter logs a named warning when the count arrives non-zero.
+**Limitations, recorded rather than worked around:** no volume on a Fyers tick; no order/trading surface; no `session_refresh`; only holdings-and-positions instruments are streamed; **the 5,000-instrument connection limit is sharded as of D5.10** (ADR-050) — HSM's per-connection ceiling is raised by opening another connection; `SUBSCRIBE_BATCH_SIZE` (1,500 topics per subscribe frame) is wire framing on one socket and is deliberately not that number; no concurrent-connection ceiling is declared (LIM-D5.10-1); no wire-level unsubscribe, `change_mode`, or channel pause/resume; series-suffix stripping covers the documented NSE cash series plus `INDEX` — **BSE single-letter group codes (`-A`, `-B`, `-X`) are deliberately not stripped**, because a one-letter suffix is indistinguishable from part of a name and stripping one wrongly renames an instrument permanently. **And one protocol requirement is knowingly unimplemented:** HSM's credential response carries an "acknowledge every N frames" count that the reference client honours by sending a ReqType-3 frame; a codec here returns a decoded event and cannot put a frame back on the wire. If the server enforces it the feed goes quiet with the socket still open — bounded by `StreamingTickProvider`'s tick-freshness backstop, so the account falls back to the delayed baseline within two minutes — and the adapter logs a named warning when the count arrives non-zero.
 
 **Live validation has not been performed.** A Fyers feed needs a per-user session obtainable only through an interactive browser login. Everything asserted about this adapter is deterministic validation against fixtures built from the reference client's own framing, plus 22 source mutations observed red. The outstanding smoke test is listed in TASK.md's D4.10 section — including **whether the acknowledgement count is ever non-zero**, which is the one open protocol question, and **holding the connection past 30 seconds**, which is the only way to prove the keep-alive.
 
@@ -500,7 +500,7 @@ The protocol was read from **two independent sources set against each other**: D
 
 **Session-expiry and entitlement classification.** Codes 807/808/809 stop the stream through the `AUTH_EXPIRED` path — the account's token is dead. Code **806** ("Data APIs not subscribed") takes the `NOT_ENTITLED` path added in **D5.5 (ADR-045)**: the token is valid and only the market-data entitlement is missing, so the account's *feed* stops while its session, its other channels and its trading surface keep working. Until D5.5 it was approximated as an expired session — an honest message on a dishonest state — and that approximation is now closed. Code **805** ("too many active connections") is deliberately neither: Dhan drops the oldest socket when a sixth opens, so the next attempt may succeed, and it is reported as `ERROR` and left to the reconnect ladder.
 
-**Limitations, recorded rather than worked around:** a holding reporting `"ALL"` cannot be streamed (its symbol, quantity and P&L are unaffected); no order/trading surface; no `margins`, `session_refresh` or `session_invalidate`; only holdings-and-positions instruments are streamed; the 5,000-instrument connection ceiling is enforced by trimming **with a warning naming the number** rather than by sharding (D5 owns sharding); no wire-level unsubscribe; and **no series-suffix stripping** — both official samples and the SDK fixtures show bare symbols, and inventing a strip rule for a suffix this broker does not appear to send would risk renaming an instrument permanently.
+**Limitations, recorded rather than worked around:** a holding reporting `"ALL"` cannot be streamed (its symbol, quantity and P&L are unaffected); no order/trading surface; no `margins`, `session_refresh` or `session_invalidate`; only holdings-and-positions instruments are streamed; **the 5,000-instrument connection ceiling is sharded as of D5.10** (ADR-050), capped at Dhan's documented **five concurrent feed connections per user** — declared because Dhan does not refuse a sixth connection but disconnects the *oldest* with code 805, so an uncapped plan would destroy the connection it opened first; instruments beyond five connections' capacity are still trimmed with a warning naming the number; no wire-level unsubscribe; and **no series-suffix stripping** — both official samples and the SDK fixtures show bare symbols, and inventing a strip rule for a suffix this broker does not appear to send would risk renaming an instrument permanently.
 
 **One broker-neutral debt was found and named rather than fixed: DB-5.** The transport resets its reconnect backoff after any connection that *completed*, so a socket a broker accepts and immediately closes reconnects roughly every 1.5s indefinitely — which Dhan's code 805 is simply the first protocol to expose, against a broker whose own documentation warns that further requests may get the user blocked. The fix is to reset the backoff only after a connection that lasted a minimum duration, which **is flap suppression**, which is D5's. ✅ **CLOSED in D5.1 (2026-08-25, ADR-041)** — see *Reconnect pacing* below.
 
@@ -1182,7 +1182,9 @@ Latency
 
 The scoring itself lives entirely in the Market Engine and reads nothing an adapter provides beyond the fact that a batch of canonical ticks was accepted. **A new broker gets latency scoring by declaring `TICK_STREAM` and pushing canonical ticks through the existing seam; it writes no latency code, exposes no timestamp, and needs no entry in any table.** A broker whose feed is genuinely slow will rank behind a faster one *of the same user* and is never excluded, never marked unhealthy, and never surfaced to the user by name.
 
-Broker *API* latency — the round-trip time of an authenticated REST call, which is what the Admin Portal rows below mean — is a different measurement on a different subsystem and is still unimplemented. `BrokerHealth` remains counter-based (availability, auth-failure rate, error rate) and D5.4 did not touch it.
+**D5.9 (ADR-049) adds a p95 and puts both figures on `health()`, and still requires nothing of an adapter.** The p95 is the same accepted-batch interval series read over a wider window (the last 20 rather than the newest 9, by nearest rank); the median — and therefore ranking — is unchanged. A broker feed's `health()` now carries `established / p50_seconds / p95_seconds / samples`, derived on read, with unknown as `None`. It is per-socket and per-user, is never shared to Redis (ADR-048: a pushed feed's health is not shared), is discarded on reconnect with the rest of the link's evidence, and names no broker. **A new broker still writes no latency code and exposes no timestamp.**
+
+Broker *API* latency — the round-trip time of an authenticated REST call, which is what the Admin Portal rows below mean — is a different measurement on a different subsystem and is still unimplemented. `BrokerHealth` remains counter-based (availability, auth-failure rate, error rate); neither D5.4 nor D5.9 touched it.
 
 **Broker health is now the deployment's, not one worker's (D5.8, ADR-048).** A broker's API is one remote system, so every worker's calls to it are evidence about the same outage — and holding one counter per worker meant an Admin Portal row that reported whichever replica served the request, and a broker that needed eight consecutive failures *per worker* before any of them said `down`. Since D5.8 the counters behind `BrokerHealth` are a shared Redis record with atomic transitions, mirrored onto each worker's adapter instance.
 
@@ -1348,3 +1350,54 @@ Adding a new broker should require only creating a new adapter while keeping the
 ---
 
 # End of Broker Integration Documentation
+
+
+---
+
+# Instrument Sharding Across Broker Connections (D5.10, ADR-050)
+
+Every streaming broker caps how many instruments one connection may carry. Until D5.10 an over-cap subscription was trimmed to a deterministic prefix with a warning, leaving the account's feed quietly narrower than its portfolio. It is now **sharded**: the subscription is split into as many broker-valid batches as it needs, one connection per batch, and the account still registers **exactly one market-data provider**.
+
+## What a channel declares
+
+Two class attributes on `BrokerStreamChannel` (or, for a single-channel broker, on the adapter as `stream_max_instruments_per_connection` / `stream_max_connections`). Both default to `None`.
+
+| Attribute | Meaning | `None` means |
+|---|---|---|
+| `max_instruments_per_connection` | How many instruments **one connection** may hold | *No shardable limit known* → exactly one connection. **Never "unlimited".** |
+| `max_connections` | How many such connections **one account** may hold | No documented ceiling → the plan is uncapped |
+
+**Declare a per-connection limit only.** Three different limits appear in these adapters and only one of them is raised by opening another socket:
+
+* **per connection** — shardable. Another connection genuinely doubles capacity.
+* **per session / per client code** — a quota counted across the account, not the socket. Sharding it opens a socket the same quota refuses. Declare `None` and keep trimming.
+* **per frame** — how many instruments fit in one subscribe *message* on one socket. Wire framing; the codec already handles it by sending more frames.
+
+## The declared limits, per broker
+
+| Broker | Per connection | Concurrent ceiling | Notes |
+|---|---|---|---|
+| Zerodha (Kite ticker) | 3,000 | not documented here | Sharded as of D5.10 |
+| Upstox (v3 market feed) | 5,000 (`ltpc` keys) | not documented here | Declared on the *market* channel; the order channel has no instrument subscription |
+| Angel One (SmartAPI) | **none — quota, not a ceiling** | 3 sockets per client code | 1,000 tokens **per session**; still trimmed with a warning (LIM-D5.10-2) |
+| Fyers (HSM) | 5,000 | not documented here | 1,500 topics per subscribe *frame* is framing, not sharding |
+| Dhan (DhanHQ v2) | 5,000 | **5 per user** | Dhan disconnects the **oldest** connection past the ceiling, so the cap is load-bearing; 100 instruments per *message* is framing |
+
+## What sharding does not change
+
+Instrument identity, the codec, the canonical `MarketTick`, `InstrumentMap` resolution, the Market Gateway, the Source Manager, the provider registry, the fallback chain, readiness, probation, freshness, entitlement classification, the reconnect ladder, the re-probe register, and the distributed health boundary. A tick from shard 2 resolves to exactly the same canonical instrument as if it had arrived on shard 1.
+
+## Live smoke test (NOT YET PERFORMED)
+
+Requires an interactive session on an account whose holdings-and-positions universe genuinely exceeds one connection's limit — easiest on Zerodha (3,001+ instruments) or with a temporarily lowered `stream_max_instruments_per_connection`.
+
+1. **Subscription larger than one connection.** Connect the account, sync the portfolio, and confirm the planner logs `N instruments sharded across M connections (limit L per connection)` with `M == ceil(N / L)`.
+2. **Multiple live connections.** `stream_manager.status()` lists `M` rows for the tick channel, distinct `shard` values, all `running: True`; the broker's own session page shows `M` active feed connections.
+3. **Ticks through more than one shard.** With DEBUG logging, confirm `… stream connected for user …` appears `M` times and that instruments from at least two different shards appear in the canonical batches reaching the provider.
+4. **Canonical ticks correct.** Spot-check three instruments from three different shards against the broker's own web terminal: symbol, exchange and last price must match, and no instrument may be missing from `covered_symbols`.
+5. **One shard can fail without destroying the others.** Kill one connection at the network level (drop the socket, not the session). Confirm: the other connections stay `running`; `describe()["covered_symbols"]` loses only that shard's instruments; the account's quotes for the surviving instruments still resolve to the feed **once the baseline is unavailable** (see LIM-D5.10-3 — while the baseline is up it is preferred, because the feed is on probation).
+6. **Reconnect restores the shard.** Confirm the killed connection reconnects on D5.1's ladder, re-subscribes its own batch, and its instruments return to `covered_symbols`.
+7. **Readiness and probation after reconnect.** Confirm `describe()["stability"]` is `probation` immediately after the reconnect and returns to `stable` only after a full window of valid data on **every** connection — not on the reconnected one alone.
+8. **No duplicate or missing instruments.** The union of every shard's `subscribed_instruments` must equal the account's `stream_instruments(...)` output exactly, with no repeats.
+
+Until this is run, **LIVE VALIDATION: NOT PERFORMED** stands for sharding, as it does for every stream adapter (ADR-036…040, ADR-050).

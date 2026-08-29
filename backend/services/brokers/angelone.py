@@ -445,6 +445,26 @@ class AngelOneAdapter(BrokerAdapter):
     #: SmartAPI WebSocket 2.0 — binary ticks, JSON errors, text keep-alive.
     stream_protocol = "smartapi_stream_v2"
 
+    #: NO per-connection instrument limit is declared, and that is the D5.10
+    #: audit finding for this broker rather than an omission.
+    #:
+    #: SmartAPI's documented cap is a **per-session token quota** counted across
+    #: the client code — :data:`MAX_SUBSCRIBED_INSTRUMENTS`, spent per token and
+    #: mode — not a ceiling on what one socket may hold. Sharding cannot raise a
+    #: quota. Declaring 1,000 here would open a second socket that the same quota
+    #: refuses, spending one of this broker's three permitted concurrent
+    #: connections to subscribe to nothing and turning today's honest warning
+    #: into a feed that is dead rather than merely narrow.
+    #:
+    #: So the quota stays enforced where it always was, in
+    #: :meth:`stream_subscribe_frames`, by trimming with a warning. `None` here
+    #: means "no *shardable* limit known", which is the truthful answer, and the
+    #: 1,000-token quota remains a recorded limitation (LIM-D5.10-2).
+    #:
+    #: The three-socket-per-client-code ceiling is likewise not declared: a
+    #: ceiling with no per-connection limit beneath it can never be reached,
+    #: because the planner produces exactly one shard.
+
     # -- HTTP ----------------------------------------------------------------
     def _headers(self, session: dict = None) -> dict:
         """SmartAPI's fixed header set, with this user's session token.
