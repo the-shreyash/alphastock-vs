@@ -285,6 +285,16 @@ class MarketGateway:
         if callable(binder):
             binder(None)
         provider_registry.unregister(name)
+        # D5.7: drop any failure cool-down this feed was serving. Not a recovery
+        # claim — a re-attached feed is a new instance with fresh UNKNOWN health
+        # and would never be re-admitted on the old one's ladder anyway; this
+        # only stops the register accumulating an entry per feed that has ever
+        # been down.
+        # D5.8 makes this reach the shared store too, for the same reason: an
+        # unregistered provider's shared record is evidence about a subject that
+        # no longer exists. (For a streaming feed there is no shared record —
+        # `health_is_shared` is False — and this is the local drop it always was.)
+        await source_manager.forget_health_recovery_shared(provider)
         owner = provider.owner_user_id
         if owner:
             # Announce the demotion *before* forgetting the cached per-user
@@ -349,7 +359,7 @@ class MarketGateway:
         """
         if not ticks:
             return
-        if source_manager.record_success(provider):
+        if await source_manager.record_success_shared(provider):
             await source_manager.publish_status()
 
         payload: Dict[str, Any] = {
@@ -427,7 +437,15 @@ class MarketGateway:
         set, and `observability/instruments.py` keeps that vocabulary frozen on
         purpose.
         """
-        resolution = source_manager.resolve_feed(capability, context, user_id=user_id)
+        # D5.8 — one awaitable prelude, then the same synchronous resolution.
+        # `prepare` refreshes the candidates' health from the shared store and
+        # atomically claims at most one recovery trial per DOWN provider, so what
+        # this worker ranks is what the deployment has observed and the trial it
+        # may spend is one no other worker is spending.
+        shared = await source_manager.prepare(capability, context, user_id=user_id)
+        resolution = source_manager.resolve_feed(
+            capability, context, user_id=user_id, shared=shared
+        )
 
         if not resolution.available:
             # The explicit unavailable state. `reason` distinguishes "nothing is
@@ -460,7 +478,7 @@ class MarketGateway:
                         call.empty()
             except Exception as exc:
                 last_error = exc
-                if source_manager.record_failure(provider, exc):
+                if await source_manager.record_failure_shared(provider, exc):
                     await source_manager.publish_status()
                 remaining = len(resolution.chain) - attempt - 1
                 logger.warning(
@@ -469,7 +487,7 @@ class MarketGateway:
                 )
                 continue
 
-            if source_manager.record_success(provider, empty=empty):
+            if await source_manager.record_success_shared(provider, empty=empty):
                 await source_manager.publish_status()
             return provider, result
 

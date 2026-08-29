@@ -40,7 +40,7 @@ surface an explicit "connect your broker" state.
 """
 import logging
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, Sequence
 
 from services.brokers import BrokerCapability, broker_gateway, broker_registry
 from services.brokers.base import BrokerAdapter
@@ -53,8 +53,13 @@ from services.brokers.market_feed import (
     publish_market_ticks,
     set_market_feed_link,
 )
+from services.brokers.recovery import (
+    RecoveryClass,
+    RecoveryService,
+    recovery_register,
+)
 from services.brokers.stream import stream_manager
-from services.brokers.streaming import StreamEventKind
+from services.brokers.streaming import DEFAULT_STREAM_CHANNEL, StreamEventKind
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +105,17 @@ class BrokerEngine:
         #: would only add a window in which a correct map is thrown away and
         #: rebuilt from a narrower source.
         self._instrument_maps: dict = {}
+        #: D5.6. The paced re-probe that gives a withdrawn feed a way back.
+        #: Constructed here rather than at module scope so its three injected
+        #: callables bind to *this* engine — the recovery module holds no engine
+        #: import, which is what keeps `services.brokers.recovery` free of a
+        #: cycle and every branch in it assertable without a database.
+        self._recovery = RecoveryService(
+            recovery_register,
+            attach=self._reattach_channel,
+            has_session=self._has_live_session,
+            is_attached=self._channel_is_attached,
+        )
 
     # -- wiring -----------------------------------------------------------------
     def configure(self, db, ws_push=None):
@@ -248,6 +264,12 @@ class BrokerEngine:
         await self._push(user_id, {"type": "broker_status", "data": {
             "broker": broker, "connected": True}})
         await self._publish_connection(user_id, broker, connected=True)
+        # D5.6. A new valid session supersedes everything known about the old
+        # one, so this is one of exactly two places that clear the re-probe
+        # *ladder* as well as the withdrawal (the other is `disconnect`). It is
+        # also the mechanism behind ADR-046's auth rule: a feed withdrawn for a
+        # dead token becomes attachable again here and nowhere else.
+        recovery_register.forget(user_id, broker)
         # Initial sync + stream are best-effort: connection succeeds even if
         # the first sync hits a transient broker error.
         sync_result = None
@@ -276,6 +298,10 @@ class BrokerEngine:
             await broker_gateway.invalidate_session(broker, session)
         self._sessions.pop((user_id, broker), None)
         self._forget_instrument_map(user_id, broker)
+        # D5.6. The user removed the account; there is nothing left to recover,
+        # and leaving a candidate behind would re-probe a broker the user has
+        # deliberately detached.
+        recovery_register.forget(user_id, broker)
         # The entitlement has ended, so the feed must stop being resolvable now
         # rather than at the next health transition — a broker feed is legally
         # this user's own data (MARKET_DATA_ARCHITECTURE.md, Category 2).
@@ -523,7 +549,8 @@ class BrokerEngine:
 
     # -- realtime streaming -------------------------------------------------------------------------
     async def start_stream(self, user_id: str, broker: str,
-                           holdings: list = None, positions: list = None):
+                           holdings: list = None, positions: list = None,
+                           channels: "Optional[Sequence[str]]" = None):
         """Open the broker's official WebSocket for this account.
 
         Fully broker-agnostic as of D3. What used to be here was an `if broker
@@ -575,7 +602,24 @@ class BrokerEngine:
         # updates and market ticks on separate feeds gets both, from the same
         # transport, with no name of its own anywhere in this method.
         credentials = broker_gateway.stream_credentials(broker)
+        #: Whether this call actually (re)opened the channel that carries market
+        #: ticks (D5.6). Registering the feed below replaces whatever provider
+        #: the account already had, so a channel-scoped re-probe of an *order*
+        #: socket must not run it: that would discard a live tick feed's
+        #: readiness, probation and latency evidence to re-ask a question about
+        #: a different channel.
+        started_tick_channel = False
         for channel in broker_gateway.stream_channels(broker):
+            # D5.6: `channels=None` — every existing caller — opens every
+            # channel, byte-identically to before. A re-probe passes the one
+            # channel it is recovering, because `BrokerStreamManager.start_stream`
+            # stops a channel before replacing it: an account-wide attach would
+            # blip a perfectly healthy *order* socket in order to re-ask a
+            # question about the market feed.
+            if channels is not None and channel.name not in channels:
+                continue
+            started_tick_channel = started_tick_channel or self._channel_carries_ticks(
+                broker, channel.name)
             await stream_manager.start_stream(
                 user_id, broker, session,
                 credentials=credentials,
@@ -587,7 +631,7 @@ class BrokerEngine:
                 on_link_state=self._on_stream_link_state,
                 channel=channel.name,
             )
-        if streams["ticks"]:
+        if streams["ticks"] and started_tick_channel:
             # D4.4: this account's tick stream becomes a registered market-data
             # provider. Best-effort on purpose — the stream itself is already
             # up and driving portfolio and trade P&L, and a provider-registry
@@ -694,6 +738,16 @@ class BrokerEngine:
         is dropped inside `canonical_ticks`; a batch that yields nothing stops
         here rather than waking two recomputes that would find nothing to do.
         """
+        # D5.6: market data arriving on this account's feed is the evidence
+        # that discharges an outstanding recovery candidate, and it is taken
+        # *before* canonical mapping deliberately. The question a re-probe asks
+        # is whether the account may consume this feed at all, and a broker
+        # frame carrying market data answers it — an account whose holdings this
+        # process cannot yet name is entitled all the same. Readiness is a
+        # different question, asked further down and answered only by a valid
+        # canonical tick reaching the provider; recovery never shortcuts it.
+        if ticks:
+            recovery_register.discharge(user_id, broker)
         instrument_map = await self._instrument_map(user_id, broker)
         ticks = canonical_ticks(ticks, instrument_map, broker=broker)
         if not ticks:
@@ -793,6 +847,17 @@ class BrokerEngine:
         properly, which cancels their tasks rather than merely forgetting them.
         """
         self._sessions.pop((user_id, broker), None)
+        # D5.6. Recorded, and recorded as SESSION rather than merely left out:
+        # an expired token must be *visibly* excluded from re-probe rather than
+        # absent from the register, so the exclusion is a fact a test can read
+        # and a mutation can break. Retrying a dead credential on a schedule is
+        # a login attempt on a timer, which is how an account gets locked rather
+        # than how a feed comes back. It also *replaces* any REPROBE candidate
+        # this account already had: the strictly stronger condition is the later
+        # one, so an entitlement re-probe stops the moment the token dies.
+        recovery_register.reclassify(user_id, broker, RecoveryClass.SESSION)
+        recovery_register.record_withdrawal(
+            user_id, broker, channel or DEFAULT_STREAM_CHANNEL, RecoveryClass.SESSION)
         # A dead token means the feed cannot deliver another tick. Unregistering
         # it is what stops the Source Manager resolving a priority-1 streaming
         # provider that can only answer with silence; the baseline below it then
@@ -854,7 +919,74 @@ class BrokerEngine:
         if self._channel_carries_ticks(broker, channel):
             await detach_market_feed(user_id, broker)
         stream_manager.discard(user_id, broker, channel)
+        # D5.6, and the whole of what this sprint adds to this method. The
+        # refusal stays exactly as terminal as D5.5 made it — the loop does not
+        # reconnect and nothing here restarts it — but the withdrawal is now
+        # *recorded*, so a paced re-probe can later ask the one question a
+        # reconnect could not: has this account's entitlement changed? See
+        # ADR-046. The class is REPROBE because an entitlement is a
+        # provider-level condition a person can grant without this process being
+        # told; it is not a credential problem and not a transport problem.
+        recovery_register.record_withdrawal(
+            user_id, broker, channel or DEFAULT_STREAM_CHANNEL, RecoveryClass.REPROBE)
         await self._audit(user_id, "broker.feed.entitlement_denied", {"broker": broker})
+
+    # -- provider recovery (D5.6) ----------------------------------------------------------------------
+    def _has_live_session(self, user_id: str, broker: str) -> bool:
+        """Whether this account has a session a re-probe could attach with.
+
+        Reads the engine's own session cache and nothing else. It is deliberately
+        not a *freshness* check and not a broker call: `get_session` would hit
+        the database and possibly the broker on a background sweep, and the
+        authority on whether a token still works is the attach attempt itself —
+        which reports `AUTH_EXPIRED` through the path that already exists and
+        reclassifies the candidate out of re-probe entirely.
+
+        What this does guarantee is the rule ADR-046 rests on: every path that
+        invalidates a session (`disconnect`, `_on_stream_expired`) pops this map
+        first, so a candidate whose session went away after it was recorded
+        cannot be attempted.
+        """
+        return bool(self._sessions.get((user_id, broker)))
+
+    def _channel_is_attached(self, user_id: str, broker: str, channel: str) -> bool:
+        """Whether a stream is already running for this exact channel.
+
+        Asked so a re-probe never replaces a live connection. `start_stream`
+        stops a channel before opening it, so an unguarded sweep would tear down
+        a feed that a user reconnect or a session restore had already brought
+        back — recovering a feed by breaking it.
+        """
+        return any(
+            row["running"]
+            for row in stream_manager.status()
+            if row["user_id"] == user_id and row["broker"] == broker
+            and row["channel"] == channel
+        )
+
+    async def _reattach_channel(self, user_id: str, broker: str, channel: str):
+        """One ordinary attach of one channel — the whole of what a re-probe does.
+
+        There is no probe-only path: this is `start_stream` scoped to a single
+        channel, so a recovered feed travels the identical route a first
+        attachment does — connect, subscribe, first valid canonical tick, READY,
+        probation, stability, latency. A control-plane "yes" would have proved
+        something the platform does not accept as evidence (ADR-046).
+        """
+        await self.start_stream(user_id, broker, channels=(channel,))
+
+    def start_recovery(self):
+        """Begin the bounded background re-probe sweep. Idempotent.
+
+        Started from the same place session restore is, and it is the only timer
+        this sprint adds. A sweep with an empty register performs no I/O: it
+        reads two dictionaries and goes back to sleep, so a deployment where
+        nothing has ever been refused pays a dictionary lookup a minute.
+        """
+        return self._recovery.start()
+
+    async def stop_recovery(self):
+        await self._recovery.stop()
 
     # -- startup ---------------------------------------------------------------------------------------
     async def load_sessions(self):
@@ -906,9 +1038,14 @@ class BrokerEngine:
             logger.error(f"Broker session restore failed: {e}")
         if restored:
             logger.info(f"Restored {restored} live broker session(s) from database.")
+        # D5.6. Session restore is the natural place: it is the point at which
+        # this process knows which accounts exist, and it already runs exactly
+        # once per startup. Idempotent, so a second call adds no second sweeper.
+        self.start_recovery()
         return restored
 
     async def shutdown(self):
+        await self.stop_recovery()
         await stream_manager.stop_all()
 
     # -- legacy compatibility (single-session zerodha_service shim) ------------------------------------------

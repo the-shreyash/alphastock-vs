@@ -16,6 +16,8 @@ See `base.py` for the contract and why the streaming push surface is not part
 of D1.
 """
 from services.market_engine.providers.base import (
+    DEGRADED_AFTER_FAILURES,
+    DOWN_AFTER_FAILURES,
     GLOBAL_CONTEXT,
     Capability,
     CapabilityUnavailable,
@@ -27,6 +29,13 @@ from services.market_engine.providers.base import (
     ProviderState,
     ResolutionContext,
     SourceTier,
+)
+from services.market_engine.providers.health_recovery import (
+    HEALTH_PROBE_BASE_DELAY,
+    HEALTH_PROBE_MAX_DELAY,
+    HealthProbe,
+    ProbeClaims,
+    ProviderHealthRecovery,
 )
 from services.market_engine.providers.registry import (
     ProviderRegistry,
@@ -46,6 +55,8 @@ from services.market_engine.providers.yahoo import YahooPollingAdapter
 
 __all__ = [
     "DEFAULT_TICK_MAX_AGE_SECONDS",
+    "HEALTH_PROBE_BASE_DELAY",
+    "HEALTH_PROBE_MAX_DELAY",
     "GLOBAL_CONTEXT",
     "LATENCY_WINDOW_SAMPLES",
     "PROBATION_WINDOW_SECONDS",
@@ -55,9 +66,14 @@ __all__ = [
     "CapabilityUnavailable",
     "FeedReadiness",
     "FeedStability",
+    "DEGRADED_AFTER_FAILURES",
+    "DOWN_AFTER_FAILURES",
+    "HealthProbe",
+    "ProbeClaims",
     "MarketDataProvider",
     "ProviderContractError",
     "ProviderHealth",
+    "ProviderHealthRecovery",
     "ProviderKind",
     "ProviderRegistry",
     "ProviderState",

@@ -58,6 +58,7 @@ from services.brokers.contracts import (
     coerce_profile,
     coerce_trades,
 )
+from services.brokers import health as broker_health
 from services.brokers.errors import (
     BrokerAuthError,
     BrokerError,
@@ -153,16 +154,18 @@ class BrokerGateway:
         except BrokerAuthError as exc:
             # Per-user session failure. Recorded, but deliberately not counted
             # against the broker's API health — see health.py.
-            adapter.health.record_auth_failure()
+            # D5.8 — recorded in the shared store when one is configured, so the
+            # count an operator reads is the deployment's and not one worker's.
+            await broker_health.record_auth_failure_shared(adapter.health)
             raise normalize_broker_error(exc, broker=adapter.name, operation=label, display_name=adapter.display_name)
         except BaseException as exc:
             error = normalize_broker_error(exc, broker=adapter.name, operation=label, display_name=adapter.display_name)
             if _counts_against_health(error):
-                if adapter.health.record_failure(error.code):
+                if await broker_health.record_failure_shared(adapter.health, error.code):
                     logger.warning("Broker %s health degraded to %s", adapter.name, adapter.health.state.value)
             raise error
 
-        adapter.health.record_success()
+        await broker_health.record_success_shared(adapter.health)
         return coerce(result, adapter.name) if coerce else result
 
     # ── Authentication / configuration ───────────────────
@@ -406,11 +409,40 @@ class BrokerGateway:
         )
 
     def health(self, broker: str) -> Dict[str, Any]:
+        """This worker's view of a broker's API health.
+
+        Kept synchronous and kept as the local read: it is what a log line, a
+        metric callback or any non-awaitable caller can ask for. A surface that
+        reports to an operator wants :meth:`health_shared`.
+        """
         return self.resolve(broker).health.as_dict()
+
+    async def health_shared(self, broker: str) -> Dict[str, Any]:
+        """The deployment's view of a broker's API health (D5.8).
+
+        DB-1's read path for the Admin Portal. Before this, an operator asking
+        whether a broker was up got the answer from whichever worker happened to
+        serve the request, and two refreshes could disagree — which is the
+        symptom that made health-driven automation unsafe to build on.
+        """
+        adapter = self.resolve(broker)
+        await broker_health.refresh_shared(adapter.health)
+        return adapter.health.as_dict()
 
     def diagnostics(self) -> Dict[str, Any]:
         """Full broker detail for admin surfaces and logs."""
         return {"brokers": self._registry.describe()}
+
+    async def diagnostics_shared(self) -> Dict[str, Any]:
+        """:meth:`diagnostics` over the shared health state (D5.8).
+
+        One round trip for every broker rather than one each, so an admin page's
+        cost does not grow with the broker list.
+        """
+        await broker_health.refresh_shared(
+            *(adapter.health for adapter in self._registry.all())
+        )
+        return self.diagnostics()
 
     def reset_health(self) -> None:
         """Drop every broker's health. Startup and tests only."""

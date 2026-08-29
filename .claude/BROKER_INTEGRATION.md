@@ -530,6 +530,28 @@ The protocol was read from **two independent sources set against each other**: D
 
 • **`AUTH_EXPIRED` and `NOT_ENTITLED` must not be collapsed.** They share the property of being terminal and nothing else: one ends the account's session, the other ends one feed. An adapter that cannot tell them apart from what its broker sent should return `ERROR` and let the ladder run, rather than guess.
 
+## Provider recovery — how a withdrawn feed comes back (D5.6, ADR-046)
+
+D5.5 made an entitlement refusal terminal, which is correct, and left it a one-way door. D5.6 gives it a way back that is neither a retry nor a reconnect. **Nothing here is an adapter's business** — the whole of it is generic, and this section exists so an adapter author knows what *not* to build.
+
+• **An adapter must not implement recovery, re-probing, entitlement polling or a "try again later" of any kind.** Same rule, and the same reason, as the reconnect and keep-alive rules above. An adapter's whole contribution is classifying what its broker *said*; when and whether to try again is a property of a connection and an account the adapter does not own. `services/brokers/recovery.py` names no broker and must keep naming none.
+
+• **There is no `check_entitlement()` on the adapter contract, and there will not be one.** A re-probe is **one ordinary attach** of the withdrawn channel through the existing lifecycle, so an adapter needs no new method and no new capability. A control-plane "yes" would prove the wrong thing anyway: the platform's only definition of a usable feed is a valid canonical tick on the current link.
+
+• **Five recovery classes, and only one of them is retried.** `TRANSPORT` (the reconnect ladder owns it) and `EVIDENCE` (the next accepted tick owns it) are refused registration outright, because both already heal themselves. `REPROBE` — what a `NOT_ENTITLED` refusal produces — is retried on a paced ladder. `SESSION` — what an `AUTH_EXPIRED` produces — is **never** retried: a new valid session through the ordinary re-authentication lifecycle is the only way back, and an automatic probe with a dead credential is a login attempt on a timer. `CONFIGURATION` covers a channel or protocol the deployment no longer serves.
+
+• **The re-probe ladder is not the reconnect ladder.** 300 seconds, doubling, capped at 3600. Reconnect asks whether a socket is reachable and answers in seconds; a re-probe asks whether an account's entitlement changed, and entitlements change when a person changes them. The two must never be shared, and a test asserts the slowest reconnect is still faster than the fastest re-probe.
+
+• **Only reconnecting or disconnecting the broker resets the ladder.** An attach that appears to succeed does not — otherwise a broker that accepts a socket and then refuses in a frame would reset the pacing on every cycle, which is DB-5's storm on a five-minute period.
+
+• **A candidate is cleared by market data, not by a socket.** A connection that opened proves nothing about entitlement; a frame carrying market data proves it exactly.
+
+• **A recovered feed earns everything again.** New provider instance, so READY must be re-earned from a valid canonical tick, the probation window must be served in full, and no readiness, stability or latency evidence carries over from the refused connection. Recovery creates the opportunity to earn eligibility; it never creates eligibility.
+
+• **Scope is (user, broker, channel)**, the same key the stream registry uses. A market-feed re-probe opens only the market-feed channel — it does not blip the account's order socket — and an order-channel re-probe can never replace a live market feed.
+
+**Live validation has not been performed for D5.6.** See ADR-046 for the outstanding smoke test.
+
 **Live validation has not been performed.** A Dhan feed needs a per-user access token obtainable only through an interactive browser consent login. Everything asserted about this adapter is deterministic validation against fixtures packed with the reference client's own `struct` formats, plus 27 source mutations of which 25 were observed red. The outstanding smoke test is listed in TASK.md's D4.11 section — including **whether a real `/holdings` row returns `"ALL"` or a real exchange**, which decides how much of the holdings limitation actually bites, and **holding the connection past 40 seconds**, which is the only way to prove the library's pong satisfies Dhan's ping.
 
 ---
@@ -1161,6 +1183,17 @@ Latency
 The scoring itself lives entirely in the Market Engine and reads nothing an adapter provides beyond the fact that a batch of canonical ticks was accepted. **A new broker gets latency scoring by declaring `TICK_STREAM` and pushing canonical ticks through the existing seam; it writes no latency code, exposes no timestamp, and needs no entry in any table.** A broker whose feed is genuinely slow will rank behind a faster one *of the same user* and is never excluded, never marked unhealthy, and never surfaced to the user by name.
 
 Broker *API* latency — the round-trip time of an authenticated REST call, which is what the Admin Portal rows below mean — is a different measurement on a different subsystem and is still unimplemented. `BrokerHealth` remains counter-based (availability, auth-failure rate, error rate) and D5.4 did not touch it.
+
+**Broker health is now the deployment's, not one worker's (D5.8, ADR-048).** A broker's API is one remote system, so every worker's calls to it are evidence about the same outage — and holding one counter per worker meant an Admin Portal row that reported whichever replica served the request, and a broker that needed eight consecutive failures *per worker* before any of them said `down`. Since D5.8 the counters behind `BrokerHealth` are a shared Redis record with atomic transitions, mirrored onto each worker's adapter instance.
+
+What this means for a broker adapter: **nothing.** No adapter was changed, no method was added to the contract, and no adapter may reach the store. `BrokerGateway.call` records the outcome exactly where it always did; the difference is where the number lives. The two rules that governed the counters still govern them unchanged:
+
+  * an **auth failure is still not a health failure** — it is counted separately and stays out of the state machine, and sharing the count is what finally makes a token-expiry wave legible (a climbing auth count against a flat error count) instead of splitting it across replicas;
+  * the thresholds are still 3 and 8, and they still match the market-provider model.
+
+Two reads exist and the difference matters at the surface: `broker_gateway.health(broker)` is the synchronous, this-worker view for logs and metric callbacks, and **`broker_gateway.health_shared(broker)` / `diagnostics_shared()` are what an operator surface must call** — they adopt the shared record before rendering, so two refreshes cannot disagree. Where Redis is not configured (the supported single-process deployment) both are the same answer and behave exactly as they did before D5.8.
+
+Per-user session state is untouched and remains per user on `BrokerConnection`; nothing about a user's tokens, sessions or identity is written to the shared store, whose keys carry a broker name and nothing else.
 
 Authentication Success
 

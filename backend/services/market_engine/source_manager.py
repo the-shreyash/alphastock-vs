@@ -87,14 +87,25 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 
+from infrastructure import health_state
+from infrastructure.health_state import (
+    SharedHealthStore,
+    provider_key,
+    shared_health_store,
+)
 from services.market_engine.event_bus import event_bus
 from services.market_engine.providers import (
+    DEGRADED_AFTER_FAILURES,
+    DOWN_AFTER_FAILURES,
     GLOBAL_CONTEXT,
     Capability,
     MarketDataProvider,
+    ProbeClaims,
+    ProviderHealthRecovery,
     ProviderRegistry,
     ProviderState,
     ResolutionContext,
@@ -141,6 +152,14 @@ HEALTH_RANK = {
     ProviderState.UP: 0,
     ProviderState.UNKNOWN: 0,
     ProviderState.DEGRADED: 1,
+    # D5.7. A DOWN provider is normally filtered out before ranking ever sees
+    # it; it reaches this table only when its failure cool-down has run and it
+    # has been re-admitted for one trial. The band is worst, and because health
+    # is the *first* element of the selection key that single fact is the whole
+    # of "a re-probed provider can never outrank a healthy or a probationary
+    # one" — there is no branch enforcing it, only the position of the element
+    # and the value in this row.
+    ProviderState.DOWN: 2,
 }
 
 #: Selection order among providers of equal health (D5.2). Lower wins.
@@ -277,11 +296,60 @@ def _selection_rank(provider: MarketDataProvider) -> Tuple[int, int, float]:
     )
 
 
+@dataclass(frozen=True)
+class SharedResolution:
+    """What one worker learned from the shared store before resolving (D5.8).
+
+    DB-1 has to make a decision — "may this worker spend this provider's
+    recovery trial?" — that only Redis can answer, on a path
+    (:meth:`SourceManager.resolve_feed`) that is synchronous and called from
+    routes, diagnostics and the gateway alike. Making that path `async` would
+    have changed a contract five modules deep for a question asked about a
+    handful of DOWN providers.
+
+    So the awaitable work is lifted into :meth:`SourceManager.prepare`, which
+    runs once per gateway call, and its result travels as this value. Resolution
+    stays synchronous, stays pure, and — the property that matters — makes no
+    decision the shared store has not already made: `claims` is filtered, never
+    re-derived.
+
+    A caller that does not prepare gets exactly the D5.7 behaviour, which is
+    what keeps every existing call site correct and what a single-process
+    deployment runs.
+    """
+
+    context: Optional[ResolutionContext] = None
+    claims: Optional[ProbeClaims] = None
+    #: Whether the shared health records were actually read. False means Redis
+    #: did not answer and every provider below is being judged on this worker's
+    #: own evidence — a fact the diagnostics surface must be able to state.
+    health_synced: bool = False
+
+
 class SourceManager:
     """Resolves the active market-data provider for a capability and context."""
 
-    def __init__(self, registry: Optional[ProviderRegistry] = None) -> None:
+    def __init__(
+        self,
+        registry: Optional[ProviderRegistry] = None,
+        *,
+        health_recovery: Optional[ProviderHealthRecovery] = None,
+        store: Optional[SharedHealthStore] = None,
+    ) -> None:
         self._registry = registry if registry is not None else provider_registry
+        #: D5.7's failure cool-down — the second half of step 2 of the
+        #: Resolution procedure, which D1 implemented as an unconditional
+        #: exclusion. Owned here rather than on the registry because deciding
+        #: *whether* an excluded provider may be tried is a selection decision,
+        #: and the registry filters without choosing.
+        self._health_recovery = (
+            health_recovery if health_recovery is not None else ProviderHealthRecovery()
+        )
+        #: D5.8's shared health record. Injected for the same reason the
+        #: cool-down register is: a test supplies one pointed at its own Redis,
+        #: and a deployment without Redis keeps the process-local behaviour
+        #: D5.1–D5.7 shipped without a branch anywhere else.
+        self._store = store if store is not None else shared_health_store
         self._last_status: Optional[Dict[str, Any]] = None
         #: user_id -> last published per-user status, for change gating (D4.5).
         self._last_status_by_user: Dict[str, Dict[str, Any]] = {}
@@ -295,7 +363,70 @@ class SourceManager:
     def registry(self) -> ProviderRegistry:
         return self._registry
 
+    @property
+    def health_recovery(self) -> ProviderHealthRecovery:
+        """The failure cool-down register (D5.7). Diagnostics and tests."""
+        return self._health_recovery
+
     # ── Resolution ───────────────────────────────────────
+
+    async def prepare(
+        self,
+        capability: Capability,
+        context: Optional[ResolutionContext] = None,
+        *,
+        user_id: Optional[str] = None,
+    ) -> SharedResolution:
+        """Read the shared health state and claim any due trials (D5.8).
+
+        The awaitable half of resolution, and the whole of DB-1's read path. Run
+        once by the Market Gateway immediately before :meth:`resolve_feed`, it
+        does two things and nothing else:
+
+        1. **Refreshes every eligible provider's health from Redis**, so this
+           worker ranks on the failures every worker has seen rather than only
+           on its own. Overwriting, not merging — see
+           :meth:`MarketDataProvider.apply_shared_health`.
+        2. **Claims at most one recovery trial per DOWN provider**, atomically,
+           so two workers resolving in the same instant cannot both spend it.
+
+        Cost is bounded and flat: one round trip for the health read of the whole
+        candidate set, plus one per *currently DOWN* provider. A deployment with
+        nothing down pays exactly one Redis operation per gateway call, and a
+        deployment with no Redis pays none.
+
+        The eligible set is `candidates_for + down_candidates_for`, which is the
+        registry's one eligibility pass split by health — so the set read here
+        cannot disagree with the set resolved below it, even though the health
+        it is keyed on is what this method is about to change.
+        """
+        ctx = self._context(context, user_id)
+        eligible = (
+            self._registry.candidates_for(capability, ctx)
+            + self._registry.down_candidates_for(capability, ctx)
+        )
+        shareable = [p for p in eligible if p.health_is_shared]
+
+        synced = False
+        if shareable:
+            ok, records = await self._store.read_many(
+                [self._store_key(p) for p in shareable]
+            )
+            if ok:
+                synced = True
+                for provider in shareable:
+                    record = records.get(self._store_key(provider))
+                    if record is not None:
+                        provider.apply_shared_health(record)
+
+        # Re-partitioned *after* the refresh: a provider this worker thought was
+        # healthy may have been driven DOWN by another worker one millisecond
+        # ago, and it is the post-refresh health that decides whether it is a
+        # candidate or a cool-down subject.
+        claims = await self._health_recovery.claim_due(
+            self._registry.down_candidates_for(capability, ctx)
+        )
+        return SharedResolution(context=ctx, claims=claims, health_synced=synced)
 
     def resolve_feed(
         self,
@@ -303,6 +434,7 @@ class SourceManager:
         context: Optional[ResolutionContext] = None,
         *,
         user_id: Optional[str] = None,
+        shared: Optional[SharedResolution] = None,
     ) -> Resolution:
         """Resolve `capability` into an explicit :class:`Resolution`.
 
@@ -322,7 +454,24 @@ class SourceManager:
         ctx = self._context(context, user_id)
         candidates = self._registry.candidates_for(capability, ctx)
 
-        if not candidates:
+        # D5.7 — step 2's other half. A provider excluded at DOWN is re-admitted
+        # for one trial once its failure cool-down has run, and for no other
+        # reason. It is *appended*, never merged into the healthy set: the sort
+        # below puts it last because DOWN is the worst health band, so this can
+        # add a last resort to the chain and can never reorder what is above it.
+        #
+        # Nothing here treats the provider as recovered. Its health is untouched
+        # by re-admission and stays DOWN until a real call succeeds, which is
+        # the same evidence every other provider has always needed.
+        # D5.8 — when the caller prepared, the claim was made once, atomically,
+        # in `prepare`. This filters that answer and re-decides nothing, so a
+        # trial another worker holds is never offered here.
+        probes = self._health_recovery.due_from(
+            self._registry.down_candidates_for(capability, ctx),
+            claims=shared.claims if shared is not None else None,
+        )
+
+        if not candidates and not probes:
             return Resolution(
                 capability=capability,
                 context=ctx,
@@ -341,7 +490,7 @@ class SourceManager:
         # Nothing here is cached and no provider is marked as primary: which
         # provider leads is the *output* of this sort and never an input to it
         # (D4.5), which is what makes promotion and demotion atomic.
-        chain = sorted(candidates, key=_selection_rank)
+        chain = sorted(candidates + probes, key=_selection_rank)
         return Resolution(
             capability=capability,
             context=ctx,
@@ -472,6 +621,12 @@ class SourceManager:
             # The one place a selected provider's name is legitimate.
             "selected_for_quotes": quotes.provider.name if quotes.provider else None,
             "failover_chain": [p.name for p in quotes.chain],
+            # D5.7. Outstanding failure cool-downs, so an operator can tell
+            # "excluded and waiting" from "excluded forever" — which is the
+            # thing that was invisible while the exclusion was unconditional.
+            # Admin-only, alongside the provider names already here; `status()`
+            # is unchanged and carries none of this.
+            "health_recovery": self._health_recovery.describe(),
         }
 
     async def publish_status(
@@ -634,8 +789,18 @@ class SourceManager:
     # ── Health bookkeeping (called by the gateway) ───────
 
     def record_success(self, provider: MarketDataProvider, *, empty: bool = False) -> bool:
-        """Record a successful provider call. True when the state changed."""
-        return provider.record_success(empty=empty) is not None
+        """Record a successful provider call. True when the state changed.
+
+        Clearing the D5.7 cool-down is gated on the provider's *resulting state*
+        rather than on the call having returned, and that is the whole of "stale
+        evidence cannot restore health" on this path: an empty success does not
+        reset the failure streak, so a provider answering 200-with-no-data stays
+        DOWN and keeps its cool-down, exactly as it keeps its exclusion.
+        """
+        changed = provider.record_success(empty=empty) is not None
+        if provider.health().state is not ProviderState.DOWN:
+            self._health_recovery.note_recovered(provider)
+        return changed
 
     def record_failure(self, provider: MarketDataProvider, exc: BaseException) -> bool:
         """Record a failed provider call. True when the state changed.
@@ -656,9 +821,123 @@ class SourceManager:
         assigns to Phase 5 (sprint D5) along with probation windows. D3's broker
         adapter is the natural first caller — a reconnected WebSocket knows it
         recovered without anyone polling it. Pinned by
-        `test_a_demoted_provider_has_no_self_recovery_path_in_d2`.
+        `test_a_demoted_provider_has_no_self_recovery_path_in_d2`, which is
+        about DEGRADED and remains true: a DEGRADED provider is still a
+        candidate, still in the chain, and recovers the moment the chain reaches
+        it — it is unreached, not unreachable.
+
+        CLOSED FOR DOWN IN D5.7. The DOWN half of the same paragraph was a real
+        deadlock, because exclusion made the provider unreach*able*. Every
+        failure recorded while a provider is DOWN now charges its failure
+        cool-down, so the eighth consecutive failure that creates the state and
+        a failed trial afterwards climb one ladder rather than two. Read from
+        the provider's resulting state rather than from the exception: this
+        module does not classify failures and must not start.
         """
-        return provider.record_failure(exc) is not None
+        changed = provider.record_failure(exc) is not None
+        if provider.health().state is ProviderState.DOWN:
+            self._health_recovery.note_probe_failed(provider)
+        return changed
+
+    async def record_success_shared(
+        self, provider: MarketDataProvider, *, empty: bool = False
+    ) -> bool:
+        """The distributed form of :meth:`record_success` (D5.8).
+
+        Same semantics, one authority. The transition is computed inside Redis so
+        that a success racing a failure from another worker produces one logical
+        transition rather than two half-applied ones, and the authoritative
+        counters are then mirrored onto this worker's provider object — so the
+        very next synchronous `resolve_feed` ranks on them without a second read.
+
+        The empty-success rule survives the move intact and is enforced in the
+        one place it can be: the script counts an empty call and does **not**
+        clear the streak, so a provider answering 200-with-no-data stays DOWN
+        and keeps its cool-down in every worker, not just in this one.
+
+        Falls back to the purely local path when Redis does not answer.
+        """
+        if not provider.health_is_shared:
+            return self.record_success(provider, empty=empty)
+
+        ok, record = await self._store.record(
+            self._store_key(provider),
+            health_state.EMPTY if empty else health_state.SUCCESS,
+            stamp=_now_iso(),
+            degraded_after=DEGRADED_AFTER_FAILURES,
+            down_after=DOWN_AFTER_FAILURES,
+        )
+        if not ok or record is None:
+            return self.record_success(provider, empty=empty)
+
+        provider.apply_shared_health(record)
+        if provider.health().state is not ProviderState.DOWN:
+            await self._health_recovery.note_recovered_shared(provider)
+        return record.changed
+
+    async def record_failure_shared(
+        self, provider: MarketDataProvider, exc: BaseException
+    ) -> bool:
+        """The distributed form of :meth:`record_failure` (D5.8).
+
+        The counter that decides DOWN is incremented inside Redis, which is what
+        makes "eight consecutive failures" mean eight failures *observed by the
+        deployment* rather than eight observed by one worker — the difference
+        between a broken provider being excluded after 8 calls and after 8×N.
+
+        Charging the cool-down is still gated on the provider's resulting state
+        rather than on the exception, exactly as D5.7 has it: this module does
+        not classify failures and must not start.
+        """
+        if not provider.health_is_shared:
+            return self.record_failure(provider, exc)
+
+        ok, record = await self._store.record(
+            self._store_key(provider),
+            health_state.FAILURE,
+            stamp=_now_iso(),
+            degraded_after=DEGRADED_AFTER_FAILURES,
+            down_after=DOWN_AFTER_FAILURES,
+            label=type(exc).__name__,
+        )
+        if not ok or record is None:
+            return self.record_failure(provider, exc)
+
+        provider.apply_shared_health(record)
+        if provider.health().state is ProviderState.DOWN:
+            await self._health_recovery.note_probe_failed_shared(provider)
+        return record.changed
+
+    async def forget_health_recovery_shared(self, provider: MarketDataProvider) -> bool:
+        """Drop a provider's cool-down and shared health because it is going away.
+
+        The distributed form of :meth:`forget_health_recovery`. An unregistered
+        provider's shared record is evidence about a subject that no longer
+        exists, and leaving it would mean a re-registered feed of the same name
+        inheriting a verdict about its predecessor.
+        """
+        return await self._health_recovery.forget_shared(provider)
+
+    @staticmethod
+    def _store_key(provider: MarketDataProvider):
+        """This provider's key in the shared store.
+
+        Owner scope *and* name, never the name alone: two users holding a feed
+        from the same broker are two subjects, and one account's outage is not
+        the other's.
+        """
+        return provider_key(provider.name, provider.owner_user_id)
+
+    def forget_health_recovery(self, provider: MarketDataProvider) -> bool:
+        """Drop a provider's failure cool-down because it is being unregistered.
+
+        Not a claim that it recovered — see
+        :meth:`ProviderHealthRecovery.forget`. Called from the gateway's
+        unregister path for the same reason :meth:`forget_user_status` is: a map
+        keyed by every provider that has ever been down would otherwise grow for
+        the life of the process.
+        """
+        return self._health_recovery.forget(provider)
 
     def reset(self) -> None:
         """Drop cached status, broker tracking and every provider's health.
@@ -666,8 +945,20 @@ class SourceManager:
         self._last_status = None
         self._last_status_by_user.clear()
         self._connected_brokers.clear()
+        self._health_recovery.clear()
         for provider in self._registry.all():
             provider.reset_health()
+
+
+def _now_iso() -> str:
+    """The wall-clock stamp written onto a shared health record.
+
+    Diagnostics only, and deliberately so. Every *decision* in D5 — cool-downs,
+    probation, freshness, latency — is made from a monotonic clock or, since
+    D5.8, from Redis's own; these two fields are the "when did this last work"
+    an operator reads and nothing compares them.
+    """
+    return datetime.now(timezone.utc).isoformat()
 
 
 #: Module-level singleton, matching `event_bus` / `market_gateway`.

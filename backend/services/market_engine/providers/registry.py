@@ -148,6 +148,45 @@ class ProviderRegistry:
         they have never been tried, and filtering them out would make being
         tried impossible. Only DOWN is disqualifying.
         """
+        return [
+            provider
+            for provider in self._eligible_for(capability, context)
+            if provider.health().state is not ProviderState.DOWN
+        ]
+
+    def down_candidates_for(
+        self,
+        capability: Capability,
+        context: Optional[ResolutionContext] = None,
+    ) -> List[MarketDataProvider]:
+        """Providers that pass every filter in :meth:`candidates_for` *except*
+        health, and are DOWN — the input to D5.7's failure cool-down.
+
+        The exact complement of `candidates_for` over one eligibility pass, so
+        the two can never disagree about entitlement, capability, readiness or
+        coverage: a provider is in exactly one of the two lists and the filters
+        deciding that are written once.
+
+        This is not a relaxation of the DOWN filter and it does not select
+        anything. It answers "which providers would be candidates but for their
+        health", which is a question only the Source Manager's cool-down asks,
+        and the Source Manager decides — from evidence the registry does not
+        hold — whether any of them may be tried. Keeping the decision out of
+        here is the same line `candidates_for` already draws: the registry
+        stores and filters, it does not choose.
+        """
+        return [
+            provider
+            for provider in self._eligible_for(capability, context)
+            if provider.health().state is ProviderState.DOWN
+        ]
+
+    def _eligible_for(
+        self,
+        capability: Capability,
+        context: Optional[ResolutionContext],
+    ) -> List[MarketDataProvider]:
+        """Entitlement and capability, in priority order. Health is not asked."""
         ctx = context if context is not None else GLOBAL_CONTEXT
         # The capability travels *inside* the context from here down (D4.5), so
         # a provider's own `is_eligible_for` can answer differently for a pushed
@@ -160,9 +199,7 @@ class ProviderRegistry:
         return [
             provider
             for provider in self.all()
-            if provider.supports(capability)
-            and provider.is_eligible_for(ctx)
-            and provider.health().state is not ProviderState.DOWN
+            if provider.supports(capability) and provider.is_eligible_for(ctx)
         ]
 
     def entitled_for(self, context: ResolutionContext) -> List[MarketDataProvider]:

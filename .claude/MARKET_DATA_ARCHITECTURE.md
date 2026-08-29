@@ -3,7 +3,7 @@
 
 Version: 1.1
 
-Status: Approved Design — Phase 1 Implemented (Sprint D1, 2026-08-19); Phase 2 Implemented in backend (Sprint D2, 2026-08-20, frontend tier indicator outstanding); Phase 3 re-scoped to the Broker Provider Framework and Implemented (Sprint D3, 2026-08-20, ADR-031); Phase 4 Implemented through 4.11 (Sprints D4.1–D4.11, 2026-08-21…25, ADR-032…040 — Zerodha Kite, Upstox v3, Angel One SmartAPI, Fyers HSM and Dhan DhanHQ v2 are the five concrete stream adapters, and Dhan is the first that required no generic framework change at all; **live validation not yet performed for any of them**); Phase 5 implemented through 5.5 (Sprints D5.1–D5.5, 2026-08-25…27, ADR-041…045 — flap suppression, probation, stale-feed demotion, delivery latency, entitlement-failure classification); remaining broker adapters, the rest of Phase 5 (sharding, chaos tests, DB-1) and Phase 6 pending
+Status: Approved Design — Phase 1 Implemented (Sprint D1, 2026-08-19); Phase 2 Implemented in backend (Sprint D2, 2026-08-20, frontend tier indicator outstanding); Phase 3 re-scoped to the Broker Provider Framework and Implemented (Sprint D3, 2026-08-20, ADR-031); Phase 4 Implemented through 4.11 (Sprints D4.1–D4.11, 2026-08-21…25, ADR-032…040 — Zerodha Kite, Upstox v3, Angel One SmartAPI, Fyers HSM and Dhan DhanHQ v2 are the five concrete stream adapters, and Dhan is the first that required no generic framework change at all; **live validation not yet performed for any of them**); Phase 5 implemented through 5.8 (Sprints D5.1–D5.8, 2026-08-25…29, ADR-041…048 — flap suppression, probation, stale-feed demotion, delivery latency, entitlement-failure classification, generalized re-probe, health recovery, distributed health state); remaining broker adapters, the rest of Phase 5 (p95/exchange latency, sharding, chaos tests) and Phase 6 pending
 
 Priority: Critical
 
@@ -373,7 +373,7 @@ The Source Manager is a dedicated service that decides, for every user and every
 
 **Location convention:** `backend/services/market_engine/source_manager.py`
 
-**Implemented in Sprints D1–D2.** D1 built capability-based resolution over the registry, health-based exclusion and `provider.status` publication. D2 completed the resolution semantics: an ordered failover chain instead of a single pick, an explicit `UnavailableReason` instead of a bare `None`, a `ResolutionContext` (user, symbol, exchange) honoured through `MarketDataProvider.is_eligible_for()`, and a fourth health state `unknown`. See ADR-029 for the reasoning and for the one limitation D2 leaves open (a demoted provider cannot recover on its own until Phase 5's re-probe).
+**Implemented in Sprints D1–D2.** D1 built capability-based resolution over the registry, health-based exclusion and `provider.status` publication. D2 completed the resolution semantics: an ordered failover chain instead of a single pick, an explicit `UnavailableReason` instead of a bare `None`, a `ResolutionContext` (user, symbol, exchange) honoured through `MarketDataProvider.is_eligible_for()`, and a fourth health state `unknown`. See ADR-029 for the reasoning and for the one limitation D2 left open (a demoted provider cannot recover on its own). D5.6 built the generalized re-probe (ADR-046) and closed the entitlement instance of that deadlock; **D5.7 closed the health instance (ADR-047)** by implementing the failure cool-down step 2 of the Resolution procedure had always named, on the resolution path that already runs on every request. The DEGRADED half of ADR-029's sentence was never a deadlock — a DEGRADED provider stays a candidate and recovers the moment the chain reaches it — and is unchanged.
 
 ## Responsibilities
 
@@ -465,7 +465,9 @@ Priority 3   Yahoo Finance
 |---|---|---|
 | 0 | `up`, `unknown` | not known to be failing |
 | 1 | `degraded` | demonstrated intermittent failure |
-| — | `down` | filtered out at step 2 |
+| 2 | `down` | filtered out at step 2 **while its failure cool-down runs**; re-admitted to the tail of the chain for one trial once it has (D5.7) |
+
+**Step 2's cool-down was implemented in D5.7 (ADR-047).** Until then only the first half of the clause existed: `down` was an unconditional exclusion, which made a cool-down permanent and produced ADR-029's deadlock. A DOWN provider now leaves the candidate list for `HEALTH_PROBE_BASE_DELAY` (60s, doubling to a 240s ceiling) and is then appended to the chain for one trial. Band 2 is worst and health is the first ranking term, so a re-admitted provider can never lead the chain while anything else is a candidate — it is reached exactly when the request would otherwise have returned nothing.
 
 Ranking is a *stable* sort over the already priority-ordered candidate list, so priority order survives inside each band — which is exactly rules 4 and 5.
 
@@ -631,7 +633,7 @@ Retry loop continues; first provider to recover restores the feed.
 1. **Never expose internal errors.** No stack traces, no provider names, no "WebSocket closed with code 1006" in any user-facing surface.
 2. **The AI never pleads ignorance.** The AI must never say "I don't have live market data." Its context always contains the last known market state with its timestamp; it reasons over that and, when data is stale, frames it naturally ("as of 10:42 AM, RELIANCE was at ₹2,891…"). Staleness is metadata the AI uses, not an excuse it gives.
 3. **Cached data is always shown**, always honestly timestamped. An empty screen is a bug; a clearly-stamped last-known state is the design.
-4. **Flap suppression.** A provider that fails repeatedly within a window enters an extended cool-down so users don't experience tier oscillation.
+4. **Flap suppression.** A provider that fails repeatedly within a window enters an extended cool-down so users don't experience tier oscillation. **Implemented in D5.1 (reconnect pacing), D5.2/D5.3 (probation and its decay) and D5.7 (the provider-health cool-down, ADR-047).** The health cool-down is a *bounded exclusion*, not a give-up: it expires, and the provider is then offered one trial at the tail of the failover chain.
 5. **Failover is per user where entitlement is per user** (broker feeds) and global where entitlement is global (Yahoo, licensed feeds).
 
 ---
@@ -778,7 +780,12 @@ providers/base.py        ProviderState.UNKNOWN (4th state, initial);
                          ResolutionContext (user_id, symbol, exchange);
                          owner_user_id + is_eligible_for() entitlement filter
 providers/registry.py    candidates_for(capability, context) — entitlement,
-                         capability and health filtering; entitled_for(context)
+                         capability and health filtering; entitled_for(context);
+                         down_candidates_for() — the D5.7 cool-down's input
+    health_recovery.py   ProviderHealthRecovery — the failure cool-down that
+                         step 2 of the Resolution procedure names (D5.7);
+                         read on the resolution path, charged by call outcomes,
+                         no task and no timer
 source_manager.py        Resolution (provider + ordered failover chain + reason),
                          UnavailableReason, resolve_feed(), failover_chain(),
                          HEALTH_RANK
@@ -907,7 +914,7 @@ Nothing changed in the Market Engine, the Market Gateway, the Source Manager, `S
 
 **Phase 4.12 — the remaining broker adapters.** Groww, INDmoney — each one adapter and nothing else, per Developer Rule 9.
 
-**Phase 5 — Hardening.** Latency scoring (D5.4 ✅ — delivery latency; exchange latency is not measurable, see ADR-044), flap suppression (D5.1 ✅), probation windows (D5.2 ✅) and their decay (D5.3 ✅), entitlement-failure classification (D5.5 ✅, ADR-045), multi-connection sharding, chaos tests (kill connections in staging, verify silent failover).
+**Phase 5 — Hardening.** Latency scoring (D5.4 ✅ — delivery latency; exchange latency is not measurable, see ADR-044), flap suppression (D5.1 ✅), probation windows (D5.2 ✅) and their decay (D5.3 ✅), entitlement-failure classification (D5.5 ✅, ADR-045), generalized provider re-probe and recovery (D5.6 ✅, ADR-046), provider health recovery (D5.7 ✅, ADR-047), multi-connection sharding, chaos tests (kill connections in staging, verify silent failover).
 
 **Phase 5.1 — Reconnect flap suppression. Implemented (Sprint D5.1, 2026-08-25, ADR-041).** Closes DB-5. Reconnect pacing moved out of the run loop into `services/brokers/reliability.py`, which imports nothing from `services.` and names no broker. `ConnectionStability` classifies each attempt as STABLE / SHORT_LIVED / NEVER_ESTABLISHED from link timestamps alone, and the ladder resets **only** for a connection that lasted `STABLE_CONNECTION_SECONDS`. That constant is 30 seconds and is deliberately *this document's* probation window, so the transport and the provider layer share one meaning of "stable" instead of drifting into two; Phase 5's probation work consumes the same constant rather than declaring a second. One model per (user, broker, channel), so no user's flapping session paces another's reconnects.
 
@@ -956,7 +963,55 @@ Nothing changed in the Market Engine, the Market Gateway, the Source Manager, `S
 
   * **No change to `MarketTick`, no timer, no new consumer surface.** The user-scoped `provider.status` the unregistration already publishes is the whole of what a consumer sees, unchanged in shape.
 
-Still outstanding in Phase 5: p95 latency and latency inside `health()` (D5.4 delivers p50 on the provider only — see LIM-D5.4-3), exchange-timestamp latency (LIM-D5.4-1, which needs a decoded exchange instant, a field on `MarketTick` to carry it, and a defensible clock-offset estimate before the subtraction means anything), broker health's process-local scope (DB-1), instrument sharding, and chaos tests.
+**D5.6 — generalized provider re-probe and safe recovery (ADR-046).** Closes LIM-D5.5-3. The sprint that gives a terminal condition a way back without giving it a retry.
+
+  * **Recovery is classified, never generic.** Five classes — `TRANSPORT` (the reconnect ladder owns it), `EVIDENCE` (the next accepted tick owns it), `REPROBE` (a paced attach), `SESSION` (a new valid session, never a retry) and `CONFIGURATION` (a deployment change). Only `REPROBE` is ever retried on a schedule. Collapsing them is the exact defect D5.5 found one layer down, so the taxonomy is the deliverable.
+
+  * **Self-healing conditions are refused registration outright.** A transport blip recovers in under a second through D5.1; a stale open feed recovers on the next accepted tick through D5.3. Neither gets a candidate, because a candidate for a self-healing condition is a second recovery mechanism racing the first. Both behaviours are pinned as they stand and neither gained any machinery.
+
+  * **The probe is one ordinary attach.** No control-plane probe, no `check_entitlement()` on the adapter contract, no new adapter method. A re-probe calls the account's existing attach path scoped to the one withdrawn channel, and its outcome is read off the callbacks that already exist. A control-plane "yes" would prove something this document does not accept as evidence: the only definition of a usable feed is a valid canonical tick on the current link.
+
+  * **Recovery creates no eligibility.** A recovered feed is a *new* provider instance, so it re-earns READY from a valid canonical tick, serves a full probation window before it may outrank a steady source, and inherits neither readiness, nor stability, nor delivery-latency evidence from the connection that was refused. There is nothing to inherit because there is no object left holding it.
+
+  * **Re-probe pacing is its own ladder.** 300 seconds, doubling, capped at 3600, jittered. Reconnect asks whether the same socket is reachable and is measured in seconds; re-probe asks whether a provider-level condition has changed and is measured in minutes, because an entitlement changes when a person changes it. The two share only the equal-jitter arithmetic. The base delay is honestly a new number rather than a reused one — see ADR-046.
+
+  * **A dead session is excluded twice, by guards that catch different facts.** Classification excludes a token that expired; a session predicate asked again at attempt time excludes a session that went away *after* the entitlement was refused. An expiry on any channel reclassifies every outstanding candidate of that account.
+
+  * **Only a lifecycle event resets the ladder.** Reconnecting or disconnecting the broker clears it; an apparent success does not. Otherwise a broker that accepts a socket, ticks once and refuses would reset the ladder on every cycle — DB-5's accept-then-refuse storm on a five-minute period.
+
+  * **The candidate is discharged by market data, not by a socket.** A connection that opened proves nothing about entitlement; a frame carrying market data proves it exactly.
+
+  * **Scope is (user, broker, channel), structurally** — the same key the stream registry uses. Two users on one broker recover independently; a market-feed re-probe does not blip the same account's order socket, and an order-channel re-probe cannot replace a live market feed.
+
+  * **Make-before-break is preserved by doing nothing.** The baseline is never released to make room for a probe. There is no instant during a recovery at which a user has no feed.
+
+  * **One bounded background sweep**, per process, capped per wake-up, performing no I/O when nothing is due. It is the only timer the sprint adds.
+
+  * **Consumer surfaces are unchanged.** `provider.status` is byte-identical in shape and carries no recovery vocabulary. Recovery detail lives in the logs and in the admin `describe()` surface, where provider names already live.
+
+**D5.7 — provider health recovery (ADR-047).** Closes the ADR-029 deadlock and LIM-D5.6-1. The sprint whose implementation was already written down: step 2 of the Resolution procedure says "`down` **or inside a failure cool-down**", and only the first half existed.
+
+  * **The deadlock is specific to providers whose evidence requires being called.** A pushed feed records a success from the ingest path whether or not it is selected (ADR-044's property), and a DEGRADED provider is never excluded at all. A *polled* provider at DOWN closes the cycle completely — and the only polled provider is the permanent baseline, so the untreated case was a total feed outage that survived until a restart.
+  * **The recovery path is the resolution path.** No task, no sweeper, no timer. The cool-down is read where candidates are already built and charged by the outcome of a call that actually happened, so a provider offered at the tail and never reached costs nothing and keeps its trial. Pacing is exact: at most one call per cool-down.
+  * **Re-admission is a place at the tail, and nothing else.** `down` becomes health band 2 and health is the first ranking term, so a re-admitted provider cannot outrank a healthy or a probationary one — by the position of an element, not by a branch. Its health stays `down` until a real success; an *empty* success clears neither the failure streak nor the cool-down.
+  * **Everything else is still asked.** `candidates_for` and `down_candidates_for` are exact complements over one eligibility pass, so entitlement, capability, readiness and per-symbol coverage cannot answer differently on the two paths.
+  * **60s, doubling, capped at 240s, no jitter.** The ceiling is derived: the slowest health cool-down stays faster than the fastest D5.6 re-probe (300s), because a DOWN provider is a machine-timescale condition this process can observe ending while an unresolved entitlement is a human-timescale one it cannot. Jitter is omitted because there is no shared schedule to decorrelate.
+  * **It does not compete with D5.6.** Different layer, different unit, different question, no shared code and no shared constant; the Market Engine still cannot import the broker layer, and `services/brokers/recovery.py` still cannot name provider health. Both directions are swept.
+  * **Nothing is ever disconnected or suppressed.** The mechanism only adds a last resort to a chain, so Yahoo is unaffected throughout — including when Yahoo is the provider being recovered.
+  * **Consumer surfaces are unchanged.** `provider.status` is byte-identical in shape; the cool-down is visible only on the admin `diagnostics()` surface.
+
+**Sprint D5.8 — distributed health and recovery state (DB-1, ADR-048).** Every mechanism above was correct for one process and `N` independent opinions for `N` workers. The visible symptoms were an Admin Portal reporting whichever worker answered and a provider needing `8 x N` failures to be excluded; the load-bearing one was that D5.7's "at most one trial per cool-down" held *per worker*, so a genuinely down provider was retried `N` times per cool-down.
+
+  * **What is shared is evidence about something every worker observes.** A broker's API and a polled provider are one remote system each; their health lives in Redis. A **streaming provider is one live socket in one process** — its health, readiness, probation window, freshness evidence and delivery-latency intervals are evidence about that link, which D5.3 already discards on reconnect — so none of it is shared, stated once as `MarketDataProvider.health_is_shared`. Publishing it would let a dead socket's `down` verdict be inherited by the fresh link another worker opened.
+  * **D5.6's REPROBE register stays process-local by argument.** It records *this worker's own* withdrawn sockets and a re-probe is one ordinary attach; sharing it would produce two sockets for one `(user, broker, channel)`.
+  * **Resolution stayed synchronous.** `SourceManager.prepare()` runs once per gateway call — one batched health read, plus one atomic trial claim per DOWN provider — and its result travels as a value into the unchanged `resolve_feed`, which filters and re-decides nothing. A caller that does not prepare gets exactly the D5.7 behaviour.
+  * **Every mutation is one Lua script**, so one logical event produces one logical transition even when several workers observe it at once. The scripts take the clock from Redis, because monotonic clocks are not comparable between processes and per-worker wall clocks would be as skewed as the worst clock in the fleet.
+  * **A trial claim leases the offer, never the ladder.** D5.7's charge-by-evidence rule is intact: a 30-second exclusive lease on the right to *offer* a provider, released by the write that charges a failed probe. Bounded by the longest provider HTTP timeout below and the base cool-down above.
+  * **Key model** `sa:health:{provider|broker}:{owner|-}:{name}`, trial key derived from it so the two cannot be scoped differently. No credential is ever written to a key or a value. **TTL one hour** — longer than the 240s cool-down ceiling it must outlive, and finite so a closed account's feed does not hold a key forever.
+  * **Redis unavailable is a bounded local fallback**, not a verdict. Redis is a non-critical dependency here; failing closed would turn a blip into a total feed outage and failing open would discard the evidence the worker holds. Each worker reverts to exactly its pre-D5.8 behaviour until Redis returns.
+  * **No policy changed.** The same thresholds, four states, auth-failure exclusion and empty-success rule, with the Lua pinned against the Python implementation by parity tests.
+
+Still outstanding in Phase 5: p95 latency and latency inside `health()` (D5.4 delivers p50 on the provider only — see LIM-D5.4-3), exchange-timestamp latency (LIM-D5.4-1, which needs a decoded exchange instant, a field on `MarketTick` to carry it, and a defensible clock-offset estimate before the subtraction means anything), instrument sharding, and chaos tests. Cross-worker *notification* of a health change is deliberately not built (LIM-D5.8-4): a worker learns by reading, and a pub/sub push may become an optimisation on top of that authoritative read but never the authority.
 
 **Phase 6 (future) — Enterprise feeds** as entitlements and licensing arrive.
 
@@ -994,6 +1049,8 @@ Every future engineer reading this document should hold one picture in mind: bel
 | Stable | Valid data has kept arriving across the full probation window on that link, **and is still arriving** (D5.3) — it may be preferred |
 | Fresh evidence | An accepted canonical tick arrived within the coverage window. The only thing that counts as current market-data evidence; a socket, a session or a subscription never does (D5.3) |
 | Flap suppression | Cool-down preventing rapid tier oscillation |
+| Recovery class | What has to happen before a withdrawn feed may be attached again: transport, evidence, re-probe, session, or configuration (D5.6) |
+| Re-probe | A paced, bounded re-attach of a feed previously judged unusable. Asks whether a *provider-level condition* changed — never whether a socket is reachable, which is reconnect's question (D5.6) |
 | Entitlement | The legal/contractual right to consume a feed (user's broker account, platform license) |
 
 ---

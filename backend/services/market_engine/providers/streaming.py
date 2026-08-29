@@ -490,6 +490,23 @@ class StreamingTickProvider(MarketDataProvider):
     normalizer_key = "canonical"
     priority = STREAMING_FEED_PRIORITY
 
+    #: Never shared across workers (D5.8 / DB-1), and this is the sharpest
+    #: instance of that sprint's "do not over-distribute" rule.
+    #:
+    #: Everything this class measures — readiness, the probation window, freshness
+    #: evidence, delivery-latency intervals and the health streak that rides with
+    #: them — is evidence about **one live socket held by one process**. No other
+    #: worker holds that socket, no other worker has this provider registered, and
+    #: `_reset_link_evidence` already discards all of it on reconnect because
+    #: evidence from a dead link says nothing about a new one (D5.3).
+    #:
+    #: Publishing it would create the one failure DB-1 must not introduce: worker
+    #: A's socket dies DOWN, worker B re-attaches the account, and the fresh link
+    #: inherits a verdict about a socket that no longer exists — instead of
+    #: earning READY and serving its probation window as D5.5/D5.6 require of a
+    #: re-attached feed.
+    health_is_shared = False
+
     def __init__(
         self,
         name: str,

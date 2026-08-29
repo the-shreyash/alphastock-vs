@@ -370,6 +370,22 @@ class MarketDataProvider(ABC):
     #: check.
     owner_user_id: Optional[str] = None
 
+    #: Whether this provider's health is evidence about something every worker
+    #: observes, and therefore belongs in the shared store (D5.8 / DB-1).
+    #:
+    #: True for a polled adapter: the baseline is registered in every worker and
+    #: every worker calls the same remote HTTP API, so one worker's failure is
+    #: evidence for all of them — and it is exactly there that N workers would
+    #: otherwise each spend D5.7's "one trial per cool-down".
+    #:
+    #: A provider whose health is evidence about **one live link in one process**
+    #: overrides this to False. See `StreamingTickProvider`: publishing a socket's
+    #: health would let a dead link's DOWN state be inherited by the fresh link a
+    #: different worker opened, which contradicts the rule D5.3 established and
+    #: D5.5/D5.6 rely on — a reconnected feed is a new feed that earns its
+    #: readiness again.
+    health_is_shared: bool = True
+
     def __init__(self) -> None:
         self._health = ProviderHealth()
         self._connected = False
@@ -580,6 +596,40 @@ class MarketDataProvider(ABC):
     def reset_health(self) -> None:
         """Drop all health state. Startup and tests only."""
         self._health = ProviderHealth()
+
+    def apply_shared_health(self, shared: Any) -> Optional[ProviderState]:
+        """Adopt the authoritative shared record (D5.8). Returns a changed state.
+
+        The mirror half of DB-1. When a shared store is available it — not this
+        object's arithmetic — decides what the counters are, and this method
+        copies its answer in. Two properties make that safe:
+
+        * it **overwrites** rather than merges, so a worker that missed a
+          mutation (it was resolving while another worker recorded a failure)
+          converges on the next read instead of drifting;
+        * it is the **only** writer besides the local `record_*` methods, so
+          there is one shared source of truth and one local fallback, never a
+          third opinion assembled from both.
+
+        `shared` is duck-typed rather than imported. `providers/base.py` is the
+        contract every adapter implements and must not acquire a dependency on
+        the infrastructure layer to state it; the store's snapshot carries plain
+        counters and this reads them.
+        """
+        previous = self._health.state
+        try:
+            state = ProviderState(shared.state)
+        except ValueError:  # pragma: no cover - defensive
+            state = ProviderState.UNKNOWN
+        self._health.state = state
+        self._health.consecutive_failures = int(shared.consecutive_failures)
+        self._health.total_calls = int(shared.total_calls)
+        self._health.total_errors = int(shared.total_errors)
+        self._health.total_empty = int(shared.total_empty)
+        self._health.last_success_at = shared.last_success_at
+        self._health.last_error_at = shared.last_error_at
+        self._health.last_error_class = shared.error_label
+        return state if state != previous else None
 
     def _transition(self, state: ProviderState) -> Optional[ProviderState]:
         if self._health.state == state:

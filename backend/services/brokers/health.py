@@ -32,6 +32,19 @@ health would drive Zerodha to DOWN every single morning while its API was
 perfectly available, and an admin dashboard that cries outage daily is a
 dashboard nobody reads. Auth failures are counted separately, where a *rising*
 auth-failure rate is genuinely interesting, and left out of the state machine.
+
+D5.8 — WHY THIS IS THE FIRST THING DB-1 MOVED
+----------------------------------------------
+A broker's API is one remote system. Every worker's calls to it observe the same
+outage, so N workers holding N independent counters is not N opinions about N
+things — it is N partial views of one thing, and the Admin Portal was reporting
+whichever worker happened to answer. The counters below are therefore mirrored
+from a shared record (`infrastructure/health_state.py`) whenever one is
+configured, and computed locally exactly as before when one is not.
+
+Nothing about the *policy* changed: the thresholds, the four states, the
+auth-failure exclusion and the public method names are the ones D3 shipped. What
+changed is who owns the number.
 """
 
 from __future__ import annotations
@@ -41,6 +54,9 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, Optional
+
+from infrastructure import health_state
+from infrastructure.health_state import broker_key, shared_health_store
 
 logger = logging.getLogger(__name__)
 
@@ -134,6 +150,31 @@ class BrokerHealth:
         self.last_error_at = None
         self.last_error_code = None
 
+    def apply_shared(self, shared: Any) -> Optional[BrokerConnectionState]:
+        """Adopt the shared record as authoritative (D5.8). Returns a changed state.
+
+        Overwrites rather than merges, for the reason
+        :meth:`MarketDataProvider.apply_shared_health` does: a worker that missed
+        a mutation converges on the next one instead of carrying a private drift
+        forward forever. `error_label` is the store's generic name for the one
+        short diagnostic string each subsystem keeps — here, the broker error
+        code.
+        """
+        previous = self.state
+        try:
+            state = BrokerConnectionState(shared.state)
+        except ValueError:  # pragma: no cover - defensive
+            state = BrokerConnectionState.UNKNOWN
+        self.state = state
+        self.consecutive_failures = int(shared.consecutive_failures)
+        self.total_calls = int(shared.total_calls)
+        self.total_errors = int(shared.total_errors)
+        self.total_auth_failures = int(shared.total_auth_failures)
+        self.last_success_at = shared.last_success_at
+        self.last_error_at = shared.last_error_at
+        self.last_error_code = shared.error_label
+        return state if state != previous else None
+
     def _transition(self, state: BrokerConnectionState) -> Optional[BrokerConnectionState]:
         if self.state == state:
             return None
@@ -160,6 +201,102 @@ class BrokerHealth:
             "last_error_at": self.last_error_at,
             "last_error_code": self.last_error_code,
         }
+
+
+# --------------------------------------------------------------------------- #
+# The distributed path (D5.8 / DB-1)                                            #
+# --------------------------------------------------------------------------- #
+#
+# Free functions rather than methods, because `BrokerHealth` is a dataclass the
+# adapter owns and awaiting inside it would make every read of a plain counter
+# look like I/O. Each one does the shared mutation, mirrors the authoritative
+# answer back onto `health`, and falls back to the local arithmetic — the same
+# code that has always been there — when Redis does not answer.
+
+
+async def record_success_shared(health: BrokerHealth) -> Optional[BrokerConnectionState]:
+    """Record a successful call against the shared record."""
+    ok, record = await shared_health_store.record(
+        broker_key(health.broker),
+        health_state.SUCCESS,
+        stamp=_now_iso(),
+        degraded_after=DEGRADED_AFTER_FAILURES,
+        down_after=DOWN_AFTER_FAILURES,
+    )
+    if not ok or record is None:
+        return health.record_success()
+    return health.apply_shared(record)
+
+
+async def record_failure_shared(
+    health: BrokerHealth, code: Optional[str] = None
+) -> Optional[BrokerConnectionState]:
+    """Record a failed call against the shared record.
+
+    The consecutive-failure counter is incremented inside Redis, which is what
+    makes `DOWN_AFTER_FAILURES` mean eight failures observed by the deployment
+    rather than eight observed by one worker.
+    """
+    ok, record = await shared_health_store.record(
+        broker_key(health.broker),
+        health_state.FAILURE,
+        stamp=_now_iso(),
+        degraded_after=DEGRADED_AFTER_FAILURES,
+        down_after=DOWN_AFTER_FAILURES,
+        label=code,
+    )
+    if not ok or record is None:
+        return health.record_failure(code)
+    return health.apply_shared(record)
+
+
+async def refresh_shared(*healths: BrokerHealth) -> bool:
+    """Adopt the shared record for each of `healths`. True when Redis answered.
+
+    The read half of DB-1 for brokers, and the reason the Admin Portal stops
+    reporting whichever worker happened to serve the request: an operator asking
+    "is this broker up?" gets the deployment's answer rather than one replica's
+    partial view of it.
+
+    Batched into one round trip, because the diagnostics surface asks about every
+    broker at once and one round trip per broker would make an admin page's cost
+    grow with the broker list.
+    """
+    subjects = [h for h in healths if h.broker]
+    if not subjects:
+        return False
+    ok, records = await shared_health_store.read_many(
+        [broker_key(h.broker) for h in subjects]
+    )
+    if not ok:
+        return False
+    for health in subjects:
+        record = records.get(broker_key(health.broker))
+        if record is not None:
+            health.apply_shared(record)
+    return True
+
+
+async def record_auth_failure_shared(health: BrokerHealth) -> None:
+    """Record a per-user session failure against the shared record.
+
+    Shared for the *count* and excluded from the state machine, exactly as
+    locally. Sharing it is what makes the signal readable at all: a token-expiry
+    wave at 06:00 IST is visible as a climbing auth count against a flat error
+    count, and split across N workers it was neither.
+    """
+    ok, record = await shared_health_store.record(
+        broker_key(health.broker),
+        health_state.AUTH,
+        stamp=_now_iso(),
+        degraded_after=DEGRADED_AFTER_FAILURES,
+        down_after=DOWN_AFTER_FAILURES,
+        label="BROKER_AUTH",
+    )
+    if not ok or record is None:
+        health.record_auth_failure()
+        return
+    health.apply_shared(record)
 
 
 def _now_iso() -> str:
