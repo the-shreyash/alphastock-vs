@@ -3245,3 +3245,124 @@ One unrelated flake was observed once and did not reproduce: `test_backup_restor
 - **LIM-D5.10-6 — no live validation.** See above.
 
 **Next sprint: D5.11 — chaos testing.** Kill connections in staging (single shard, several shards, whole channel, whole session) and verify silent failover, correct readiness/probation re-earning, and no duplicate or missing instruments across a reshard under failure.
+
+---
+
+## D5.11 — Chaos Testing & Failure Resilience
+
+Status
+
+COMPLETED (2026-08-30, ADR-051)
+
+Priority
+
+High
+
+**What it is.** A proof sprint. Ten sprints (D5.1–D5.10) each shipped one recovery rule with its own suite, and each of those suites tests its rule on a fixture built for that rule with everything else healthy. D5.11 asserts that the rules still hold **when something is failing**, and that the failure stays where it happened. **Zero production files were changed.**
+
+**Resilience audit (31 failure boundaries, answered from the code).** Every boundary the brief enumerates was mapped to an owner, a state transition, a recovery mechanism, whether recovery is automatic, the expected fallback, and its blast radius. The full table is in the completion report. Three findings shaped the sprint:
+
+1. **The gap is composition, not coverage.** 787 D4/D5 tests exist and they are good ones. What none of them asked is what happens when two mechanisms are exercised at once — a shard dropping *while* the feed is stable, an entitlement refusal arriving *after* readiness, a reconnect *during* a reshard, a Redis outage *while* a provider is DOWN. Three of the eight invariants (provider isolation, fallback honesty under partial failure, and the boundedness of the combined reconnect/re-probe/cool-down ladders) had no single owner and therefore no single test.
+2. **The seams were already there.** `ConnectionStability` takes an injected clock and jitter (D5.1); `StreamingTickProvider` takes an injected monotonic clock (D4.5); `BrokerStream._connect` is already patched by the D4.2 suite; `RecoveryRegister` and `ProviderHealthRecovery` both take injected clocks and delays. **Nothing had to be opened up to make the platform fail on demand**, which is itself a result.
+3. **Every recovery path is reachable from the platform's own interfaces.** No production chaos flag was needed, and none was added.
+
+**Harness.** `tests/_chaos.py` — a scripted socket (`Close` / `Raise` / `Advance` / `Call` control items between frames), a scripted sequence of connection attempts, a manual monotonic clock shared by the transport and the provider, a `RecordingStability` that removes D5.1's jitter through the constructor argument it already exposes and records the true ladder rung while returning zero to the sleeper, and a fictional `ChaosAdapter` whose every failure mode is reachable from a frame. **Deterministic with no seed**: every failure D5.11 enumerates is a named case, not a sample, so a scripted case is stronger evidence and reproducible without one. **No chaos test sleeps, reads a wall clock, opens a socket or reaches a broker API.**
+
+The reconnect loop is driven through `BrokerStream._run` rather than D4.2's `drive_stream`, which runs one transport pass: backoff, ladder reset, terminal classification and boundedness are all properties of the loop *around* the pass.
+
+**Files changed.** New: `backend/tests/_chaos.py`, `backend/tests/test_chaos_resilience.py`. Modified: `.claude/MARKET_DATA_ARCHITECTURE.md`, `.claude/DECISIONS.md` (ADR-051), `.claude/TASK.md`. **No production source file was touched.**
+
+**Tests.** 200 new in `test_chaos_resilience.py`, in sixteen sections: transport (§A), protocol/frame (§B, two tables split by the boundary that refuses them), readiness (§C), probation (§D), stale-feed (§E, D5.3's lazy decay re-proved without adding a timer), latency (§F, D5.4/D5.9 at 0/8/9/12/20/25 samples), entitlement (§G, one refusal at five points in a feed's life), re-probe (§H), distributed health over a real Redis (§I), sharding (§J, all eleven kill combinations of a four-connection plan), make-before-break (§K), Yahoo fallback and the cross-provider matrix across one and two users (§L), restart at seven points (§M), a credential sweep at DEBUG (§N), boundedness (§O), and §P — the gaps the mutation campaign found in this file.
+
+**Falsification. 32 mutations applied to the shipped source and reverted; 32/32 observed RED against the chaos suite alone, and 32/32 against the wider D4/D5 set.** That the two numbers agree is the useful part: the chaos suite is not leaning on inherited coverage.
+
+**Five defects were found, and all five were in the tests rather than in the architecture.** Two mutations were malformed (anchors that did not exist in source) and were reformed. Three survived the first pass and were closed by adding the coverage they proved was missing:
+
+- **M30 — a credential sweep that could not have failed.** `test_a_frame_carrying_a_credential_is_never_echoed_into_a_log` used a frame that *decoded successfully* to nothing, so it never reached the decode-failure branch it was searching. A mutation that interpolated the raw frame into that log line survived it. Now parametrized over six shapes that each drive the codec into a different failure path, with a separate test asserting the branch is actually reached — the premise, stated separately, because a sweep over a run that never held a credential proves nothing.
+- **M07 — a stale-feed test the ranking masked.** With the symbol-less eligibility branch mutated to `return True`, a stale feed is eligible again, but it is also on probation, so the baseline still leads and `active_tier()` still says `delayed`. The eligibility bug was invisible behind the ranking. Now asked of the predicate directly, and again with no baseline registered, where eligibility is the only thing left to decide the answer — which is the case that matters operationally.
+- **M21 — a latency gate never under test.** Every §F test worked from a ready feed, so the readiness establishment gate was never exercised. Now a feed that connected and *never subscribed* accumulates a full window of intervals and must report `None`; the test also asserts the samples really accumulated, so it cannot pass vacuously.
+- **M25 — a sweep borrowed from another file.** Only `test_broker_streaming.py` caught a broker-specific branch added to the generic path. The sweep is now repeated in the chaos suite over exactly the modules this sprint drives.
+- **M13 — fail-open asserted too weakly.** The Redis-outage test asserted the claim set was not distributed, which a *fail-closed* implementation satisfies just as well by returning an undistributed empty set. Now asks the distinguishing question: is a DOWN provider whose local cool-down has expired still offered its trial?
+
+**No mutation revealed a defect in D4 or D5 production code.**
+
+**One documented consequence was pinned rather than newly found.** A partially failed sharded feed is ranked below the delayed baseline for *every* instrument, including the ones its healthy connections are still delivering. The first draft of the sharding section recorded this as a new limitation; it is **LIM-D5.10-3**, already derived in ADR-050. D5.11 adds the first test that exercises it across all eleven kill combinations and asserts both halves — the survivors stay eligible and keep their coverage, and they are nonetheless outranked while the feed is on probation. **No new limitation was found and none was invented.**
+
+**One diagnostics observation, deliberately not fixed.** When a partially covering feed is the only registered provider, a request for an instrument it does not cover reports `ALL_PROVIDERS_DOWN` rather than a coverage miss. The consumer-facing consequence is correct — feed unavailable, nothing fabricated — so changing `_diagnose` was judged outside "the smallest justified architectural change".
+
+**Regression.** Baseline **3901 passed / 15 failed / 41 skipped / 95 deselected / 4 xfailed**; final **4142 passed / 15 failed / 0 skipped / 95 deselected / 4 xfailed**. It reconciles: 3901 + **200 new chaos tests** + **41 D5.8 tests that were skipped in the baseline for want of a reachable Redis** = 4142. The 15 failures are the known pre-existing Docker set in `test_entrypoint_log_level.py`, unchanged in count and identity. Order-independence confirmed across **five shuffled file orderings** of the fourteen D4/D5/chaos suites, 1,221 tests each time, all passing. Three sequential full-suite runs were performed; two reported exactly 4142/15 and the third additionally failed `test_api_errors.py::TestRateLimitIntegration::test_the_anonymous_tier_is_attached_to_real_endpoints`, which passes in isolation and in the other two runs. It is an order/state-dependent flake in a rate-limit module D5.11 does not touch, and it is recorded here rather than absorbed into this sprint's baseline — the same treatment D5.10 gave its one-off GPG flake.
+
+**Quality.** flake8 clean and isort clean on both new files. No existing file was reformatted; no unrelated failure was fixed.
+
+**Security.** The whole transport chaos script re-run at DEBUG with seven live-looking fake credentials (JWT, API key, API secret, feed token, client id, partner secret, password) planted in the session, the credentials dict, the endpoint query string and an Authorization header. Swept: log records including `exc_text` and raw `args`, task names, `describe()`, `health()`, `status()`, resolution payloads, quote payloads and Redis key names — for the full secret **and for a 20-character prefix**, so a naive redaction that keeps a prefix cannot pass. A separate test asserts the premise: the material really is reachable, and `safe_url` is what keeps it out of the connect log line.
+
+**Deliberately NOT done in D5.11** — no D5.12, no new brokers (no Groww, no INDmoney), no trading or order APIs, no frontend changes, no new fallback source, no second retry framework, no timer added to make a test observable, no production chaos flag, no change to `MarketTick`, any codec, the provider architecture, or the D5.8 ownership boundary; no unrelated failure fixed, no repository-wide formatting; nothing committed and nothing pushed.
+
+**LIVE VALIDATION: NOT PERFORMED.** No interactive broker session exists. Synthetic chaos proves the platform's own recovery semantics; it proves nothing about how a real broker behaves at 09:15, and this sprint does not claim otherwise.
+
+**Limitations carried out of D5.11.**
+- **LIM-D5.11-1 — the harness's broker is fictional.** `ChaosAdapter` can express every failure mode the five real adapters' codecs can, but a sixth broker whose failures it cannot express would be evidence the harness's vocabulary has fallen behind the wire. The five real codecs remain pinned by `test_broker_streaming.py`, which D5.11 did not touch.
+- **LIM-D5.11-2 — §I requires a reachable Redis and skips without one.** The multi-worker properties are server-side guarantees and are deliberately not asserted against a double, which is the rule D5.8 set. In this sprint's runs a Redis was available, so the 41 previously-skipped D5.8 tests and all of §I ran.
+- **LIM-D5.11-3 — restart is modelled by rebuilding the objects.** That *is* what a restart is for process-local state, and nothing pretends otherwise; what it does not exercise is the real `server.py` boot ordering, which DB-2 and D4.1 pin separately.
+- **LIM-D5.11-4 — no live validation.** See above.
+
+**Next sprint: D5.12.** Not started. The remaining named Phase 5 item is exchange-timestamp latency (LIM-D5.4-1), which needs a decoded exchange instant, a field on `MarketTick` to carry it, and a defensible clock-offset estimate before the subtraction means anything.
+
+
+---
+
+## D5.12 — Health Recovery Deadlock Re-Verification
+
+Status
+
+COMPLETED (2026-08-30, ADR-052) — **audit and falsification only; no production file changed**
+
+Priority
+
+High
+
+**What it is, and what it turned out to be.** The brief asked whether the ADR-029 `DOWN`-provider deadlock (LIM-D5.6-1) could be closed without coupling the Market Engine to the broker layer, and instructed a full architecture audit before any implementation. **The audit's finding is that the premise is false: LIM-D5.6-1 was closed by D5.7 (ADR-047) and its multi-worker half by D5.8 (ADR-048), and D5.11 did not leave it open** — D5.11's carried limitations are LIM-D5.11-1 through -4, none of which concerns health recovery. Both `TASK.md` and `MARKET_DATA_ARCHITECTURE.md` already recorded the closure before this sprint began. The brief's implementation target was conditional on the audit proving the deadlock real; it is not, so **nothing was implemented**. Building the mechanism it describes would have created a second recovery mechanism racing `ProviderHealthRecovery` for the same providers — the exact defect ADR-046's taxonomy exists to prevent, and one the brief's own rules forbid.
+
+**The audit, answered from the repository (the brief's fifteen questions).**
+1. `DOWN` is written in `MarketDataProvider.record_failure` (`providers/base.py`) at `DOWN_AFTER_FAILURES` = 8 consecutive failures, and inside the Redis Lua script for a provider whose health is shared.
+2. Only one non-empty successful call moves it upward. An **empty** success does not reset the failure streak, so it restores neither health nor the cool-down.
+3. The callers are the Market Gateway's own call path (`record_success_shared` / `record_failure_shared`, `gateway.py:481,490`) and, for a pushed feed, `_ingest_ticks` (`gateway.py:362`).
+4. It can: `resolve_feed` appends `ProviderHealthRecovery.due_from(registry.down_candidates_for(...))` — the "**or inside a failure cool-down**" half of the Resolution procedure that D1 never implemented.
+5. The deadlock never existed for **streaming** providers (evidence arrives from ingest without selection — ADR-044's property), never for **DEGRADED** providers (never excluded), never for **Yahoo** since D5.7 and never for **shared-health** providers since D5.8. It existed completely only for a **polled** provider at DOWN — and the only polled provider is the permanent baseline, which is why the untreated case was a total feed outage.
+6/7. **REPROBE is a different recovery class and must stay one.** Different layer (broker vs Market Engine), unit ((user, broker, channel) vs one registered provider), question (has a person changed an entitlement? vs is a failing remote system answering again?), timescale (minutes-to-an-hour vs seconds-to-minutes), and no shared constant — pinned by `test_the_two_recovery_mechanisms_share_no_constant`. Making `RecoveryRegister` own health recovery would require the Market Engine to import the broker layer, which is forbidden and swept.
+8. Yes — the D5.7 ladder **is** the reuse: 60s doubling to 240s, charged by evidence and never by the offer.
+9. Redis-unavailable degrades to exactly the pre-D5.8 process-local cool-down; neither fail-open nor fail-closed.
+10. Yes. No `MarketTick` field, no adapter, no codec, no transport, no frontend and no consumer payload is involved.
+11. Through the existing resolver: `down_candidates_for` is the exact complement of `candidates_for` over **one** eligibility pass, so entitlement, capability, readiness and per-symbol coverage cannot answer differently on the two paths.
+12. No — `claim_trials` is one atomic Lua script per subject taking a 30s lease on the *right to offer*, never on the ladder.
+13. Yes, and the semantics are explicit: shared health and the shared ladder survive in Redis with a one-hour TTL; every process-local window is rebuilt from zero.
+14. Yes, in full — health recovery never replaces the provider object and grants it nothing it had not earned; readiness, probation, freshness and latency are untouched by it.
+15. No. `HEALTH_RANK[DOWN] = 2` is the worst band and health is the first element of the selection key, so a re-admitted provider is appended to the **tail** and can never reorder anything above it.
+
+**Falsification: 19 mutations, 19 RED.** Every mutation the brief names, plus two of this sprint's own (`HEALTH_RANK[DOWN] = 0`; re-admission itself recording a success). Each was killed by tests named for the property mutated — e.g. removing the recovery opportunity kills 21 tests across three suites; letting two workers claim one trial kills `test_two_workers_claiming_the_same_trial_in_the_same_instant_spend_it_once`; a broker-name branch kills `test_the_health_recovery_layer_names_no_broker`; importing the broker layer kills `test_the_market_engine_never_imports_a_broker_module`.
+
+**A first campaign was discarded as invalid rather than reported.** It also read 19/19 RED — because the harness passed `--timeout`, a flag this repository's pytest does not provide, so every run exited on a usage error and every "RED" was the harness failing before a test ran. Caught by an implausible artifact (no `FAILED` line behind any of the 19 kills). Recorded because it is the same class of defect the PH3.12 review named: **a probe that could not have failed is not evidence.**
+
+**Files changed.** Modified: `backend/tests/test_provider_health_recovery.py` (+2 tests), `.claude/MARKET_DATA_ARCHITECTURE.md`, `.claude/DECISIONS.md` (ADR-052), `.claude/TASK.md`, `.claude/BROKER_INTEGRATION.md`. **No production source file was touched.**
+
+**Tests.** 2 added, both falsified against separate mutations before being kept: `test_the_feed_reports_available_while_a_trial_is_only_offered` and `test_a_failed_trial_publishes_an_available_then_unavailable_pair`. They pin LIM-D5.12-1 — the sprint's only finding — as it behaves today, so that changing it later has to be a decision.
+
+**Regression.** Baseline **4157 passed / 0 failed / 95 deselected / 4 xfailed**; final **4159 / 0 / 95 / 4**. It reconciles exactly: 4157 + 2 new. **The 15 `test_entrypoint_log_level.py` failures carried since D3 passed in this sprint's runs** because a Docker daemon was reachable; they are unchanged and unabsorbed, and their identity is confirmed by the reconciliation (D5.11's 4142 + 15 + 2 = 4159). Order-independence confirmed across **five shuffled file orderings** of the thirteen D4/D5/chaos suites, **1,189 tests each time, all passing**. **Redis up: 354 passed / 0 skipped** across the four recovery suites; **Redis down: 305 passed / 49 skipped**, reconciling exactly. `flake8` clean on the modified file and on every module of the mechanism. `isort` and `black` report the modified test file dirty **in its pristine state at HEAD as well** — a pre-existing condition of that file, not introduced here, and deliberately not reformatted (D5.11's "no repository-wide formatting" rule).
+
+**Security.** No production change, therefore no new surface. Re-verified rather than assumed: `test_no_credentials_or_broker_vocabulary_reach_the_logs_at_debug` passes, the recovery keys carry only a provider name and an owner scope, and the two new tests assert the consumer payload's exact key set and the absence of any provider name.
+
+**Deliberately NOT done in D5.12** — no new recovery mechanism, no second ladder, no second health state, no timer, no sweeper, no new recovery class, no ADR-046 taxonomy change, no `status()` change (argued, not omitted — see ADR-052), no exchange-timestamp latency (LIM-D5.4-1 stands blocked; no defensible clock offset exists and none was invented), no frontend explanation of an entitlement refusal (LIM-D5.5-2 stands), no distribution of D5.6's REPROBE register (LIM-D5.6-4 stands by ADR-048's argument), no new brokers, no trading APIs, no D5.13; no change to `MarketTick`, any adapter, codec, transport, the D5.8 ownership boundary or any consumer payload; nothing committed and nothing pushed.
+
+**LIVE VALIDATION: NOT PERFORMED.** No interactive broker session exists. Deterministic tests prove the platform's own recovery semantics and prove nothing about broker interoperability; this sprint does not claim otherwise.
+
+**Limitations after D5.12.**
+- **LIM-D5.6-1 — the ADR-029 health deadlock.** ✅ **CLOSED (D5.7/ADR-047, multi-worker half D5.8/ADR-048); re-verified end to end by D5.12 with 19 falsifying mutations.** Not re-opened by this sprint.
+- **LIM-D5.12-1 — the feed reports `available` while a trial is only offered. NEW, and the sprint's only finding.** During a sustained total outage of the only provider serving a capability, the consumer-facing feed state flips to `available` at each cool-down expiry — before anything has answered — and back to `unavailable` once the trial is spent and fails. Nothing is fabricated: `status()` resolves through the same path a request does, and a re-admitted provider genuinely is a candidate. It is bounded by the ladder and cannot become a flap. Making `status()` ignore probes would remove the blink at the price of a consumer surface that disagrees with resolution, so it is pinned as it stands and left to the sprint that owns the consumer contract.
+- **LIM-D5.5-2 — the user is told their tier moved, not why.** Still open; needs a consumer-payload field and a frontend change. Now paired with LIM-D5.12-1: they are the same surface and should be decided together.
+- **LIM-D5.6-2 — `RecoveryClass.CONFIGURATION` is classified and never recorded.** Still open, and re-affirmed rather than re-litigated: the two terminal transport paths return without a callback, and widening `BrokerStream` for a condition that is correctly unrecoverable buys nothing. The register still refuses to re-probe one, which is pinned.
+- **LIM-D5.6-3 — a re-probe the broker refuses again costs one connection.** Still open; the mechanism working as designed, bounded by the ladder rather than eliminated.
+- **LIM-D5.6-4 / LIM-D5.8-3 — the REPROBE register is process-local.** Still open **by argument** (ADR-048): sharing it would let worker B attach a channel whose stream lives in worker A.
+- **LIM-D5.6-5 — no live validation.** Still open; unchanged.
+- **LIM-D5.4-1 — exchange-to-ingest latency.** Still **explicitly blocked**. Three of five adapters put no exchange timestamp on the wire in the subscribed mode, the two that do disagree about units, and no clock offset against an exchange has ever been established. Nothing was faked.
+
+**Next sprint: D5.13 — not started.** The two candidates, in order of the evidence: **(a) the consumer feed contract** — LIM-D5.12-1 and LIM-D5.5-2 together, since a user who loses a broker feed and a user watching a baseline outage both learn the wrong thing from the same payload, and both fixes are one field and one frontend change on one surface; **(b) exchange-timestamp latency (LIM-D5.4-1)**, which stays blocked until a decoded exchange instant, a field on `MarketTick` to carry it, and a defensible clock-offset estimate all exist — and must not be started before they do.

@@ -2903,4 +2903,163 @@ MARKET_DATA_ARCHITECTURE.md
 
 
 
+# ADR-051
+
+Title
+
+Chaos Is a Proof Obligation, Not a Mechanism: Deterministic Failure Injection Across the D4/D5 Market-Data Path (Sprint D5.11, chaos testing and failure resilience)
+
+Date
+
+2026-08-30
+
+Status
+
+Accepted — implemented; **live validation not performed** (see Consequences)
+
+Context
+
+Phase 5's remaining hardening item was recorded in MARKET_DATA_ARCHITECTURE.md as *"chaos tests (kill connections in staging, verify silent failover)"*. Ten sprints — D5.1 through D5.10 — each shipped one recovery rule with its own suite, and each of those suites tests its rule on a fixture built for that rule, with everything else healthy. That is the right way to establish a rule and it is not evidence that the rules compose.
+
+**The audit that opened this sprint found the gap is composition, not coverage.** 787 D4/D5 tests exist and they are good ones. What none of them ask is what happens when two mechanisms are exercised at once: a shard dropping *while* the feed is stable, an entitlement refusal arriving *after* readiness, a reconnect *during* a reshard, a Redis outage *while* a provider is DOWN. Three of the eight invariants this sprint enumerates — provider isolation, fallback honesty under partial failure, and the boundedness of the combined reconnect/re-probe/cool-down ladders — have no single owner and therefore had no single test.
+
+**The second finding is that the seams were already there.** `ConnectionStability` takes an injected clock and jitter (D5.1). `StreamingTickProvider` takes an injected monotonic clock (D4.5). `BrokerStream._connect` is already patched by the D4.2 suite. `RecoveryRegister` and `ProviderHealthRecovery` both take injected clocks and delays. Nothing in the architecture had to be opened up to make it fail on demand, which is itself a result: a system that needed a chaos flag to be chaos-tested would have been a system whose failure paths were not reachable from its own interfaces.
+
+**The third finding is the trap this sprint had to avoid.** The brief's own instruction — *"D5.11 is a proof sprint, not a license to add mechanisms"* — is the whole difficulty, because the easiest way to make a chaos test observable is to add the thing that makes it observable: a timer so a stale feed's decay can be watched, a production chaos flag, a second retry framework to pace the injection. Each would change the mechanism under observation into a different mechanism.
+
+Decision
+
+1. **The harness is test-side and drives only seams that already exist.** `tests/_chaos.py` holds a scripted socket, a scripted sequence of connection attempts, a manual monotonic clock and a fictional broker. Every failure it produces is produced the way the real one is: a socket that closes, a handshake that raises, a frame the codec cannot read, a link transition the transport reports. **No production file was opened up, and no production line was changed for testability.**
+
+2. **Determinism without a seed.** The brief permits a seeded generator; this sprint declines one. Every failure it enumerates is a *named* case with a named consequence — "the socket closed after one tick" is not a sample from a distribution — so a scripted case is stronger evidence and needs no seed to be reproducible. The one source of randomness on the production path, `reconnect_pause`'s jitter, is displaced by an identity function through the constructor argument D5.1 already exposes, so the recorded ladder is the real ladder rather than a re-implementation. **No chaos test sleeps, reads a wall clock, opens a socket or reaches a broker API.**
+
+3. **The reconnect loop is driven through `_run`, not `_run_websocket`.** D4.2's `drive_stream` runs one transport pass, which is the right tool for a codec question and the wrong one for every question D5.11 asks — backoff, ladder reset, terminal classification and boundedness are all properties of the loop *around* the pass. The harness exhausts a connection script and lets the loop exit by its own `if self._stopped: return`, so no test reaches past the transport's own exit conditions.
+
+4. **The malformed-frame table is split in two, because the two halves are refused at different boundaries.** A frame the codec cannot read produces no `BrokerTick`; a *value* the codec reads successfully — a negative price, an impossible price, a NaN — is a well-formed statement in the broker's own vocabulary and is refused one layer up, at `MarketTick`. The first draft merged them and failed, correctly: a merged table would pass against an implementation that had collapsed the two boundaries into one, which is the change D4.3 exists to prevent.
+
+5. **Chaos logic names no broker, and this file carries its own sweep.** Every transport and protocol case runs against a fictional `ChaosAdapter`, for the reason D4.2 built the codec boundary. The mutation campaign found that only `test_broker_streaming.py` caught a broker-specific branch added to the generic path, so the sweep is repeated in the chaos suite over exactly the modules this sprint drives — a chaos suite relying on another file's sweep stops catching it the day that file is reorganised.
+
+6. **Restart is modelled by rebuilding the objects, and nothing pretends local state survived.** Seven restart points, one property: the new process starts from zero readiness, zero probation, zero freshness, zero latency and zero coverage. `CONNECTED` is legitimately true after a re-attach — that is D4.5's whole distinction — and it is the case where a persisted-state optimisation would most plausibly have blurred the two.
+
+7. **Multi-worker properties are asserted against a real Redis and never against a double**, reusing `test_distributed_health.py`'s discovery and `Worker` object rather than re-implementing them, so the two suites cannot come to disagree about what a worker is.
+
+Consequences
+
+• **200 chaos tests added in two new files** (`tests/_chaos.py`, `tests/test_chaos_resilience.py`), covering sixteen sections: transport, protocol/frame, readiness, probation, stale-feed, latency, entitlement, re-probe, distributed health, sharding, make-before-break, Yahoo fallback and the cross-provider matrix, restart, security and boundedness. **Zero production files changed.**
+
+• **32 falsification mutations were applied and all 32 observed RED against the chaos suite alone**, and all 32 against the wider D4/D5 set. That the two numbers agree is the useful part: the chaos suite is not leaning on inherited coverage.
+
+• **The campaign found five defects, and all five were in the tests rather than in the architecture.** Two mutations were malformed (anchors that did not exist) and were reformed. Three survived the first pass and were closed by adding the coverage they proved was missing: a credential-leak sweep that used a frame which decoded successfully and therefore never reached the decode-failure branch it was searching; a stale-feed test that could not distinguish ineligibility from being outranked, because the ranking masked the eligibility bug; and a latency test that only ever worked from a ready feed, so the readiness establishment gate was never the thing under test. **No mutation revealed a defect in D4 or D5 production code.**
+
+• **LIM-D5.10-3 is now pinned rather than merely recorded.** A partially failed sharded feed being ranked below the delayed baseline for *every* instrument was documented in ADR-050 as a derived consequence; D5.11 exercises it across all eleven kill combinations of a four-connection plan, and asserts both halves — that the surviving instruments stay eligible and keep their coverage, and that they are nonetheless outranked while the feed is on probation. No new limitation was found and none was invented.
+
+• **One diagnostics observation, deliberately not fixed.** When a feed covering some instruments is the only registered provider, a request for an instrument it does not cover is reported as `ALL_PROVIDERS_DOWN` rather than as a coverage miss. The consumer-facing consequence is correct — feed unavailable, nothing fabricated — and the vocabulary is a diagnostics nuance, so changing `_diagnose` was judged outside "the smallest justified architectural change".
+
+• **The suite is order-independent**, verified across five shuffled file orderings of the fourteen D4/D5/chaos suites, 1,221 tests each time.
+
+• **Regression: 3,901 → 4,142 passing, with the same 15 pre-existing failures** (`tests/test_entrypoint_log_level.py`, Docker-dependent, unrelated and untouched). The increase is 200 new chaos tests plus 41 D5.8 tests that were skipped in the baseline for want of a reachable Redis and ran here against one.
+
+• **Live validation not performed.** No interactive broker session exists. Synthetic chaos proves the platform's own recovery semantics; it proves nothing about how a real broker behaves at 09:15, and this ADR does not claim otherwise.
+
+Requires Approval
+
+None.
+
+Review Date
+
+At the first sprint with a live broker session, where the chaos scripts become a checklist to run against a real socket rather than a proof of the platform's internal semantics. Also at the sixth streaming broker: `ChaosAdapter` is deliberately fictional, and a broker whose failure modes the fictional one cannot express would be evidence the harness's vocabulary has fallen behind the wire.
+
+Authoritative document
+
+MARKET_DATA_ARCHITECTURE.md
+
+---
+
+
+
+# ADR-052
+
+Title
+
+The ADR-029 Deadlock Was Already Closed: An Audit Sprint That Adds No Mechanism (Sprint D5.12, health recovery re-verification)
+
+Date
+
+2026-08-30
+
+Status
+
+Accepted — audit and falsification only; **no production file changed**; **live validation not performed**
+
+Context
+
+The D5.12 brief opens from a premise: that D5.11 leaves **LIM-D5.6-1 — the ADR-029 health deadlock** open, that a provider reaching `DOWN` can therefore never recover, and that the sprint should decide whether a broker-neutral recovery mechanism can close it.
+
+**The premise is false, and establishing that is the whole of the sprint.** LIM-D5.6-1 was closed by **D5.7 (ADR-047)** and its multi-worker half by **D5.8 (ADR-048)**. D5.11 did not leave it open — it left LIM-D5.11-1 through LIM-D5.11-4, none of which concerns health recovery. The mechanism the brief asks for exists, in the shape the brief prescribes, and it is reached on every gateway call:
+
+    MarketGateway._serve
+      -> SourceManager.prepare()            shared health read + one atomic trial claim per DOWN provider
+      -> SourceManager.resolve_feed()       candidates_for + down_candidates_for filtered by the claim
+      -> HEALTH_RANK[DOWN] = 2              re-admitted providers rank last, by position not by branch
+      -> gateway walks the chain            the trial is spent only if it is actually reached
+      -> record_failure_shared/record_success_shared   the ladder is charged by evidence, never by the offer
+
+Answering the brief's fifteen audit questions from the repository rather than from the brief:
+
+  * **DOWN is written** in `MarketDataProvider.record_failure` (`providers/base.py`) at `DOWN_AFTER_FAILURES` (8) consecutive failures, and inside the Redis Lua script for a shared provider.
+  * **Only a real `record_success` moves DOWN upward** — one non-empty successful call. An *empty* success does not reset the streak and therefore does not restore health or clear the cool-down.
+  * **The callers are the Market Gateway's own call path** (`record_success_shared` / `record_failure_shared`) and, for a pushed feed, `_ingest_ticks`.
+  * **The resolver reaches a DOWN provider through `down_candidates_for`**, the exact complement of `candidates_for` over one eligibility pass, filtered by `ProviderHealthRecovery.due_from` — the "or inside a failure cool-down" half of the Resolution procedure that D1 never implemented.
+  * **The deadlock never existed for streaming providers** (evidence arrives from ingest without selection — ADR-044's property), never for DEGRADED providers (never excluded at all), and existed *completely* only for a **polled** provider at DOWN — of which the platform ships exactly one, the permanent baseline. That is why the untreated case was a total feed outage rather than a corner case.
+  * **REPROBE is not the same recovery class**, and D5.7 already argued it: different layer (broker vs Market Engine), different unit ((user, broker, channel) vs one registered provider), different question (has a human changed an entitlement? vs is a failing remote system answering again?), different timescale, no shared code and — pinned by test — no shared constant. Reusing `RecoveryRegister` would have required the Market Engine to import the broker layer, which is forbidden and swept.
+  * **Two workers cannot perform the same trial**: `claim_trials` is one Lua script per subject taking a `TRIAL_LEASE_SECONDS` lease on the *right to offer*, never on the ladder.
+  * **Redis unavailable degrades to exactly the pre-D5.8 local cool-down** — neither fail-open nor fail-closed — and restart semantics are defined: shared health and the shared ladder survive in Redis, every process-local window is rebuilt from zero.
+  * **Nothing in the mechanism touches `MarketTick`, an adapter, a codec, the transport, the frontend or any consumer payload**, and a re-admitted feed re-earns readiness, probation, freshness and latency exactly as any other feed does, because health recovery never replaces the provider object and never grants it anything.
+
+Decision
+
+1. **Add no mechanism.** The brief's implementation target is conditional on the audit proving the deadlock real; it is not. Adding a second caller, a second ladder or a recovery class would violate the brief's own rules (*no second recovery mechanism, no second cool-down ladder, no second health state*) to solve a problem that is closed.
+
+2. **Falsify the existing guarantees rather than restate them.** Nineteen mutations were applied to production code and run against the fourteen D4/D5 suites — every mutation the brief names, plus two of this sprint's own (`HEALTH_RANK[DOWN] = 0`; re-admission itself recording a success). **All 19 observed RED**, each killed by tests whose names match the property being mutated.
+
+3. **Record what the audit did find**, which is not a deadlock but a consumer-surface consequence of D5.7 that no document stated and no test pinned — LIM-D5.12-1 below — and pin it as it behaves today so that changing it later is a decision rather than an accident.
+
+4. **Leave every other limitation where its owning ADR left it**, restated rather than quietly re-litigated: LIM-D5.6-2 (CONFIGURATION classified, never recorded), LIM-D5.6-3 (a refused re-probe costs one connection), LIM-D5.6-4 / LIM-D5.8-3 (the REPROBE register is process-local **by argument**, ADR-048), LIM-D5.5-2 (no consumer-visible explanation of an entitlement refusal), LIM-D5.4-1 (exchange-clock latency stays blocked — no defensible offset exists and none was invented).
+
+Alternatives Considered
+
+**Take the brief literally and build the caller it describes.** Rejected. It would be a second mechanism racing `ProviderHealthRecovery` for the same providers, with two ladders charging the same failures — precisely the defect ADR-046's taxonomy exists to prevent, and the one D5.6 refused when it declined to give self-healing conditions a recovery candidate.
+
+**Make `status()` ignore re-admitted providers**, so the feed is reported `unavailable` until something has actually answered. Rejected, and this is the closest call in the sprint. It would remove the blink LIM-D5.12-1 describes, at the price of making the consumer surface disagree with the resolution path: `status()` would report `unavailable` for a request that would in fact succeed. A surface that is late is not obviously better than one that is optimistic, and choosing between them belongs to the sprint that owns the consumer contract — the same one that owes LIM-D5.5-2. Recorded, pinned, and left.
+
+**Treat the "offered but never reached" tail as a residual deadlock.** Investigated and rejected on the evidence. A re-admitted provider that a healthier peer keeps from being reached costs nothing, keeps its trial, and does not climb the ladder (`test_the_cool_down_is_charged_by_evidence_and_never_by_the_offer`), so it is immediately due the moment it becomes the head of the chain. It is bounded and self-correcting, not a cycle.
+
+Consequences
+
+• **Zero production files changed.** The deliverable is the audit, the falsification campaign and two tests.
+
+• **Two tests added** to `tests/test_provider_health_recovery.py` (35 → 37 test functions), pinning LIM-D5.12-1 in both halves: that the feed state flips to `available` while a trial is only offered and that this is not a claim about data, and that a failed trial publishes exactly one `available`/`unavailable` pair on `provider.status` which cannot repeat, because the next cool-down is twice as long. Both were falsified against two separate mutations before being kept.
+
+• **19/19 mutations RED.** A first campaign reported 19/19 RED and was **discarded as invalid**: the harness passed `--timeout`, which this repository's pytest does not provide, so every run exited on a usage error and every "RED" was the harness failing rather than a test. It is recorded here rather than quietly re-run, because it is the same class of defect ADR-047's review named — a probe that could not have failed is not evidence.
+
+• **LIM-D5.12-1 is new and is the sprint's only finding.** During a sustained total outage of the only provider serving a capability, the consumer-facing feed state flips to `available` at each cool-down expiry, before anything has answered, and back to `unavailable` once the trial is spent and fails. No price is fabricated and no tier is invented — `status()` resolves through the same path a request does, and a re-admitted provider genuinely is a candidate — but a user watching the tier indicator through a hard outage can see a brief "recovered" blink. It is bounded by the ladder and cannot become a flap.
+
+• **LIM-D5.6-1 is confirmed closed, with the evidence rather than the assertion.** `test_the_baseline_is_the_provider_the_deadlock_actually_stranded` drives the real gateway and the real Yahoo adapter through a total outage and out the other side, and removing the re-admission (`probes = []`) kills 21 tests across three suites.
+
+• **Live validation not performed.** No interactive broker session exists. Nothing here claims broker interoperability.
+
+Requires Approval
+
+None.
+
+Review Date
+
+At the sprint that owns the consumer feed contract, where LIM-D5.12-1 and LIM-D5.5-2 are the same surface and should be decided together. Also whenever a **second polled provider** is registered: every argument above for why the "offered but never reached" tail is benign rests on the polled baseline being the only provider of its kind, and a second one makes that a question again rather than an observation.
+
+Authoritative document
+
+MARKET_DATA_ARCHITECTURE.md
+
+---
+
 # End of Decisions Documentation
