@@ -99,32 +99,43 @@ def throttle_stats() -> dict:
 # --------------------------------------------------------------------------- #
 # Quotes (light live map: cached 2d Yahoo quote + factual sector metadata)
 # --------------------------------------------------------------------------- #
-async def quotes_map(symbols: list) -> dict:
-    """{UPPER_SYMBOL: quote|None} from the cached Yahoo layer, enriched with
-    reference sector metadata (needed by the allocation-by-sector event).
+async def quotes_map(symbols: list, user_id=None) -> dict:
+    """{UPPER_SYMBOL: quote|None} for a portfolio recompute, plus reference
+    sector metadata (needed by the allocation-by-sector event).
 
-    Deliberately uses the cheap 2d quote (price/day-change) instead of the 3mo
-    indicator quote — the live snapshot needs marks, not RSI/MACD."""
-    import asyncio
+    D5.16 — RESOLVED THROUGH THE MARKET GATEWAY, FOR THIS ACCOUNT.
+    This called `fetch_yahoo_quote` directly and without a user, which produced
+    a state that is hard to see and easy to disbelieve: a holding whose price
+    was arriving live on the account's own broker feed was *marked* from Yahoo
+    on every recompute that a tick did not drive — a portfolio synced, a
+    reconnect, a scheduled snapshot. The live number and the snapshot number
+    came from different providers and could disagree by a day's move.
 
+    `user_id` is optional so the pure-snapshot callers that have no account in
+    hand keep working; every caller that knows whose portfolio it is passes it,
+    and that is what lets their own feed answer.
+    """
     from market_data import get_stock_meta
-    from services.real_market import fetch_yahoo_quote
+    from services.market_engine.gateway import market_gateway
 
     uniq = list({(s or "").upper() for s in symbols if s})
     if not uniq:
         return {}
-    results = await asyncio.gather(
-        *[fetch_yahoo_quote(s, "2d") for s in uniq], return_exceptions=True
-    )
+    try:
+        resolved = await market_gateway.get_prices(uniq, user_id=user_id)
+    except Exception as e:
+        logger.warning(f"Portfolio quote resolution failed: {e}")
+        resolved = {}
     out = {}
-    for sym, res in zip(uniq, results):
-        if isinstance(res, Exception) or not res or res.get("price") is None:
+    for sym in uniq:
+        quote = resolved.get(sym)
+        if not quote or quote.get("price") is None:
             out[sym] = None
             continue
         meta = get_stock_meta(sym) or {}
         out[sym] = {
-            "price": res.get("price"),
-            "change_pct": res.get("change_pct"),
+            "price": quote.get("price"),
+            "change_pct": quote.get("change_pct"),
             "sector": meta.get("sector", ""),
         }
     return out
@@ -184,7 +195,15 @@ async def publish_snapshot(db, user_id: str,
     ``price_override`` ({UPPER_SYMBOL: price}) lets broker ticks supersede the
     cached quote price while keeping quote metadata (sector/day-change).
     Returns the published payload, or None when the user has no holdings."""
-    fetch = quotes_map_func or quotes_map
+    # D5.16 — the default fetch is resolved FOR THIS ACCOUNT. An injected
+    # `quotes_map_func` is a caller that already decided how to price (a shared
+    # prefetch, a test double) and is left alone; the default is the one that
+    # used to reach Yahoo with no user at all.
+    if quotes_map_func is None:
+        async def fetch(symbols):
+            return await quotes_map(symbols, user_id=user_id)
+    else:
+        fetch = quotes_map_func
 
     async def _quotes(symbols: list) -> dict:
         base = await fetch(symbols)

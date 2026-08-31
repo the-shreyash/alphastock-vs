@@ -27,20 +27,33 @@ Everything Upstox-specific below terminates in this file. What leaves it is a
 instrument key, which `InstrumentMap` turns into a canonical symbol exactly as
 it does for Kite's integer token.
 """
+import asyncio
+import gzip
 import json
 import logging
 import math
 import struct
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import urlencode
 
 from services.brokers.base import (
-    IST, AdapterStreamChannel, BrokerAdapter, BrokerAuthError, BrokerError, normalize_status,
+    IST, AdapterStreamChannel, BrokerAdapter, BrokerAuthError, BrokerError,
+    _broker_http_client, normalize_status,
 )
 from services.brokers.capabilities import BrokerCapability
+from services.brokers.catalogue import (
+    INDEX_SEGMENT,
+    CatalogueCache,
+    InstrumentCatalogue,
+    canonical_index,
+    normalize_exchange,
+    resolve_from_index,
+)
 from services.brokers.credentials import BrokerCredentialSpec
+from services.brokers.errors import BrokerErrorCode
 from services.brokers.streaming import (
     BrokerStreamChannel,
     BrokerStreamEndpoint,
@@ -113,6 +126,44 @@ MARKET_STREAM_MODE = "ltpc"
 #: a deterministic prefix, which is strictly better than a feed with nothing on
 #: it.
 MAX_SUBSCRIBED_INSTRUMENTS = 5000
+
+#: Upstox's published NSE instrument master (D5.15).
+#:
+#: A static, public, credential-free asset — no token is sent to fetch it and
+#: none could be: it is the same file Upstox's own SDK reads. That is why the
+#: catalogue does not take the user's session, and why one process-wide cache
+#: serves every account rather than one per user: an instrument master is a fact
+#: about the exchange, not about anybody's account.
+#: One master per exchange, because the equity catalogue covers two (D5.16).
+#: Upstox publishes them separately and both carry the same row shape, so the
+#: parser is one expression over two downloads.
+INSTRUMENT_MASTER_URLS = {
+    "NSE": "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz",
+    "BSE": "https://assets.upstox.com/market-quote/instruments/exchange/BSE.json.gz",
+}
+
+#: How long a fetched master stays authoritative. Upstox regenerates it daily
+#: before the open; a trading day is the natural life of one copy, and refetching
+#: more often would spend bandwidth on a file that has not changed.
+INSTRUMENT_MASTER_TTL_SECONDS = 6 * 60 * 60
+
+#: The cash-equity segment on each exchange. Upstox keys are segment-qualified
+#: (`NSE_EQ|<ISIN>`), and a trading symbol is only unique *within* a segment —
+#: the same string names a different instrument in the F&O and index segments.
+#: Restricting the index to these is what stops `RELIANCE` resolving to a
+#: futures contract, and what keeps `NSE_INDEX` rows out (Phase 8 defers
+#: indices; it does not smuggle them in through the catalogue).
+INSTRUMENT_EQUITY_SEGMENTS = {"NSE": "NSE_EQ", "BSE": "BSE_EQ"}
+
+#: The index segment on each exchange (D5.17).
+#:
+#: Named per exchange for the same reason the equity segments are: an Upstox
+#: instrument key is segment-qualified, and `NSE_INDEX|Nifty 50` and
+#: `BSE_INDEX|SENSEX` are the strings the subscription and the v3 feed both
+#: carry. Verified against the live masters on 2026-08-31: 139 `NSE_INDEX` and
+#: 77 `BSE_INDEX` rows, whose `trading_symbol` for the four indices the platform
+#: names is `NIFTY`, `BANKNIFTY`, `INDIA VIX` and `SENSEX`.
+INSTRUMENT_INDEX_SEGMENTS = {"NSE": "NSE_INDEX", "BSE": "BSE_INDEX"}
 
 
 # ── Upstox v3 market-data feed: the protobuf codec ──────────────────────────
@@ -516,6 +567,7 @@ class UpstoxAdapter(BrokerAdapter):
         BrokerCapability.SESSION_INVALIDATE,
         BrokerCapability.ORDER_STREAM,
         BrokerCapability.TICK_STREAM,
+        BrokerCapability.INSTRUMENT_CATALOGUE,
     })
 
     credential_spec = BrokerCredentialSpec(
@@ -753,6 +805,108 @@ class UpstoxAdapter(BrokerAdapter):
             if key is not None:
                 keys.add(key)
         return sorted(keys)
+
+    # -- instrument catalogue (D5.15; exchange-aware in D5.16) -----------------
+    #: Process-wide cache of the two equity masters, as one merged index.
+    #:
+    #: A class attribute rather than an instance one because the registry holds
+    #: one adapter instance per broker anyway, and because the thing being
+    #: cached is an exchange fact shared by every account.
+    _catalogue_cache = CatalogueCache(INSTRUMENT_MASTER_TTL_SECONDS)
+
+    @staticmethod
+    def build_catalogue_index(*row_groups) -> Dict[Tuple[str, str], Any]:
+        """`{(EXCHANGE, TRADING_SYMBOL): instrument_key}` from master rows.
+
+        Upstox's `instrument_type` is the exchange's own series/group code — `EQ`
+        / `BE` / `SG` on NSE, `A` / `B` on BSE — which is exactly what the shared
+        cash-equity policy ranks, so no per-broker series table exists here.
+
+        Pure, and separate from the download, because this is the whole of what
+        "Upstox has a catalogue" *means*: the fetch is I/O no hermetic test can
+        honestly cover, and the meaning is a function of rows.
+        """
+        catalogue = InstrumentCatalogue()
+        for rows in row_groups:
+            for row in rows if isinstance(rows, list) else ():
+                if not isinstance(row, dict):
+                    continue
+                exchange = row.get("exchange")
+                name = normalize_exchange(exchange)
+                if name is None:
+                    # Explicit, rather than relying on `.get("")` returning None
+                    # and a row whose `segment` is also None matching it. That
+                    # row was refused one line later by `offer`'s own exchange
+                    # check, so nothing was ever wrong — but with two segment
+                    # tables to miss against, "safe because something downstream
+                    # catches it" is one edit away from being false.
+                    continue
+                if row.get("segment") == INSTRUMENT_INDEX_SEGMENTS.get(name):
+                    canonical = canonical_index(row.get("trading_symbol"))
+                    if canonical is None:
+                        continue
+                    catalogue.offer(
+                        exchange, canonical,
+                        instrument_key(row.get("instrument_key")),
+                        rank=0, segment=INDEX_SEGMENT,
+                    )
+                    continue
+                if row.get("segment") != INSTRUMENT_EQUITY_SEGMENTS.get(name):
+                    continue
+                catalogue.offer(
+                    exchange,
+                    row.get("trading_symbol"),
+                    instrument_key(row.get("instrument_key")),
+                    series=row.get("instrument_type"),
+                )
+        return catalogue.build()
+
+    async def _download_catalogue(self) -> Dict[Tuple[str, str], Any]:
+        """Fetch both equity masters and index them.
+
+        One exchange failing takes the whole download down rather than yielding
+        a half-catalogue: a silently NSE-only index is precisely the D5.15 state
+        D5.16 exists to end, and it is indistinguishable from a correct one at
+        every call site. The gateway turns the error into "no catalogue", so the
+        account keeps its portfolio-derived subscription — a visible, bounded
+        degradation instead of a wrong answer.
+        """
+        groups = []
+        for exchange, url in INSTRUMENT_MASTER_URLS.items():
+            try:
+                # The same egress-pinned client every other broker HTTP call
+                # uses. A second client here would be a second network policy.
+                async with _broker_http_client(60.0) as client:
+                    response = await client.get(url)
+                    response.raise_for_status()
+                    groups.append(json.loads(gzip.decompress(response.content)))
+            except Exception as exc:
+                raise BrokerError(
+                    f"Upstox {exchange} instrument master unavailable: {type(exc).__name__}",
+                    code=BrokerErrorCode.NETWORK,
+                    user_message="Live instrument data is temporarily unavailable.",
+                ) from exc
+        index = self.build_catalogue_index(*groups)
+        logger.info("Upstox instrument catalogue loaded: %d cash equities", len(index))
+        return index
+
+    async def _instrument_catalogue(self) -> Dict[Tuple[str, str], Any]:
+        """`{(EXCHANGE, TRADING_SYMBOL): instrument_key}`, cached per process."""
+        return await type(self)._catalogue_cache.get(self._download_catalogue)
+
+    async def resolve_instruments(self, instruments: Sequence[Any],
+                                  session: dict = None) -> Dict[str, Any]:
+        """Canonical instruments -> Upstox instrument keys.
+
+        `session` is accepted and unused: the masters are public assets and this
+        method must not become a per-account call. Keeping the parameter is the
+        adapter contract — a broker whose catalogue *is* an authenticated search
+        endpoint needs it, and a signature that varied per broker would put the
+        difference back in the caller.
+        """
+        if not instruments:
+            return {}
+        return resolve_from_index(instruments, await self._instrument_catalogue())
 
     def stream_connect_error(self, error: BaseException) -> Optional[str]:
         """Whether a refused portfolio-stream handshake means this session is dead.

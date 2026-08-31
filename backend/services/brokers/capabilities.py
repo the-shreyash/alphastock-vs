@@ -74,6 +74,22 @@ class BrokerCapability(str, Enum):
     # ── Realtime ─────────────────────────────────────────
     #: Live order-status updates over the broker's WebSocket.
     ORDER_STREAM = "order_stream"
+    #: The broker can name an instrument this platform names canonically —
+    #: symbol -> that broker's own instrument identifier (D5.15).
+    #:
+    #: Separate from TICK_STREAM on purpose, because they are different facts
+    #: and a broker may have either without the other. TICK_STREAM says a feed
+    #: exists; this says the feed can be *aimed* at an instrument the account
+    #: does not already hold. Before D5.15 the only instrument identifiers the
+    #: platform had were the ones holdings and positions carry, so an account
+    #: with an empty portfolio subscribed to nothing and its feed could never
+    #: deliver a tick — a live socket that was structurally silent.
+    #:
+    #: The resolution itself is broker knowledge and stays in the adapter: an
+    #: instrument master, a search endpoint or a static map are all legitimate
+    #: implementations, and the Market Engine must not be able to tell which
+    #: one a broker used.
+    INSTRUMENT_CATALOGUE = "instrument_catalogue"
     #: Live price ticks over the broker's WebSocket. Declaring this is what
     #: makes a broker a market-data provider: since D4.4 it is the single gate
     #: `services/brokers/market_feed.py` checks before registering the account's
@@ -110,6 +126,7 @@ CAPABILITY_METHODS: Dict[BrokerCapability, str] = {
     # deliver nothing.
     BrokerCapability.ORDER_STREAM: "normalize_stream_order",
     BrokerCapability.TICK_STREAM: "stream_instruments",
+    BrokerCapability.INSTRUMENT_CATALOGUE: "resolve_instruments",
 }
 
 #: Capabilities that name a real adapter method and are therefore verifiable at

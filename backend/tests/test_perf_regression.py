@@ -32,12 +32,14 @@ from __future__ import annotations
 
 import ast
 import inspect
+import textwrap
 from pathlib import Path
 
 import pytest
 from bson import ObjectId
 
 import server
+from services.market_engine.gateway import MarketGateway
 from tests._perf import count_queries, measure
 
 
@@ -424,7 +426,10 @@ class TestIndependentWorkStaysConcurrent:
 
     @staticmethod
     def _gather_calls(fn):
-        tree = ast.parse(inspect.getsource(fn))
+        # Dedented so a *method* can be inspected too, not only a module-level
+        # function: `inspect.getsource` returns the body at its original
+        # indentation and `ast.parse` rejects that outright.
+        tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
         return [
             node for node in ast.walk(tree)
             if isinstance(node, ast.Call)
@@ -446,10 +451,27 @@ class TestIndependentWorkStaysConcurrent:
         )
 
     def test_quote_fanout_is_gathered(self):
-        """`real_quotes_map` fans out per symbol. Sequential would make a
-        12-symbol watchlist twelve provider round trips deep."""
-        assert self._gather_calls(server.real_quotes_map), (
-            "real_quotes_map must fetch symbols concurrently"
+        """The per-symbol fan-out is concurrent. Sequential would make a
+        12-symbol watchlist twelve provider round trips deep.
+
+        D5.16 moved the fan-out one layer down and the probe follows it rather
+        than being relaxed. `real_quotes_map` no longer calls a provider at all:
+        it delegates to `MarketGateway.get_prices`, which is where per-symbol
+        resolution lives, and *that* is what must gather. Asserting on the old
+        location would have gone green the moment the gather was unrolled inside
+        the gateway — a probe passing for a reason unrelated to the property.
+
+        Both halves are asserted, because either alone is satisfiable while the
+        property is false: a gathering gateway that `real_quotes_map` stopped
+        using, or a delegating `real_quotes_map` in front of a sequential loop.
+        """
+        assert self._gather_calls(MarketGateway.get_prices), (
+            "MarketGateway.get_prices must resolve symbols concurrently — it is "
+            "the batch path behind every equity price surface in the product"
+        )
+        source = inspect.getsource(server.real_quotes_map)
+        assert "get_prices" in source, (
+            "real_quotes_map no longer routes through the gateway's batch path"
         )
 
 

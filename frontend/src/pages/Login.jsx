@@ -4,6 +4,7 @@ import { motion } from "framer-motion";
 import { useAuth } from "../context/AuthContext";
 import { Eye, EyeOff, ArrowRight } from "lucide-react";
 import { resolveApiErrorMessage } from "../utils/apiError";
+import { startGoogleLogin } from "../services/googleAuth";
 
 /* ─────────────────────────────────────────────
    LOGIN SPECIFIC CSS

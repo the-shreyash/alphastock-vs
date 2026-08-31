@@ -1449,7 +1449,13 @@ def test_a_broker_feed_registers_through_the_existing_provider_framework():
         assert before.reason is UnavailableReason.CAPABILITY_UNSUPPORTED
 
         with nova_registered():
-            name = run(_attach("u1", "nova"))
+            # D5.15 — the subscription is part of the fixture because it is part
+            # of every real attach: `BrokerEngine.start_stream` always passes the
+            # account's universe, and a feed that asked the wire for nothing no
+            # longer serves the link-level TICKS capability. What D4.4 asserts
+            # here — that a broker feed becomes a provider through the existing
+            # framework — is unchanged.
+            name = run(_attach("u1", "nova", ["RELIANCE"]))
 
         assert name in registry, "the broker feed was not registered as a market-data provider"
 
@@ -1782,8 +1788,9 @@ def test_a_second_fictional_broker_uses_the_same_seam_with_no_new_code():
 
     with _clean_provider_registry() as registry:
         with nova_registered(), nova_registered(OrionAdapter()):
-            first = run(_attach("u1", "nova"))
-            second = run(_attach("u2", "orion"))
+            # D5.15 — see the note on the D4.4 registration test above.
+            first = run(_attach("u1", "nova", ["RELIANCE"]))
+            second = run(_attach("u2", "orion", ["RELIANCE"]))
 
         assert first == feed_provider_name("u1", "nova")
         assert second == feed_provider_name("u2", "orion")
@@ -1809,7 +1816,8 @@ def test_an_unready_feed_is_not_resolved_and_ending_the_entitlement_unregisters_
 
     with _clean_provider_registry() as registry:
         with nova_registered():
-            name = run(_attach("u1", "nova"))
+            # D5.15 — see the note on the D4.4 registration test above.
+            name = run(_attach("u1", "nova", ["RELIANCE"]))
         manager = SourceManager(registry)
         ctx = ResolutionContext(user_id="u1")
         provider = provider_registry.get(name)

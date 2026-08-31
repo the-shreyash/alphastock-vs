@@ -53,9 +53,10 @@ Usage:
     from services.market_engine import market_gateway
     quote = await market_gateway.get_quote("RELIANCE")
 """
+import asyncio
 import logging
 from datetime import datetime, timezone
-from typing import Any, Awaitable, Callable, Dict, List, Optional, TypeVar
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, TypeVar
 
 from observability import instruments
 from services.market_engine.event_bus import event_bus
@@ -99,6 +100,14 @@ T = TypeVar("T")
 #: domain segment and already maps `market` to the `market` socket channel, so a
 #: tick lands where every other market event lands with no routing-table change.
 TICK_TOPIC = "market.tick"
+
+#: How many instruments `get_prices` resolves at once.
+#:
+#: Small on purpose — see the reasoning in `get_prices`. It is a failure-blast
+#: bound first and a throughput knob second: eight in flight turns a 100-symbol
+#: cold read from ~100 sequential round trips into ~13, while keeping the number
+#: of requests that can hit an already-dead provider before failover to eight.
+_PRICE_RESOLUTION_CONCURRENCY = 8
 
 OVERVIEW_INDEX_NAMES = {
     "nifty": "NIFTY 50",
@@ -570,8 +579,118 @@ class MarketGateway:
 
     # ── Single stock quote ───────────────────────────────
 
-    async def get_quote(self, symbol: str, *, user_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
-        """Fetch, normalize, validate a single stock quote."""
+    async def get_prices(
+        self,
+        symbols: Sequence[str],
+        *,
+        user_id: Optional[str] = None,
+    ) -> Dict[str, Dict[str, Any]]:
+        """`{SYMBOL: quote}` for a set of instruments, resolved for one user.
+
+        WHY THIS EXISTS (D5.15)
+        -----------------------
+        The platform's live price broadcast — the message every dashboard,
+        watchlist and market page actually renders — did not come through this
+        gateway at all. It called Yahoo directly, from
+        `heartbeat_engine._collect_prices`, behind a five-minute bundle cache,
+        and broadcast one global map to every socket. Three consequences, all
+        observed rather than reasoned about:
+
+        * **a broker feed could never reach the screen.** The loop had no user,
+          so no per-user provider was ever a candidate; a user promoted to their
+          own live feed still saw the shared baseline, and the tier indicator
+          (D5.14) correctly said `streaming` beside prices that were not.
+        * **the prices were up to five minutes old** while being presented as
+          live, which is the "non-changing dashboard" symptom D5.15 opened with.
+        * **it bypassed Developer Rule 2.** Nothing that reaches a consumer may
+          route around this choke point, and the single most-rendered number in
+          the product did.
+
+        Per symbol, because eligibility is per symbol: MARKET_DATA_ARCHITECTURE's
+        rule that "a broker feed covering NSE equities does not disqualify Yahoo
+        from serving a US index the broker doesn't carry" is only honoured if
+        each instrument is resolved on its own. A symbol whose resolution fails
+        or whose quote does not validate is **omitted** rather than carried with
+        a null price — an absent price renders as the last known one, a null
+        renders as a hole.
+
+        Callers that fan out to many users should read
+        :meth:`baseline_prices_are_shared` first; it says when one resolution
+        can legitimately serve everybody.
+        """
+        wanted = list(dict.fromkeys(
+            str(s).strip().upper() for s in (symbols or []) if str(s or "").strip()))
+        if not wanted:
+            return {}
+
+        # RESOLVED CONCURRENTLY, BUT BOUNDED (D5.16).
+        #
+        # Sequentially, a hundred-symbol watchlist on a cold cache is a hundred
+        # round trips end to end: ~20 s for one `GET /api/watchlist`, and — less
+        # visibly — most of the 15-second budget of the price broadcast loop
+        # that calls this for the whole dashboard universe every cycle. The
+        # per-symbol resolution D5.15 introduced is correct and was serialised.
+        #
+        # The bound is the part that is not incidental. Unbounded, a dead
+        # provider is discovered by every symbol independently: a hundred
+        # concurrent requests all fail, all advance the failover chain, and the
+        # provider's health is marked down a hundred times over — the same
+        # "failover works, after N failed requests" shape D2 closed. With a
+        # small window, at most `_PRICE_RESOLUTION_CONCURRENCY` requests can be
+        # in flight against a provider before the rest observe the state its
+        # failure produced.
+        semaphore = asyncio.Semaphore(_PRICE_RESOLUTION_CONCURRENCY)
+
+        async def _resolve(symbol: str):
+            async with semaphore:
+                return symbol, await self._quote(symbol, user_id=user_id)
+
+        out: Dict[str, Dict[str, Any]] = {}
+        results = await asyncio.gather(
+            *(_resolve(symbol) for symbol in wanted), return_exceptions=True)
+        for result in results:
+            # `_quote` already swallows its own failures; this catches only a
+            # cancellation or a programming error, and one symbol's must not
+            # cost the batch.
+            if isinstance(result, BaseException):
+                logger.warning(f"Gateway: price resolution raised: {result}")
+                continue
+            symbol, quote = result
+            if quote and quote.get("price") is not None:
+                out[symbol] = quote
+        return out
+
+    def baseline_prices_are_shared(self, user_id: Optional[str]) -> bool:
+        """Whether this user's prices are the same ones everybody else gets.
+
+        True when the user has no provider of their own in play, which is the
+        normal case and the one that makes a fan-out affordable: with no
+        per-user provider eligible, resolving for this user and resolving for
+        the platform choose from the identical candidate set and therefore
+        return the identical answer. A caller may compute the platform map once
+        and reuse it for every user this returns True for.
+
+        Deliberately asked of the Source Manager rather than inferred from
+        "does this user have a broker connected": a connected broker with no
+        registered feed, an unready feed, a feed on probation and a feed that
+        lost its link all still resolve to the baseline, and a caller that
+        guessed from the connection would send those users a second, redundant
+        resolution — or worse, believe their prices were personal when they were
+        not.
+        """
+        return source_manager.active_tier(user_id=user_id) == source_manager.active_tier()
+
+    async def _quote(self, symbol: str, *, user_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Resolve, normalize, validate and tier-stamp one quote.
+
+        The body `get_quote` used to be, extracted so the batch path above and
+        the single-quote path below cannot drift — in particular so they cannot
+        come to disagree about which provider answered or what tier to stamp.
+        What stays in `get_quote` and *not* here is the `price.updated` publish:
+        one bus event per symbol per user per cycle would put a Redis round-trip
+        behind every price on every dashboard, and the batch path has its own
+        delivery.
+        """
         try:
             provider, raw = await self._serve_with_provider(
                 Capability.QUOTES, "get_quote",
@@ -595,6 +714,13 @@ class MarketGateway:
             return None
 
         _stamp_tier(normalized, provider)
+        return normalized
+
+    async def get_quote(self, symbol: str, *, user_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Fetch, normalize, validate a single stock quote."""
+        normalized = await self._quote(symbol, user_id=user_id)
+        if not normalized:
+            return None
 
         await event_bus.publish("price.updated", {
             "symbol": symbol,

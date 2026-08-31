@@ -3339,7 +3339,7 @@ High
 14. Yes, in full — health recovery never replaces the provider object and grants it nothing it had not earned; readiness, probation, freshness and latency are untouched by it.
 15. No. `HEALTH_RANK[DOWN] = 2` is the worst band and health is the first element of the selection key, so a re-admitted provider is appended to the **tail** and can never reorder anything above it.
 
-**Falsification: 19 mutations, 19 RED.** Every mutation the brief names, plus two of this sprint's own (`HEALTH_RANK[DOWN] = 0`; re-admission itself recording a success). Each was killed by tests named for the property mutated — e.g. removing the recovery opportunity kills 21 tests across three suites; letting two workers claim one trial kills `test_two_workers_claiming_the_same_trial_in_the_same_instant_spend_it_once`; a broker-name branch kills `test_the_health_recovery_layer_names_no_broker`; importing the broker layer kills `test_the_market_engine_never_imports_a_broker_module`.
+**Falsification: 21 mutations, 21 RED.** Every mutation the brief names, plus two of this sprint's own (`HEALTH_RANK[DOWN] = 0`; re-admission itself recording a success). Each was killed by tests named for the property mutated — e.g. removing the recovery opportunity kills 21 tests across three suites; letting two workers claim one trial kills `test_two_workers_claiming_the_same_trial_in_the_same_instant_spend_it_once`; a broker-name branch kills `test_the_health_recovery_layer_names_no_broker`; importing the broker layer kills `test_the_market_engine_never_imports_a_broker_module`.
 
 **A first campaign was discarded as invalid rather than reported.** It also read 19/19 RED — because the harness passed `--timeout`, a flag this repository's pytest does not provide, so every run exited on a usage error and every "RED" was the harness failing before a test ran. Caught by an implausible artifact (no `FAILED` line behind any of the 19 kills). Recorded because it is the same class of defect the PH3.12 review named: **a probe that could not have failed is not evidence.**
 
@@ -3427,3 +3427,544 @@ The same collapse explains LIM-D5.5-2 from the other side. `UnavailableReason` i
 - **LIM-D5.4-1 — exchange-to-ingest latency.** Still **explicitly blocked** and untouched by this sprint. Three of five adapters put no exchange timestamp on the wire in the subscribed mode, the two that do disagree about units, and no clock offset against an exchange has ever been established. Nothing was faked.
 
 **Next sprint: D5.14 — not started.** On the evidence, in order: **(a) LIM-D5.13-1, the frontend feed-state surface** — the backend contract is now complete and unread, so this is the smallest remaining gap between what the platform knows and what a user is told, and it is the first D5 item whose work is genuinely frontend; **(b) exchange-timestamp latency (LIM-D5.4-1)**, which stays blocked until a decoded exchange instant, a field on `MarketTick` to carry it, and a defensible clock-offset estimate all exist — and must not be started before they do.
+
+---
+
+## D5.14 — Frontend Feed-State Surface
+
+**Status: COMPLETE (2026-08-31). ADR-054. Closes LIM-D5.13-1. Zero backend files changed. LIVE VALIDATION: NOT PERFORMED.**
+
+**What the sprint owned.** D5.13 completed the consumer feed contract and recorded the half it did not build: nothing in the frontend read it. D5.14 renders it — accurately, and without creating a second source of truth.
+
+**Architecture audit — the diagnosis was right and incomplete.** ADR-053 named one break (the store drops the `provider` domain). There were **two, and either alone hid the entire contract**:
+
+1. `realtimeStore.applyEvent` routes by `event.split(".")[0]` and had no `provider` case — every feed event that reached the browser fell through `default: break`.
+2. `RealtimeProvider.CHANNELS` did not list `provider`. `provider.status` has no entry in the event bridge's `DOMAIN_CHANNEL` map, so `resolve_channel` falls through to the domain name and the **platform-scoped** event is broadcast on a channel called `provider`. User-scoped publishes (D4.5) carry `user_id` and bypass channel subscription, so they would have arrived; a user on the shared Yahoo baseline could not have been told anything at all.
+
+Because fixing either alone changes nothing observable, the wiring test drives the **real** provider, socket lifecycle, 40 ms batch window and store — a green store-reducer test would have been fully compatible with a product that still showed nothing.
+
+**Existing frontend feed-state flow: there was none.** No canonical feed-state model existed to extend. `ConnectionStatus` is the **socket** state machine (`offline | connecting | live | reconnecting`) and answers a different question; `InvestmentAdvisor.jsx` renders a per-response `source_tier` chip from a REST payload — provenance for one answer, not the state of the feed. Both are left intact.
+
+**Final consumer semantics.** Four words, because there are four things a user acts on differently: **Live** (`available` + `streaming`) · **Delayed** (`available` + `delayed`) · **Recovering** (a candidate is being retried; what is on screen is **not** live) · **Unavailable**. `tier` is not overloaded to carry connection state; the state is never inferred from the tier; `live` is true in exactly one case. The three `FeedChangeReason` values render as broker-neutral sentences ("Your market-data connection needs attention…", "Your market-data access has expired…", "Your market-data account is no longer connected…"); an unrecognised reason renders **nothing** and falls back to the state's own line. Before the first event, `feedState` is `null` and the indicator renders nothing — "not told yet" is neither "down" nor "live".
+
+**Why the frontend owns no recovery logic.** Health, cool-downs, readiness, probation, freshness, delivery latency and provider selection stay the Source Manager's. `src/lib/feedState.js` is an allow-list projection — field by field, never a spread — and contains no inference and **no timer**: `recovering` ends when the backend says it ends. The unsafe direction is closed by construction: an unrecognised state projects to `unavailable`, never `available`, and a tier is dropped outside `available` (LIM-D5.12-1 *was* a tier stamped on a state with no data behind it).
+
+**Files changed.** Production (5, all frontend): `src/lib/feedState.js` (new), `src/components/layout/MarketFeedStatus.jsx` (new), `src/store/realtimeStore.js`, `src/context/RealtimeProvider.jsx`, `src/components/layout/Navbar.jsx`. Tests (5, new): `src/lib/__tests__/feedState.test.js`, `src/store/__tests__/feedState.store.test.js`, `src/components/__tests__/MarketFeedStatus.test.jsx`, `src/context/__tests__/RealtimeProvider.feed.test.jsx`, `src/__tests__/feedStateSecurity.test.jsx`. Docs: `.claude/DECISIONS.md` (ADR-054), `.claude/MARKET_DATA_ARCHITECTURE.md`, `.claude/BROKER_INTEGRATION.md`, `.claude/TASK.md`. **No backend file was touched** — no adapter, transport, codec, `MarketTick`, `SourceManager` recovery, `ProviderHealthRecovery`, D5.6 REPROBE, D5.8 distributed health, D5.9 latency or exchange-timestamp work. `WebSocketManager.subscribe` already accepts free-form channel names, so the channel needed no backend change either.
+
+**Tests: 93 added, written before the implementation.** Projection (31) — the three states, the tier dropped outside `available`, unknown state → `unavailable`, the allow-listed change/unavailable reasons, the copy for each reason, no fabricated percentage/countdown/ETA/broker name. Store (16) — the **exact** bridged envelope, `recovering` never live, `unavailable` distinguishable, the batched ingest path, an empty frame not blanking a good feed, per-account isolation, a platform broadcast not clobbering a promoted user, nothing sensitive surviving ingestion. Component (17) — nothing rendered before the first event, `available`/`recovering`/`unavailable` presentation, each change reason, an unknown reason rendered as nothing, no provider identity in any renderable state. Wiring (7) — the `provider` channel subscription, platform and user-scoped delivery end to end, identity binding, sign-out clearing, **no frontend timer**. Security (22) — the real socket→store→DOM path with hostile payloads.
+
+**Falsification: 14 mutations, 14 RED**, each on a targeted assertion. `recovering` treated as `available`; `recovering` assigned the live tier; the change reason dropped from the transition; the entitlement reason rendered as raw broker text; session expiry described as an entitlement refusal; disconnection described as a live feed; state inferred from the tier alone; the frontend inventing its own recovery timer; provider identity projected and rendered; the store ignoring the `provider` domain again; one account's event overwriting another's; the socket unsubscribing from the `provider` channel; a platform broadcast clobbering a promoted user's feed; an empty frame blanking a good feed. **Two (the recovery timer and the channel unsubscribe) produced no test name in the harness's summary output and were therefore re-run individually rather than counted on trust** — each failed on exactly one assertion, the intended one. The security suite was separately falsified (a provider-identity leak turns 13 of its 22 tests red), so its all-green result is evidence rather than vacuum.
+
+**Regression.** Frontend baseline recorded at `f1cd6f4` **before editing**: 8 failed / 392 passed / 400 total, 2 suites failing. Final: **8 failed / 485 passed / 493 total**. Reconciles exactly: 392 + 93. **The 8 failures are pre-existing and unabsorbed** — 4 in `Landing.test.jsx`, 4 in `Login.test.jsx`, identical in both runs. Backend: **15 failed / 4119 passed / 49 skipped / 95 deselected / 4 xfailed**, byte-identical to the D5.13 final line; the 15 are the pre-existing Docker-dependent `test_entrypoint_log_level.py` set carried since D3. **`craco build` fails at HEAD and still fails** — `src/pages/Login.jsx:164` calls an undefined `startGoogleLogin`, a pre-existing `no-undef` that is also the cause of the 4 `Login.test.jsx` failures. It is in a file this sprint did not touch and is **reported, not absorbed and not opportunistically fixed**. It is also the proof the new files lint clean: CRA's ESLint pass covers every reachable module, and the five new/changed files are reachable and produce no finding. No repo has an `eslint.config.js`, so the standalone ESLint 9 binary cannot run — the build's bundled pass is the lint gate that exists.
+
+**Security.** The real path — socket frame → `RealtimeProvider` → batch window → store → projection → rendered DOM — was driven with payloads carrying a JWT, an access token, an API key, a password, four broker names, an internal provider object name (`brokerfeed:zerodha:user-a`), a raw `TokenException` string, a `wss://` transport URL with the key in its query string, a Redis health key, and cool-down/probation/re-probe recovery internals. Across all seven state/reason combinations, **0 of 15 forbidden values reached the store and 0 reached the DOM**, and each combination still rendered an honest sentence — "leaks nothing" is not satisfied here by rendering nothing. The mechanism is structural: the projection copies allow-listed fields and never spreads the payload, so an unlisted key is not rendered because it is never stored.
+
+**Deliberately NOT done in D5.14** — no backend change of any kind; no dismissible banner (deferred with its reasoning in ADR-054, not rejected); no per-capability indicator (recorded as LIM-D5.14-1); no `DOMAIN_CHANNEL` entry for `provider` (the fall-through is already correct); no change to `ConnectionStatus`, to the `InvestmentAdvisor` `source_tier` chip, or to any Yahoo/delayed presentation; no exchange-timestamp latency (LIM-D5.4-1 stands blocked); no instrument sharding, chaos tests, new brokers, new recovery mechanisms or trading APIs; no D5.15; no mass reformatting; nothing committed and nothing pushed.
+
+**LIVE VALIDATION: NOT PERFORMED.** No interactive broker session exists. The frontend was validated against controlled backend events shaped exactly as `SourceManager.publish_status` emits them; that is **not** a Zerodha/Upstox/Angel One/Fyers live-feed validation and is not represented as one.
+
+**Limitations after D5.14.**
+- **LIM-D5.13-1 — nothing in the frontend consumes `provider.status`.** ✅ **CLOSED.** The store consumes the domain, the socket subscribes to the channel, and the state and its explanation are rendered.
+- **LIM-D5.13-2 — `recovering` is reasoned about with one polled provider.** **OPEN and untouched.** It is a backend limitation about which state the Source Manager resolves; D5.14 renders whichever state arrives and adds no reasoning of its own, so nothing here closes it or makes it worse.
+- **LIM-D5.14-1 — the indicator is global while feed state is per-capability. NEW.** `SourceManager.status()` reports the QUOTES resolution plus a `capabilities` list. The projection stores that list and nothing reads it, so a page showing only sectors or only news is told about the quote feed. Closing it needs a product decision about which surfaces get their own indicator, not a contract change.
+- **LIM-D5.4-1 — exchange-to-ingest latency.** Still **explicitly blocked** and untouched. Nothing was faked.
+- **LIM-D5.6-2 / -3 / -4 / LIM-D5.8-3 / LIM-D5.6-5** — unchanged, restated rather than re-litigated.
+- **Pre-existing and out of scope, reported not absorbed:** `src/pages/Login.jsx:164` references an undefined `startGoogleLogin`, breaking `craco build` and 4 `Login.test.jsx` tests at HEAD; 4 `Landing.test.jsx` failures; 15 Docker-dependent backend failures.
+
+**Next sprint: D5.15 — not started.** On the evidence, in order: **(a) LIM-D5.14-1, per-capability feed indication** — the payload already carries `capabilities`, the frontend already stores it, and the only open question is which surfaces deserve their own indicator, making this the smallest remaining gap between what the platform knows and what a user is shown; **(b) exchange-timestamp latency (LIM-D5.4-1)**, which stays blocked until a decoded exchange instant, a field on `MarketTick` to carry it, and a defensible clock-offset estimate all exist — and must not be started before they do.
+
+---
+
+## D5.15 — Real Market Data End-to-End Activation
+
+**Status: COMPLETE (2026-08-31). ADR-055. LIVE VALIDATED for Upstox through the backend; the browser render is TEST VERIFIED only (LIM-D5.15-1).**
+
+**What the sprint owned.** The first sprint whose purpose was to prove the D4/D5 architecture works against a **real broker account and real market data**, and then to make it do so end to end. It was not an isolated architecture improvement, and it was not allowed to conclude anything from a green synthetic suite.
+
+**Architecture audit — the answers, traced against the running system.** Authenticated session: `broker_accounts` (Fernet-encrypted tokens), restored at startup by `BrokerEngine.load_sessions`. `start_stream` is reached from `complete_auth` → `sync_portfolio` and from `load_sessions`. The subscription is `broker_gateway.stream_instruments(holdings, positions)`; each channel's socket opens in `BrokerStreamManager.start_stream`; the subscribe frame is the channel's `subscribe_frames`; frames decode in the channel's `decode`; `BrokerTick` → `InstrumentMap` → `MarketTick` in `canonical_ticks`; `publish_market_ticks` → `StreamingTickProvider.on_raw`; readiness on the first valid tick; probation 30s; `SourceManager.resolve_feed` ranks; `MarketGateway._ingest_ticks` publishes `market.tick`; `event_bridge` delivers per-user; `realtimeStore` receives; components read `priceTicks`. **Yahoo could mask a broken broker feed everywhere, because the dashboard never consulted the gateway at all.**
+
+**The live run, and what it found.** A real Upstox account, connected 08:25:23Z, NSE open. Authentication ✅. Portfolio sync ✅ against the real REST API — **holdings 0, positions 0**. Both broker WebSockets open, confirmed at the TCP layer by certificate (`CN=*.upstox.com`). Feed registered, `provider.status` advertising `ticks`. **`market.tick` events in ten minutes: zero.**
+
+**First failing boundary: SUBSCRIBE → REAL TICK.** Not auth, not the socket, not the codec. The subscription was empty because the instrument universe is `holdings + positions` and the account held nothing — a rule all five adapters share and all five documented as a deferred catalogue.
+
+**Four root causes, not one symptom.** (1) empty subscription; (2) empty `InstrumentMap`, so an arriving tick could not have been named — the same defect one step later, and silent; (3) the dashboard price loop called Yahoo directly behind a 300s cache and broadcast one global map with no user, making a per-user feed unreachable **by construction** (and putting every user's watchlist symbols in every other user's payload); (4) a socket with zero subscriptions was reported as an active market-data feed.
+
+**What was built.** A broker-neutral **feed universe** (`services/brokers/feed_universe.py`) — portfolio, then watchlist, then the dashboard set the product actually renders; a declared **`BrokerCapability.INSTRUMENT_CATALOGUE`** with `resolve_instruments` on the adapter contract, implemented for Upstox against its published NSE instrument master (cached, process-wide, credential-free); `InstrumentMap` extended so what the feed is aimed at is nameable when it returns; link-level eligibility gated on an actual subscription; `MarketGateway.get_prices` + `baseline_prices_are_shared`, and a **per-user** price stream loop; and the frontend's `market.tick` consumer.
+
+**LIVE VALIDATION — what was actually observed.** Provider registered 09:25:34Z. Tier `delayed → streaming` at **09:26:05Z** (readiness + the 30s probation window). `market.tick` at ~7 batches/second, `source_tier: "streaming"`, canonical symbols, per-user scoped. Continuously changing prices over 24 seconds: RELIANCE 1290.4→1290.0, ICICIBANK 1443.3→1443.6→1443.4, TCS 2333.0→2331.7→2330.1. **Independent oracle** (a different provider entirely): RELIANCE 1290.2, TCS 2331.3, ICICIBANK 1444.4 — all within normal tick drift. A mid-session process restart re-earned readiness, re-served probation and was re-selected **30.6 seconds** later.
+
+**Per-broker live status. Never aggregated.**
+- **Upstox — LIVE VALIDATED** through `market.tick` on the event bus. Browser render NOT live-validated.
+- **Zerodha, Angel One, Fyers, Dhan — NOT AVAILABLE FOR LIVE VALIDATION.** No live session exists in this environment (the one stored Zerodha session expired 2026-07-10). Nothing is claimed for them.
+- **Yahoo — LIVE, as baseline**, and it is what every non-promoted user is still correctly served.
+
+**Files changed.** Backend production (7): `services/brokers/feed_universe.py` (new), `services/brokers/capabilities.py`, `services/brokers/base.py`, `services/brokers/gateway.py`, `services/brokers/upstox.py`, `services/brokers/instruments.py`, `services/broker_engine.py`, plus `services/market_engine/providers/streaming.py`, `services/market_engine/gateway.py`, `services/heartbeat_engine.py`. Frontend production (1): `src/store/realtimeStore.js`. Tests: `tests/test_feed_instrument_universe.py` (new, 24), `tests/test_dashboard_price_path.py` (new, 15), `src/store/__tests__/marketTick.store.test.js` (new, 17), plus `tests/_fakedb.py` (gained `distinct`), `tests/test_broker_streaming.py` (3 fixtures) and `tests/test_provider_latency.py` (1 contract change).
+
+**Deliberately NOT done.** No exchange timestamp on `MarketTick` and no exchange-to-ingest latency (LIM-D5.4-1 stands blocked). No change to probation (D5.2), freshness (D5.3), latency (D5.4/D5.9), recovery (D5.6/D5.7) or distributed health (D5.8). No broker-specific branch in any engine, provider or selection path. No new provider architecture. No catalogue for the other four adapters. No synthetic or faked tick anywhere. Nothing committed and nothing pushed.
+
+**Falsification: 21 mutations, 21 RED.** One (M16 — the frontend dropping `market.tick` on the batched path only) was **GREEN on the first pass and is reported as a finding, not a wrong mutation**: `applyEvent` caught the event anyway, so correctness held while the Sprint R9 coalescing could have silently regressed to one store write per tick batch. A test that counts store writes closed it and M16 is now RED.
+
+**Regression.** Backend baseline at `f1cd6f4` **before editing**: 16 failed / 4118 passed / 49 skipped / 95 deselected / 4 xfailed. Final: **15 failed / 4158 passed / 49 skipped / 95 deselected / 4 xfailed**. The 15 are the pre-existing Docker-dependent `test_entrypoint_log_level.py` set carried since D3. The 16th baseline failure — `test_api_errors.py::TestRateLimitIntegration::test_a_throttled_response_still_carries_security_headers` — is an order/state-dependent flake in a file this sprint never touched; it passed in both post-change runs and is reported, not absorbed. Frontend baseline 8 failed / 485 passed; final **8 failed / 502 passed / 510 total**, the 8 being the pre-existing `Landing.test.jsx` (4) and `Login.test.jsx` (4) failures, the latter caused by an undefined `startGoogleLogin` at `src/pages/Login.jsx:164` that also breaks `craco build` at HEAD. `flake8 --select=E9,F63,F7,F82,F811,F632` clean repo-wide.
+
+**A fifth root cause, found by watching the live feed go quiet.** A feed whose socket stays open and simply stops delivering is demoted **lazily**, inside `is_eligible_for`, when the next resolution asks. That is correct for prices — they fall back to the baseline immediately — and it is not a state transition, so **no `provider.status` was ever published**. Observed: the feed stopped delivering at 09:45:20Z and the newest status event on the bus was 09:44:02Z, tier `streaming`. The D5.14 indicator is event-driven, so it would have gone on reading **Live** over baseline data — exactly the case the feed-state contract exists to prevent. Closed by having the per-user price loop announce the tier it just resolved; `publish_status` is change-gated, so a steady feed emits nothing and a feed that went stale emits exactly one event. **TEST VERIFIED, not live** — it fires only for a connected socket, and no browser session existed.
+
+**Limitations after D5.15.**
+- **LIM-D5.15-1 — the browser render is not live-validated. NEW.** A real broker tick has been observed through `market.tick` on the bus with the exact payload the store consumes, and the store's consumption is pinned by 17 tests against that payload. It has **not** been observed changing a pixel, because that needs an authenticated browser session this sprint could not create without handling the user's credentials. Closing it is one logged-in browser during market hours.
+- **LIM-D5.15-2 — four of five adapters have no instrument catalogue. NEW.** Zerodha, Angel One, Fyers and Dhan keep the pre-D5.15 behaviour: their feeds cover the account's portfolio and nothing else, so an empty account still subscribes to nothing. Each publishes a reachable, unauthenticated instrument master (verified by HTTP range request): Kite `api.kite.trade/instruments`, Angel One `OpenAPIScripMaster.json`, Fyers `public.fyers.in/sym_details/NSE_CM.csv`, Dhan `api-scrip-master.csv`. The missing capability per broker is `resolve_instruments` alone; the seam, the universe, the map and the wiring are already broker-neutral and shared.
+- **LIM-D5.15-3 — the catalogue is NSE equity only. NEW.** The Upstox implementation indexes the `NSE_EQ` segment, so an F&O, BSE or index instrument in a watchlist resolves to nothing and silently falls back to the baseline for that symbol. Deliberate: a trading symbol is unique only within a segment, and resolving across segments without a disambiguation rule would aim the feed at a futures contract when the user meant the stock.
+- **LIM-D5.15-4 — a catalogue-resolved instrument carries no exchange. NEW.** `MarketInstrument.exchange` is `None` for anything not in the portfolio, because the master's segment is broker vocabulary and inventing an exchange from it is a claim. Consequence: a `market.tick` for a watchlisted instrument has `exchange: null` while one for a held instrument does not.
+- **LIM-D5.14-1 — the feed indicator is global while feed state is per-capability.** OPEN and untouched.
+- **LIM-D5.13-2, LIM-D5.6-2/-3/-4, LIM-D5.8-3, LIM-D5.6-5** — unchanged, restated rather than re-litigated.
+- **LIM-D5.4-1 — exchange-to-ingest latency.** Still **explicitly blocked**. Nothing was faked.
+
+**Next sprint: D5.16 — not started.** On the evidence, in order: **(a) close LIM-D5.15-1** — one logged-in browser during market hours finishes the sprint's own acceptance criterion and needs no code; **(b) LIM-D5.15-2, the second adapter's catalogue** — the seam is argued, not proven, until a broker with a genuinely different identifier format goes through it, and Zerodha's numeric token is the sharpest test of it; **(c) LIM-D5.15-3, segment disambiguation**, which is what a watchlist beyond NSE equity needs and what a search-selected instrument will need first.
+
+---
+
+# D5.16 — REAL BROKER EQUITY DATA ACTIVATION
+
+## Phase 1 — Architecture audit (read-only, no production code changed)
+
+Traced against the working tree at `f1cd6f4` + the uncommitted D5.15 deliverables.
+Every answer below is from source, with file:line.
+
+### 1. Where does the dashboard obtain every equity price?
+
+Four distinct paths reach a rendered equity price, and only one of them is canonical.
+
+| # | Path | Canonical? |
+|---|---|---|
+| P1 | `heartbeat_engine._publish_prices` (15 s) → `market_gateway.get_prices(symbols, user_id)` → `send_to_user` `{"type":"prices"}` → `realtimeStore._mergePrices` → `priceTicks` | **Yes** (D5.15) |
+| P2 | broker socket → `BrokerEngine._on_stream_tick` → `canonical_ticks` → `publish_market_ticks` → `StreamingTickProvider` → `market.tick` bus event → `realtimeStore.tickBatchToPriceMap` → `priceTicks` | **Yes** (D5.15) |
+| P3 | `heartbeat_engine.task_watchlist_stream` (120 s) → `fetch_real_stock_quote` (**Yahoo direct**) → `watchlist.quotes` **broadcast** → `priceTicks` | **No** — and it is the security P0 (§17) |
+| P4 | REST: `server.real_quote` / `real_quotes_map` (server.py:307-338) → `fetch_real_stock_quote` (**Yahoo direct**) → `GET /api/watchlist`, `POST /api/watchlist`, `/analysis/explain`, `/analysis/full-report`, portfolio monitor | **No** |
+
+P4 is the widest bypass in the product and the audit brief did not name it: **two
+functions**, `real_quote` and `real_quotes_map`, are the equity-price source for
+every REST equity surface the dashboard first paints from, and neither has ever
+touched the Market Gateway. Fixing those two functions fixes more surfaces than
+every other item in this sprint combined.
+
+### 2. Which dashboard components still call Yahoo / direct REST?
+
+Backend callers of `fetch_real_stock_quote` / `fetch_all_universe_quotes` /
+`fetch_yahoo_quote` outside `providers/yahoo.py` (which is the legitimate one):
+
+* **In D5.16 scope (equity price for a rendered surface):**
+  * `server.py:310, 325` — `real_quote` / `real_quotes_map`.
+  * `real_market.py:955 fetch_real_top_picks` — Top AI Picks (Phase 7).
+  * `heartbeat_engine.py:598 task_watchlist_stream` — Phase 2 + Phase 5.
+  * `portfolio_stream.py:111 quotes_map` — the mark used for live portfolio P&L
+    when a broker tick has not arrived for a holding. It has a `user_id` at every
+    caller, so it can be resolved per user and is not resolved per user today.
+* **Explicitly out of D5.16 scope (documented, not fixed):**
+  * `stock_details.py` (×6) — OHLC/history/beta/correlation. `Capability.OHLC`
+    territory, not equity *price*; routing it is a separate sprint.
+  * `heartbeat_engine.py:86/143/215/250/286/492` — the scan/analytics tasks
+    (breakouts, volume, momentum, US markets, top-pick generation input). These
+    compute signals, not rendered prices.
+  * `paper_trade.py` (×3), `scheduler.py` (×2) — simulation and alerting marks.
+  * `observability/instruments.py:392` — a deliberate synthetic Yahoo probe; the
+    whole point is that it measures Yahoo.
+
+### 3. Which components consume `realtimeStore.priceTicks`?
+
+* `Dashboard.jsx:756` — indices only (NIFTY/BANKNIFTY/SENSEX).
+* `Dashboard.jsx:831` — the watchlist widget rows.
+* `Markets.jsx:234` — the market table.
+* `Watchlist.jsx:116` — per-row via `selectTickForSymbol`.
+* **Nothing else.** In particular `TopPicksCard` (`Dashboard.jsx:317`, fed by
+  `picks` from `GET /analysis/top-picks` at `Dashboard.jsx:911`) and
+  `CommoditiesStrip` (`Dashboard.jsx:123`, fed once at `Dashboard.jsx:948`) never
+  read `priceTicks` at all. `StockPicks.jsx:382` likewise fetches once.
+
+### 4. Where is `market.tick` received?
+
+`realtimeStore.js:380` (`applyEvent`, the `market` channel branch) and
+`realtimeStore.js:194` (`priceMapFromMessage`, the batched-ingest path). Both
+funnel into `tickBatchToPriceMap` → `_mergePrices`. This is D5.15's fix and it
+works; the gap is not reception, it is that only four call sites read the result.
+
+### 5. Where is `source_tier` lost, transformed, or ignored?
+
+Not lost — **deliberately not per-symbol**. `_stamp_tier` (gateway.py:962-970)
+puts `source_tier` on each normalized quote, so P1 and P4 carry it per symbol into
+`priceTicks`. The `market.tick` batch carries **one** `source_tier` for the batch
+(`gateway.py:399`) and `tickBatchToPriceMap` deliberately does not fold it into
+per-symbol entries — the D5.14 feed-state indicator is the tier surface, not the
+price row. **No fix required.** Confirmed by
+`test_dashboard_price_path.py:323 test_a_resolved_price_carries_a_tier_and_no_provider_identity`.
+
+### 6. How does watchlist data get scoped to a user?
+
+* REST: correctly — `db.watchlist.find({"user_id": user["_id"]})` (server.py:4959),
+  with a unique `{user_id, symbol}` index (server.py:6744).
+* Add/remove events: correctly — `_publish_watchlist_updated` (server.py:5016)
+  puts `user_id` in the payload, and `event_bridge._deliver` (event_bridge.py:88-94)
+  routes any payload carrying `user_id` through `send_to_user`.
+* **Realtime quotes: NOT scoped.** See §17.
+
+### 7. Where does Top AI Picks obtain its symbols and prices?
+
+`real_market.py:955 fetch_real_top_picks`. Symbols: `market_data.STOCK_UNIVERSE`
+(the whole list). Prices **and** technicals: `fetch_real_stock_quote(symbol)` per
+symbol — Yahoo direct, no gateway, no user, no tier. Consumed by
+`server.py:1930 GET /analysis/top-picks` (which caches picks into
+`db.market_analysis` for the day), `server.py:1993 /analysis/morning-report`,
+`morning_report.py:388`, `heartbeat_engine.py:467`.
+
+### 8. How does portfolio pricing work?
+
+Two marks, and they disagree about routing:
+* Live: `BrokerEngine._on_stream_tick` → `portfolio_stream.apply_broker_ticks`
+  (broker_engine.py) — canonical, per user, correct.
+* Fallback / non-broker: `portfolio_stream.quotes_map` (portfolio_stream.py:103)
+  → `fetch_yahoo_quote` direct. Not per user, not through the gateway, so a user
+  whose broker feed covers a holding can still be marked from Yahoo on a
+  recompute that was not tick-driven.
+
+### 9. How does the dashboard determine which symbols should be subscribed to?
+
+`feed_universe.build_feed_universe` (D5.15) — portfolio → watchlist → dashboard,
+de-duplicated first-occurrence, capped at `MAX_FEED_UNIVERSE = 500`. Called from
+`BrokerEngine._resolve_feed_catalogue` (broker_engine.py:903). The dashboard half
+is `market_data.STOCK_UNIVERSE`. This part is already correct and D5.16 does not
+redesign it.
+
+### 10-11. Broker instrument identity, and who has a catalogue today
+
+| Broker | Feed subscribes by | `instrument_token` shape | `INSTRUMENT_CATALOGUE` |
+|---|---|---|---|
+| Zerodha | numeric Kite token | `int` (`738561`) | **No** |
+| Upstox | instrument key | `"NSE_EQ\|INE002A01018"` | **Yes** (`upstox.py:857`) |
+| Angel One | `(exchangeType, token)` | `"1\|2885"` (`angelone.py:250`) | **No** |
+| Fyers | HSM topic | `"sf\|nse_cm\|14428"` (`fyers.py:345`) | **No** |
+| Dhan | `(segment, securityId)` | `"NSE_EQ\|1333"` (`dhan.py:336`) | **No** |
+
+Exactly one of five, which is **LIM-D5.15-2**. The registration log confirms it:
+only `upstox` lists `instrument_catalogue` among its capabilities.
+
+**Upstox's catalogue is not exchange-aware.** `INSTRUMENT_MASTER_URL`
+(upstox.py:129) is the NSE-only master and `INSTRUMENT_EQUITY_SEGMENT = "NSE_EQ"`
+(upstox.py:141) filters to NSE cash. `resolve_instruments(symbols: Sequence[str])`
+takes bare symbols, so a caller asking for `RELIANCE` on **BSE** silently receives
+the **NSE** key. Today nothing asks for BSE, so it is latent rather than live —
+but it is precisely the "first catalogue match" behaviour Phase 3 forbids, and the
+signature has no place to say which exchange was meant. **The contract itself has
+to change**, not just gain four implementations.
+
+### 12-13. Zero holdings / zero positions / an unheld watchlist symbol
+
+Since D5.15 this works — *for Upstox only*. `_resolve_feed_catalogue`
+(broker_engine.py:903) builds the universe from watchlist + dashboard even with
+empty holdings, resolves it through the adapter, and `InstrumentMap.from_portfolio`
+takes the `catalogue` argument so an arriving tick for an unheld symbol can still
+be *named* (instruments.py:118-160). For the other four brokers the gateway's
+capability gate returns `{}` (gateway.py:388) and the account falls back to the
+pre-D5.15 portfolio-only universe: **a user with zero holdings on Zerodha, Angel
+One, Fyers or Dhan subscribes to nothing and can never receive a tick.** That is
+the single biggest functional gap in D5.16's scope.
+
+### 14-15. Unresolvable symbols, and whether fallback is per-symbol
+
+* A symbol the adapter cannot name is **omitted** from the returned map
+  (`upstox.py:872`), so it never enters the subscribe frame.
+* It is therefore absent from `InstrumentMap`, so the feed's `covered_symbols`
+  excludes it, so `StreamingTickProvider.is_eligible_for` (streaming.py:1335)
+  refuses that symbol, so `_quote` falls through to Yahoo **for that symbol
+  alone**. Fallback is already **per instrument**, by construction, and
+  `test_dashboard_price_path.py:149` pins it. Phase 10 needs no new mechanism.
+
+### 16. Can a zero-subscription feed claim TICKS?
+
+No. `attach_market_feed` (market_feed.py:100) subscribes the provider to the
+account's universe, and `StreamingTickProvider` cannot leave `SUBSCRIBED` for
+`READY` without one (streaming.py:1329, 1615). Pinned by
+`test_feed_instrument_universe.py:287/298/314/324`. **The D5.15 invariant holds;
+Phase 9 is a re-proof, not a fix.**
+
+### 17. Does any realtime path broadcast watchlist data without owner scope? — **YES. P0.**
+
+`heartbeat_engine.task_watchlist_stream` (heartbeat_engine.py:589-627):
+
+```
+symbols = await _db.watchlist.distinct("symbol")          # line 601 — NO FILTER
+...
+await _publish("watchlist.quotes", {"quotes": quotes, ...})  # line 621 — NO user_id
+```
+
+`_publish` → `event_bus` → `event_bridge._deliver`; the payload carries no
+`user_id`, so line 94 takes the `broadcast_to_channel("watchlist", …)` branch.
+Every socket subscribed to the `watchlist` channel receives **every user's**
+watchlisted symbols and their prices. It is not merely displayed — 
+`realtimeStore.priceMapFromMessage` (realtimeStore.js:193) folds
+`watchlist.quotes` straight into `priceTicks`, so another user's symbols enter the
+victim's live price store and render on `Watchlist.jsx` / the Dashboard widget.
+
+The defect is **already named in the tree and was left unfixed**: D5.15's own
+docstring at heartbeat_engine.py:734 calls out `db.watchlist.distinct("symbol")`
+"with **no filter**" as the thing `_user_price_symbols` exists to avoid — D5.15
+fixed the `prices` loop and never touched the `watchlist.quotes` loop 130 lines
+above it. `test_dashboard_price_path.py:279` pins the fixed path only.
+
+Impact: symbol-level watchlist disclosure (what another user is tracking) across
+every connected session. No credential or PII disclosure. Fix is Phase 2.
+
+### 18. Is the `Login.jsx` `startGoogleLogin` build failure still present? — **YES.**
+
+`frontend/src/pages/Login.jsx:164` calls `startGoogleLogin()`. Its imports
+(lines 1-6) do **not** include it. `Register.jsx:6` imports it correctly from
+`../services/googleAuth` (which exports it at googleAuth.js:10). It is a
+one-line missing import, genuinely pre-existing, and it fails the CRA production
+build (`no-undef` under `craco build`) — so it blocks the D5.16 acceptance test,
+which requires a built frontend. **Trivial and in scope: fix it.**
+
+### 19. Which existing tests already cover these paths?
+
+* `test_dashboard_price_path.py` (15) — D5.15's per-user price path, per-symbol
+  fallback, staleness, tier stamping, cross-user price isolation on the `prices`
+  message. **Does not cover `watchlist.quotes`.**
+* `test_feed_instrument_universe.py` (24) — universe construction, the catalogue
+  seam, zero-subscription readiness.
+* `test_broker_streaming.py`, `test_broker_framework.py`, `test_chaos_resilience.py`
+  (200), `test_market_gateway.py`, `test_consumer_feed_contract.py`,
+  `test_stale_feed_demotion.py`.
+* Frontend: `store/__tests__/marketTick.store.test.js`, `feedState.store.test.js`,
+  `context/__tests__/RealtimeProvider.feed.test.jsx`,
+  `__tests__/feedStateSecurity.test.jsx`, `components/__tests__/MarketFeedStatus.test.jsx`.
+
+### Audit conclusion — what D5.16 actually has to build
+
+1. **P0 security**: scope `task_watchlist_stream` per user (Phase 2).
+2. **An exchange-aware catalogue contract** — the current
+   `resolve_instruments(Sequence[str])` cannot express `(symbol, exchange, segment)`
+   and would resolve BSE to NSE (Phase 3).
+3. **Four adapter catalogues**: Zerodha, Angel One, Fyers, Dhan (Phase 3).
+4. **Route the four remaining equity-price bypasses** through the gateway:
+   `real_quote`/`real_quotes_map`, `fetch_real_top_picks`, `task_watchlist_stream`,
+   `portfolio_stream.quotes_map` (Phases 5 & 7).
+5. **Make Top AI Picks realtime on the client** (Phase 6).
+6. **One-line `Login.jsx` import** (Phase 11).
+
+Phases 4, 9 and 10 are already satisfied by D5.15 and need re-proof, not rework.
+Phase 8 (indices/commodities) stays deferred and gets an honesty guard so those
+surfaces are never labelled broker-live.
+
+
+---
+
+## D5.16 — Implementation record
+
+### Phase 2 — Security P0 (closed)
+
+`heartbeat_engine.task_watchlist_stream` is per-account: `_watchlist_symbols(user_id)` reads with an owner filter, `_watchlist_quotes(user_id, …)` resolves through the gateway, and the publish carries `user_id` so `event_bridge._deliver` takes its `send_to_user` branch instead of `broadcast_to_channel`. The recipient set is the *connected* accounts, matching `_publish_prices`.
+
+Scoped at **selection**, not at delivery — per-user delivery over a global read preserves the identical disclosure and only hides it. `WATCHLIST_STREAM_CAP` is now per account, so one user's 400-symbol watchlist cannot consume the whole cycle.
+
+**Test.** `test_watchlist_stream_isolation.py` (10). The isolation assertions run through the real `event_bridge._deliver`, not against the bus event: a payload the bridge then broadcasts would pass a bus-level test. One test asserts the **query**, via a spy — with one user in the database a results-only assertion cannot falsify the global read.
+
+### Phase 3 — Exchange-aware catalogue, five adapters (closed)
+
+New `services/brokers/catalogue.py`: `FeedInstrument` policy constants, `series_rank`, `CashEquityCatalogue` (offer → build), `CatalogueCache`, `resolve_from_index`. `FeedInstrument(symbol, exchange, segment)` in `feed_universe.py`. Contract widened from `Sequence[str]` to `Sequence[FeedInstrument]` in `base.py` and `gateway.py`.
+
+Per adapter: a pure `build_catalogue_index` plus a `_download_catalogue`. Formats and discriminators verified against the live published masters — see BROKER_INTEGRATION.md for the table.
+
+**A latent D5.15 bug found here.** Every download path read `code=BrokerErrorCode.UPSTREAM` — an enum member that has never existed — so the `except` block raised `AttributeError: UPSTREAM` *while constructing the error it appears to construct*, and the `BrokerError` the gateway is written to catch was never raised. Behaviour still degraded correctly, one layer out and for the wrong reason, which is why it survived D5.15 and why every catalogue test missed it: they all stub `_instrument_catalogue`, so none ever ran the download's failure path. Fixed to `BrokerErrorCode.NETWORK` in all five, with a regression test that exercises the real path.
+
+### Phases 4 & 9 — Subscription universe (verified, extended)
+
+`build_feed_universe` returns `FeedInstrument`s. Holdings/positions carry their own exchange; watchlist and dashboard entries take the stated default. An **unqualified** symbol does not add a second listing for an instrument already covered — otherwise a user holding `RELIANCE` on BSE and watching `RELIANCE` would subscribe to the NSE listing and name its ticks with the BSE holding's identity. Two explicitly qualified rows are both kept.
+
+D5.15's zero-subscription invariant re-proved rather than assumed, because D5.16 changed what feeds a subscription. `test_empty_portfolio_feed.py` (31) runs the zero-holdings case once per broker, including that an arriving tick for an unheld watchlist instrument can be *named* — a subscription the map cannot read back is the same defect as no subscription, reached one step later.
+
+### Phases 5 & 7 — Canonical routing (closed)
+
+Four bypasses closed: `server.real_quote`/`real_quotes_map` (nine surfaces), `fetch_real_top_picks`, `task_watchlist_stream`, `portfolio_stream.quotes_map`. `user_id` threaded to every call site that has one, including the socket's `subscribe_prices` handler. `task_monitor_portfolio` now shares one resolution only among users `baseline_prices_are_shared` says it is safe for.
+
+The AI ranking is untouched — only price acquisition moved, exactly as the brief required.
+
+`get_prices` gained bounded concurrency (8). `macd_signal` joined the canonical quote on every tier.
+
+`services/portfolio_stream.py` removed from `KNOWN_GATEWAY_BYPASSES`.
+
+### Phase 6 — Frontend realtime (closed)
+
+`src/lib/livePrices.js` — `applyLivePrices(rows, ticks)`, wired into `Dashboard.TopPicksCard` and `StockPicks`. Preserves array and row identity when nothing moved (Sprint R9), never writes a field the tick did not carry, and copies only `price`/`change_pct`.
+
+### Phase 8 — Indices/commodities (deferred, guarded)
+
+Not implemented, as instructed. The commodities strip now carries an explicit `Delayed` badge naming no provider, so a `Live` feed indicator elsewhere on the page cannot be read as covering it.
+
+### Phase 11 — Login build blocker (closed)
+
+`Login.jsx:164` called `startGoogleLogin` with no import. `no-undef` is an **error**, not a warning, so it failed `craco build` outright — verified by reverting the one-line fix and watching the build fail again. The production build now succeeds.
+
+### Phases 10, 12, 13
+
+Fallback: verified per instrument, no new mechanism. Mutations: 34/34 RED. Live validation: **market data NOT PERFORMED** (no broker session in the environment; 21:38 IST, six hours after close). All five catalogues **were** validated against their live published masters. See the completion report.
+
+---
+
+# D5.17 — INDICES ON THE CANONICAL PATH (2026-08-31) — COMPLETE, uncommitted
+
+Decision record: **ADR-056**. HEAD remains `f1cd6f4`; nothing committed or pushed.
+
+## Phase 1 — Architecture audit (read-only)
+
+Every visible price traced frontend → store → transport → route → Market Gateway
+→ provider → source. The full table is in MARKET_DATA_ARCHITECTURE.md. What the
+audit changed about the sprint's plan:
+
+* **The frontend was already ready for live indices.** `market.tick` →
+  `tickBatchToPriceMap` → `priceTicks.NIFTY` → the index strip existed since
+  D5.15/D5.16. Nothing had ever put an index in `priceTicks`.
+* **The blockers were all on this side of the line** — the catalogue key, the
+  feed universe, and the fact that every master spells the indices differently.
+  No broker capability was missing.
+* **Commodities are not a deferral.** No Indian broker publishes a spot
+  instrument for gold, silver, crude or USD-INR; only dated MCX/CDS futures.
+* Four defects were found that the brief did not name: the D5.16 watchlist
+  `user_id` carry-over, the commodity unit mislabelling, the `^NSEI` Yahoo
+  ticker in frontend code, and the `SECTORS` inconsistency.
+
+## Phase 2 — Index/commodity support matrix
+
+| Instrument | Brokers carrying it | Identifier | Adapter ready | Catalogue ready (pre-D5.17) | MarketTick sufficient | Outcome |
+|---|---|---|---|---|---|---|
+| NIFTY | all 5 | per broker, from the master | yes | **no** | yes | **B — implemented** |
+| BANKNIFTY | all 5 | per broker | yes | **no** | yes | **B — implemented** |
+| SENSEX | all 5 (BSE) | per broker | yes | **no** | yes | **B — implemented** |
+| INDIAVIX | all 5 | per broker | yes | **no** | yes | **B — implemented** |
+| Gold | **none (spot)** | MCX dated future only | n/a | n/a | n/a | **C — Yahoo remains** |
+| Silver | **none (spot)** | MCX dated future only | n/a | n/a | n/a | **C — Yahoo remains** |
+| Crude | **none (spot)** | MCX dated future only | n/a | n/a | n/a | **C — Yahoo remains** |
+| USD-INR | **none (spot)** | NSE CDS dated future only | n/a | n/a | n/a | **C — Yahoo remains** |
+
+Outcome **D** (widen `MarketTick`) was considered and **rejected**: an index level
+is a price, `exchange` already names NSE/BSE, `volume` is already optional.
+
+## Phase 3 — What shipped
+
+**Backend.** `catalogue.py`: `INDEX_SEGMENT`, `SUPPORTED_SEGMENTS`,
+`INDEX_EXCHANGES`, `INDEX_ALIASES`, `canonical_index()`; `CashEquityCatalogue` →
+`InstrumentCatalogue` with a `(segment, exchange, symbol)` key;
+`resolve_from_index` reads the segment off the instrument and refuses one that
+names none. `feed_universe.py`: segment validation in `FeedInstrument.of`,
+`index_instruments()`, an `indices=` argument ordered between watchlist and
+dashboard. Five adapters gained an index branch in `build_catalogue_index` (no
+new downloads). `fyers.instrument_id` gained a topic-kind argument.
+`broker_engine` passes the indices. `heartbeat_engine._index_prices` resolves
+index prices through `get_prices(..., user_id=...)` and publishes `INDIAVIX`.
+`market_data.py`: `TATAMOTORS` → `TMPV` + `TMCV`; `SECTORS` completed.
+`real_market.py`: the delisted Yahoo mapping removed; commodity names and units
+corrected.
+
+**Frontend.** `livePrices.js`: `applyLiveIndexPrices`, which never writes a field
+the tick did not carry. `Dashboard.jsx`: the index-strip effect uses it, the VIX
+card is tick-driven, the commodities strip renders its unit, and the Nifty
+sparkline asks for `NIFTY` instead of Yahoo's `%5ENSEI`.
+
+**Carry-over fix.** `heartbeat_engine._watchlist_quotes` never passed `user_id`
+to `get_prices`. D5.16 reported that bypass closed and had closed it halfway; its
+own three isolation tests were red in the working tree. One line.
+
+## Regression
+
+Recorded **before** any edit, and again after.
+
+| | Baseline | After |
+|---|---|---|
+| Backend | 4268 passed, 18 failed, 49 skipped, 4 xfailed | 4366 passed, **15 failed**, 50 skipped, 4 xfailed |
+| Frontend | 518 passed, 4 failed | 536 passed, 4 failed |
+| Build (`craco build`) | success | success |
+| flake8 blocking | 0 | 0 |
+| flake8 advisory | 477 | 476 |
+| isort | 4+ pre-existing failures | no new file fails |
+| black | 225 would reformat / 12 clean | 229 / 12 — delta is exactly the 4 new test files |
+
+The 15 remaining backend failures are the pre-existing Docker-dependent
+`test_entrypoint_log_level.py` set. The 3 that were also failing at baseline
+(`test_watchlist_stream_isolation.py`) are the D5.16 carry-over above and are now
+green. The 4 frontend failures are pre-existing dead-link assertions in
+`Landing.test.jsx`, untouched by this sprint. Test order was randomized on the
+final run (`pytest` default) as well as fixed (`-p no:randomly`); same result.
+
+## Falsification
+
+**36 mutations, 36 red** — 24 backend, 7 frontend, 5 boundary-sweep.
+
+**M22 was green on the first pass and is the finding of the sprint.** Deleting
+`indices=index_instruments()` from the engine's one call to `build_feed_universe`
+left every test green: every layer of the boundary was proved and none of it
+would have reached a broker socket. Closed by a per-broker test that drives
+`_plan_tick_subscription` and asserts both halves — on the wire, and nameable
+when it comes back. Re-run: red.
+
+No mutation was counted without confirming the mutated behaviour was exercised
+and the targeted assertion failed; the harness reports an unmatched anchor as
+INERT rather than as a result.
+
+## Live validation
+
+**LIVE MARKET VALIDATION OF A BROKER TICK: NOT PERFORMED.** A valid Upstox
+session exists in the database (connected 2026-08-31, token valid until 22:00
+UTC) and the backend and MongoDB were both reachable — but the run happened at
+**23:12 IST, nearly eight hours after the 15:30 close**, so no market event
+existed to observe. A socket opened then would have delivered silence, which is
+indistinguishable from a broken feed.
+
+**What WAS verified live, through production code paths:**
+`resolve_instruments(index_instruments())` against all five brokers' real
+published masters — **20/20 index resolutions**, correct exchange, correct
+identifier format — and **35/35** on a full universe (30 dashboard equities + 4
+indices + a watchlist symbol + a BSE-held RELIANCE). Identifiers are tabulated in
+BROKER_INTEGRATION.md. The `TATAMOTORS` finding was verified against all five
+masters and against Yahoo.
+
+### The smoke test still owed
+
+1. Connect a real broker during NSE hours (09:15–15:30 IST).
+2. Confirm the subscribe frame carries the four index identifiers for that broker
+   (BROKER_INTEGRATION.md tabulates them).
+3. Observe a raw index packet arrive on the socket.
+4. Confirm a `MarketTick` with `symbol` in `{NIFTY, BANKNIFTY, SENSEX, INDIAVIX}`.
+5. Confirm a `market.tick` bus event carrying it, `source_tier: streaming`, with
+   the owner's `user_id`.
+6. Confirm `realtimeStore.priceTicks.NIFTY` in the browser.
+7. Confirm the Nifty card's number changes **and its day-change does not vanish**.
+8. Restart the backend; confirm the feed reconnects, re-earns readiness, and the
+   index resumes.
+9. **Do this on Fyers specifically** — LIM-D5.17-3 is the one identifier no
+   offline evidence can settle.
+10. Record timestamps and observed values.
+
+## Limitations
+
+**Closed:** LIM-D5.16-2 (with evidence; the class reopens as LIM-D5.17-1).
+
+**Carried:** LIM-D5.16-1, LIM-D5.16-3, LIM-D5.16-4, LIM-D5.15-1.
+
+**New:** LIM-D5.17-1 (no reference-data refresh mechanism), LIM-D5.17-2 (no
+broker index tick observed), LIM-D5.17-3 (Fyers index topic prefix unverified),
+LIM-D5.17-4 (a live index level beside a baseline day-change).
+
+**Observation, not changed:** `services/market_engine/gift_nifty.py` names
+Zerodha in a docstring. The repository's established sweep permits prose and bans
+actionable literals, so this is legal — noted because a stricter reading would
+flag it, and the module is otherwise untouched by this sprint.
+
+## Next sprint — D5.18
+
+The objective has not moved: **connect a real broker account, receive actual
+market ticks, and see the dashboard price change from those ticks.** Every layer
+is now built and test-verified, and the last hop has never been observed.
+
+D5.18 should be a **market-hours live run and nothing else** — the smoke test
+above, on at least two brokers including Fyers, with an authenticated browser
+session so the DOM assertion in LIM-D5.15-1 can finally be made. If it finds
+defects, they are D5.18's scope; if it does not, D5.15-1, D5.17-2 and D5.17-3
+close together and the product objective is met.
+
+The reference-data refresh mechanism (LIM-D5.17-1) is the natural D5.19: it is
+scoped, it has an opt-in check to grow from, and it is the difference between
+one corrected symbol and a universe that stays correct.

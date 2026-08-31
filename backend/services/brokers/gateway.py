@@ -44,7 +44,7 @@ module.
 from __future__ import annotations
 
 import logging
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from services.brokers.base import BrokerAdapter
 from services.brokers.capabilities import BrokerCapability
@@ -360,6 +360,48 @@ class BrokerGateway:
         if required is None:
             return True
         return self.resolve(broker).supports(BrokerCapability(required))
+
+    async def resolve_instruments(
+        self,
+        broker: str,
+        instruments: "Sequence[Any]",
+        session: dict = None,
+    ) -> Dict[str, Any]:
+        """Canonical instruments -> this broker's instrument identifiers.
+
+        `instruments` are `FeedInstrument` values — symbol, exchange, segment —
+        since D5.16; the result stays keyed by canonical symbol, because that is
+        what `InstrumentMap` matches an arriving tick against.
+
+        Returns `{}` — not an error — for a broker that publishes no instrument
+        catalogue, so a caller can always ask and never has to know which
+        brokers can answer. That is the same shape `stream_instruments` uses for
+        a broker with no tick feed, and for the same reason: the alternative is
+        every call site asking two questions to get one answer, and the second
+        question being the one a new broker makes someone forget.
+
+        Best-effort by contract. A catalogue is an optimisation of *coverage* —
+        it widens what a feed can be aimed at — and a broker whose master file
+        is unreachable must degrade to the portfolio-derived subscription it
+        had before D5.15, not fail the user's stream. The error is logged with
+        the broker's name and nothing else; a catalogue lookup carries no
+        credential and its failure is not a per-user auth event.
+        """
+        if not instruments:
+            return {}
+        if not self.supports(broker, BrokerCapability.INSTRUMENT_CATALOGUE):
+            return {}
+        try:
+            resolved = await self.call(
+                broker,
+                BrokerCapability.INSTRUMENT_CATALOGUE,
+                lambda a: a.resolve_instruments(instruments, session),
+                operation="resolve_instruments",
+            )
+        except BrokerError as exc:
+            logger.warning("%s instrument catalogue unavailable: %s", broker, exc)
+            return {}
+        return {str(k): v for k, v in (resolved or {}).items() if v is not None}
 
     def stream_instruments(self, broker: str, holdings: list = None, positions: list = None) -> List[Any]:
         """Instrument identifiers to subscribe on this broker's tick feed.

@@ -50,12 +50,24 @@ import logging
 import struct
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import urlencode
 
-from services.brokers.base import IST, BrokerAdapter, BrokerAuthError, BrokerError
+from services.brokers.base import (
+    IST, BrokerAdapter, BrokerAuthError, BrokerError, _broker_http_client,
+)
 from services.brokers.capabilities import BrokerCapability
+from services.brokers.catalogue import (
+    INDEX_SEGMENT,
+    CatalogueCache,
+    InstrumentCatalogue,
+    canonical_index,
+    normalize_exchange,
+    resolve_from_index,
+    series_rank,
+)
 from services.brokers.credentials import BrokerCredentialSpec
+from services.brokers.errors import BrokerErrorCode
 from services.brokers.streaming import BrokerStreamEndpoint, BrokerStreamEvent
 
 logger = logging.getLogger(__name__)
@@ -125,6 +137,38 @@ EXCHANGE_TYPES: Dict[str, int] = {
     "CDS": 13,
 }
 EXCHANGE_NAMES: Dict[int, str] = {1: "NSE", 2: "NFO", 3: "BSE", 4: "BFO", 5: "MCX", 7: "NCDEX", 13: "CDS"}
+
+#: SmartAPI's public scrip master — every instrument on every exchange, served
+#: unauthenticated. The same file Angel One's own SDK downloads.
+INSTRUMENT_MASTER_URL = (
+    "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
+)
+
+#: How long a fetched master stays authoritative — one trading day's worth.
+INSTRUMENT_MASTER_TTL_SECONDS = 6 * 60 * 60
+
+#: The `instrumenttype` a SmartAPI cash-market row carries: the empty string.
+#:
+#: Derivatives carry `OPTSTK`/`FUTSTK`/`OPTIDX`…, indices carry `AMXIDX`, and
+#: cash rows carry nothing at all. That is the master's own discriminator and it
+#: is what keeps an index out of an equity catalogue — verified against the live
+#: file on 2026-08-31, where `Nifty 50` is `AMXIDX` and `RELIANCE-EQ` is `""`.
+INSTRUMENT_CASH_TYPE = ""
+
+#: The `instrumenttype` SmartAPI gives an index row (D5.17).
+#:
+#: Its own discriminator, and a positive one rather than the absence the cash
+#: rows are identified by — which is what lets the index branch be additive
+#: without touching the equity filter. Verified against the live master on
+#: 2026-08-31: `NIFTY` (99926000, NSE), `BANKNIFTY` (99926009, NSE),
+#: `INDIA VIX` (99926017, NSE), `SENSEX` (99919000, BSE).
+#:
+#: The `name` column is read, not `symbol`: SmartAPI's `symbol` for the Nifty is
+#: `"Nifty 50"` while its `name` is `"NIFTY"`, and the same row pair holds for
+#: Bank Nifty. Both spellings are in `catalogue.INDEX_ALIASES` anyway — the
+#: column choice is about reading the field the master means as the identity,
+#: exactly as the equity branch reads `symbol` for its series suffix.
+INSTRUMENT_INDEX_TYPE = "AMXIDX"
 
 #: Token subscriptions one SmartAPI socket may hold.
 #:
@@ -426,6 +470,7 @@ class AngelOneAdapter(BrokerAdapter):
         BrokerCapability.MARGINS,
         BrokerCapability.SESSION_INVALIDATE,
         BrokerCapability.TICK_STREAM,
+        BrokerCapability.INSTRUMENT_CATALOGUE,
     })
 
     credential_spec = BrokerCredentialSpec(
@@ -710,6 +755,101 @@ class AngelOneAdapter(BrokerAdapter):
         # Sorted on the parsed pair rather than the string, so 1|10 does not
         # precede 1|9 and two runs cannot produce different-looking lists.
         return sorted(ids, key=lambda value: parse_instrument_id(value))
+
+    # -- instrument catalogue (D5.16) ------------------------------------------
+    _catalogue_cache = CatalogueCache(INSTRUMENT_MASTER_TTL_SECONDS)
+
+    @staticmethod
+    def build_catalogue_index(*row_groups) -> Dict[Tuple[str, str], Any]:
+        """`{(EXCHANGE, SYMBOL): "<segment>|<token>"}` from scrip-master rows.
+
+        TWO EXCHANGES THAT SPELL A SERIES DIFFERENTLY
+        ----------------------------------------------
+        SmartAPI names an NSE equity `RELIANCE-EQ` and the *same company's* BSE
+        listing plainly `RELIANCE` — verified in the live master, where they are
+        tokens 2885 and 500325. So the series is recoverable from the symbol on
+        NSE and simply absent on BSE, and the two halves are ranked differently
+        for a reason that is the exchange's, not this adapter's:
+
+        * **NSE** — the suffix is the series and is ranked by the shared policy.
+          That is what keeps sovereign gold bonds (`-SG`), treasury bills
+          (`-TB`), NCDs (`-N0`) and mutual-fund units (`-MF`) out of an equity
+          catalogue: they are cash-market rows with `instrumenttype: ""` and
+          would otherwise all be admitted.
+        * **BSE** — there is no series to read, so every accepted row ranks
+          equally and a symbol claimed twice is dropped rather than guessed.
+          Verified: 12,897 BSE cash rows, 0 such collisions.
+
+        The identifier is built by `instrument_id`, the same function that
+        stamps a synced holding row and decodes a tick, so the catalogue's
+        value and the wire's value are one expression and cannot drift.
+        """
+        catalogue = InstrumentCatalogue()
+        for rows in row_groups:
+            for row in rows or ():
+                if not isinstance(row, dict):
+                    continue
+                instrument_type = row.get("instrumenttype") or ""
+                if instrument_type == INSTRUMENT_INDEX_TYPE:
+                    exchange = normalize_exchange(row.get("exch_seg"))
+                    canonical = canonical_index(row.get("name"))
+                    if exchange is None or canonical is None:
+                        continue
+                    catalogue.offer(
+                        exchange, canonical,
+                        instrument_id(exchange, row.get("token")),
+                        rank=0, segment=INDEX_SEGMENT,
+                    )
+                    continue
+                if instrument_type != INSTRUMENT_CASH_TYPE:
+                    continue
+                exchange = normalize_exchange(row.get("exch_seg"))
+                if exchange is None:
+                    continue
+                raw = str(row.get("symbol") or "").strip().upper()
+                symbol = trading_symbol(raw)
+                if exchange == "NSE":
+                    rank = series_rank(exchange, raw.rpartition("-")[2])
+                    if rank is None:
+                        continue
+                else:
+                    rank = 0
+                catalogue.offer(
+                    exchange, symbol,
+                    instrument_id(exchange, row.get("token")),
+                    rank=rank,
+                )
+        return catalogue.build()
+
+    async def _download_catalogue(self) -> Dict[Tuple[str, str], Any]:
+        """Fetch and index SmartAPI's scrip master."""
+        try:
+            async with _broker_http_client(60.0) as client:
+                response = await client.get(INSTRUMENT_MASTER_URL)
+                response.raise_for_status()
+                rows = response.json()
+        except Exception as exc:
+            raise BrokerError(
+                f"SmartAPI scrip master unavailable: {type(exc).__name__}",
+                code=BrokerErrorCode.NETWORK,
+                user_message="Live instrument data is temporarily unavailable.",
+            ) from exc
+        index = self.build_catalogue_index(rows if isinstance(rows, list) else [])
+        logger.info("SmartAPI instrument catalogue loaded: %d cash equities", len(index))
+        return index
+
+    async def _instrument_catalogue(self) -> Dict[Tuple[str, str], Any]:
+        return await type(self)._catalogue_cache.get(self._download_catalogue)
+
+    async def resolve_instruments(self, instruments: Sequence[Any],
+                                  session: dict = None) -> Dict[str, Any]:
+        """Canonical instruments -> SmartAPI `"<segment>|<token>"` identifiers.
+
+        `session` is accepted and unused: the master is public.
+        """
+        if not instruments:
+            return {}
+        return resolve_from_index(instruments, await self._instrument_catalogue())
 
     # -- realtime: the SmartAPI codec ------------------------------------------
     def stream_endpoint(self, session: dict, credentials: dict = None) -> BrokerStreamEndpoint:

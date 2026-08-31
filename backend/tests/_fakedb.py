@@ -282,6 +282,31 @@ class FakeCollection:
         n = before - len(self.docs)
         return _Result(modified=n, matched=n, deleted=n)
 
+    async def distinct(self, key, flt=None):
+        """Motor's `distinct`, including its filter argument (D5.15).
+
+        Added because the double did not have it at all, which made every code
+        path that calls it fall into its caller's `except` branch and return a
+        degraded-but-plausible answer. That is the worst shape a test double can
+        take: `heartbeat_engine._user_price_symbols` would have "passed" a
+        scoping test by raising, and the assertion that one account's watchlist
+        stays out of another's price payload could not have failed.
+
+        Order follows first appearance so a caller that renders the result is
+        deterministic under test; Mongo makes no ordering promise, and no caller
+        may rely on one.
+        """
+        seen = []
+        for doc in self.docs:
+            if not _match(doc, flt or {}):
+                continue
+            value = doc.get(key)
+            values = value if isinstance(value, list) else [value]
+            for item in values:
+                if item is not None and item not in seen:
+                    seen.append(item)
+        return seen
+
     async def count_documents(self, flt=None):
         return len([d for d in self.docs if _match(d, flt or {})])
 

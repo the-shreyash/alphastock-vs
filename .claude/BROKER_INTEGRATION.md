@@ -526,6 +526,8 @@ The protocol was read from **two independent sources set against each other**: D
 
 • **What the user is told, and in whose words (D5.13, ADR-053).** The unregistration publishes a user-scoped `provider.status` carrying `change_reason: "entitlement_refused"` — the Market Engine's `FeedChangeReason` vocabulary, which describes the *feed* and is closed against anything else. Until D5.13 the user saw their tier drop from `streaming` to `delayed` with no explanation at all (LIM-D5.5-2); they now see why.
 
+  **And since D5.14 (ADR-054) they actually see it.** `MarketFeedStatus` renders the explanation from that event: *"Your market-data connection needs attention — your account is not cleared for this data."* The frontend maps the three `FeedChangeReason` values through an allow-list in `src/lib/feedState.js`; a value outside the three renders **nothing at all** rather than raw text, so an adapter that ever leaked a wire code into this field would produce silence on the user's screen, not a broker error string. The three sentences name no broker.
+
   **An adapter contributes nothing to this and must not try.** The `reason` string an adapter passes to `BrokerStreamEvent.not_entitled(...)` is the broker's own words and goes to the audit row and the admin diagnostics — never to the consumer payload. A wire code, an error string or the broker's name on that surface is a Developer Rule 4 breach, and a field a consumer can only render for the brokers somebody has read the error tables of is not a consumer field. The three reasons exist because there are three *platform* paths that unregister a live feed (`entitlement_refused`, `session_expired`, `feed_disconnected`), not because there are three things a broker can say.
 
 • **How an adapter says it.** `decode_stream_frame` returns `BrokerStreamEvent.not_entitled(reason)` for a refusal the broker sends **in a frame**; `stream_connect_error` may return the same event for one the broker sends at the **handshake** (a 403 that means "not licensed" rather than "token rejected"). Returning a reason *string* from `stream_connect_error` still means session expiry, so no adapter written before D5.5 changed.
@@ -973,7 +975,9 @@ prices, portfolio, orders, P&L, watchlist, scanner, AI context
 
 The user does NOT need a StockAssist subscription for this. The broker already owns the user's market data entitlement — StockAssist simply consumes the feed on behalf of the authenticated user.
 
-On broker disconnect, the Source Manager falls back to Yahoo Finance automatically. The frontend never notices the switch.
+On broker disconnect, the Source Manager falls back to Yahoo Finance automatically. The frontend never notices the *switch* — no spinner, no remount, no toast, and no provider name anywhere.
+
+**What it does notice, since D5.14 (ADR-054), is the resulting feed state**, and only in the platform's own vocabulary: the tier indicator moves from `Live` to `Delayed`, and if the user *removed* the broker account, `change_reason: "feed_disconnected"` renders as *"Your market-data account is no longer connected, so streaming data has stopped."* Which broker, which transport and which error remain invisible to the frontend — the projection copies only the contract's fields, so a broker name on the payload is not rendered, it is not even stored.
 
 **How the switch is actually gated (D4.5).** The upgrade is deliberately *not* triggered by `broker.connected`, and not by the WebSocket opening either. The account's stream registers as a market-data provider (D4.4) and stays behind a readiness gate until a valid canonical tick has arrived on that link while it is subscribed. Only then is it eligible for the quote capability at all, and only for the instruments it actually streams. Yahoo is never disconnected — it moves to standby inside the same failover chain — so there is no instant at which the user has no provider.
 
@@ -1407,3 +1411,182 @@ Requires an interactive session on an account whose holdings-and-positions unive
 8. **No duplicate or missing instruments.** The union of every shard's `subscribed_instruments` must equal the account's `stream_instruments(...)` output exactly, with no repeats.
 
 Until this is run, **LIVE VALIDATION: NOT PERFORMED** stands for sharding, as it does for every stream adapter (ADR-036…040, ADR-050).
+
+
+---
+
+## The Instrument Catalogue capability (D5.15, ADR-055)
+
+### `BrokerCapability.INSTRUMENT_CATALOGUE`
+
+```python
+async def resolve_instruments(
+    self, symbols: Sequence[str], session: dict = None
+) -> Dict[str, Any]:
+    """canonical symbol -> this broker's own instrument identifier."""
+```
+
+Bound to `resolve_instruments` in `CAPABILITY_METHODS`, so the registry rejects an adapter that declares it without implementing it — the same guarantee every other capability gets.
+
+**Why it is a capability and not a required method.** Resolving a symbol needs an instrument master, a search endpoint or a static table, and not every broker publishes one. A broker without it is not broken: it keeps the pre-D5.15 behaviour of covering exactly what the account holds, because holdings and positions carry their own identifiers. Declaring the capability is what says *"this broker's feed can be aimed at an instrument the account does not own."*
+
+**Why it is separate from TICK_STREAM.** They are different facts and either can exist without the other. TICK_STREAM says a feed exists; INSTRUMENT_CATALOGUE says the feed can be pointed somewhere. Before D5.15 the platform had only the first, so an account with an empty demat opened a live socket that was structurally incapable of carrying a packet — which is what a real broker account did in production.
+
+### What an implementation must guarantee
+
+| Rule | Why |
+|---|---|
+| **Canonical in, broker-opaque out.** `symbols` are uppercase canonical symbols; the return values are whatever this broker's feed subscribes by. | The Market Engine and the broker engine name no instrument format. `services/broker_engine.py` is swept for every identifier string the five adapters use. |
+| **A symbol you cannot name is OMITTED.** Never a sentinel, never `None` in the map, never a guess. | Brokers reject an over-limit or malformed subscribe request *as a whole*. One bad key costs the account every instrument, not just the one. |
+| **Partial answers are correct.** | A watchlist may name an instrument this broker does not carry. That symbol falls back to the baseline for that symbol alone. |
+| **Never raise for an unreachable catalogue.** Raise `BrokerError`; the gateway turns it into "no catalogue". | A catalogue widens *coverage*. It is not load-bearing for a feed that already has a portfolio, and a master-file outage must not cost the user their stream. |
+| **`session` is part of the signature even when unused.** | A broker whose catalogue is an authenticated search endpoint needs it. A signature that varied per broker would put the difference back in the caller. |
+| **Cache per process, not per user, when the source is public.** | An instrument master is a fact about the exchange, not about anybody's account. One download serves every account; guard it with a lock so a restart restoring N sessions does not fetch N times. |
+
+### Per-broker status
+
+| Broker | TICK_STREAM | INSTRUMENT_CATALOGUE | What is missing |
+|---|---|---|---|
+| **Upstox** | ✅ | ✅ | Nothing for NSE equity. `NSE_EQ` segment only — an F&O, BSE or index symbol resolves to nothing (LIM-D5.15-3). |
+| **Zerodha** | ✅ | ✅ (D5.16) | Trading symbol → numeric Kite `instrument_token`, from `api.kite.trade/instruments`. |
+| **Angel One** | ✅ | ✅ (D5.16) | Symbol → SmartAPI `"<segment>\|<token>"`, from `OpenAPIScripMaster.json`. |
+| **Fyers** | ✅ | ✅ (D5.16) | Symbol → HSM topic `"sf\|<segment>\|<token>"`, from `public.fyers.in/sym_details/{NSE,BSE}_CM.csv`. |
+| **Dhan** | ✅ | ✅ (D5.16) | Symbol → `"<segment>\|<securityId>"`, from `api-scrip-master.csv`. |
+
+**LIM-D5.15-2 and LIM-D5.15-3 are CLOSED.** All five adapters declare `INSTRUMENT_CATALOGUE`, and the contract is exchange-aware — see the section below.
+
+Every one of those four sources was confirmed reachable and unauthenticated by HTTP range request during D5.15 — **reachability only**. No schema was parsed, no mapping was written, and nothing is claimed about any of them beyond that the work is bounded and per-adapter. The seam, the universe assembly, the instrument map and the engine wiring are already shared and broker-neutral, so each remaining broker is one method (LIM-D5.15-2).
+
+**The seam is argued, not proven.** One implementation cannot demonstrate a broker-neutral abstraction. Zerodha is the sharpest next test of it, because a numeric token is the identifier format least like the compound string the first implementation returns.
+
+
+---
+
+## The equity instrument catalogue (D5.16)
+
+### What an adapter must implement
+
+Two members, and the split between them is the point:
+
+```python
+@staticmethod
+def build_catalogue_index(*row_groups) -> Dict[Tuple[str, str], Any]:
+    """{(EXCHANGE, SYMBOL): broker identifier} from instrument-master rows."""
+
+async def _download_catalogue(self) -> Dict[Tuple[str, str], Any]:
+    """Fetch the master(s) and hand the rows to build_catalogue_index."""
+```
+
+`build_catalogue_index` is **pure**, and that is deliberate: it is the whole of what "this broker has a catalogue" *means*, and it is the whole of what a hermetic test can honestly cover. The download is I/O whose correctness depends on a file at a third party, and no fixture can assert anything true about that. `resolve_instruments` and the per-process cache are inherited — an adapter writes neither.
+
+```python
+_catalogue_cache = CatalogueCache(INSTRUMENT_MASTER_TTL_SECONDS)
+
+async def _instrument_catalogue(self):
+    return await type(self)._catalogue_cache.get(self._download_catalogue)
+
+async def resolve_instruments(self, instruments, session=None):
+    if not instruments:
+        return {}
+    return resolve_from_index(instruments, await self._instrument_catalogue())
+```
+
+### Rules
+
+| Rule | Why |
+|---|---|
+| **Key on `(EXCHANGE, SYMBOL)`, never on the symbol alone.** | `RELIANCE` is two instruments with two identifiers at all five brokers. Verified 2026-08-31. |
+| **Never take the session.** | Every one of the five masters is a public, unauthenticated asset. A catalogue that took a session would become a per-account call and a per-account download. |
+| **Offer rows; do not resolve them.** | The winner is not knowable until every candidate for a key has been seen, and the masters disagree about ordering. `CashEquityCatalogue.offer()` then `.build()`. |
+| **Pass `series=` when the master has one; `rank=0` when it does not.** | The shared policy ranks the series. A master with no series column (Kite) offers everything equally, which makes a duplicate key resolve to *dropped* — the correct answer for a master that cannot tell two rows apart. |
+| **Build the identifier with the adapter's own `instrument_id`/`instrument_token`.** | The value the catalogue stores and the value the wire carries must be one expression. Two derivations are two things that can drift, and the symptom is a subscription that ticks into an unnameable void. |
+| **Return `None` for an identifier you could not build.** | Three of the five brokers reject a malformed *subscription* rather than the offending entry, so one bad row would cost the account every price it asked for. |
+| **Raise `BrokerError` with `type(exc).__name__`, never `exc`.** | An httpx error stringifies to the request it failed on, URL and all. `BrokerError` renders its developer message into logs. This is how D3's token-in-log-URL leak happened. |
+| **Always supply `user_message`.** | `BrokerError.__init__` does `user_message or message`. An adapter that omits it does not get an empty user message — it gets the *developer* one, which is the string carrying the vendor detail. |
+
+### The masters, as published (verified 2026-08-31)
+
+| Broker | URL | Format | Equity discriminator | Series field | Keys built |
+|---|---|---|---|---|---|
+| Zerodha | `api.kite.trade/instruments` | CSV + header | `instrument_type == "EQ"` and `segment == exchange` | *none* | 22,993 |
+| Upstox | `assets.upstox.com/.../{NSE,BSE}.json.gz` | gzip JSON ×2 | `segment in {NSE_EQ, BSE_EQ}` | `instrument_type` | 8,536 |
+| Angel One | `margincalculator.angelbroking.com/.../OpenAPIScripMaster.json` | JSON array | `instrumenttype == ""` | NSE: symbol suffix; BSE: *none* | 16,406 |
+| Fyers | `public.fyers.in/sym_details/{NSE,BSE}_CM.csv` | CSV, **headerless** | fyToken segment prefix | ticker suffix | 8,536 |
+| Dhan | `images.dhan.co/api-data/api-scrip-master.csv` | CSV + header | `SEM_SEGMENT == "E"` and `SEM_INSTRUMENT_NAME == "EQUITY"` | `SEM_SERIES` | 8,557 |
+
+Fyers' files are headerless, so its column positions are constants (`MASTER_FYTOKEN_COLUMN = 0`, `MASTER_TICKER_COLUMN = 9`, `MASTER_NAME_COLUMN = 13`). That is a genuine fragility, and the mitigation is that every value read through them is then put through the adapter's own validators rather than trusted — a column shift at Fyers produces an *empty* catalogue and a logged degradation, not a catalogue of wrong identifiers.
+
+Fyers keys on the master's underlying-name column rather than on the ticker, because `trading_symbol` only strips suffixes it recognises as NSE cash series: canonicalising `BSE:RELIANCE-A` would yield `RELIANCE-A` and no BSE symbol would ever match a watchlist entry. The ticker is still read — for its series, which is what separates `NSE:CHOLAFIN-EQ` from `NSE:CHOLAFIN-D1` and keeps `BSE:ENERGY-INDEX` out entirely.
+
+---
+
+## The index catalogue (D5.17)
+
+D5.16's table above is the **equity** half. D5.17 adds the index half, from the
+same downloads: no adapter fetches a new file, and Fyers' index rows are inside
+the very NSE_CM.csv / BSE_CM.csv it already reads.
+
+Each adapter contributes only its broker's own **discriminator** and identifier
+format. The canonical spellings live once, in
+`services/brokers/catalogue.py::INDEX_ALIASES`, and a sweep
+(`tests/test_d517_boundaries.py`) fails if an adapter carries a copy.
+
+| Broker | Index discriminator | Identity column read | Identifier format |
+|---|---|---|---|
+| Zerodha | `segment == "INDICES"` (note: `instrument_type` is `"EQ"`, same as a share) | `tradingsymbol` | `int` instrument token |
+| Upstox | `segment in {NSE_INDEX, BSE_INDEX}` | `trading_symbol` | `NSE_INDEX\|Nifty 50` |
+| Angel One | `instrumenttype == "AMXIDX"` | `name` (not `symbol`) | `"<segment>\|<token>"` |
+| Fyers | ticker suffix `-INDEX` | column 13, the underlying name | `if\|<segment>\|<token>` |
+| Dhan | `SEM_SEGMENT == "I"` | `SEM_TRADING_SYMBOL` | `IDX_I\|<securityId>` |
+
+### The two traps, per broker
+
+**Zerodha.** An index row carries `instrument_type: "EQ"` — identical to an
+ordinary share. Only the segment tells them apart, which is why the equity
+branch tests `segment == exchange` and not the type.
+
+**Angel One.** SmartAPI's `symbol` for the Nifty is `"Nifty 50"` while its
+`name` is `"NIFTY"`. Both spellings are in the shared table, so either column
+would resolve; `name` is read because it is the field the master means as the
+identity, mirroring how the equity branch reads `symbol` for its series suffix.
+
+**Dhan.** The master says `"I"`; the *subscription* says `"IDX_I"`, and it says
+it for a BSE index as well as an NSE one — Dhan's index segment is not
+per-exchange, unlike `NSE_EQ`/`BSE_EQ`. Routing a BSE index through
+`HOLDING_EXCHANGE_SEGMENTS` would produce `BSE_EQ|51`, which is a real NSE
+security id belonging to an unrelated company.
+
+**Fyers.** The one place a wrong answer is invisible. A Fyers tick is identified
+by the topic string the *server* returns on the snapshot record, not by what was
+subscribed, and an index is an `if` topic rather than an `sf` one. The prefix is
+**not derivable from the fyToken** — `NSE:NIFTY50-INDEX` sits in the `nse_cm`
+segment exactly as `NSE:SBIN-EQ` does and its token begins with the same four
+characters — so `instrument_id(fy_token, kind)` takes it from the caller, which
+is the only layer that read the master row. Getting it wrong is not a subscribe
+error: the map has no entry for the topic that arrives, every packet is dropped,
+and the symptom is an index that never ticks on a healthy socket. **Unverified
+against a live HSM connection (LIM-D5.17-3.)**
+
+### Live resolution, verified 2026-08-31 through production code paths
+
+`resolve_instruments(index_instruments())` against each broker's real published
+master — **20/20**, every index at every broker, on the right exchange:
+
+| | NIFTY | BANKNIFTY | SENSEX | INDIAVIX |
+|---|---|---|---|---|
+| Zerodha | `256265` | `260105` | `265` | `264969` |
+| Upstox | `NSE_INDEX\|Nifty 50` | `NSE_INDEX\|Nifty Bank` | `BSE_INDEX\|SENSEX` | `NSE_INDEX\|India VIX` |
+| Angel One | `1\|99926000` | `1\|99926009` | `3\|99919000` | `1\|99926017` |
+| Fyers | `if\|nse_cm\|26000` | `if\|nse_cm\|26009` | `if\|bse_cm\|1` | `if\|nse_cm\|26017` |
+| Dhan | `IDX_I\|13` | `IDX_I\|25` | `IDX_I\|51` | `IDX_I\|21` |
+
+A full universe (30 dashboard equities + 4 indices + a watchlist symbol + a
+BSE-held RELIANCE) resolved **35/35 at all five brokers** in the same run.
+
+### What no broker carries
+
+Gold, silver, crude and USD-INR have **no spot instrument at any Indian broker**.
+The masters carry dated futures — `GOLD26OCTFUT`, `CRUDEOIL26SEPFUT`,
+`USDINR26SEPFUT` — a different instrument with a rolling identity, behind an
+MCX/CDS segment entitlement, at a price that is not the spot number the
+dashboard shows. This is a fact about the venues, not a deferral: see ADR-056.

@@ -82,7 +82,12 @@ YAHOO_TICKERS = {
     "ITC": "ITC.NS", "SBIN": "SBIN.NS", "BHARTIARTL": "BHARTIARTL.NS",
     "KOTAKBANK": "KOTAKBANK.NS", "LT": "LT.NS", "AXISBANK": "AXISBANK.NS",
     "ASIANPAINT": "ASIANPAINT.NS", "MARUTI": "MARUTI.NS", "TITAN": "TITAN.NS",
-    "SUNPHARMA": "SUNPHARMA.NS", "TATAMOTORS": "TATAMOTORS.NS",
+    "SUNPHARMA": "SUNPHARMA.NS",
+    # `TATAMOTORS` removed in D5.17: the symbol is delisted after the demerger
+    # and `TATAMOTORS.NS` answers "No data found, symbol may be delisted".
+    # Its successors need no entry — `resolve_yahoo_ticker` appends `.NS` to an
+    # unmapped NSE symbol, and `TMPV.NS` / `TMCV.NS` both quote. Verified
+    # 2026-08-31. See market_data.py for the reference-data gap this exposed.
     "BAJFINANCE": "BAJFINANCE.NS", "WIPRO": "WIPRO.NS", "ONGC": "ONGC.NS",
     "NTPC": "NTPC.NS", "POWERGRID": "POWERGRID.NS", "M&M": "M%26M.NS",
     "HCLTECH": "HCLTECH.NS", "TATASTEEL": "TATASTEEL.NS",
@@ -857,12 +862,31 @@ async def fetch_real_global_markets():
 
 
 async def fetch_real_commodities():
-    """Get real-time commodities and forex data from Yahoo Finance."""
+    """Get real-time commodities and forex data from Yahoo Finance.
+
+    THE NAMES AND UNITS ARE THE CONTRACT (D5.17)
+    ---------------------------------------------
+    Gold was labelled `"Gold (MCX)"` with unit `"INR/10g"` while the ticker
+    fetched was `GC=F` — **COMEX gold futures, quoted in US dollars per troy
+    ounce**. Silver the same: `"Silver (MCX)"`, `"INR/kg"`, `SI=F`, USD/oz. The
+    dashboard renders the number with no unit at all, so a user read a
+    four-figure dollar price as rupees per ten grams — off by roughly a factor
+    of thirty, in a direction that looks plausible.
+
+    Nothing simulated the number: the price was real and the *label* was the
+    fabrication, which is why every "no fake data" check passed over it for as
+    long as it existed. The rule this restores is the same one the tick contract
+    states: a field is either true or absent.
+
+    The tickers are unchanged. Switching to an MCX contract is not a relabelling
+    — see the D5.17 audit: MCX publishes no spot instrument, only dated futures,
+    and no broker feed carries one under an entitlement this platform can assume.
+    """
     commodity_tickers = {
         "crude_oil": {"name": "Brent Crude", "ticker": "BZ=F", "unit": "USD/bbl"},
-        "gold": {"name": "Gold (MCX)", "ticker": "GC=F", "unit": "INR/10g"},
-        "silver": {"name": "Silver (MCX)", "ticker": "SI=F", "unit": "INR/kg"},
-        "usd_inr": {"name": "USD/INR", "ticker": "INR=X", "unit": ""},
+        "gold": {"name": "Gold (COMEX)", "ticker": "GC=F", "unit": "USD/oz"},
+        "silver": {"name": "Silver (COMEX)", "ticker": "SI=F", "unit": "USD/oz"},
+        "usd_inr": {"name": "USD/INR", "ticker": "INR=X", "unit": "INR"},
     }
     
     keys = list(commodity_tickers.keys())
@@ -953,32 +977,72 @@ async def fetch_real_chart_data(symbol: str, period: str = "1D"):
 
 
 async def fetch_real_top_picks(count=3):
-    """Fetch live data for all stocks, analyze technically, and select top picks."""
+    """Analyze the universe technically and select top picks.
+
+    D5.16 — THE PRICES COME THROUGH THE MARKET GATEWAY.
+    ---------------------------------------------------
+    This called `fetch_real_stock_quote` per symbol: Yahoo, directly, with no
+    resolution, no failover and no tier stamp. That made the most prominent
+    number on the dashboard — the entry, stop and targets of an AI
+    recommendation — the one number in the product that could not be served by
+    the canonical market-data system, and it violated Developer Rule 2 on the
+    surface where being wrong costs the user money.
+
+    WHAT DID *NOT* CHANGE, DELIBERATELY
+    -----------------------------------
+    The ranking. Every line below this fetch — the RSI/volume/MACD weighting,
+    the pattern detection, the confidence mapping, the stop and target
+    arithmetic — is untouched. D5.16's brief is explicit that the AI's selection
+    logic is not this sprint's business; only where the *market price* comes
+    from is.
+
+    WHY THIS RESOLUTION IS PLATFORM-SCOPED AND NOT PER USER
+    --------------------------------------------------------
+    Top picks are generated once a day and persisted platform-wide
+    (`db.market_analysis`), so there is no user to resolve for and caching a
+    per-user resolution would serve one account's broker prices to everybody —
+    which is the D5.15 defect running backwards. The per-user live price a
+    connected account sees on these cards arrives the same way every other
+    live equity price does: as a `market.tick` for that account, merged into
+    `priceTicks` in the browser. The server supplies the canonical mark; the
+    socket supplies the movement.
+    """
     cache_key = "real_top_picks"
     cached = await cache_get(cache_key)  # 30-minute cache
     if cached:
         return cached
 
     from market_data import STOCK_UNIVERSE
-    
-    # 1. Fetch full technical quotes for all stocks in parallel
-    tasks = [fetch_real_stock_quote(s["symbol"]) for s in STOCK_UNIVERSE]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    
+    from services.market_engine.gateway import market_gateway
+
+    # 1. Resolve the universe through the gateway. Per symbol inside, so a
+    #    provider that cannot serve one instrument costs that instrument and not
+    #    the batch; a symbol with no usable quote is simply absent.
+    try:
+        resolved = await market_gateway.get_prices([s["symbol"] for s in STOCK_UNIVERSE])
+    except Exception as e:
+        logger.warning(f"Top picks: universe resolution failed: {e}")
+        resolved = {}
+
     valid_stocks = []
-    for s, res in zip(STOCK_UNIVERSE, results):
-        if isinstance(res, Exception) or res is None:
+    for s in STOCK_UNIVERSE:
+        quote = resolved.get((s["symbol"] or "").upper())
+        if not quote:
             continue
-        res.setdefault("name", s["name"])
-        res.setdefault("sector", s["sector"])
-        valid_stocks.append(res)
+        quote.setdefault("name", s["name"])
+        quote.setdefault("sector", s["sector"])
+        valid_stocks.append(quote)
 
     if not valid_stocks:
         # Live data unavailable — return explicit unavailable, never simulated picks
         return {
             "picks": [],
             "available": False,
-            "note": "Live market data is temporarily unavailable. Picks will resume once Yahoo Finance is reachable.",
+            # D5.16 — no provider name. The gateway resolves whichever provider
+            # can serve, and naming one in a user-facing string is both a
+            # provider-identity leak (Developer Rule 4) and, now, wrong: Yahoo
+            # being reachable is neither necessary nor sufficient.
+            "note": "Live market data is temporarily unavailable. Picks will resume once it returns.",
         }
 
     # Real sector performance for per-pick sector change

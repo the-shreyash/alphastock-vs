@@ -38,6 +38,12 @@ const CHANNELS = [
   "watchlist",
   "ai",
   "broker",
+  // D5.14. `provider.status` has no entry in the bridge's DOMAIN_CHANNEL map,
+  // so `resolve_channel` falls through to the domain name — the platform-scoped
+  // feed state is broadcast on a channel literally called "provider". Without
+  // this line the only feed events that ever arrived were the per-user ones
+  // (which bypass subscriptions), so a user on the shared baseline saw nothing.
+  "provider",
 ];
 
 const HEARTBEAT_MS = 30000; // send a ping every 30s
@@ -70,6 +76,11 @@ export function RealtimeProvider({ children }) {
 
   useEffect(() => {
     const store = useRealtimeStore.getState();
+
+    // Bind the feed state to this account before any event can land (D5.14).
+    // Done for the anonymous case too, so signing out clears the previous
+    // account's feed state instead of leaving it on screen.
+    store.setFeedIdentity(isAnon(userId) ? null : userId);
 
     if (!WS_URL || isAnon(userId)) {
       store.setConnection("offline");

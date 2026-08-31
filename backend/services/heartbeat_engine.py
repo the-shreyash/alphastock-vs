@@ -440,6 +440,15 @@ async def task_monitor_portfolio():
 
         # One shared quote fetch for every symbol held by anyone this cycle —
         # each user's snapshot then reads from the prefetched map (no N× fetch).
+        #
+        # D5.16 — the share is now conditional, for the same reason the price
+        # broadcast's is (`_publish_prices`): a user with their own promoted
+        # feed must be marked from *their* feed, and one platform resolution
+        # reused for everybody makes that unreachable by construction. The
+        # Source Manager answers whether a user's baseline is genuinely the
+        # shared one; only those users share, and there is one extra resolution
+        # per promoted account rather than one per user.
+        from services.market_engine.gateway import market_gateway
         symbols = {t["symbol"] for t in manual} | {
             h["symbol"] for h in broker_holdings if h.get("symbol")}
         prefetched = await portfolio_stream.quotes_map(list(symbols))
@@ -449,8 +458,11 @@ async def task_monitor_portfolio():
 
         streamed = 0
         for user_id in user_ids:
+            shared = market_gateway.baseline_prices_are_shared(str(user_id))
             snapshot = await portfolio_stream.publish_snapshot(
-                _db, user_id, quotes_map_func=shared_quotes, reason="monitor")
+                _db, user_id,
+                quotes_map_func=shared_quotes if shared else None,
+                reason="monitor")
             if snapshot:
                 streamed += 1
 
@@ -585,42 +597,129 @@ async def task_earnings():
         log_activity("Checking Earnings failed", "news", "warning")
 
 
-WATCHLIST_STREAM_CAP = 40  # max distinct symbols enriched per cycle
+#: Max symbols enriched **per account** per cycle.
+#:
+#: Was a platform-wide cap, which is what a platform-wide query needs. Now that
+#: the cycle is per account the same number means something different and
+#: better: one user with a 400-symbol watchlist can no longer consume the whole
+#: budget and leave every other connected account unrefreshed.
+WATCHLIST_STREAM_CAP = 40
+
+
+async def _watchlist_symbols(user_id) -> list:
+    """One account's watchlisted symbols — filtered by owner, always.
+
+    D5.16 §2. This read was `db.watchlist.distinct("symbol")` with **no filter**
+    and its result was published as one event with no `user_id`, which the event
+    bridge therefore *broadcast*: every socket on the `watchlist` channel
+    received every user's watchlisted symbols and their prices, and the browser
+    folded them straight into its live price store.
+
+    The scoping is here, at selection, rather than at delivery. Publishing
+    per-user while still selecting globally would have kept exactly the same
+    disclosure and merely made it harder to see — and a filter applied by the
+    consumer is not a boundary at all.
+    """
+    if _db is None:
+        return []
+    try:
+        symbols = await _db.watchlist.distinct("symbol", {"user_id": str(user_id)})
+    except Exception as e:
+        # No account identifier in the message: this line is reachable on every
+        # cycle for every connected user, and the id is what identifies them.
+        logger.error(f"Watchlist symbol read for one account failed: {e}")
+        return []
+    return sorted({s for s in symbols if s})[:WATCHLIST_STREAM_CAP]
+
+
+#: The fields a `watchlist.quotes` entry carries.
+#:
+#: A closed list rather than the resolved quote, for two reasons that happen to
+#: point the same way. Data minimisation — this payload crosses a socket and the
+#: normalized quote carries a dozen fields the widget does not render. And
+#: containment — `source_tier` aside, nothing about *which* provider answered may
+#: reach a consumer (Developer Rule 4), and a closed projection makes that a
+#: property of this boundary rather than of every future normalizer field.
+_WATCHLIST_QUOTE_FIELDS = ("price", "change_pct", "rsi", "volume_ratio", "source_tier")
+
+
+async def _watchlist_quotes(user_id, symbols: list) -> dict:
+    """`{SYMBOL: quote}` for one account's watchlist, through the gateway.
+
+    D5.16 §5. This called `fetch_real_stock_quote` directly — Yahoo, with no
+    user and no resolution — so a user on their own broker feed was quoted from
+    the delayed baseline on the very surface that shows a live price, and no
+    ranking could have changed it.
+
+    A broker feed's quote is *thin*: a `MarketTick` carries a price and not an
+    RSI. Absent fields are omitted rather than written as null, so the merge in
+    the browser's price store keeps the technical fields an earlier cycle or the
+    REST read supplied instead of blanking them.
+    """
+    from services.market_engine.gateway import market_gateway
+
+    resolved = await market_gateway.get_prices(symbols, user_id=user_id)
+    quotes = {}
+    for symbol, quote in resolved.items():
+        entry = {k: quote[k] for k in _WATCHLIST_QUOTE_FIELDS
+                 if quote.get(k) is not None}
+        if entry.get("price") is not None:
+            quotes[symbol] = entry
+    return quotes
 
 
 async def task_watchlist_stream():
-    """Stream enriched quotes (RSI, volume ratio) for every watchlisted symbol
-    as a broadcast ``watchlist.quotes`` event (Sprint R8). The fast 15s price
-    loop already covers price/change; this slower task covers the technical
-    fields the Watchlist UI shows, so the page needs no fallback poll while
-    connected."""
+    """Stream enriched quotes (RSI, volume ratio) to each connected account for
+    that account's own watchlist, as a per-user ``watchlist.quotes`` event
+    (Sprint R8; scoped and canonically routed in D5.16).
+
+    The fast 15s price loop already covers price/change; this slower task covers
+    the technical fields the Watchlist UI shows, so the page needs no fallback
+    poll while connected.
+
+    The recipient set is the *connected* accounts, taken from the socket manager
+    exactly as `_publish_prices` takes it. A user with rows in the database and
+    no socket produces no work: there is nobody to send it to, and resolving a
+    watchlist for an absent user would be a per-user query with a platform-wide
+    cost.
+    """
     from services.activity_logger import log_activity
-    from services.real_market import fetch_real_stock_quote
     log_activity("Refreshing Watchlists", "monitor", "running")
     try:
-        symbols = await _db.watchlist.distinct("symbol")
-        symbols = sorted(s for s in symbols if s)[:WATCHLIST_STREAM_CAP]
-        if not symbols:
+        users = list(getattr(_ws, "user_connections", {}) or {})
+        if not users:
+            log_activity("No connected accounts to refresh", "monitor", "done")
+            return
+        served = 0
+        total = 0
+        for user_id in users:
+            try:
+                symbols = await _watchlist_symbols(user_id)
+                if not symbols:
+                    continue
+                quotes = await _watchlist_quotes(user_id, symbols)
+                if not quotes:
+                    continue
+                # `user_id` is what makes the event bridge deliver rather than
+                # broadcast (`realtime/event_bridge._deliver`). It is the whole
+                # security property of this publish, so it is not optional and
+                # not conditional.
+                await _publish("watchlist.quotes", {
+                    "user_id": str(user_id),
+                    "quotes": quotes,
+                    "count": len(quotes),
+                })
+                served += 1
+                total += len(quotes)
+            except Exception as e:
+                # One account's failure must not cost every other connected
+                # account its refresh.
+                logger.warning(f"Watchlist refresh for one account failed: {e}")
+        if not served:
             log_activity("No watchlisted stocks to refresh", "monitor", "done")
             return
-        results = await asyncio.gather(
-            *[fetch_real_stock_quote(s) for s in symbols], return_exceptions=True
-        )
-        quotes = {}
-        for sym, res in zip(symbols, results):
-            if isinstance(res, dict) and res and res.get("price") is not None:
-                quotes[sym] = {
-                    "price": res["price"],
-                    "change_pct": res.get("change_pct", 0),
-                    "rsi": res.get("rsi"),
-                    "volume_ratio": res.get("volume_ratio"),
-                }
-        if not quotes:
-            log_activity("Watchlist quotes unavailable", "monitor", "warning")
-            return
-        await _publish("watchlist.quotes", {"quotes": quotes, "count": len(quotes)})
         log_activity(
-            f"Watchlist refreshed — {len(quotes)}/{len(symbols)} live quotes",
+            f"Watchlists refreshed — {total} live quotes across {served} account(s)",
             "monitor", "done",
         )
     except Exception as e:
@@ -700,59 +799,210 @@ async def _heartbeat_loop():
         await asyncio.sleep(TICK_INTERVAL)
 
 
-async def _collect_prices():
-    """Build {SYMBOL: {price, change_pct}} for indices + watchlist + open trades."""
-    from services.real_market import fetch_real_market_overview, fetch_all_universe_quotes, fetch_yahoo_quote
-    data = {}
+#: Index keys carried on the overview, and the canonical symbols the price
+#: store keys them by.
+_INDEX_SYMBOLS = (("nifty", "NIFTY"), ("bank_nifty", "BANKNIFTY"), ("sensex", "SENSEX"))
 
-    # Main indices
-    overview = await fetch_real_market_overview()
-    if overview:
-        for key, sym in (("nifty", "NIFTY"), ("bank_nifty", "BANKNIFTY"), ("sensex", "SENSEX")):
-            val = overview.get(key, {})
-            if val.get("value"):
-                data[sym] = {"price": val["value"], "change_pct": val.get("change_pct", 0)}
+#: The overview key India VIX is carried under, and its canonical symbol.
+#:
+#: It is a bare number on the overview, not a `{value, change_pct}` block like
+#: the three above — the provider publishes no day-change for it — so it is
+#: unpacked separately rather than being bent into the same loop. The symbol is
+#: the one `real_market.INDEX_TICKERS` and `catalogue.INDEX_ALIASES` already
+#: agree on, which is what lets the delayed baseline and a broker tick land in
+#: the same slot of the same price store.
+_VIX_KEY, _VIX_SYMBOL = "india_vix", "INDIAVIX"
 
-    # Symbols in any watchlist or any open trade
-    symbols = set()
+#: Every canonical index symbol this loop publishes.
+INDEX_PRICE_SYMBOLS = tuple(symbol for _key, symbol in _INDEX_SYMBOLS) + (_VIX_SYMBOL,)
+
+
+async def _index_prices(user_id=None) -> dict:
+    """`{NIFTY|BANKNIFTY|SENSEX|INDIAVIX: {price, change_pct}}` for one account.
+
+    D5.15 — was a direct `fetch_real_market_overview()` call. Indices are
+    resolved for a user like everything else, so a provider that carries them
+    for one entitlement and not another is chosen per user rather than assumed.
+
+    D5.17 — TWO READS, AND WHY THAT IS NOT A SECOND PIPELINE
+    --------------------------------------------------------
+    `get_indices` serves `Capability.INDICES`, which only a polling provider
+    declares: a broker feed publishes TICKS and QUOTES and has no notion of a
+    market *overview*. So the overview is, and will remain, the delayed
+    baseline — and once D5.17 put the indices on broker feeds, a user on a live
+    feed had a tick worth 24815.25 arriving on `market.tick` and this loop
+    overwriting it 15 seconds later with the baseline's 24810. Visibly: an index
+    card that flickered between two numbers, one of them stale, with the feed
+    indicator reading `Live`.
+
+    The fix is not to skip the overview — it carries the day-change a
+    `MarketTick` cannot — but to ask the **same** canonical question about the
+    price that every equity on this page is already asked:
+    `get_prices(..., user_id=...)`, per symbol, through the Source Manager. For
+    a user with no feed of their own it resolves the baseline and the answer is
+    identical to the overview's. For a user whose feed covers the index it
+    resolves that feed, which is the whole point of D5.17.
+
+    `price` is the only field taken from that resolution. A thin streaming quote
+    carries no `change_pct`, and writing one that is not there — or a zero —
+    would put a fabricated "unchanged" beside a real live price.
+    """
+    from services.market_engine.gateway import market_gateway
+    out = {}
     try:
-        symbols.update(await _db.watchlist.distinct("symbol"))
-        symbols.update(await _db.trades.distinct("symbol", {"status": "OPEN"}))
+        overview = await market_gateway.get_indices(user_id=user_id)
     except Exception as e:
-        logger.error(f"_collect_prices symbol gather error: {e}")
+        logger.warning(f"Index prices unavailable: {e}")
+        overview = None
+    for key, symbol in _INDEX_SYMBOLS:
+        value = (overview or {}).get(key) or {}
+        if value.get("value") is not None:
+            out[symbol] = {"price": value["value"], "change_pct": value.get("change_pct", 0)}
+    vix = (overview or {}).get(_VIX_KEY)
+    if isinstance(vix, (int, float)) and not isinstance(vix, bool):
+        # No `change_pct`: the provider publishes none for VIX and inventing one
+        # is the fabrication this whole path exists to avoid.
+        out[_VIX_SYMBOL] = {"price": vix}
+    try:
+        resolved = await market_gateway.get_prices(INDEX_PRICE_SYMBOLS, user_id=user_id)
+    except Exception as e:
+        logger.warning(f"Index price resolution failed: {e}")
+        return out
+    for symbol, quote in resolved.items():
+        price = quote.get("price")
+        if price is None:
+            continue
+        # An index the overview could not supply is still published when a feed
+        # can price it — a live NIFTY beside a missing baseline is strictly
+        # better than nothing, and the merge below adds no field it did not get.
+        out.setdefault(symbol, {})["price"] = price
+    return out
 
+
+async def _user_price_symbols(user_id: str) -> set:
+    """The equity symbols one user's live price stream should carry.
+
+    Their own watchlist, their own open trades, and the dashboard universe every
+    account sees. Scoped to the user — D5.15. This read used to be
+    `db.watchlist.distinct("symbol")` with **no filter**, so the map broadcast to
+    every socket carried every user's watchlist symbols; per-user delivery
+    without per-user selection would have kept that and merely hidden it.
+    """
+    from services.brokers.feed_universe import dashboard_symbols
+    symbols = set(dashboard_symbols())
+    if _db is None:
+        return symbols
+    try:
+        symbols.update(await _db.watchlist.distinct("symbol", {"user_id": str(user_id)}))
+        symbols.update(await _db.trades.distinct(
+            "symbol", {"user_id": str(user_id), "status": "OPEN"}))
+    except Exception as e:
+        logger.error(f"Price symbol gather for one account failed: {e}")
+    return {s for s in symbols if s}
+
+
+async def _collect_prices(user_id=None):
+    """`{SYMBOL: {price, change_pct, source_tier}}` for one account.
+
+    D5.15 — EVERY PRICE ON THIS PATH NOW COMES THROUGH THE MARKET GATEWAY.
+    It previously called Yahoo directly (`fetch_all_universe_quotes`, behind a
+    300-second bundle cache) and returned one global map for every socket. That
+    made a per-user broker feed unreachable by construction — the loop had no
+    user, so no per-user provider could ever be a candidate — and presented
+    five-minute-old data as live. Resolution, failover, freshness and the tier
+    stamp are the Source Manager's again, exactly as Developer Rule 2 requires.
+
+    `user_id=None` is the platform/baseline resolution and is what the shared
+    fan-out below computes once.
+    """
+    from services.brokers.feed_universe import dashboard_symbols
+    from services.market_engine.gateway import market_gateway
+    data = await _index_prices(user_id)
+    symbols = await _user_price_symbols(user_id) if user_id else set(dashboard_symbols())
     if symbols:
-        quotes = await fetch_all_universe_quotes()
-        qmap = {q["symbol"]: q for q in (quotes or []) if q.get("symbol")}
-        missing = []
-        for sym in symbols:
-            q = qmap.get(sym)
-            if q and q.get("price") is not None:
-                data[sym] = {"price": q["price"], "change_pct": q.get("change_pct", 0)}
-            else:
-                missing.append(sym)
-        # Symbols not in the universe cache (rare custom trade symbols)
-        if missing:
-            extra = await _price_map(missing)
-            for sym, q in extra.items():
-                data[sym] = {"price": q["price"], "change_pct": q.get("change_pct", 0)}
-
+        try:
+            data.update(await market_gateway.get_prices(sorted(symbols), user_id=user_id))
+        except Exception as e:
+            logger.error(f"Price resolution failed: {e}")
     return data
 
 
+async def _publish_prices() -> int:
+    """Send each connected account its own resolved price map. Returns the
+    number of accounts served.
+
+    THE FAN-OUT, AND WHY IT IS STILL ONE RESOLUTION FOR ALMOST EVERYBODY
+    ---------------------------------------------------------------------
+    Per-user resolution is required for correctness (a user on their own broker
+    feed must get *their* prices) and would be wasteful if taken literally: for
+    a user with no provider of their own, resolving with their id and resolving
+    for the platform choose from the identical candidate set and return the
+    identical answer. `market_gateway.baseline_prices_are_shared` is that
+    question asked of the Source Manager rather than guessed from "has a broker
+    connected", and the users it answers True for share one resolution.
+
+    A user with a personal feed is resolved on their own — that is the whole
+    point, and there is one such resolution per promoted account, not per socket.
+    """
+    from services.market_engine.gateway import market_gateway
+    from services.market_engine.source_manager import source_manager
+    users = list(getattr(_ws, "user_connections", {}) or {})
+    if not users:
+        return 0
+    shared_users = [u for u in users if market_gateway.baseline_prices_are_shared(u)]
+    shared_prices = await _collect_prices(None) if shared_users else {}
+    served = 0
+    for user_id in users:
+        try:
+            if user_id in shared_users:
+                symbols = await _user_price_symbols(user_id)
+                prices = {s: q for s, q in shared_prices.items()
+                          if s in symbols or s in INDEX_PRICE_SYMBOLS}
+            else:
+                prices = await _collect_prices(user_id)
+            if not prices:
+                continue
+            await _ws.send_to_user(user_id, {
+                "type": "prices",
+                "data": prices,
+                "timestamp": _now_iso(),
+            })
+            # D5.15 — ANNOUNCE THE TIER THIS USER IS ACTUALLY ON.
+            #
+            # Every other `provider.status` publish is driven by a *state
+            # transition*: a provider registering, unregistering, or changing
+            # readiness or stability. Staleness is none of those. A feed whose
+            # socket stays open and simply stops delivering is demoted lazily,
+            # inside `is_eligible_for`, when the next resolution asks — so
+            # prices correctly fall back to the baseline and **no event is ever
+            # published**. The D5.14 indicator is event-driven, so it went on
+            # reading `Live` while the data behind it was the delayed baseline.
+            #
+            # Observed, not reasoned about: a live feed stopped delivering at
+            # 09:45:20Z and the last `provider.status` on the bus was from
+            # 09:44:02Z, tier `streaming`. That is precisely the "showing Yahoo
+            # data while implying the broker feed is live" case the feed-state
+            # contract exists to prevent.
+            #
+            # This loop is the right place because it is already resolving this
+            # user's feed on a cadence, so the answer costs nothing extra, and
+            # `publish_status` is change-gated per user — it emits only when the
+            # state, tier or reason actually moved. A steady feed produces no
+            # events at all; a feed that went stale produces exactly one.
+            await source_manager.publish_status(user_id=user_id)
+            served += 1
+        except Exception as e:
+            logger.error(f"Price delivery for one account failed: {e}")
+    return served
+
+
 async def _price_stream_loop():
-    """Broadcast live prices to all clients every PRICE_STREAM_INTERVAL seconds."""
+    """Send each connected account its live prices every PRICE_STREAM_INTERVAL seconds."""
     logger.info("AI price stream loop running")
     while True:
         try:
             if _ws and _ws.active:
-                prices = await _collect_prices()
-                if prices:
-                    await _broadcast({
-                        "type": "prices",
-                        "data": prices,
-                        "timestamp": _now_iso(),
-                    })
+                await _publish_prices()
         except Exception as e:
             logger.error(f"Price stream loop error: {e}")
         await asyncio.sleep(PRICE_STREAM_INTERVAL)

@@ -47,7 +47,7 @@ import logging
 import os
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import httpx
 
@@ -476,6 +476,61 @@ class BrokerAdapter(ABC):
         entitled to know what an instrument identifier looks like at this broker.
         """
         return []
+
+    #: Build this broker's `{(EXCHANGE, SYMBOL): identifier}` index from raw
+    #: master rows. Overridden by every adapter that declares
+    #: `INSTRUMENT_CATALOGUE`; a plain function of its inputs, so the whole of
+    #: an adapter's catalogue *meaning* is testable without a network.
+    @staticmethod
+    def build_catalogue_index(*row_groups) -> Dict[Tuple[str, str], Any]:
+        """`{(EXCHANGE, SYMBOL): broker identifier}` from instrument-master rows."""
+        return {}
+
+    @capability_stub
+    async def resolve_instruments(
+        self, instruments: "Sequence[Any]", session: dict = None
+    ) -> Dict[str, Any]:
+        """Canonical instrument -> this broker's own instrument identifier.
+
+        The adapter-side half of the instrument catalogue. `instruments` are
+        :class:`~services.brokers.feed_universe.FeedInstrument` values — a
+        canonical symbol, an exchange and a segment — and the returned
+        identifiers are whatever this broker's feed subscribes by: an opaque
+        integer, a compound string, an exchange-qualified key. The Market Engine
+        never sees either side of the mapping; it asks for a *universe of
+        instruments* and the broker layer answers with something only that
+        broker can interpret.
+
+        D5.16 WIDENED THE INPUT FROM A SYMBOL TO AN INSTRUMENT
+        -------------------------------------------------------
+        D5.15 took `Sequence[str]`. A bare symbol cannot say which listing it
+        means, and `RELIANCE` is two instruments with two identifiers at every
+        one of the five brokers (verified against their published masters). The
+        single implementation was an NSE-only master, so a BSE request was
+        answered with the NSE key — silently, and with the account then marked
+        at the wrong listing's price. Widening the input is what makes that
+        state unrepresentable rather than merely unlikely.
+
+        WHY THIS IS A CAPABILITY AND NOT A REQUIRED METHOD
+        ---------------------------------------------------
+        Resolving a symbol needs an instrument master, a search endpoint, or a
+        static table, and not every broker publishes one. A broker without it is
+        not broken: it keeps the pre-D5.15 behaviour of covering exactly what
+        the account holds, because holdings and positions carry their own
+        identifiers. Declaring the capability is what says "this broker's feed
+        can be aimed at an instrument the account does not own".
+
+        Partial answers are correct and expected. A symbol this broker cannot
+        name is **omitted** rather than mapped to a sentinel: an unmapped
+        instrument must disappear from the subscription, not enter it as a key
+        the wire will reject and take the whole subscribe frame down with it.
+
+        Returns `{}` from here rather than raising, unlike most stubs, because
+        the gateway already gates the call on the capability — see
+        :meth:`BrokerGateway.resolve_instruments`, which never reaches an
+        adapter that has not declared it.
+        """
+        return {}
 
     @capability_stub
     def normalize_stream_order(self, payload: dict) -> dict:

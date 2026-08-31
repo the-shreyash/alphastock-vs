@@ -3154,4 +3154,377 @@ MARKET_DATA_ARCHITECTURE.md
 
 ---
 
+# ADR-054
+
+Title
+
+The Frontend Renders the Feed Contract and Owns None of It (Sprint D5.14)
+
+Date
+
+2026-08-31
+
+Status
+
+Accepted — production change in five frontend files, **zero backend files**; **live broker validation NOT performed**
+
+Context
+
+ADR-053 completed the backend consumer feed contract and recorded the half it did not build: **LIM-D5.13-1 — nothing in the frontend consumes `provider.status`.** The audit that opened D5.14 confirmed the diagnosis and found it was **two independent breaks, not one**, either of which alone made the whole contract invisible:
+
+1. **The store dropped the domain.** `realtimeStore.applyEvent` routes by `event.split(".")[0]`, and `provider` had no case — it fell through `default: break`. Every feed-state event that reached the browser was discarded.
+2. **The socket never subscribed to the channel.** `services/realtime/event_bridge.py` maps a domain to a socket channel through `DOMAIN_CHANNEL`, and `provider` has no entry, so `resolve_channel` falls through to the domain name: the platform-scoped feed state is broadcast on a channel literally called `provider`. `RealtimeProvider.CHANNELS` did not list it. Per-user publishes (D4.5) bypass channel subscription and would have arrived; **platform-scoped ones never could**, so a user on the shared Yahoo baseline could not have been told anything even if the store had been listening.
+
+Fixing either alone changes nothing observable. That is the reason this sprint's wiring test drives the real provider, the real socket, the real batching window and the real store rather than unit-testing the store's reducer — a green reducer test would have been fully compatible with a product that still showed nothing.
+
+The audit also confirmed what did **not** exist: there is no canonical feed-state model in the frontend to extend. The one nearby thing, `ConnectionStatus`, is the **socket** state machine (`offline | connecting | live | reconnecting`) and answers a different question. The only other feed-adjacent surface is `InvestmentAdvisor.jsx`, which renders a per-response `source_tier` chip from a REST payload — provenance for one answer, not the state of the feed.
+
+Decision
+
+**One projection module, one store slice, one indicator, and no inference anywhere.**
+
+**1. `src/lib/feedState.js` is the frontend's only interpretation of the contract.** It takes a `provider.status` payload and returns the fields the UI may use. It is an **allow-list, field by field, never a spread**: `state`, `tier`, `reason` and `change_reason` are closed enumerations on the backend, and a value outside them is dropped rather than rendered. Unlisted keys are not copied at all.
+
+**2. The frontend infers nothing.** Health, cool-downs, readiness, probation, freshness, delivery latency and provider selection are the Source Manager's, and none of them is re-derived here. In particular the state is **never** derived from the tier, and there is **no timer**: `recovering` ends when the backend says it ends. A second source of truth in React would be a second answer to a question the platform has exactly one answer for, and the two would disagree precisely when it mattered.
+
+**3. The unsafe direction is closed by construction.** An unrecognised state projects to `unavailable`, never to `available`. A tier is dropped outside `available` — the backend already nulls it, and this is the second lock on the same door, because LIM-D5.12-1 *was* a tier stamped on a state that had no data to make a claim about.
+
+**4. `live` is one field, true in one case.** `describeFeed().live` is true only when the state is `available` **and** the tier is `streaming`. `recovering` cannot reach it — not because a branch excludes it, but because outside `available` it has no tier to qualify with.
+
+**5. The feed gets its own indicator, next to the connection pill, not inside it.** `MarketFeedStatus` sits beside `ConnectionStatus` in the navbar. They can disagree in both directions: a socket can be perfectly live while every provider behind it is down. Folding the second into the first is how a user reads "Live" over prices nothing has delivered — the defect D5.12 found on the backend, which would simply have relocated into the UI.
+
+**6. Four words, because there are four things a user acts on differently.** *Live* (available + streaming) · *Delayed* (available + delayed) · *Recovering* (a candidate is being retried; what is on screen is not live) · *Unavailable* (no usable feed). The state carries the first distinction and the tier the second: `tier` is **not** overloaded to carry connection state.
+
+**7. Change reasons are rendered in the platform's words or not at all.** Each of the three says what the platform did to the user's feed and what they can do about it, and names no broker:
+
+| `change_reason` | shown to the user |
+|---|---|
+| `entitlement_refused` | "Your market-data connection needs attention — your account is not cleared for this data." |
+| `session_expired` | "Your market-data access has expired. Reconnect your account to resume the live feed." |
+| `feed_disconnected` | "Your market-data account is no longer connected, so streaming data has stopped." |
+
+An unrecognised reason renders **nothing**, falling back to the state's own line. That is what makes "a broker wire code can never reach a user" true here by construction rather than by the backend never making a mistake.
+
+**8. Feed state is bound to an account.** The store is a module singleton that outlives a logout in the same tab. `setFeedIdentity` binds it; a user-scoped payload addressed to anyone else is dropped, and changing identity clears the slice rather than reinterpreting it. A platform broadcast does not overwrite a user who has spoken for themselves — the D4.5 defect (the platform view saying `delayed` about a user promoted to their own streaming feed), which is exactly as wrong in React as it was on the bus.
+
+**9. Nothing is asserted before the backend speaks.** `feedState` is `null` until an event arrives and the indicator renders nothing. "We have not been told yet" is not the same claim as "the feed is down", and it is not the same claim as "the feed is live".
+
+Alternatives Rejected
+
+**Extend `ConnectionStatus` with the feed states.** Rejected: it conflates two states that can disagree, and the conflation is the specific failure this sprint exists to prevent. The two pills sit side by side and each answers its own question.
+
+**Derive `recovering` in the frontend from a missing tier, a stale timestamp, or the socket state.** Rejected as the whole point. Every one of those is the frontend guessing at a question the Source Manager answers, and each would be wrong in a different way at a different moment.
+
+**A countdown, a progress bar, or a retry ETA while recovering.** Rejected — the platform does not know. D5.7's cool-down ladder is not published to consumers (LIM-D5.6-4 stands), and the trial may simply fail again. A number invented to fill a gap is fabricated provenance on the surface least able to afford it.
+
+**Show the broker's name so the user knows what to reconnect.** Rejected: Developer Rule 4, and the same argument ADR-053 made — a field a consumer can only render for the brokers somebody has read the error tables of is not a consumer field. Broker identity remains available on the broker-account surfaces where the user connected it, which is where a reconnection actually happens.
+
+**A dismissible banner instead of a pill.** Deferred, not rejected. A pill is always-visible and always-honest, and cannot be dismissed into a state where a user is trading on `recovering` prices with no indicator. A banner carries a dismissal-lifetime decision — per session, per transition, per reason — with no evidence yet to make it on.
+
+**Add `provider` to the backend's `DOMAIN_CHANNEL` map.** Rejected as an unnecessary backend change: the fall-through already produces a stable, correct channel name, and the map exists to *rename* domains whose channel differs from the domain, which this one's does not.
+
+Consequences
+
+• **Zero backend files changed.** The channel already resolved, the payload already carried everything needed, and `WebSocketManager.subscribe` accepts free-form channel names. D5.14 is entirely a consumer of D5.13's contract.
+• **`recovering` is now visible and is never presented as live** — in the store (`selectFeedIsLive`), in the projection (`live`), and in the DOM (`data-feed-live="false"`).
+• **93 frontend tests added** across five files; the full suite goes 400 → 493.
+• **14 mutations, 14 red**, each on a targeted assertion; the two whose failures were unnamed by the harness were re-verified individually and each failed on exactly its intended test.
+• **LIM-D5.13-1 CLOSED.** LIM-D5.13-2 (state reasoning exercised with one polled provider) is a backend limitation and is **untouched** — this sprint renders whichever state the backend resolves and adds no new reasoning about it.
+• **A new frontend limitation is recorded rather than absorbed: LIM-D5.14-1** — the indicator is global, but feed state is per-capability on the backend (`capabilities` is projected and stored, and nothing reads it yet), so a page showing only sector data is told about the QUOTES feed.
+
+Requires Approval
+
+None.
+
+Review Date
+
+Whenever a surface needs feed state **per capability** rather than globally (LIM-D5.14-1), or when product decides the explanation deserves a dismissible banner rather than an always-on pill.
+
+Authoritative document
+
+MARKET_DATA_ARCHITECTURE.md
+
+---
+
+# ADR-055
+
+D5.15 — The Instrument Universe, the Broker Instrument Catalogue, and the Dashboard Price Path
+
+Status
+
+Accepted (2026-08-31). Supersedes nothing; extends ADR-035 (readiness), ADR-043 (freshness) and Developer Rules 2 and 4 of MARKET_DATA_ARCHITECTURE.md.
+
+Context
+
+D5.15 was the first sprint to trace a **real, authenticated broker account** through the running platform during market hours instead of through a fixture. The result contradicted twelve sprints of green tests without any of them being wrong.
+
+The account authenticated. The portfolio sync succeeded against the real broker REST API. Both broker WebSockets were open — confirmed at the TCP layer, by certificate. The feed was registered with the Market Gateway and its owner's `provider.status` advertised the TICKS capability. And in ten minutes of an open market the platform published **zero** `market.tick` events.
+
+The account held nothing: zero holdings, zero positions. Every adapter derives its subscription from `holdings + positions` — five adapters, each of which documented the same consequence in its own docstring ("the feed covers what the account holds and nothing else") and deferred the catalogue that would fix it. With an empty portfolio the subscribe frame was empty, so the socket was **structurally incapable** of delivering a packet.
+
+Three separate defects followed from that one rule, and each alone was sufficient to produce the reported symptom — a connected broker and a dashboard that never moves:
+
+1. **The subscription was empty.** Nothing to receive.
+2. **The identity map was empty.** `InstrumentMap.from_portfolio([], [])` has no entries, so a tick that *had* arrived could not have been named and would have been dropped inside `canonical_ticks` — silently, with no exception and no log line.
+3. **The dashboard never asked the Market Engine anything.** The loop that produces the message every price surface renders called Yahoo **directly**, behind a 300-second cache, and broadcast **one global map to every socket**. Having no user, it could never resolve a per-user provider: a promoted broker feed was unreachable by construction, not misranked. The same read (`db.watchlist.distinct("symbol")`, unfiltered) also put every user's watchlist symbols in every other user's payload.
+
+A fourth was found by reading rather than by the outage: **a socket with zero subscriptions was reported as an active market-data feed.** Link-level eligibility asked only `is_link_up`, so the owner of an empty account was told the TICKS capability was available for a feed that could never deliver one — the same class of claim LIM-D5.12-1 removed from the `available` state.
+
+Decision
+
+**1. A feed's instrument universe is the portfolio *plus* what the user watches *plus* what the dashboard shows.** Assembled by `services/brokers/feed_universe.py`, in canonical symbols, by a module that names no broker and is swept for broker names in its comments as well as its code. Ordered portfolio → watchlist → dashboard, because every downstream ceiling trims from the end and nobody's position should go unpriced because a default dashboard symbol took its slot. Every input is optional: a caller that passes only the portfolio gets the pre-D5.15 universe byte for byte, which is what makes this safe to introduce beneath five adapters at once.
+
+**2. Symbol → broker instrument identifier is a declared broker capability.** `BrokerCapability.INSTRUMENT_CATALOGUE`, bound to `resolve_instruments` and verified at registration like every other capability. It is deliberately **separate from TICK_STREAM**: one says a feed exists, the other says the feed can be *aimed* at an instrument the account does not own. A broker that declares neither is unchanged. A broker that declares it may implement it with an instrument master, a search endpoint or a static table, and the Market Engine cannot tell which — the identifier is opaque above the adapter boundary, and `services/broker_engine.py` is swept for every instrument-format string the five adapters use.
+
+Degradation is part of the contract, at three levels: a broker with no catalogue resolves nothing; an unreachable master resolves nothing; an unresolvable symbol is **omitted**, never mapped to a sentinel — a key the wire rejects can take a whole subscribe frame down with it. In every case the account keeps exactly the portfolio-derived subscription it had before.
+
+**3. Whatever the feed is aimed at must be nameable when it comes back.** `InstrumentMap.from_portfolio` takes the resolved catalogue, so a subscription and the identity map cannot disagree. Portfolio rows win: a held instrument carries an exchange and a broker-confirmed identifier, a catalogue entry is a lookup, and the catalogue never invents an exchange it was not given.
+
+**4. Zero subscriptions is not an active market-data feed.** Link-level eligibility (TICKS, DEPTH) now requires a subscription as well as a link. **This is a behaviour change to a D5.4-era invariant** and is recorded as one: D5.4 protected the link-level comparison by *ranking* an unsubscribed feed last, on the argument that latency must rank and never filter. Ranking is not enough when the feed is the only candidate — last in a chain of one is still the answer, which is exactly how an empty account came to be told its ticks were available. `test_an_unready_feed_carries_no_latency_into_the_link_level_comparison` was rewritten rather than deleted: the guarantee it protects is unchanged and now rests on a stronger mechanism. The *applicability* question (`capability is None` — diagnostics, `entitled_for`) is deliberately **not** gated, because hiding an attached-but-idle feed from the surfaces whose job is to explain why it is not serving would replace one wrong answer with another.
+
+**5. Every price a dashboard renders is resolved through the Market Gateway, for the user who will see it, and delivered to that user alone.** `MarketGateway.get_prices(symbols, user_id=...)` resolves per symbol — per-symbol eligibility is the rule that lets a broker feed cover NSE equities without disqualifying the baseline from a US index — and the price stream loop sends each connected account its own map.
+
+Per-user resolution taken literally would be wasteful, so the fan-out asks the Source Manager rather than guessing: `baseline_prices_are_shared(user_id)` is true when the user's resolution and the platform's choose from the identical candidate set, and those users share one resolution. It is asked of resolution and **not** of "does this user have a broker connected", because a connected broker with no registered feed, an unready feed, a feed on probation and a feed that lost its link all resolve to the baseline.
+
+**6. The frontend consumes `market.tick`.** The event existed, reached the browser and was dropped: `applyEvent` routes on the domain and the `market` branch tested for four specific event names and then a top-level `data.symbol && data.price`, none of which a `{ ticks: [...] }` batch has. It is folded into the same `_mergePrices` sink every other price source uses, so a component cannot tell a pushed tick from a polled quote — which is Developer Rule 4, not an implementation convenience. Only `price` is taken: a `MarketTick` has no `change_pct`, and writing a zero would render a real price beside a fabricated "unchanged".
+
+**7. A feed that goes stale is announced, not merely demoted.** Staleness is the one demotion that is not a state transition: a socket that stays open and stops delivering is filtered lazily inside `is_eligible_for`, so prices fall back correctly and no listener fires. Observed live — the feed stopped delivering at 09:45:20Z while the newest `provider.status` on the bus was 09:44:02Z, tier `streaming` — which means the D5.14 indicator would have gone on reading **Live** over baseline data. The per-user price loop now announces the tier it has just resolved. It is the right place because it is already resolving on a cadence, and `publish_status` is change-gated per user: a steady feed emits nothing, a feed that went stale emits exactly one event. No timer, no second mechanism, and no change to how staleness itself is decided (D5.3 untouched).
+
+Consequences
+
+• **LIVE VALIDATED, end to end, on a real broker account during NSE market hours.** Provider registered 09:25:34Z; tier moved `delayed → streaming` at 09:26:05Z after readiness and the 30-second probation window; `market.tick` published at ~7 batches/second carrying `source_tier: "streaming"` and canonical symbols. Prices changed continuously (RELIANCE 1290.4→1290.0, TCS 2333.0→2330.1 over 24 seconds) and matched an **independent oracle** to within normal tick drift (oracle: RELIANCE 1290.2, TCS 2331.3, ICICIBANK 1444.4). A process restart mid-session re-earned readiness, re-served probation and was re-selected 30.6 seconds later — reconnect and recovery, observed rather than argued.
+• **The last hop was NOT live-validated.** A real broker tick has been observed reaching the browser's transport boundary but not rendering in the dashboard DOM, because that requires an authenticated browser session this sprint could not create. It is TEST VERIFIED and recorded as **LIM-D5.15-1**, not claimed.
+• **One capability is added to the broker contract**, and four of the five adapters do not implement it yet. Each publishes a reachable, unauthenticated instrument master (verified by HTTP range request, not assumed), so the work is per-adapter and bounded — recorded as **LIM-D5.15-2** with the exact missing capability per broker.
+• **56 tests added** — 39 backend (24 on the universe and catalogue seam, 15 on the dashboard price path) and 17 frontend. Backend 4118 → 4158 passing; frontend 485 → 502 passing.
+• **21 mutations, 21 red.** One (M16) was green on the first pass and exposed a real gap rather than a wrong mutation: the batched-ingest handler was redundant for *correctness* because `applyEvent` caught the event anyway, so the Sprint R9 coalescing could have regressed to one store write per tick batch — a re-render storm at 7 batches a second — with every price assertion still passing. A test that counts store writes closed it.
+• **`FakeDB` gained `distinct`.** It had none, so every call fell into its caller's `except` branch and returned a degraded-but-plausible answer: the cross-user scoping assertion could not have failed. A control is only certified if the probe could have failed.
+
+Requires Approval
+
+None.
+
+Review Date
+
+When a second adapter implements INSTRUMENT_CATALOGUE (the point at which the seam is proven rather than argued), or when a surface needs an instrument universe wider than the dashboard set — a search-selected instrument is the case the abstraction was shaped for and the one nothing exercises yet.
+
+Authoritative document
+
+MARKET_DATA_ARCHITECTURE.md
+
+---
+
+# ADR-052 — The feed universe is exchange-qualified, and the equity catalogue is a shared policy over five private parsers
+
+Status: Accepted (D5.16, 2026-08-31)
+
+## Context
+
+D5.15 gave the broker layer an instrument catalogue: `resolve_instruments(symbols: Sequence[str]) -> {symbol: identifier}`, one implementation (Upstox), and a feed universe of bare canonical symbols. It closed the "connected broker, empty demat, dead feed" defect for one broker.
+
+Two things were wrong with it, and only one was known.
+
+**Known (LIM-D5.15-2): four adapters had no catalogue.** For Zerodha, Angel One, Fyers and Dhan the gateway's capability gate returned `{}`, so an account owning nothing subscribed to nothing — the exact state D5.15 existed to end, still reachable at four of five brokers.
+
+**Not known: a bare symbol cannot name an instrument.** Verified against all five brokers' own published masters on 2026-08-31:
+
+| | NSE | BSE |
+|---|---|---|
+| Kite | `738561` | `128083204` |
+| Angel One | `1\|2885` | `3\|500325` |
+| Fyers | `sf\|nse_cm\|2885` | `sf\|bse_cm\|500325` |
+| Dhan | `NSE_EQ\|2885` | `BSE_EQ\|500325` |
+| Upstox | `NSE_EQ\|INE002A01018` | `BSE_EQ\|INE002A01018` |
+
+`RELIANCE` is two instruments. A catalogue keyed on the symbol answers with whichever listing it indexed first, and the one implemented master was NSE-only, so a BSE request received the NSE key — silently. The account would then subscribe to the wrong listing and be marked at the wrong price, with nothing raising and nothing to see in a log.
+
+## Decision
+
+**1. The unit of a feed universe is `FeedInstrument(symbol, exchange, segment)`, not a symbol.** `build_feed_universe` returns these and `resolve_instruments` takes them. `segment` is fixed at `EQUITY` this sprint and carried anyway, so widening to F&O or currency is a value change rather than a signature change.
+
+**2. An unqualified symbol takes a *stated* default exchange, never a first match.** A watchlist row has no exchange column and neither does the dashboard universe. `catalogue.DEFAULT_EQUITY_EXCHANGE = "NSE"` is the platform saying what it already means — its universe, its indices and every symbol its AI reasons about are NSE. An exchange outside `{NSE, BSE}` resolves to *nothing* rather than being rewritten: silently turning `MCX` into `NSE` resolves a commodity to an equity of the same name.
+
+**3. An unqualified symbol does not add a second listing for an instrument already covered.** A user holding `RELIANCE` on BSE who also watches `RELIANCE` means one instrument. Two explicitly qualified rows that disagree are kept — that is the account's own record, not a default.
+
+**4. "Which row is the ordinary share" is one shared policy, not five.** Parsing is irreducibly per-broker — Kite a headed CSV, Angel One a JSON array, Fyers a headerless CSV, Dhan a `SEM_`-prefixed CSV, Upstox gzipped JSON per exchange — and stays in the adapter. Ranking does not: `CHOLAFIN` is `-EQ` and `-D1` (differential voting rights), `ELECTCAST` is `-EQ` and `-W1` (warrants), and a user naming the symbol means the share. Five copies of that judgement would be five chances to disagree *silently*, because the symptom of picking the wrong row is a correct-looking price for the wrong instrument.
+
+**5. A genuine tie is dropped, never guessed.** Two candidates at equal rank — which is what a master with no series column produces — resolve to no answer. The instrument is omitted from the subscription and falls back to the baseline per symbol, which is the same path a symbol the broker never heard of already takes. Applied to the five real masters, the ambiguous-drop count is **0** and `RELIANCE`, `CHOLAFIN`, `ELECTCAST` and `MOTHERSON` all resolve to their ordinary shares on both exchanges.
+
+## Consequences
+
+* Five of five adapters declare `INSTRUMENT_CATALOGUE`. LIM-D5.15-2 and LIM-D5.15-3 are closed.
+* An account with zero holdings subscribes to its watchlist and dashboard universe at **every** broker.
+* Per-instrument fallback needed no new mechanism: an unresolvable instrument is absent from the subscription, so absent from `covered_symbols`, so refused by `is_eligible_for` for that symbol alone.
+* **Kite is the one broker whose master has no series column.** Its `instrument_type` is a single `EQ` flag, so every accepted row is offered at equal rank and a duplicate `(exchange, tradingsymbol)` would be dropped. Verified safe: Kite spells a non-ordinary series into the trading symbol itself (`CHOLAFIN` vs `CHOLAFIN-D1`), so distinct series produce distinct keys and 0 collisions across 22,993 keys. Its NSE key set is ~3× the others' because bonds and SGBs cannot be filtered out — they occupy keys like `("NSE", "0ABCL31-N0")` that no watchlist symbol will ever match, so they are noise rather than a mis-resolution risk.
+
+## Requires Approval
+
+None.
+
+## Review Date
+
+When a surface needs an instrument outside NSE/BSE cash equity — a search-selected instrument on a third exchange, or the indices/commodities work Phase 8 defers. The `segment` field exists for that day and nothing exercises it yet.
+
+## Authoritative document
+
+MARKET_DATA_ARCHITECTURE.md
+
+---
+
+# ADR-053 — Every rendered equity price resolves through the Market Gateway, per user
+
+Status: Accepted (D5.16, 2026-08-31)
+
+## Context
+
+D5.16's brief named one bypass of Developer Rule 2: Top AI Picks calling Yahoo directly. The audit found four, and the widest was unnamed:
+
+`server.real_quote` and `server.real_quotes_map` — two functions, ~30 lines — were the equity-price source for `GET /api/watchlist`, the watchlist add, `/analysis/explain`, `/analysis/full-report`, the advisor, the open-trades view, the exit-price fallback, the portfolio monitor and the socket's own `subscribe_prices` handler. Neither had ever touched the gateway. For every one of those surfaces a user's own promoted broker feed was unreachable **by construction** — not misranked, never asked.
+
+The other three: `fetch_real_top_picks`; `heartbeat_engine.task_watchlist_stream` (which was also a cross-user disclosure, see below); and `portfolio_stream.quotes_map`, which marked a holding from Yahoo on every recompute a broker tick did not drive — so the live number and the snapshot number came from different providers and could disagree by a day's move.
+
+## Decision
+
+**1. All four route through `market_gateway.get_prices`, and every call site that knows whose request it is passes `user_id`.** Where a caller is genuinely platform-scoped — the daily top-pick generation, persisted platform-wide — it resolves with no user, deliberately: caching a per-user resolution would serve one account's broker prices to everybody.
+
+**2. `get_prices` resolves concurrently, with a small bound.** Sequentially, a 100-symbol watchlist on a cold cache is 100 round trips; the same loop prices the whole dashboard universe every 15 seconds. The bound is the load-bearing part: unbounded, a dead provider is discovered by every symbol independently and marked down 100 times over — D2's "failover works, after N failed requests" shape. Eight in flight caps the blast radius.
+
+**3. `macd_signal` joins the canonical quote.** It was the one half of the MACD pair the normalizer dropped, and nothing noticed while every consumer read a raw Yahoo quote. Routing them made it load-bearing: `_advisor_score` and the top-pick scorer both branch on `macd > macd_signal`, and an absent signal line becomes `0.0` — true for every stock with positive momentum. Present-and-`None` on every tier, because a key that exists on a delayed quote and is missing on a streaming one is a consumer able to tell which provider answered.
+
+## Consequences
+
+* `services/portfolio_stream.py` leaves `KNOWN_GATEWAY_BYPASSES`. The register may only shrink, and it did.
+* Per-instrument fallback now holds on the REST path too: `real_quotes_map(["RELIANCE", "TCS"])` for a user whose feed covers only `RELIANCE` returns one live price and one baseline price from a single call.
+* A broker feed's quote is *thin* — a tick carries a price, not an RSI. Absent technicals stay `None` rather than becoming `0.0`, and the browser's field-by-field merge keeps what an earlier cycle supplied. This is LIM-D5.16-1.
+
+## Requires Approval
+
+None.
+
+## Review Date
+
+When a streaming provider gains a QUOTES surface richer than a tick, which is what would let the thin-quote limitation close.
+
+## Authoritative document
+
+MARKET_DATA_ARCHITECTURE.md
+
+---
+
+# ADR-054 — A user-scoped realtime stream is scoped at selection, not at delivery
+
+Status: Accepted (D5.16, 2026-08-31)
+
+## Context
+
+`heartbeat_engine.task_watchlist_stream` read `db.watchlist.distinct("symbol")` with **no filter** and published the result as a bus event carrying **no `user_id`**. `event_bridge._deliver` routes on exactly that field: a payload with one goes to `send_to_user`, a payload without one goes to `broadcast_to_channel`. Every socket on the `watchlist` channel received every user's watchlisted symbols and their prices — and not as inert JSON: `realtimeStore.priceMapFromMessage` folds `watchlist.quotes` straight into `priceTicks`, so another account's instruments entered the victim's live price store and rendered.
+
+D5.15 named this exact query as the thing to avoid, in a docstring 130 lines below the loop that was still doing it. It fixed the `prices` broadcast and left this one alone.
+
+## Decision
+
+**Scope at selection.** The read is `distinct("symbol", {"user_id": …})` and the recipient set is the *connected* accounts. Publishing per-user while still selecting globally would have preserved the identical disclosure and merely made it harder to see; a filter applied by the consumer is not a boundary at all.
+
+**The `user_id` on the publish is not optional and not conditional.** It is the entire security property of that call, so it is unconditional in the payload rather than added when convenient.
+
+**The test asserts the query, not only the result.** With one user in the database, `distinct("symbol")` and `distinct("symbol", {"user_id": "A"})` return the identical list — a results-only test cannot falsify the global read. A spy records every call and asserts every one carries an owner filter.
+
+## Consequences
+
+* There is no unfiltered read of `db.watchlist` anywhere in the codebase.
+* The same change routed this path through the gateway, so it is also the fix for one of ADR-053's four bypasses.
+* One account's failure no longer costs every other connected account its refresh.
+
+## Requires Approval
+
+None.
+
+## Review Date
+
+When a second broadcast-shaped event carries user-derived data. The rule generalises and the bridge already implements it; what is missing is a way to make "this payload is user-derived" impossible to forget.
+
+## Authoritative document
+
+SECURITY_ARCHITECTURE.md
+
+---
+
+# ADR-056 — The instrument catalogue gains a second segment, and commodities are refused on the evidence
+
+Status: Accepted (D5.17, 2026-08-31). Extends ADR-052 (the exchange-qualified feed universe and the shared equity catalogue) and ADR-053 (every rendered price resolves through the Market Gateway, per user). Supersedes nothing.
+
+## Context
+
+D5.16 shipped broker-live cash equities and left the rest of the dashboard on the delayed baseline, with an explicit `Delayed` badge and an open question: *could* indices and commodities be broker-powered, or were they merely deferred? D5.17 opened by answering that against the five brokers' **live published masters** rather than against their documentation, and the answer split cleanly in two.
+
+**Indices: the brokers were never the obstacle.** All five publish NIFTY, BANKNIFTY, SENSEX and INDIA VIX in the same masters the equity catalogue already downloads, in exchange segments whose ticks the five codecs already decode — Kite's `INDICES` segment (price divisor 100, the default), Angel One's `AMXIDX` rows in the NSE/BSE cash segments its decoder already names, Dhan's `IDX_I` (already in its `SEGMENTS` table), Upstox's `NSE_INDEX`/`BSE_INDEX` keys, Fyers' `-INDEX` tickers in the `nse_cm`/`bse_cm` masters it already fetches. Every obstacle was on *this* side of the line:
+
+1. the catalogue key was `(exchange, symbol)`, so an index had nowhere to be filed;
+2. the feed universe had no index source, so nothing asked for one;
+3. **every master spells the indices differently from the platform, and differently from each other.**
+
+(3) is the finding that mattered. An equity's canonical symbol *is* its trading symbol at all five brokers — `RELIANCE` is `RELIANCE` everywhere — which is why D5.16's catalogue needed no name table. An index's is not:
+
+| canonical | Kite | Angel One | Dhan | Upstox | Fyers |
+|---|---|---|---|---|---|
+| `NIFTY` | `NIFTY 50` | `NIFTY` | `NIFTY` | `NIFTY` | `NIFTY` |
+| `BANKNIFTY` | `NIFTY BANK` | `BANKNIFTY` | `BANKNIFTY` | `BANKNIFTY` | `BANKNIFTY` |
+| `SENSEX` | `SENSEX` | `SENSEX` | `SENSEX` | `SENSEX` | `SENSEX` |
+| `INDIAVIX` | `INDIA VIX` | `INDIA VIX` | `INDIA VIX` | `INDIA VIX` | `INDIAVIX` |
+
+A catalogue matching on identity would have resolved indices at *some* brokers and silently not at others — the worst of the three possible outcomes, because the symptom (an index that never ticks on a healthy socket) is indistinguishable from a quiet market.
+
+**Commodities and currency: the brokers genuinely do not carry them.** Not "not yet". **No Indian broker publishes a spot instrument for gold, silver, crude or USD-INR at all.** What the masters carry is dated futures — `GOLD26OCTFUT`, `CRUDEOIL26SEPFUT`, `USDINR26SEPFUT` — a different instrument, with an identity that rolls at every expiry, behind an MCX/CDS segment entitlement most retail accounts do not hold, at a price that is not the spot number the dashboard shows.
+
+The audit also found the dashboard's commodities strip was **already** misrepresenting its data, and had been since long before D5.16: the payload labelled gold `"Gold (MCX)"` in `"INR/10g"` and silver `"Silver (MCX)"` in `"INR/kg"`, while the tickers fetched were `GC=F` and `SI=F` — **COMEX futures quoted in US dollars per troy ounce**. The strip rendered the number with no unit at all, so a user read a four-figure dollar price as rupees per ten grams: wrong by roughly a factor of thirty, in a direction that looks plausible. Nothing simulated the number. The price was real and the *label* was the fabrication, which is why every "is the data real?" control in twelve sprints passed over it.
+
+## Decision
+
+**1. The catalogue key carries the segment: `(segment, exchange, symbol)`.** `CashEquityCatalogue` becomes `InstrumentCatalogue` and holds both segments in one object, because two rows that claim one key must be visible to each other for the ambiguity rule to drop them — a per-segment catalogue would file an index and an equity of the same name separately and resolve both. `resolve_from_index` reads the segment **off the instrument** and refuses one that names none, rather than defaulting to EQUITY: an instrument with no segment is a caller this contract does not cover, and answering it with an equity lookup is precisely how an index would silently resolve to a share of the same name.
+
+**2. The index name table is a shared platform policy, not five private ones.** `catalogue.INDEX_ALIASES` maps each canonical symbol to every spelling the five masters use, and `catalogue.INDEX_EXCHANGES` states each index's exchange (`SENSEX` is BSE; the other three are NSE — the one place the platform default would have been wrong). This is the identical argument ADR-052 made for the cash-series policy: five copies would be five chances to disagree, silently. An adapter may name its own **discriminator** — that is its broker's format and belongs to it — but not the platform's indices, and a sweep enforces the line against executable string literals.
+
+Matching is exact against a closed table, with internal whitespace collapsed and nothing else removed. A normalizer loose enough to join `"NIFTY 50"` to `"NIFTY"` also joins `"NIFTY 500"`, `"NIFTY 50 EQUAL WEIGHT"` and the twenty other `NIFTY *` indices in the same segment of the same file. Verified against all five live masters: every canonical symbol resolves at every broker, on the right exchange, with **zero collisions**.
+
+**3. `MarketTick` is NOT widened.** An index level is a price; `exchange` already names NSE/BSE; `volume` is already optional. A `segment` field would have been convenience, and the sweep that pins the field list is mutation-tested to prove it would catch one being added.
+
+**4. The index universe is four instruments, stated as pairs, inserted between the watchlist and the dashboard set.** Position in the order *is* the priority statement, because every downstream ceiling trims from the end: an account is entitled to its own instruments before the platform's defaults, and four indices that every page renders outrank thirty dashboard equities that one card does. `indices` is an optional argument like every other, so a caller that omits it gets the D5.16 universe byte for byte.
+
+**5. Index *prices* are resolved through `get_prices(..., user_id=...)`, not read off the overview.** `get_indices` serves `Capability.INDICES`, which only a polling provider declares — a broker feed publishes TICKS and QUOTES and has no notion of a market overview. So the overview is, and will remain, the delayed baseline. The moment indices went onto broker feeds that became a defect rather than a limitation: a tick worth 24815.25 would arrive on `market.tick` and this loop would overwrite it 15 seconds later with the baseline's 24810 — an index card flickering between two numbers, one stale, under a feed indicator reading `Live`. The loop now asks the same canonical question every equity on the page is already asked, and takes **only `price`** from the answer, because a thin streaming quote carries no day-change and the overview's real one must survive beside the live price.
+
+**6. Commodities and currency stay on the documented delayed path, permanently and on the evidence, and their units are now stated.** The `Delayed` badge is no longer provisional. The server labels the instrument it actually fetches (`Gold (COMEX)`, `USD/oz`) and the strip renders the unit beside the number — not in a tooltip, because a user has no way to know to hover, and a commodity price without its unit is not a smaller truth but a different number.
+
+**7. `TATAMOTORS` is replaced by `TMPV` and `TMCV`, on evidence, closing LIM-D5.16-2.** D5.16's rule — do not delete a symbol merely because today's catalogues lack it — is right, and D5.17 supplied what it asks for: Tata Motors demerged, the symbol trades at no venue, all five live masters carry only its two successors (`TMPV` holds the *old* TATAMOTORS token 3456, renamed), and Yahoo answers `TATAMOTORS.NS` with "No data found, symbol may be delisted" while both successors quote. Replaced rather than dropped, because the Auto exposure the row represented still exists.
+
+## Consequences
+
+• **The catalogue half is LIVE VERIFIED through production code paths.** `resolve_instruments` was run against all five brokers' real published masters, on the real `index_instruments()` universe: **20/20 index resolutions**, and **35/35** on a full universe (30 dashboard equities + 4 indices + a watchlist symbol + a BSE-held RELIANCE) at every broker.
+
+• **A real broker tick changing a dashboard index has NOT been observed.** A valid Upstox session exists and the run happened at 23:12 IST — nearly eight hours after the close — so no market event existed to observe. Recorded as **LIM-D5.17-2**, with the exact smoke test, and *not* claimed. The highest-priority product objective remains open at the same last hop D5.15 left it at.
+
+• **Fyers' index topic prefix is unverified and is the one place a wrong answer would be invisible.** A Fyers tick is identified by the topic string the *server* returns on the snapshot record, not by what was subscribed. Indices are subscribed as `if|<segment>|<token>` — the prefix its own decoder already lists as priceable — but if HSM answers with a different one the instrument map has no entry, every packet is dropped, and the symptom is an index that never ticks on a healthy socket with a quiet log. **LIM-D5.17-3.**
+
+• **A D5.16 carry-over defect was found and fixed.** `heartbeat_engine._watchlist_quotes` accepted `user_id` and never passed it to `get_prices`, so every account's watchlist was resolved platform-wide — D5.16 reported this bypass closed and had closed it halfway. Its own three isolation tests were **red in the working tree**. One line; the tests are green.
+
+• **A pre-existing reference-data inconsistency surfaced.** Two universe rows carried sectors (`Conglomerate`, `Mining`) that `market_data.SECTORS` did not list. Nothing read the list, so nothing broke — but the two are meant to be one statement, and a consumer that ever filtered on it would have dropped those stocks silently.
+
+• **A Yahoo identifier was removed from frontend code.** The Nifty sparkline fetched `/stocks/%5ENSEI/chart` — Yahoo's own index ticker, hardcoded in the browser, in the one place a provider switch could not reach. It now asks for `NIFTY`.
+
+• **48 tests added** — 41 backend (`test_index_feed_routing.py` 24, `test_index_price_path.py` 12, `test_d517_reference_data.py` 6, `test_d517_boundaries.py` 8 — 50 including parametrization) and 18 frontend. Backend 4326 → 4366 passing; frontend 518 → 536 passing. Two D5.16 test files were updated for the widened key; one D5.16 assertion was **strengthened** rather than relaxed to accommodate the new index entry.
+
+• **36 mutations, 36 red — one after a first pass that exposed a real gap.** M22 deleted `indices=index_instruments()` from the engine's one call to `build_feed_universe` and left every test green: the aliases, the segmented key, the five parsers, the universe and the end-to-end join were all proved, and none of it would have reached a broker socket. This is the same shape of gap D5.16 wrote `test_empty_portfolio_feed.py` for — a catalogue that resolves perfectly is worthless if the planner never consults it — and it was closed with a per-broker test that drives `_plan_tick_subscription` and asserts both halves: on the wire, and nameable when it comes back.
+
+## Requires Approval
+
+None.
+
+## Review Date
+
+At the first observed broker index tick — which is what turns the catalogue evidence above into the product claim — and specifically at the first **Fyers** one, which is the only broker whose identifier this sprint could not verify against a live wire.
+
+## Authoritative document
+
+MARKET_DATA_ARCHITECTURE.md
+
+---
+
 # End of Decisions Documentation

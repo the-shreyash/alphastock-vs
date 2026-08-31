@@ -109,12 +109,29 @@ class InstrumentMap:
         cls,
         holdings: Optional[Iterable[Dict[str, Any]]] = None,
         positions: Optional[Iterable[Dict[str, Any]]] = None,
+        catalogue: Optional[Dict[str, Any]] = None,
     ) -> "InstrumentMap":
         """Build the table from canonical holding / position rows.
 
         Rows without a symbol are skipped rather than rejected: a broker may
         return an instrument this platform cannot name, and one such row must
         not cost the account every other mapping in the batch.
+
+        `catalogue` (D5.15) is `{CANONICAL_SYMBOL: broker instrument identifier}`
+        as an adapter's `resolve_instruments` returned it — the instruments this
+        account's feed was aimed at that it does not own. Without them the
+        subscription and the map would disagree: the wire would carry ticks for
+        an instrument no arriving tick could be *named*, and `canonical_ticks`
+        would drop every one of them at the identity boundary. A subscription
+        the map cannot read back is the same defect as no subscription at all,
+        reached one step later.
+
+        Portfolio rows are applied first and win. A held instrument carries an
+        exchange and a broker-confirmed identifier; a catalogue entry is a
+        lookup, and where the two disagree the account's own record is the
+        better fact. Catalogue entries therefore have no exchange — this map
+        does not invent one, because `MarketInstrument` treats an exchange as a
+        statement and an unqualified symbol is the honest one.
         """
         by_token: Dict[str, MarketInstrument] = {}
         by_symbol: Dict[str, MarketInstrument] = {}
@@ -133,6 +150,17 @@ class InstrumentMap:
             existing = by_symbol.get(instrument.symbol)
             if existing is None or (existing.exchange is None and instrument.exchange is not None):
                 by_symbol[instrument.symbol] = instrument
+        for symbol, token in (catalogue or {}).items():
+            try:
+                instrument = MarketInstrument.of(symbol)
+            except MarketTickError:
+                continue
+            key = _token_key(token)
+            if key is not None:
+                # `setdefault`, so a portfolio row that already claimed this
+                # identifier keeps it with its exchange.
+                by_token.setdefault(key, instrument)
+            by_symbol.setdefault(instrument.symbol, instrument)
         return cls(by_token=by_token, by_symbol=by_symbol)
 
     # -- resolution -----------------------------------------------------------

@@ -4,6 +4,7 @@ import api from "../services/api";
 import { formatCurrency, formatNumber, formatPercent } from "../utils/formatters";
 import { useWebSocket } from "../hooks/useWebSocket";
 import { usePriceFlash } from "../hooks/usePriceFlash";
+import { applyLivePrices, applyLiveIndexPrices } from "../lib/livePrices";
 import AnimatedNumber from "../components/ui/AnimatedNumber";
 import {
   TrendingUp, TrendingDown, Activity, BarChart3,
@@ -120,7 +121,35 @@ function StatCard({ label, value, numericValue, change, changePct, sparkData, te
 }
 
 /* ====== Commodities & Forex Strip ====== */
-function CommoditiesStrip({ commodities }) {
+/**
+ * Gold / Silver / Crude / USD-INR.
+ *
+ * NOT BROKER-POWERED, AND LABELLED AS SUCH — now for a settled reason.
+ *
+ * D5.16 deferred these four rather than faking them, and left open whether a
+ * broker could carry them. D5.17's audit closed that question against all five
+ * brokers' live published masters, and the answer is not "later": **no Indian
+ * broker publishes a spot instrument for any of them.** What the masters carry
+ * is dated MCX/CDS futures — `GOLD26OCTFUT`, `USDINR26SEPFUT` — a different
+ * instrument, with an identity that rolls at every expiry, behind a segment
+ * entitlement most retail accounts do not hold, at a price that is not the spot
+ * number this strip shows. Subscribing one and rendering it here would be a
+ * fabrication of a kind no "is the data real?" check could catch, because every
+ * individual number would be real.
+ *
+ * So the `Delayed` badge is permanent rather than provisional, and it says
+ * "Delayed" and not a provider name: freshness is a claim the platform makes
+ * everywhere (D5.14), provider identity is one it makes nowhere (Rule 4).
+ *
+ * THE UNIT IS PART OF THE PRICE (D5.17).
+ * Gold read `Gold` over a bare `3,450` while the payload called it
+ * `"Gold (MCX)"` in `"INR/10g"` and the ticker behind it was COMEX gold in US
+ * dollars per ounce. Both halves are fixed — the server now labels the
+ * instrument it actually fetches, and this strip renders the unit — because a
+ * commodity price without its unit is not a smaller truth, it is a different
+ * number.
+ */
+export function CommoditiesStrip({ commodities }) {
   if (!commodities) return null;
   const items = [
     { key: "gold", label: "Gold", icon: "🥇" },
@@ -130,7 +159,17 @@ function CommoditiesStrip({ commodities }) {
   ];
 
   return (
-    <div data-testid="commodities-strip" className="grid grid-cols-2 md:grid-cols-4 gap-2">
+    <div data-testid="commodities-strip">
+      <div className="flex items-center justify-end mb-1.5">
+        <span
+          className="text-[9px] font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded"
+          style={{ background: "var(--hover)", color: "var(--text-muted)" }}
+          title="Commodities and currency are not carried by broker feeds — these are delayed quotes."
+        >
+          Delayed
+        </span>
+      </div>
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
       {items.map((item) => {
         const c = commodities[item.key];
         if (!c || !c.available) return (
@@ -150,6 +189,13 @@ function CommoditiesStrip({ commodities }) {
               <span className="text-[11px] font-medium block truncate" style={{ color: "var(--text-muted)" }}>{item.label}</span>
               <span className="text-[13px] font-mono font-semibold" style={{ color: "var(--text-primary)" }}>
                 {c.value != null ? formatNumber(c.value) : "—"}
+                {/* The unit, when the server states one. Rendered beside the
+                    number and not in a tooltip: a four-figure dollar price read
+                    as rupees is wrong by a factor of thirty, and a user has no
+                    way to know to hover. */}
+                {c.value != null && c.unit ? (
+                  <span className="ml-1 text-[10px] font-normal" style={{ color: "var(--text-muted)" }}>{c.unit}</span>
+                ) : null}
               </span>
             </div>
             {c.change_pct != null && (
@@ -160,6 +206,7 @@ function CommoditiesStrip({ commodities }) {
           </div>
         );
       })}
+      </div>
     </div>
   );
 }
@@ -752,24 +799,14 @@ export default function Dashboard() {
   // Live WebSocket updates
   useEffect(() => { if (marketData) setOverview(marketData); }, [marketData]);
 
+  // Index strip: Nifty / Bank Nifty / Sensex / India VIX (D5.17).
+  //
+  // `applyLiveIndexPrices` returns the same object when nothing moved, so the
+  // Sprint R9 no-op-tick property is kept — and, unlike the inline effect it
+  // replaces, it never writes a field the tick did not carry. See the module.
   useEffect(() => {
     if (!priceTicks) return;
-    const idxMap = { nifty: "NIFTY", bank_nifty: "BANKNIFTY", sensex: "SENSEX" };
-    setOverview(prev => {
-      if (!prev) return prev;
-      let changed = false;
-      const next = { ...prev };
-      for (const [key, sym] of Object.entries(idxMap)) {
-        const tick = priceTicks[sym];
-        // Skip no-op ticks (Sprint R9) — only real movement produces a render.
-        if (tick?.price != null &&
-            (prev[key]?.value !== tick.price || prev[key]?.change_pct !== tick.change_pct)) {
-          next[key] = { ...(prev[key] || {}), value: tick.price, change_pct: tick.change_pct };
-          changed = true;
-        }
-      }
-      return changed ? next : prev;
-    });
+    setOverview(prev => applyLiveIndexPrices(prev, priceTicks));
   }, [priceTicks]);
 
   useEffect(() => {
@@ -825,6 +862,20 @@ export default function Dashboard() {
       }, ...prev].slice(0, 10);
     });
   }, [latestNotification]);
+
+  // Top AI Picks: live price patch (D5.16).
+  //
+  // The card fetched `/analysis/top-picks` once on mount and then showed that
+  // number until a reload, however many real ticks arrived for those symbols —
+  // it was the most prominent price on the dashboard and the only one on it
+  // that never moved. The server half of D5.16 made the generated price
+  // canonical; this is what makes it live, through the same `priceTicks` sink
+  // every other price on the page already uses, so the card cannot tell whether
+  // a broker feed or the polled baseline produced the number.
+  useEffect(() => {
+    if (!priceTicks) return;
+    setPicks(prev => applyLivePrices(prev, priceTicks));
+  }, [priceTicks]);
 
   // Watchlist widget: live price patch + cross-surface add/remove sync.
   useEffect(() => {
@@ -957,7 +1008,13 @@ export default function Dashboard() {
 
     const fetchNiftyChart = async () => {
       try {
-        const { data } = await api.get("/stocks/%5ENSEI/chart?period=1D");
+        // `NIFTY`, not `%5ENSEI`. The old path hardcoded **Yahoo Finance's own
+        // index ticker** into the browser — the one provider identity the
+        // platform states nowhere (Developer Rule 4), in the one place a
+        // provider switch could not reach. The canonical symbol resolves to the
+        // same series through `real_market.INDEX_TICKERS`, and keeps working if
+        // the chart is ever served by something other than Yahoo. (D5.17)
+        const { data } = await api.get("/stocks/NIFTY/chart?period=1D");
         if (Array.isArray(data) && data.length > 0) {
           // Take last 30 points for a compact sparkline
           setNiftyChart(data.slice(-30));

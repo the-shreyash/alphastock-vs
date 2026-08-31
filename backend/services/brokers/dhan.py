@@ -59,18 +59,29 @@ partial instead of integrated with stub methods that lie.
 
 from __future__ import annotations
 
+import csv
+import io
 import json
 import logging
 import math
 import struct
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import urlencode
 
-from services.brokers.base import BrokerAdapter
+from services.brokers.base import BrokerAdapter, _broker_http_client
 from services.brokers.capabilities import BrokerCapability
+from services.brokers.catalogue import (
+    INDEX_SEGMENT,
+    CatalogueCache,
+    InstrumentCatalogue,
+    canonical_index,
+    normalize_exchange,
+    resolve_from_index,
+    series_rank,
+)
 from services.brokers.credentials import BrokerCredentialSpec
-from services.brokers.errors import BrokerAuthError, BrokerError
+from services.brokers.errors import BrokerAuthError, BrokerError, BrokerErrorCode
 from services.brokers.streaming import BrokerStreamEndpoint, BrokerStreamEvent
 
 logger = logging.getLogger(__name__)
@@ -155,6 +166,50 @@ SEGMENT_EXCHANGES: Dict[str, str] = {name: exchange for name, (_enum, exchange) 
 #: published under the user's stock's name. Nothing raises; the number is simply
 #: another company's.
 HOLDING_EXCHANGE_SEGMENTS: Dict[str, str] = {"NSE": "NSE_EQ", "BSE": "BSE_EQ"}
+
+#: Dhan's public scrip master — every instrument on every exchange, one CSV with
+#: a header, served unauthenticated.
+INSTRUMENT_MASTER_URL = "https://images.dhan.co/api-data/api-scrip-master.csv"
+
+#: How long a fetched master stays authoritative — one trading day's worth.
+INSTRUMENT_MASTER_TTL_SECONDS = 6 * 60 * 60
+
+#: The columns the catalogue reads, and the values that mean "cash equity".
+#:
+#: Read by NAME rather than by position — this file has a header, unlike Fyers'
+#: — so a new column at Dhan cannot silently shift the meaning of a row. A
+#: missing column yields an empty catalogue and a logged degradation.
+#:
+#: `SEM_SEGMENT == "E"` and `SEM_INSTRUMENT_NAME == "EQUITY"` are both required:
+#: the first separates the cash market from `D` (derivatives), `C` (currency)
+#: and `M` (commodity); the second is the master's own instrument classification.
+#: Verified against the live file on 2026-08-31 — 9,887 NSE and 13,574 BSE rows
+#: satisfy both, and `RELIANCE` appears once per exchange with securityId 2885
+#: and 500325 respectively.
+MASTER_EXCHANGE_COLUMN = "SEM_EXM_EXCH_ID"
+MASTER_SEGMENT_COLUMN = "SEM_SEGMENT"
+MASTER_SECURITY_ID_COLUMN = "SEM_SMST_SECURITY_ID"
+MASTER_INSTRUMENT_COLUMN = "SEM_INSTRUMENT_NAME"
+MASTER_SYMBOL_COLUMN = "SEM_TRADING_SYMBOL"
+MASTER_SERIES_COLUMN = "SEM_SERIES"
+MASTER_CASH_SEGMENT = "E"
+MASTER_EQUITY_INSTRUMENT = "EQUITY"
+
+#: The `SEM_SEGMENT` value an index row carries, and the subscribe-frame segment
+#: every index belongs to whichever exchange published it (D5.17).
+#:
+#: Two different vocabularies, which is the whole trap this pair of constants
+#: exists to keep apart. The master says `"I"`; the subscription says `"IDX_I"`,
+#: and it says it for a BSE index as well as an NSE one — Dhan's index segment
+#: is not per-exchange, unlike `NSE_EQ`/`BSE_EQ`. Mapping a BSE index through
+#: `HOLDING_EXCHANGE_SEGMENTS` would produce `BSE_EQ|51`, which is a real NSE
+#: security id belonging to an unrelated company.
+#:
+#: Verified against the live master on 2026-08-31: 119 NSE and 72 BSE rows carry
+#: `SEM_SEGMENT == "I"`, including `NIFTY` (13), `BANKNIFTY` (25),
+#: `INDIA VIX` (21) on NSE and `SENSEX` (51) on BSE.
+MASTER_INDEX_SEGMENT = "I"
+INDEX_FEED_SEGMENT = "IDX_I"
 
 
 # -- The subscription protocol (Feed Request Codes, Annexure) -----------------
@@ -614,6 +669,7 @@ class DhanAdapter(BrokerAdapter):
             BrokerCapability.POSITIONS,
             BrokerCapability.FUNDS,
             BrokerCapability.TICK_STREAM,
+            BrokerCapability.INSTRUMENT_CATALOGUE,
         }
     )
 
@@ -1009,6 +1065,89 @@ class DhanAdapter(BrokerAdapter):
             return segment, int(security_id)
 
         return sorted(identifiers, key=order)
+
+    # -- instrument catalogue (D5.16) ------------------------------------------
+    _catalogue_cache = CatalogueCache(INSTRUMENT_MASTER_TTL_SECONDS)
+
+    @staticmethod
+    def build_catalogue_index(*row_groups) -> Dict[Tuple[str, str], Any]:
+        """`{(EXCHANGE, TRADING_SYMBOL): "<segment>|<securityId>"}` from master rows.
+
+        `SEM_SERIES` carries the exchange's own series/group code — `EQ`/`BE` on
+        NSE, `A`/`B`/`T` on BSE — which is exactly what the shared cash-equity
+        policy ranks. It is what separates `CHOLAFIN` the share (`EQ`) from
+        `CHOLAFIN` the differential-voting-rights line (`D1`), and both are live
+        in the published master.
+
+        The identifier is built by `instrument_id`, the same function that stamps
+        a synced position row and decodes a tick's `(segment, securityId)` pair,
+        so the catalogue's value and the wire's value are one expression.
+        """
+        catalogue = InstrumentCatalogue()
+        for rows in row_groups:
+            for row in rows or ():
+                if not isinstance(row, dict):
+                    continue
+                if row.get(MASTER_SEGMENT_COLUMN) == MASTER_INDEX_SEGMENT:
+                    exchange = normalize_exchange(row.get(MASTER_EXCHANGE_COLUMN))
+                    canonical = canonical_index(row.get(MASTER_SYMBOL_COLUMN))
+                    if exchange is None or canonical is None:
+                        continue
+                    catalogue.offer(
+                        exchange, canonical,
+                        instrument_id(INDEX_FEED_SEGMENT,
+                                      row.get(MASTER_SECURITY_ID_COLUMN)),
+                        rank=0, segment=INDEX_SEGMENT,
+                    )
+                    continue
+                if row.get(MASTER_SEGMENT_COLUMN) != MASTER_CASH_SEGMENT:
+                    continue
+                if row.get(MASTER_INSTRUMENT_COLUMN) != MASTER_EQUITY_INSTRUMENT:
+                    continue
+                exchange = normalize_exchange(row.get(MASTER_EXCHANGE_COLUMN))
+                if exchange is None:
+                    continue
+                rank = series_rank(exchange, row.get(MASTER_SERIES_COLUMN))
+                if rank is None:
+                    continue
+                catalogue.offer(
+                    exchange,
+                    row.get(MASTER_SYMBOL_COLUMN),
+                    instrument_id(HOLDING_EXCHANGE_SEGMENTS[exchange],
+                                  row.get(MASTER_SECURITY_ID_COLUMN)),
+                    rank=rank,
+                )
+        return catalogue.build()
+
+    async def _download_catalogue(self) -> Dict[Tuple[str, str], Any]:
+        """Fetch and index Dhan's scrip master."""
+        try:
+            async with _broker_http_client(60.0) as client:
+                response = await client.get(INSTRUMENT_MASTER_URL)
+                response.raise_for_status()
+                rows = list(csv.DictReader(io.StringIO(response.text)))
+        except Exception as exc:
+            raise BrokerError(
+                f"Dhan scrip master unavailable: {type(exc).__name__}",
+                code=BrokerErrorCode.NETWORK,
+                user_message="Live instrument data is temporarily unavailable.",
+            ) from exc
+        index = self.build_catalogue_index(rows)
+        logger.info("Dhan instrument catalogue loaded: %d cash equities", len(index))
+        return index
+
+    async def _instrument_catalogue(self) -> Dict[Tuple[str, str], Any]:
+        return await type(self)._catalogue_cache.get(self._download_catalogue)
+
+    async def resolve_instruments(self, instruments: Sequence[Any],
+                                  session: dict = None) -> Dict[str, Any]:
+        """Canonical instruments -> Dhan `"<segment>|<securityId>"` identifiers.
+
+        `session` is accepted and unused: the master is a public asset.
+        """
+        if not instruments:
+            return {}
+        return resolve_from_index(instruments, await self._instrument_catalogue())
 
     # -- realtime: the DhanHQ v2 codec ---------------------------------------
     def stream_endpoint(self, session: dict, credentials: dict = None) -> BrokerStreamEndpoint:

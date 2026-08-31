@@ -5,6 +5,7 @@ import { useEffect } from "react";
 import api from "../../services/api";
 import SearchBox from "./SearchBox";
 import ConnectionStatus from "./ConnectionStatus";
+import MarketFeedStatus from "./MarketFeedStatus";
 import { useRealtimeStore, selectUnreadCount, selectConnected } from "../../store/realtimeStore";
 
 export default function Navbar({ onNotificationClick, onMenuClick }) {
@@ -54,6 +55,7 @@ export default function Navbar({ onNotificationClick, onMenuClick }) {
       <div className="flex items-center gap-1.5">
         {/* Real-time connection status */}
         <ConnectionStatus />
+        <MarketFeedStatus />
 
         {/* Theme Toggle */}
         <button

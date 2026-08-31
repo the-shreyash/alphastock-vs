@@ -900,7 +900,6 @@ KNOWN_GATEWAY_BYPASSES = frozenset({
     "services/morning_report.py",
     "services/paper_trade.py",
     "services/portfolio_engine.py",
-    "services/portfolio_stream.py",
     "services/scheduler.py",
     "services/stock_details.py",
     "services/market_engine/gateway.py",  # FII/DII + patterns, documented

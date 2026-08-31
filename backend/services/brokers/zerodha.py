@@ -6,19 +6,30 @@ sha256(api_key + request_token + api_secret). Access tokens are invalidated
 daily around 06:00 IST; Kite Connect has no refresh grant for retail apps,
 so refresh_session() reports "reconnect required".
 """
+import csv
 import hashlib
+import io
 import json
 import logging
 import struct
 from datetime import datetime, timedelta, timezone
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
 from services.brokers.base import (
-    IST, BrokerAdapter, BrokerAuthError, BrokerError, normalize_status,
+    IST, BrokerAdapter, BrokerAuthError, BrokerError, _broker_http_client,
+    normalize_status,
 )
 from services.brokers.capabilities import BrokerCapability
+from services.brokers.catalogue import (
+    INDEX_SEGMENT,
+    CatalogueCache,
+    InstrumentCatalogue,
+    canonical_index,
+    resolve_from_index,
+)
 from services.brokers.credentials import BrokerCredentialSpec
+from services.brokers.errors import BrokerErrorCode
 from services.brokers.streaming import BrokerStreamEndpoint, BrokerStreamEvent
 
 logger = logging.getLogger(__name__)
@@ -29,6 +40,39 @@ LOGIN_URL = "https://kite.zerodha.com/connect/login"
 #: the broker's business, and a shared module holding it is what made adding a
 #: streaming broker an edit to code no broker owns.
 WS_URL = "wss://ws.kite.trade"
+
+#: Kite's public instrument dump — a CSV of every tradable instrument, served
+#: unauthenticated. This is the same file Kite's own client library downloads,
+#: and it is the only place a trading symbol becomes a numeric ticker token
+#: without holding the instrument.
+INSTRUMENT_MASTER_URL = "https://api.kite.trade/instruments"
+
+#: How long a fetched dump stays authoritative. Kite regenerates it daily before
+#: the open; a trading day is the natural life of one copy.
+INSTRUMENT_MASTER_TTL_SECONDS = 6 * 60 * 60
+
+#: The `instrument_type` Kite gives a cash equity, and the `segment`/`exchange`
+#: pair that says it is the cash market rather than a derivative on it.
+#:
+#: Kite's dump carries no series column — there is no `EQ` vs `BE` vs `SG`
+#: distinction in it, only this one flag — so the shared cash-equity policy is
+#: applied here with an equal rank for every accepted row. The consequence is
+#: deliberate and is the honest one: where two Kite rows claim the same
+#: `(exchange, tradingsymbol)`, neither can be shown to be the ordinary share
+#: and the symbol is dropped rather than guessed. Verified against the live dump
+#: on 2026-08-31: 22,993 keys, 0 such collisions.
+INSTRUMENT_EQUITY_TYPE = "EQ"
+
+#: The `segment` Kite files an index under (D5.17).
+#:
+#: An index row carries `instrument_type: "EQ"` — the *same* value an ordinary
+#: share carries — and is told apart only by this segment. That is why the
+#: equity branch of `build_catalogue_index` tests `segment == exchange` rather
+#: than trusting the type, and why an index is claimed here explicitly instead
+#: of falling out of a filter. Verified against the live dump on 2026-08-31: 233
+#: rows, including `NIFTY 50` (256265, NSE), `NIFTY BANK` (260105, NSE),
+#: `INDIA VIX` (264969, NSE) and `SENSEX` (265, BSE).
+INSTRUMENT_INDEX_SEGMENT = "INDICES"
 
 # ── Kite ticker binary framing (Kite Connect v3) ────────────────────────────
 #
@@ -203,6 +247,7 @@ class ZerodhaAdapter(BrokerAdapter):
         BrokerCapability.SESSION_INVALIDATE,
         BrokerCapability.ORDER_STREAM,
         BrokerCapability.TICK_STREAM,
+        BrokerCapability.INSTRUMENT_CATALOGUE,
     })
 
     credential_spec = BrokerCredentialSpec(
@@ -465,6 +510,95 @@ class ZerodhaAdapter(BrokerAdapter):
             if token is not None:
                 tokens.add(token)
         return sorted(tokens)
+
+    # -- instrument catalogue (D5.16) ------------------------------------------
+    _catalogue_cache = CatalogueCache(INSTRUMENT_MASTER_TTL_SECONDS)
+
+    @staticmethod
+    def build_catalogue_index(*row_groups) -> Dict[Tuple[str, str], Any]:
+        """`{(EXCHANGE, TRADINGSYMBOL): instrument_token}` from Kite dump rows.
+
+        `segment == exchange` is what separates the cash market from everything
+        else in this file: a cash equity on NSE carries `segment: "NSE"`, while
+        an NSE future carries `NFO-FUT` and an index carries `INDICES`. Checking
+        `instrument_type == "EQ"` alone would admit index rows, which are typed
+        `EQ` in Kite's dump and would put `NIFTY 50` in an equity catalogue.
+
+        The token is returned as an **int**, not the string the CSV holds. Kite
+        rejects a subscription whose token list contains a string — the whole
+        frame, not the offending entry — and `stream_subscribe_frames` re-coerces
+        for exactly that reason. Coercing here as well means the value the
+        instrument map stores and the value the wire carries are one type.
+        """
+        catalogue = InstrumentCatalogue()
+        for rows in row_groups:
+            for row in rows or ():
+                if not isinstance(row, dict):
+                    continue
+                if row.get("instrument_type") != INSTRUMENT_EQUITY_TYPE:
+                    continue
+                exchange = str(row.get("exchange") or "").strip().upper()
+                segment = str(row.get("segment") or "").strip().upper()
+                if not exchange:
+                    continue
+                if segment == INSTRUMENT_INDEX_SEGMENT:
+                    # D5.17. Kite files an index under `segment: "INDICES"` with
+                    # the *same* `instrument_type: "EQ"` an ordinary share
+                    # carries — which is exactly why the equity branch below
+                    # tests the segment and not the type. `NIFTY 50` is the
+                    # tradingsymbol; `canonical_index` is what turns it into the
+                    # platform's `NIFTY`, and returns None for the other 229
+                    # index rows in this dump.
+                    canonical = canonical_index(row.get("tradingsymbol"))
+                    if canonical is None:
+                        continue
+                    catalogue.offer(
+                        exchange, canonical,
+                        instrument_token(row.get("instrument_token")),
+                        rank=0, segment=INDEX_SEGMENT,
+                    )
+                    continue
+                if segment != exchange:
+                    continue
+                catalogue.offer(
+                    exchange,
+                    row.get("tradingsymbol"),
+                    instrument_token(row.get("instrument_token")),
+                    # No series in this dump — see INSTRUMENT_EQUITY_TYPE.
+                    rank=0,
+                )
+        return catalogue.build()
+
+    async def _download_catalogue(self) -> Dict[Tuple[str, str], Any]:
+        """Fetch and index Kite's instrument dump."""
+        try:
+            async with _broker_http_client(60.0) as client:
+                response = await client.get(INSTRUMENT_MASTER_URL)
+                response.raise_for_status()
+                rows = list(csv.DictReader(io.StringIO(response.text)))
+        except Exception as exc:
+            raise BrokerError(
+                f"Kite instrument dump unavailable: {type(exc).__name__}",
+                code=BrokerErrorCode.NETWORK,
+                user_message="Live instrument data is temporarily unavailable.",
+            ) from exc
+        index = self.build_catalogue_index(rows)
+        logger.info("Kite instrument catalogue loaded: %d cash equities", len(index))
+        return index
+
+    async def _instrument_catalogue(self) -> Dict[Tuple[str, str], Any]:
+        return await type(self)._catalogue_cache.get(self._download_catalogue)
+
+    async def resolve_instruments(self, instruments: Sequence[Any],
+                                  session: dict = None) -> Dict[str, Any]:
+        """Canonical instruments -> Kite instrument tokens.
+
+        `session` is accepted and unused: the dump is a public asset served
+        without authentication, so this must not become a per-account call.
+        """
+        if not instruments:
+            return {}
+        return resolve_from_index(instruments, await self._instrument_catalogue())
 
     # -- realtime: the Kite ticker codec (D4.2) --------------------------------
     def stream_endpoint(self, session: dict, credentials: dict = None) -> BrokerStreamEndpoint:

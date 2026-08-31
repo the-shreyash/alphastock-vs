@@ -484,7 +484,9 @@ def test_an_unready_feed_carries_no_latency_into_the_link_level_comparison():
     assert ticks_chain[0] is ready, (
         "an unready feed led the link-level chain on a latency it should not have"
     )
-    assert unready in ticks_chain, "and it is still a candidate — ranked, not filtered"
+    assert unready not in ticks_chain, (
+        "a feed that asked the wire for nothing was still offered as a tick feed"
+    )
 
 
 def test_latency_ranks_and_never_filters():

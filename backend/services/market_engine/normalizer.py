@@ -87,6 +87,15 @@ def _normalize_yahoo_quote(raw: Dict[str, Any]) -> Dict[str, Any]:
         # Technical indicators (passthrough if present)
         "rsi": _to_float(raw.get("rsi")),
         "macd": raw.get("macd"),
+        # D5.16 — `macd_signal` was the one half of the MACD pair this list
+        # dropped, and nothing noticed while every consumer of it read a raw
+        # Yahoo quote rather than a normalized one. Routing those consumers
+        # through the gateway (Developer Rule 2) is what made the omission
+        # load-bearing: `_advisor_score` and the top-pick scorer both compare
+        # `macd > macd_signal`, and an absent signal line silently becomes 0.0
+        # — a comparison that is true for every stock with positive momentum
+        # and changes what the product recommends.
+        "macd_signal": raw.get("macd_signal"),
         "vwap": _to_float(raw.get("vwap")),
         "ema_20": _to_float(raw.get("ema_20")),
         "sma_50": _to_float(raw.get("sma_50")),
@@ -120,6 +129,13 @@ def _normalize_av_quote(raw: Dict[str, Any]) -> Dict[str, Any]:
         "exchange": "NSE",
         "rsi": None,
         "macd": None,
+        # D5.16 — present-and-None, like every other field this provider cannot
+        # carry. The canonical quote shape must be IDENTICAL across tiers
+        # (pinned by `test_the_payload_shape_is_identical_across_tiers`): a key
+        # that exists on a delayed quote and is absent on a streaming one is a
+        # consumer able to tell which provider answered, which is exactly what
+        # Developer Rule 4 forbids.
+        "macd_signal": None,
         "vwap": None,
         "ema_20": None,
         "sma_50": None,
@@ -152,6 +168,13 @@ def _normalize_broker_quote(raw: Dict[str, Any]) -> Dict[str, Any]:
         "exchange": raw.get("exchange", "NSE"),
         "rsi": None,
         "macd": None,
+        # D5.16 — present-and-None, like every other field this provider cannot
+        # carry. The canonical quote shape must be IDENTICAL across tiers
+        # (pinned by `test_the_payload_shape_is_identical_across_tiers`): a key
+        # that exists on a delayed quote and is absent on a streaming one is a
+        # consumer able to tell which provider answered, which is exactly what
+        # Developer Rule 4 forbids.
+        "macd_signal": None,
         "vwap": None,
         "ema_20": None,
         "sma_50": None,
@@ -208,6 +231,13 @@ def _normalize_canonical_quote(raw: Dict[str, Any]) -> Dict[str, Any]:
         "exchange": raw.get("exchange") or "NSE",
         "rsi": None,
         "macd": None,
+        # D5.16 — present-and-None, like every other field this provider cannot
+        # carry. The canonical quote shape must be IDENTICAL across tiers
+        # (pinned by `test_the_payload_shape_is_identical_across_tiers`): a key
+        # that exists on a delayed quote and is absent on a streaming one is a
+        # consumer able to tell which provider answered, which is exactly what
+        # Developer Rule 4 forbids.
+        "macd_signal": None,
         "vwap": None,
         "ema_20": None,
         "sma_50": None,
@@ -305,7 +335,7 @@ def _apply_defaults(raw: Dict[str, Any]) -> Dict[str, Any]:
         "volume_ratio": None, "market_cap": None, "pe_ratio": None,
         "week_52_high": None, "week_52_low": None, "day_range": "",
         "sector": "", "exchange": "NSE", "rsi": None, "macd": None,
-        "vwap": None, "ema_20": None, "sma_50": None,
+        "macd_signal": None, "vwap": None, "ema_20": None, "sma_50": None,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
     result = {**defaults, **raw}

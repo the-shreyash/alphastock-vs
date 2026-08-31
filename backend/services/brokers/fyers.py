@@ -58,6 +58,8 @@ type, no HSM segment — exists anywhere else in the platform.
 
 import base64
 import binascii
+import csv
+import io
 import hashlib
 import json
 import logging
@@ -66,9 +68,20 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import urlencode
 
-from services.brokers.base import IST, BrokerAdapter, BrokerAuthError, BrokerError
+from services.brokers.base import (
+    IST, BrokerAdapter, BrokerAuthError, BrokerError, _broker_http_client,
+)
 from services.brokers.capabilities import BrokerCapability
+from services.brokers.catalogue import (
+    INDEX_SEGMENT,
+    CatalogueCache,
+    InstrumentCatalogue,
+    canonical_index,
+    resolve_from_index,
+    series_rank,
+)
 from services.brokers.credentials import BrokerCredentialSpec
+from services.brokers.errors import BrokerErrorCode
 from services.brokers.streaming import (
     BrokerStreamChannel,
     BrokerStreamEndpoint,
@@ -231,7 +244,9 @@ LTP_FIELD = 0
 #: excluded rather than unsupported-by-omission: this adapter never subscribes
 #: depth, but a decoder that read a depth record's field 0 as a price would
 #: publish a *bid* as the traded price, silently and plausibly.
-PRICEABLE_TOPICS = frozenset({"sf", "if"})
+SCRIP_TOPIC = "sf"
+INDEX_TOPIC = "if"
+PRICEABLE_TOPICS = frozenset({SCRIP_TOPIC, INDEX_TOPIC})
 
 #: HSM exchange segment → the exchange name Fyers itself uses in a symbol.
 #:
@@ -266,6 +281,37 @@ SEGMENT_CODES: Dict[str, str] = {
     "1211": "bse_fo",
     "1212": "bcs_fo",
 }
+#: Fyers' public symbol masters, one CSV per exchange segment. Served
+#: unauthenticated; the same files Fyers' own client library reads.
+INSTRUMENT_MASTER_URLS = {
+    "nse_cm": "https://public.fyers.in/sym_details/NSE_CM.csv",
+    "bse_cm": "https://public.fyers.in/sym_details/BSE_CM.csv",
+}
+
+#: How long a fetched master stays authoritative — one trading day's worth.
+INSTRUMENT_MASTER_TTL_SECONDS = 6 * 60 * 60
+
+#: Where the two fields the catalogue needs sit in a master row.
+#:
+#: The index masters are the SAME two files: Fyers publishes `NSE:NIFTY50-INDEX`
+#: inside NSE_CM.csv and `BSE:SENSEX-INDEX` inside BSE_CM.csv, so D5.17 adds no
+#: download. Verified on 2026-08-31.
+#:
+#: The files are HEADERLESS, so these are positions rather than names and that
+#: is a real fragility — which is why every value read through them is then put
+#: through this adapter's own validators (`instrument_id` for the fyToken,
+#: `series_rank` for the ticker's suffix) rather than trusted. A column shift at
+#: Fyers therefore produces an empty catalogue and a logged degradation, not a
+#: catalogue of wrong identifiers.
+#:
+#: Verified against the live NSE_CM.csv and BSE_CM.csv on 2026-08-31:
+#:   0  fyToken           "101000000002885"
+#:   9  exchange ticker   "NSE:RELIANCE-EQ"  /  "BSE:RELIANCE-A"
+#:  13  underlying name   "RELIANCE"
+MASTER_FYTOKEN_COLUMN = 0
+MASTER_TICKER_COLUMN = 9
+MASTER_NAME_COLUMN = 13
+
 SEGMENT_EXCHANGES: Dict[str, str] = {
     "nse_cm": "NSE",
     "nse_fo": "NSE",
@@ -301,6 +347,19 @@ FYTOKEN_EXCHANGE_TOKEN_INDEX = 10
 #: wrongly renames an instrument permanently. Recorded as a known limitation
 #: rather than guessed at.
 CASH_SERIES_SUFFIXES = frozenset({"EQ", "BE", "BZ", "BL", "SM", "ST", "IQ", "GB", "GS", "INDEX"})
+
+#: The ticker suffix Fyers gives an index (D5.17).
+#:
+#: `NSE:NIFTY50-INDEX`, `NSE:NIFTYBANK-INDEX`, `NSE:INDIAVIX-INDEX`,
+#: `BSE:SENSEX-INDEX` — verified in the live NSE_CM.csv and BSE_CM.csv on
+#: 2026-08-31, where column 13 (the underlying name) holds `NIFTY`,
+#: `BANKNIFTY`, `INDIAVIX` and `SENSEX` respectively.
+#:
+#: It is already in :data:`CASH_SERIES_SUFFIXES` above, for a different job:
+#: there it makes `trading_symbol` strip the suffix off a *name*. Here it
+#: identifies the row. Named separately rather than reused, because the two
+#: would have to change together for unrelated reasons.
+MASTER_INDEX_SERIES = "INDEX"
 
 #: Fyers application error codes that mean "this session is finished".
 #:
@@ -342,7 +401,7 @@ def split_symbol(value: Any) -> Tuple[Optional[str], Optional[str]]:
     return name or None, (exchange or None)
 
 
-def instrument_id(fy_token: Any) -> Optional[str]:
+def instrument_id(fy_token: Any, kind: str = SCRIP_TOPIC) -> Optional[str]:
     """This account's handle for one Fyers instrument: an HSM topic string.
 
     `"101000000014428"` → `"sf|nse_cm|14428"`.
@@ -358,7 +417,17 @@ def instrument_id(fy_token: Any) -> Optional[str]:
 
     Returns None for anything that is not a usable fyToken, which keeps a
     rejected instrument out of the subscribe frame rather than corrupting it.
+
+    `kind` (D5.17) is the topic prefix. It is a parameter and not a constant
+    because the prefix is **not** a property of the fyToken: `NSE:NIFTY50-INDEX`
+    lives in the `nse_cm` segment exactly as `NSE:SBIN-EQ` does and its fyToken
+    begins with the same four characters, so nothing in the token says which of
+    the two topic families it belongs to. Only the master row does, and only the
+    caller reading that row knows. Defaulted to the scrip prefix so every
+    pre-D5.17 call site — `stream_instruments`, a synced holding — is unchanged.
     """
+    if kind not in PRICEABLE_TOPICS:
+        return None
     if fy_token is None or isinstance(fy_token, bool):
         return None
     text = str(fy_token).strip()
@@ -373,7 +442,7 @@ def instrument_id(fy_token: Any) -> Optional[str]:
     # nothing on the wire.
     if not exchange_token.isdigit() or int(exchange_token) <= 0:
         return None
-    return f"sf|{segment}|{exchange_token}"
+    return f"{kind}|{segment}|{exchange_token}"
 
 
 def parse_instrument_id(value: Any) -> Optional[Tuple[str, str, str]]:
@@ -1110,6 +1179,7 @@ class FyersAdapter(BrokerAdapter):
             BrokerCapability.MARGINS,
             BrokerCapability.SESSION_INVALIDATE,
             BrokerCapability.TICK_STREAM,
+            BrokerCapability.INSTRUMENT_CATALOGUE,
         }
     )
 
@@ -1414,6 +1484,114 @@ class FyersAdapter(BrokerAdapter):
             if parse_instrument_id(topic) is not None:
                 topics.add(str(topic))
         return sorted(topics)
+
+    # -- instrument catalogue (D5.16) ------------------------------------------
+    _catalogue_cache = CatalogueCache(INSTRUMENT_MASTER_TTL_SECONDS)
+
+    @staticmethod
+    def build_catalogue_index(*row_groups) -> Dict[Tuple[str, str], Any]:
+        """`{(EXCHANGE, NAME): HSM topic}` from symbol-master rows.
+
+        WHY THE NAME COLUMN AND NOT THE TICKER
+        ---------------------------------------
+        The ticker is exchange-qualified and series-suffixed — `NSE:RELIANCE-EQ`,
+        `BSE:RELIANCE-A` — and this adapter's `trading_symbol` only strips the
+        suffixes it recognises as NSE cash series. BSE's group codes (`A`, `T`,
+        `B`) are not among them, so canonicalising the BSE ticker would yield
+        `RELIANCE-A` and no BSE symbol would ever match a watchlist entry. The
+        master publishes the underlying name in its own column and that is the
+        same string the platform uses, on both exchanges.
+
+        The ticker is still read — for its **series**, which is what separates
+        `NSE:CHOLAFIN-EQ` (the share) from `NSE:CHOLAFIN-D1` (differential
+        voting rights) and keeps `BSE:ENERGY-INDEX` out of an equity catalogue
+        entirely. Both cases are live in the published masters.
+
+        The identifier is an HSM topic built by `instrument_id` — the same
+        function `stream_instruments` uses — because the topic is the string
+        that appears on *both* sides of the wire, so subscription and resolution
+        cannot drift.
+        """
+        catalogue = InstrumentCatalogue()
+        for rows in row_groups:
+            for row in rows or ():
+                if not isinstance(row, (list, tuple)) or len(row) <= MASTER_NAME_COLUMN:
+                    continue
+                fy_token = str(row[MASTER_FYTOKEN_COLUMN]).strip()
+                ticker = str(row[MASTER_TICKER_COLUMN]).strip().upper()
+                series = ticker.rpartition("-")[2]
+                if series == MASTER_INDEX_SERIES:
+                    # D5.17. The `-INDEX` suffix is the master's own
+                    # discriminator and is already the reason `series_rank`
+                    # refuses these rows for the equity catalogue: `INDEX` is in
+                    # neither exchange's cash-series table.
+                    #
+                    # THE TOPIC PREFIX IS THE WHOLE OF THE DIFFICULTY. An index
+                    # is an `if` topic, not an `sf` one, and the prefix is not
+                    # derivable from the fyToken — see `instrument_id`. Getting
+                    # it wrong is not a subscribe error: the topic name arrives
+                    # back on the snapshot record and becomes the tick's
+                    # identifier, so a mismatch resolves nothing and looks
+                    # exactly like an index that never traded.
+                    topic = instrument_id(fy_token, INDEX_TOPIC)
+                    canonical = canonical_index(row[MASTER_NAME_COLUMN])
+                    if topic is None or canonical is None:
+                        continue
+                    catalogue.offer(
+                        topic_exchange(topic), canonical, topic,
+                        rank=0, segment=INDEX_SEGMENT,
+                    )
+                    continue
+                topic = instrument_id(fy_token)
+                if topic is None:
+                    continue
+                exchange = topic_exchange(topic)
+                rank = series_rank(exchange, series)
+                if rank is None:
+                    continue
+                catalogue.offer(
+                    exchange, str(row[MASTER_NAME_COLUMN]).strip().upper(),
+                    topic, rank=rank,
+                )
+        return catalogue.build()
+
+    async def _download_catalogue(self) -> Dict[Tuple[str, str], Any]:
+        """Fetch and index both cash-segment symbol masters.
+
+        One segment failing takes the whole download down: a half-catalogue is
+        indistinguishable from a complete one at every call site, and the honest
+        degradation — no catalogue, portfolio-only subscription — is already
+        handled by the gateway.
+        """
+        groups = []
+        for segment, url in INSTRUMENT_MASTER_URLS.items():
+            try:
+                async with _broker_http_client(60.0) as client:
+                    response = await client.get(url)
+                    response.raise_for_status()
+                    groups.append(list(csv.reader(io.StringIO(response.text))))
+            except Exception as exc:
+                raise BrokerError(
+                    f"Fyers {segment} symbol master unavailable: {type(exc).__name__}",
+                    code=BrokerErrorCode.NETWORK,
+                    user_message="Live instrument data is temporarily unavailable.",
+                ) from exc
+        index = self.build_catalogue_index(*groups)
+        logger.info("Fyers instrument catalogue loaded: %d cash equities", len(index))
+        return index
+
+    async def _instrument_catalogue(self) -> Dict[Tuple[str, str], Any]:
+        return await type(self)._catalogue_cache.get(self._download_catalogue)
+
+    async def resolve_instruments(self, instruments: Sequence[Any],
+                                  session: dict = None) -> Dict[str, Any]:
+        """Canonical instruments -> Fyers HSM topics.
+
+        `session` is accepted and unused: the masters are public assets.
+        """
+        if not instruments:
+            return {}
+        return resolve_from_index(instruments, await self._instrument_catalogue())
 
     # -- realtime: the channel --------------------------------------------------
     def stream_channels(self) -> Tuple[BrokerStreamChannel, ...]:

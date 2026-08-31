@@ -17,6 +17,7 @@
  * Selectors live at the bottom so consumers subscribe to the narrowest slice.
  */
 import { create } from "zustand";
+import { projectFeedState, FEED_STATE } from "../lib/feedState";
 
 const MAX_TRADE_UPDATES = 50;
 const MAX_ENGINE_EVENTS = 20;
@@ -80,6 +81,17 @@ const initialState = {
   unreadCount: 0,
   latestNotification: null,
 
+  // Market feed state (D5.14) — the backend's consumer feed contract, as
+  // published on `provider.status`. Null until the backend has said something:
+  // "we have not been told yet" is not the same claim as "the feed is down",
+  // and a badge that asserts either before an event arrives is fabricating.
+  // Shape: { state, tier, reason, changeReason, previousTier, capabilities,
+  //          scope: "user"|"platform", updatedAt }
+  feedState: null,
+  // The account this store's feed state belongs to. Set by RealtimeProvider on
+  // connect; a user-scoped payload for anyone else is dropped.
+  feedUserId: null,
+
   // Broker (token-keyed ticks kept separate from the symbol-keyed price store)
   brokerStatus: null,
   portfolioSynced: null,
@@ -127,6 +139,44 @@ const tickUnchanged = (prev, tick) => {
  * price-bearing message in a burst — the 15s `prices` broadcast, per-index
  * `market.index.updated` events, `watchlist.quotes` — into ONE store write.
  */
+/**
+ * Fold a canonical `market.tick` batch into the symbol-keyed price shape
+ * (D5.15).
+ *
+ * The backend publishes ONE event per broker frame — `{ ticks: [...], count,
+ * source_tier, ingested_at }` — rather than one per instrument, so this is the
+ * only place the batch is unpacked. Before D5.15 nothing unpacked it: the event
+ * reached the browser and fell through `applyEvent`'s `market` branch because
+ * the payload carries no top-level `symbol`/`price`, so every broker tick the
+ * platform produced was dropped one step from the screen.
+ *
+ * Only `price` is taken from a tick. A `MarketTick` carries no `change_pct` —
+ * a day's change needs a previous close the tick contract does not have — and
+ * writing `change_pct: 0` would render a real price beside a fabricated
+ * "unchanged". The merge in `_mergePrices` is field-by-field, so the existing
+ * `change_pct` from the quote path survives beside the live price.
+ *
+ * `volume` and `exchange` are carried when the feed supplies them and omitted
+ * when it does not, so a broker whose subscribed mode has no cumulative volume
+ * (Upstox `ltpc`, Kite LTP) leaves the field alone instead of blanking one a
+ * previous quote filled in.
+ */
+export const tickBatchToPriceMap = (data) => {
+  const ticks = Array.isArray(data?.ticks) ? data.ticks : null;
+  if (!ticks) return null;
+  const map = {};
+  for (const tick of ticks) {
+    const symbol = tick?.symbol ? String(tick.symbol).toUpperCase() : null;
+    if (!symbol || tick.price == null) continue;
+    const entry = { price: tick.price };
+    if (tick.volume != null) entry.volume = tick.volume;
+    if (tick.exchange != null) entry.exchange = tick.exchange;
+    if (tick.ingested_at) entry.updated_at = tick.ingested_at;
+    map[symbol] = map[symbol] ? { ...map[symbol], ...entry } : entry;
+  }
+  return map;
+};
+
 const priceMapFromMessage = (msg) => {
   if (!msg) return null;
   if (msg.type === "prices") return msg.data || null;
@@ -142,6 +192,7 @@ const priceMapFromMessage = (msg) => {
     return { [String(mapped).toUpperCase()]: { price: data.value, change_pct: data.change_pct } };
   }
   if (msg.event === "watchlist.quotes") return data.quotes || null;
+  if (msg.event === "market.tick") return tickBatchToPriceMap(data);
   return null;
 };
 
@@ -152,6 +203,27 @@ export const useRealtimeStore = create((set, get) => ({
     set((s) => ({ connection: { ...s.connection, status, ...extra } })),
 
   setSend: (send) => set({ send }),
+
+  /**
+   * Bind the store's feed state to one account (D5.14).
+   *
+   * `provider.status` is published in two scopes: platform-wide (no `user_id`)
+   * and per-user (D4.5, for a user promoted to their own broker feed). The
+   * socket only ever delivers this user's per-user events, so this is defence
+   * rather than routing — but the store is a module singleton that outlives a
+   * logout in the same tab, and a stale account's feed state surviving an
+   * account switch is a real way for one user to be shown another's.
+   *
+   * Changing identity clears the feed state rather than reinterpreting it: the
+   * new account's feed is a different feed, and the honest value until the
+   * backend says otherwise is "not known yet".
+   */
+  setFeedIdentity: (userId) =>
+    set((s) => {
+      const next = userId ? String(userId) : null;
+      if (next === s.feedUserId) return {};
+      return { feedUserId: next, feedState: null };
+    }),
 
   seedUnreadCount: (count) => set({ unreadCount: Number(count) || 0 }),
 
@@ -305,6 +377,18 @@ export const useRealtimeStore = create((set, get) => ({
           set({ movers: { gainers: data.gainers || [], losers: data.losers || [] } });
         } else if (event === "market.engine.status") {
           set({ engineStatus: data });
+        } else if (event === "market.tick") {
+          // D5.15 — the canonical broker/streaming tick batch. Routed through
+          // the same `_mergePrices` sink every other price source uses, so a
+          // live tick and a polled quote land in one store slice and a
+          // component subscribed to a symbol cannot tell which produced the
+          // number it is rendering. That indistinguishability is the contract
+          // (MARKET_DATA_ARCHITECTURE.md Developer Rule 4): the payload carries
+          // `source_tier` and no provider identity, and the feed-state
+          // indicator (D5.14) — not this reducer — is what tells the user which
+          // tier they are on.
+          const map = tickBatchToPriceMap(data);
+          if (map) get()._mergePrices(map);
         } else if (data.symbol && data.price != null) {
           get()._mergePrices({ [String(data.symbol).toUpperCase()]: data });
         }
@@ -566,6 +650,41 @@ export const useRealtimeStore = create((set, get) => ({
         }
         break;
       }
+      case "provider": {
+        // D5.14 — closes LIM-D5.13-1. This domain used to fall through to
+        // `default: break`, so the entire market-feed contract reached the
+        // browser and was discarded. The payload is `SourceManager.status()`
+        // plus `previous_tier`, an optional `change_reason` and, when the
+        // publish was user-scoped, a `user_id`.
+        if (event !== "provider.status") break;
+        // A frame with no payload is not evidence that anything changed —
+        // projecting `{}` would resolve to `unavailable` and blank out a
+        // perfectly good feed on a malformed frame.
+        if (typeof data.state !== "string") break;
+
+        const scope = data.user_id ? "user" : "platform";
+        set((s) => {
+          // Not this account's event. The socket is per-user so this should be
+          // unreachable; it is here because "should be unreachable" is not the
+          // standard for a surface that can show one trader another's feed.
+          if (scope === "user" && s.feedUserId && String(data.user_id) !== s.feedUserId) {
+            return {};
+          }
+          // A platform broadcast describes the baseline, not a user who has
+          // been promoted to their own broker feed — the D4.5 defect, which is
+          // just as wrong in React as it was on the bus. Once this user's own
+          // feed has spoken, only this user's own feed speaks for it.
+          if (scope === "platform" && s.feedState?.scope === "user") return {};
+          return {
+            feedState: {
+              ...projectFeedState(data),
+              scope,
+              updatedAt: envelope.timestamp || Date.now(),
+            },
+          };
+        });
+        break;
+      }
       case "broker": {
         if (event === "broker.order.updated") {
           // Live order status (Sprint R6) — upsert by order_id so a fill
@@ -661,3 +780,9 @@ export const selectBreakingNews = (s) => s.breakingNews;
 export const selectLatestNotification = (s) => s.latestNotification;
 export const selectWatchlistEvent = (s) => s.watchlistEvent;
 export const selectMorningReportReadyAt = (s) => s.morningReportReadyAt;
+// Market feed state (D5.14). `selectFeedIsLive` is the ONLY thing a component
+// should branch on to decide whether it may present live/streaming data: it is
+// true for `available` alone, so `recovering` — which is a refinement of "not
+// available" — can never reach a live presentation by accident.
+export const selectFeedState = (s) => s.feedState;
+export const selectFeedIsLive = (s) => s.feedState?.state === FEED_STATE.AVAILABLE;

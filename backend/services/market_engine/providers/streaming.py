@@ -1341,8 +1341,16 @@ class StreamingTickProvider(MarketDataProvider):
            (MARKET_DATA_ARCHITECTURE.md, Category 2) and may never be resolved
            for anybody else. Inherited unchanged from the base class, so a
            failure of the switching logic cannot widen it.
-        2. **Link, for the pushed capabilities.** TICKS and DEPTH are answered
-           by a stream existing, and a stream with a live link exists.
+        2. **Link *and a subscription*, for the pushed capabilities.** TICKS and
+           DEPTH are answered by a stream existing — but a stream that asked the
+           wire for nothing is not one. D5.15 found this live: a real broker
+           account with an empty portfolio opened both its sockets, subscribed
+           to zero instruments, and the platform reported the TICKS capability
+           as available to its owner for a feed that was structurally incapable
+           of ever delivering a packet. The readiness gate already refuses to
+           promote such a feed (a provider with no subscription can never reach
+           READY); this is the same fact applied to the one question readiness
+           does not gate.
         3. **Readiness and coverage, for everything else** — which today means
            the quote capability, the one that displaces the baseline. The feed
            must have proved itself on this link *and* hold a recent price for
@@ -1354,8 +1362,21 @@ class StreamingTickProvider(MarketDataProvider):
         """
         if not super().is_eligible_for(context):
             return False
-        if context.capability is None or context.capability in LINK_LEVEL_CAPABILITIES:
+        if context.capability is None:
+            # No capability named is the *applicability* question — diagnostics,
+            # `entitled_for`, "does this feed have anything to do with this
+            # request". Deliberately NOT gated on the subscription: an attached
+            # feed with nothing subscribed is still this user's feed, and
+            # answering False here would hide it from the surfaces whose job is
+            # to explain why it is not serving.
             return self.is_link_up
+        if context.capability in LINK_LEVEL_CAPABILITIES:
+            # D5.15. `_subscribed` is the instrument set the feed's owner asked
+            # the wire for (D4.5). Empty means no packet can arrive for any
+            # instrument, so the honest answer to "is a live stream attached to
+            # this request" is no — and the baseline serves the capability's
+            # absence instead of a streaming provider serving silence.
+            return self.is_link_up and bool(self._subscribed)
         if not self.is_ready:
             return False
         if context.symbol:

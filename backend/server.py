@@ -304,38 +304,65 @@ def _apply_stock_meta(quote: dict, symbol: str) -> dict:
     return quote
 
 
-async def real_quote(symbol: str):
+async def real_quote(symbol: str, user_id=None):
     """Live quote for `symbol`, enriched with factual metadata.
-    Returns None when live market data is unavailable — never simulated."""
-    from services.real_market import fetch_real_stock_quote
+
+    D5.16 — THIS NOW GOES THROUGH THE MARKET GATEWAY.
+    It called `fetch_real_stock_quote` directly, which is to say it called
+    Yahoo, with no user and no resolution. That made it the single widest
+    bypass of Developer Rule 2 in the product: `GET /api/watchlist`, the
+    watchlist add, `/analysis/explain`, `/analysis/full-report`, the advisor and
+    the portfolio monitor all price equities through this function and through
+    `real_quotes_map` below, and none of them could ever have been served by a
+    user's own broker feed no matter how it was ranked.
+
+    `user_id` is optional because most callers are platform-scoped; where a
+    caller knows whose request it is, passing it is what lets that account's
+    promoted feed answer. Omitting it resolves the platform baseline, which is
+    exactly what this function used to do for everybody.
+
+    Returns None when live market data is unavailable — never simulated.
+    """
+    from services.market_engine.gateway import market_gateway
     try:
-        real = await fetch_real_stock_quote(symbol)
+        # `get_prices` rather than `get_quote`: the single-quote path publishes
+        # a `price.updated` bus event, and these call sites are request-scoped
+        # reads, not price broadcasts. One Redis round-trip per rendered quote
+        # is a cost the batch path deliberately does not pay.
+        resolved = await market_gateway.get_prices([symbol], user_id=user_id)
     except Exception as e:
-        logging.warning(f"real_quote live fetch failed for {symbol}: {e}")
-        real = None
+        logging.warning(f"real_quote resolution failed for {symbol}: {e}")
+        return None
+    real = resolved.get((symbol or "").strip().upper())
     if not real:
         return None
     return _apply_stock_meta(real, symbol)
 
 
-async def real_quotes_map(symbols):
-    """Fetch live quotes for many symbols concurrently (Yahoo layer is cached),
-    returning {UPPER_SYMBOL: quote|None}. None means live data is unavailable
-    for that symbol — callers must treat it as explicitly unavailable."""
-    from services.real_market import fetch_real_stock_quote
+async def real_quotes_map(symbols, user_id=None):
+    """Live quotes for many symbols, returning {UPPER_SYMBOL: quote|None}.
+
+    None means live data is unavailable for that symbol — callers must treat it
+    as explicitly unavailable, and an absent symbol is filled with None rather
+    than omitted so the contract this had before D5.16 is unchanged.
+
+    Resolution is per symbol inside the gateway, which is what makes fallback
+    per instrument: a broker feed that covers RELIANCE and not ABC serves the
+    first and lets the baseline serve the second, in one call.
+    """
+    from services.market_engine.gateway import market_gateway
     uniq = list({(s or "").upper() for s in symbols if s})
     if not uniq:
         return {}
-    results = await asyncio.gather(
-        *[fetch_real_stock_quote(s) for s in uniq], return_exceptions=True
-    )
-    out = {}
-    for sym, res in zip(uniq, results):
-        if isinstance(res, Exception) or not res:
-            out[sym] = None
-            continue
-        out[sym] = _apply_stock_meta(res, sym)
-    return out
+    try:
+        resolved = await market_gateway.get_prices(uniq, user_id=user_id)
+    except Exception as e:
+        logging.warning(f"real_quotes_map resolution failed: {e}")
+        resolved = {}
+    return {
+        sym: (_apply_stock_meta(resolved[sym], sym) if resolved.get(sym) else None)
+        for sym in uniq
+    }
 
 
 async def real_overview():
@@ -354,7 +381,7 @@ async def prefetch_quote_func(user_id):
     open_trades = await db.trades.find(
         {"user_id": user_id, "status": "OPEN"}
     ).to_list(50)
-    quotes = await real_quotes_map([t["symbol"] for t in open_trades])
+    quotes = await real_quotes_map([t["symbol"] for t in open_trades], user_id=user_id)
 
     def quote_func(symbol):
         return quotes.get((symbol or "").upper())
@@ -2247,7 +2274,7 @@ async def get_active_trades(user: dict = Depends(get_current_user)):
     rows and pushed `trade.updated` rows never disagree."""
     from services.trade_stream import trade_payload
     trades = await db.trades.find({"user_id": user["_id"], "status": "OPEN"}).sort("entry_time", -1).to_list(50)
-    quotes = await real_quotes_map([t["symbol"] for t in trades])
+    quotes = await real_quotes_map([t["symbol"] for t in trades], user_id=user["_id"])
     for t in trades:
         quote = quotes.get(t["symbol"].upper())
         live = trade_payload(t, quote.get("price") if quote else None)
@@ -2515,7 +2542,7 @@ async def exit_trade(trade_id: str, data: TradeExitRequest, background_tasks: Ba
 
     exit_price = data.exit_price
     if exit_price is None:
-        quote = await real_quote(trade["symbol"])
+        quote = await real_quote(trade["symbol"], user_id=user["_id"])
         if not quote:
             raise HTTPException(status_code=422,
                                 detail="Live price unavailable — please enter the exit price.")
@@ -3501,8 +3528,11 @@ async def websocket_endpoint(websocket: WebSocket):
             if msg.get("type") == "subscribe_prices":
                 # Client subscribes to price updates for specific symbols
                 symbols = msg.get("symbols", [])
-                # Start sending price ticks (live Yahoo Finance, cached)
-                quotes = await real_quotes_map(symbols)
+                # D5.16 — resolved for THIS socket's account, through the
+                # Market Gateway. It read Yahoo directly and with no user, so
+                # the one price path a client explicitly asks for was the one
+                # path a promoted broker feed could never serve.
+                quotes = await real_quotes_map(symbols, user_id=user_id)
                 for sym in symbols:
                     quote = quotes.get((sym or "").upper())
                     if quote:
@@ -4957,7 +4987,7 @@ async def get_watchlist(user: dict = Depends(get_current_user)):
     """Get user's watchlist enriched with live quotes. Items whose live quote is
     unavailable carry quote=None so the UI can show an explicit unavailable state."""
     items = await db.watchlist.find({"user_id": user["_id"]}).sort("added_at", -1).to_list(100)
-    quotes = await real_quotes_map([item["symbol"] for item in items])
+    quotes = await real_quotes_map([item["symbol"] for item in items], user_id=user["_id"])
     for item in items:
         item["_id"] = str(item["_id"])
         quote = quotes.get(item["symbol"].upper())
@@ -4988,7 +5018,7 @@ async def add_to_watchlist(data: WatchlistAdd, user: dict = Depends(get_current_
         existing["_id"] = str(existing["_id"])
         return existing
     # Real quote first so added_price matches the live prices used for since-added P&L
-    quote = await real_quote(symbol) or {}
+    quote = await real_quote(symbol, user_id=user["_id"]) or {}
     if not quote and not get_stock_meta(symbol):
         raise HTTPException(status_code=404, detail=f"Unknown symbol: {symbol}")
     doc = {

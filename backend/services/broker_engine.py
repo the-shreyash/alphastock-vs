@@ -59,6 +59,9 @@ from services.brokers.market_feed import (
     publish_market_ticks,
     set_market_feed_link,
 )
+from services.brokers.feed_universe import (
+    build_feed_universe, dashboard_symbols, index_instruments,
+)
 from services.brokers.recovery import (
     RecoveryClass,
     RecoveryService,
@@ -616,28 +619,11 @@ class BrokerEngine:
             return
 
         session = await self.get_session(user_id, broker)
-        instrument_tokens = []
-        feed_symbols = ()
+        instrument_tokens: list = []
+        feed_symbols: tuple = ()
         if streams["ticks"]:
-            if holdings is None:
-                try:
-                    holdings = await broker_gateway.get_holdings(broker, session)
-                except BrokerError:
-                    holdings = []
-            if positions is None:
-                try:
-                    positions = await broker_gateway.get_positions(broker, session)
-                except BrokerError:
-                    positions = []
-            instrument_tokens = broker_gateway.stream_instruments(
-                broker, holdings=holdings, positions=positions)
-            # D4.3: the same two lists that decide what to subscribe to also
-            # decide what an arriving tick can be named — seed the map from them
-            # so the first tick after a reconnect is already resolvable, and so
-            # intraday positions (never persisted) are mappable at all.
-            instrument_map = self._remember_instrument_map(
-                user_id, broker, holdings=holdings, positions=positions)
-            feed_symbols = instrument_map.symbols
+            instrument_tokens, feed_symbols = await self._plan_tick_subscription(
+                user_id, broker, session, holdings=holdings, positions=positions)
 
         # D4.7: one connection per channel the broker declares. A broker whose
         # realtime surface is one socket declares one channel and this loop runs
@@ -847,8 +833,124 @@ class BrokerEngine:
                 holdings = []
         return self._remember_instrument_map(user_id, broker, holdings=holdings)
 
+    async def _plan_tick_subscription(self, user_id: str, broker: str, session: dict,
+                                      *, holdings: list, positions: list) -> tuple:
+        """What this account's tick feed subscribes to, and what it may name.
+
+        Returns `(instrument_tokens, feed_symbols)` — the broker's own
+        identifiers for the wire, and the canonical symbols the provider is
+        granted coverage for. Extracted from `start_stream` when D5.15 gave the
+        subscription a second source: the method was already at the complexity
+        ceiling, and the two halves of the answer are one decision.
+
+        THE TWO SOURCES, AND WHY BOTH EXIST
+        -----------------------------------
+        1. **the portfolio**, whose rows carry the broker's identifiers already
+           (`stream_instruments`). This was the whole of the universe before
+           D5.15, and for an account that holds nothing it is empty — a socket
+           that opens, reports its link up and can never deliver a packet.
+        2. **the catalogue**, which turns the rest of the account's universe —
+           watchlist, dashboard — into this broker's identifiers through the
+           adapter, the only layer entitled to know what one looks like.
+
+        Every step of the second degrades to the first rather than failing: a
+        broker with no catalogue resolves nothing, an unreachable instrument
+        master resolves nothing, and an unresolvable symbol is omitted. In each
+        case the account keeps exactly the portfolio-derived subscription it had
+        before D5.15.
+
+        D4.3 — the same lists that decide what to subscribe to also decide what
+        an arriving tick can be *named*, so the map is rebuilt from both here.
+        A subscription the map cannot read back is the same defect as no
+        subscription, reached one step later and silently: `canonical_ticks`
+        drops what it cannot name.
+        """
+        if holdings is None:
+            try:
+                holdings = await broker_gateway.get_holdings(broker, session)
+            except BrokerError:
+                holdings = []
+        if positions is None:
+            try:
+                positions = await broker_gateway.get_positions(broker, session)
+            except BrokerError:
+                positions = []
+        instrument_tokens = broker_gateway.stream_instruments(
+            broker, holdings=holdings, positions=positions)
+        catalogue = await self._resolve_feed_catalogue(
+            user_id, broker, session, holdings=holdings, positions=positions)
+        for token in catalogue.values():
+            if token not in instrument_tokens:
+                instrument_tokens.append(token)
+        instrument_map = self._remember_instrument_map(
+            user_id, broker, holdings=holdings, positions=positions, catalogue=catalogue)
+        return instrument_tokens, instrument_map.symbols
+
+    async def _feed_watchlist_symbols(self, user_id: str) -> list:
+        """This user's watchlisted symbols, or [] when they cannot be read.
+
+        Scoped to the one account on purpose. `db.watchlist.distinct("symbol")`
+        with no filter returns every user's watchlist, and a feed consumed under
+        one user's broker entitlement may not be aimed at another user's
+        instruments.
+
+        When this was written, both of the platform's price broadcast loops did
+        exactly that. D5.15 fixed one of them; D5.16 fixed the other, which was
+        also publishing the result to every socket — see
+        `heartbeat_engine._watchlist_symbols`. There is now no unfiltered read
+        of this collection anywhere.
+        """
+        if self.db is None:
+            return []
+        try:
+            return await self.db.watchlist.distinct("symbol", {"user_id": str(user_id)})
+        except Exception as e:
+            logger.warning(f"Watchlist read for the {user_id} feed universe failed: {e}")
+            return []
+
+    async def _resolve_feed_catalogue(self, user_id: str, broker: str, session: dict,
+                                      *, holdings: list, positions: list) -> dict:
+        """`{CANONICAL_SYMBOL: broker instrument id}` for the non-portfolio half
+        of this account's feed universe (D5.15; exchange-aware in D5.16).
+
+        The universe passed to the adapter is a sequence of `FeedInstrument` —
+        symbol, exchange, segment — not bare symbols. This method is unchanged
+        by that: it neither builds nor reads one, which is the property that let
+        the contract widen beneath five adapters without the engine learning
+        what an instrument identifier or an exchange means to any of them.
+
+        Portfolio instruments are deliberately excluded from the *result* even
+        though they are included in the universe passed to the adapter: their
+        identifiers already came from the broker on the holding row itself, and
+        a catalogue lookup is a weaker source than the account's own record.
+        Passing them anyway is what lets an adapter answer for a held instrument
+        whose row carried no identifier.
+
+        Never raises. The catalogue widens coverage; it is not load-bearing for
+        a feed that already has a portfolio to subscribe to.
+        """
+        universe = build_feed_universe(
+            holdings=holdings,
+            positions=positions,
+            watchlist=await self._feed_watchlist_symbols(user_id),
+            # D5.17 — the index strip is on every page for every account and is
+            # four instruments. It enters the universe here, as the same kind of
+            # value as everything else, which is the property that let a second
+            # segment ship without this method learning what a segment is.
+            indices=index_instruments(),
+            dashboard=dashboard_symbols(),
+        )
+        if not universe:
+            return {}
+        try:
+            return await broker_gateway.resolve_instruments(broker, universe, session)
+        except Exception as e:
+            logger.warning(f"Instrument catalogue lookup for {broker} failed: {e}")
+            return {}
+
     def _remember_instrument_map(self, user_id: str, broker: str,
-                                 holdings: list = None, positions: list = None) -> InstrumentMap:
+                                 holdings: list = None, positions: list = None,
+                                 catalogue: dict = None) -> InstrumentMap:
         """Rebuild and cache the account's map from rows already in hand.
 
         `start_stream` and `sync_portfolio` both hold freshly fetched holdings
@@ -856,8 +958,16 @@ class BrokerEngine:
         is the only way an intraday position's ticks are ever mappable. Rebuilt
         wholesale rather than mutated: a stream reading the map must never
         observe a half-updated table.
+
+        `catalogue` (D5.15) carries the instruments the feed was aimed at beyond
+        the portfolio, so a tick for a watchlisted or dashboard symbol can be
+        named. It is passed only by `start_stream`, which is the one caller that
+        resolved one; a sync rebuilds from the portfolio alone and would
+        otherwise drop the catalogue half of the map on the floor — which is why
+        `start_stream` is called at the end of `sync_portfolio` and rebuilds it
+        again with both halves.
         """
-        instrument_map = InstrumentMap.from_portfolio(holdings, positions)
+        instrument_map = InstrumentMap.from_portfolio(holdings, positions, catalogue)
         self._instrument_maps[(str(user_id), broker)] = instrument_map
         return instrument_map
 

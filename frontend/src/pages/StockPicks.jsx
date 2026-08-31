@@ -2,6 +2,8 @@ import { useState, useEffect } from "react";
 import { useNavigate, Link } from "react-router-dom";
 import api from "../services/api";
 import { formatCurrency, formatPercent } from "../utils/formatters";
+import { applyLivePrices } from "../lib/livePrices";
+import { useRealtimeStore, selectPriceTicks } from "../store/realtimeStore";
 
 import { Target, Shield, TrendingUp, AlertTriangle, Brain, RefreshCw, ChevronDown, ChevronUp, Info, BarChart3 } from "lucide-react";
 import { BarChart, Bar, Cell, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts";
@@ -375,6 +377,16 @@ export default function StockPicks() {
   useEffect(() => {
     fetchPicks();
   }, []);
+
+  // Live price patch (D5.16), the same fold the dashboard card uses. This page
+  // showed the price a pick was generated with until an explicit refresh, on
+  // the surface where a stale entry price is most consequential: every stop and
+  // target on it is quoted against that number.
+  const priceTicks = useRealtimeStore(selectPriceTicks);
+  useEffect(() => {
+    if (!priceTicks) return;
+    setPicks(prev => applyLivePrices(prev, priceTicks));
+  }, [priceTicks]);
 
   const fetchPicks = async () => {
     setLoading(true);
