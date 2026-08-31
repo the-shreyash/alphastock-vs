@@ -17,7 +17,7 @@
 -r requirements.txt
 
 # Test runner
-pytest==9.0.3
+pytest==9.1.1
 iniconfig==2.3.0        # pytest dep
 pluggy==1.6.0           # pytest dep
 
@@ -26,14 +26,14 @@ pluggy==1.6.0           # pytest dep
 # Invoked explicitly — `pytest --cov` — and configured in pyproject.toml under
 # [tool.coverage.*]. TESTING.md previously listed "coverage measurement (needs
 # pytest-cov pinned)" as unowned; PH3.1 closes that.
-pytest-cov==7.0.0
+pytest-cov==7.1.0
 coverage==7.15.4        # pytest-cov dep
 
 # Formatter
 black==26.5.1
 pathspec==1.1.1         # black / mypy dep
 pytokens==0.4.1         # black dep
-platformdirs==4.9.6     # black dep
+platformdirs==4.11.5     # black dep
 
 # Linters
 flake8==7.3.0
@@ -43,7 +43,7 @@ pyflakes==3.4.0         # flake8 dep
 isort==8.0.1
 
 # Type checker
-mypy==2.1.0
+mypy==2.3.1
 mypy_extensions==1.1.0  # black / mypy dep
 
 # Dev-only runtime tooling
