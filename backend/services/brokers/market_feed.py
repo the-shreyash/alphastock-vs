@@ -72,6 +72,11 @@ from services.brokers.gateway import broker_gateway
 from services.brokers.sharding import DEFAULT_SHARD_ID
 from services.market_engine.gateway import market_gateway
 from services.market_engine.providers import StreamingTickProvider, provider_registry
+# Re-exported for the broker engine, which names these reasons at the three
+# call sites that detach a feed. This module is the documented seam between the
+# broker layer and the Market Engine, so the vocabulary crossing it crosses
+# here and not in four places.
+from services.market_engine.source_manager import FeedChangeReason  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
@@ -194,17 +199,34 @@ async def set_market_feed_link(user_id: Any, broker: str, *, up: bool,
     return await provider.mark_link_down(reason, shard)
 
 
-async def detach_market_feed(user_id: Any, broker: str) -> bool:
+async def detach_market_feed(
+    user_id: Any,
+    broker: str,
+    *,
+    change_reason: Optional[FeedChangeReason] = None,
+) -> bool:
     """Unregister this account's market feed. True when one was removed.
 
     Called when the entitlement ends — disconnect, revoked token, expired
     session. A broker feed is legally the user's own data, so an ended
     entitlement must stop being resolvable immediately rather than at the next
     health transition.
+
+    `change_reason` (D5.13) names which of those three it was, in the Market
+    Engine's own consumer-facing vocabulary, so the owner's `provider.status`
+    can say why their tier moved instead of only that it did (LIM-D5.5-2). It
+    carries nothing the broker said: no wire code, no error text, no broker
+    name. Those stay in the audit row and the admin diagnostics, which are the
+    surfaces allowed to hold them.
+
+    The direction of the dependency is the one the platform has enforced since
+    D3 — the broker layer names a Market Engine value, and the Market Engine
+    imports nothing from here.
     """
     if not user_id or not broker:
         return False
-    return await market_gateway.unregister_streaming_provider(feed_provider_name(user_id, broker))
+    return await market_gateway.unregister_streaming_provider(
+        feed_provider_name(user_id, broker), change_reason=change_reason)
 
 
 async def publish_market_ticks(user_id: Any, broker: str, ticks: Sequence[Any],

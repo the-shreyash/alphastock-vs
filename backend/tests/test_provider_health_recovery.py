@@ -78,6 +78,7 @@ from services.market_engine.providers.base import DOWN_AFTER_FAILURES
 from services.market_engine.event_bus import event_bus
 from services.market_engine.source_manager import (
     FEED_AVAILABLE,
+    FEED_RECOVERING,
     FEED_UNAVAILABLE,
     HEALTH_RANK,
     PROVIDER_STATUS_TOPIC,
@@ -692,7 +693,14 @@ def test_the_baseline_is_the_provider_the_deadlock_actually_stranded():
             assert manager.status()["state"] == "unavailable"
 
             clock.advance(HEALTH_PROBE_BASE_DELAY)
-            assert manager.status()["state"] == "available"
+            # The subject here is the deadlock, and the deadlock is broken when
+            # the baseline is a candidate again — which is asserted on the
+            # chain, where it is a fact about resolution. D5.13 changed what the
+            # *consumer* is told about that moment: `recovering`, because a
+            # trial that has answered nothing is not a usable feed. Asserting
+            # both keeps this test honest about which of the two it is pinning.
+            assert baseline in manager.resolve_feed(Capability.QUOTES).chain
+            assert manager.status()["state"] == "recovering"
 
         # The outage ends. Nothing tells the platform so; the next request does.
         with patch.object(YahooPollingAdapter, "fetch_quote",
@@ -1049,31 +1057,36 @@ def test_the_re_admission_decision_is_logged_for_an_operator():
 
 
 # ==================================================================
-# 9. D5.12 — what the consumer sees while a trial is merely offered
+# 9. D5.12/D5.13 — what the consumer sees while a trial is merely offered
 # ==================================================================
 #
-# The D5.12 audit re-verified this whole mechanism and found the deadlock
-# closed, so it added no mechanism. It did find one consequence of D5.7 that no
-# document recorded and no test pinned, and these two tests pin it exactly as it
-# behaves today so that changing it later has to be a decision:
+# D5.12 audited this mechanism, found the deadlock closed, and found one
+# consequence of D5.7 that no document recorded: `status()` resolves through
+# the same path a request does, so a re-admitted provider made the consumer
+# feed state read `available` — with a `delayed` freshness tier — before
+# anything had answered. It pinned that as LIM-D5.12-1 rather than changing it,
+# because the alternative it could see (having `status()` ignore probes) makes
+# the consumer surface disagree with the resolution path.
 #
-# `status()` resolves through the same path a request does, and a re-admitted
-# provider *is* a resolvable candidate. So during a sustained total outage the
-# consumer-facing feed state flips to `available` the moment a cool-down
-# expires — before anything has answered — and back to `unavailable` once the
-# trial is spent and fails. It is a blink, not a lie about data (no price is
-# fabricated and no tier is invented), and it is the honest report of "there is
-# a provider to try". It is recorded as LIM-D5.12-1 because the alternative —
-# having `status()` ignore probes — makes the consumer surface disagree with
-# the resolution path, which is a worse property to hold. See ADR-052.
+# D5.13 owns the consumer contract and closed it with the option D5.12 did not
+# have a mandate to add: a third state. `recovering` agrees with resolution —
+# there *is* a candidate — and claims nothing about data. Resolution itself is
+# untouched, which is why the assertions below are still about a probe that is
+# offered, selected and spent.
+#
+# The full contract lives in `test_consumer_feed_contract.py`. These two stay
+# here because they are also statements about D5.7's mechanism: that a trial
+# costs no call, and that the ladder bounds how often the state can move.
 
 
-def test_the_feed_reports_available_while_a_trial_is_only_offered():
-    """LIM-D5.12-1, first half: the flip is real and is not a data claim.
+def test_a_trial_that_is_only_offered_costs_no_call_and_claims_no_data():
+    """LIM-D5.12-1, closed. The state moves; nothing else does.
 
-    Nothing has recovered at this point — health is still DOWN and the provider
-    has answered nothing. What `available` means here is "a provider will be
-    tried", which is what the resolution path itself means by it.
+    The property D5.7 needs is that reading the status is free: the trial is
+    charged by a request that reaches the provider, never by the offer. The
+    property D5.13 adds is that the free read does not describe the offer as a
+    working feed — health is still DOWN and the provider has answered nothing,
+    so there is no tier to report and no capability to advertise.
     """
     flaky = FlakyPollingProvider()
     with wired(flaky) as (gateway, manager, _registry, clock):
@@ -1083,8 +1096,10 @@ def test_the_feed_reports_available_while_a_trial_is_only_offered():
 
         clock.advance(HEALTH_PROBE_BASE_DELAY)
         during_trial = manager.status()
-        assert during_trial["state"] == FEED_AVAILABLE
-        assert during_trial["reason"] is None
+        assert during_trial["state"] == FEED_RECOVERING
+        assert during_trial["state"] != FEED_AVAILABLE
+        assert during_trial["tier"] is None
+        assert during_trial["capabilities"] == []
         # ...and none of that is a claim that the provider recovered.
         assert flaky.health().state is ProviderState.DOWN
         assert flaky.calls == DOWN_AFTER_FAILURES, "nothing was called for the status"
@@ -1093,14 +1108,14 @@ def test_the_feed_reports_available_while_a_trial_is_only_offered():
         assert "flaky_baseline" not in str(during_trial)
 
 
-def test_a_failed_trial_publishes_an_available_then_unavailable_pair():
-    """LIM-D5.12-1, second half: the blink is observable on the consumer bus.
+def test_a_failed_trial_publishes_a_recovering_then_unavailable_pair():
+    """The pair is bounded by the ladder, which is D5.7's property and not D5.13's.
 
-    Only when something publishes status inside the window between the cool-down
-    expiring and the trial being spent — the `/market/status` route, a broker
-    connect, an unregister. Pinned so that a sprint which owns the consumer
-    surface (the one that also owes LIM-D5.5-2) can see exactly what it is
-    changing, and so that the pair can never grow into a repeating flap.
+    A status published inside the window between a cool-down expiring and the
+    trial being spent — by the `/market/status` route, a broker connect, an
+    unregister — still produces two events. What changed is that neither half
+    now claims a usable feed; what did not change is that the second cool-down
+    is twice as long, so this can never grow into a repeating flap.
     """
     seen = []
 
@@ -1118,7 +1133,8 @@ def test_a_failed_trial_publishes_an_available_then_unavailable_pair():
             run(manager.publish_status())
             run(gateway.get_quote("RELIANCE"))
             run(manager.publish_status())
-            assert seen == [FEED_AVAILABLE, FEED_UNAVAILABLE]
+            assert seen == [FEED_RECOVERING, FEED_UNAVAILABLE]
+            assert FEED_AVAILABLE not in seen
 
             # Bounded, and that is the property that matters: the second
             # cool-down is twice as long, so the blink cannot become a flap.

@@ -116,13 +116,38 @@ from services.market_engine.providers import (
 logger = logging.getLogger(__name__)
 
 #: Feed state published to consumers. Mirrors the Source Manager state machine
-#: in MARKET_DATA_ARCHITECTURE.md, collapsed to what a consumer can act on: it
-#: is either being served, or it is not.
+#: in MARKET_DATA_ARCHITECTURE.md, collapsed to what a consumer can act on.
+#:
+#: D5.13 — WHY THERE ARE THREE OF THESE AND NOT TWO
+#: Until D5.13 there were two, on the stated reasoning that a feed "is either
+#: being served, or it is not". That is a true dichotomy and it was projected
+#: from the wrong question. `as_status()` reported the *resolution* answer —
+#: "is there a provider I will try?" — on a surface whose consumers ask the
+#: *delivery* question — "is my feed serving me usable data?". For every
+#: provider that has passed health, readiness, freshness and coverage the two
+#: answers coincide, which is why the collapse survived twelve sprints.
+#:
+#: They come apart in exactly one place, and D5.7 created it: a provider
+#: excluded at DOWN is re-admitted for one trial once its cool-down expires.
+#: It is a genuine resolution candidate and a genuine non-answer, so the
+#: two-value contract had to call it one of the two and called it `available`
+#: — reporting a usable feed, and a freshness `tier` to go with it, about a
+#: provider whose health was DOWN and which had returned nothing (LIM-D5.12-1).
+#:
+#: :data:`FEED_RECOVERING` is that third case named. It is a refinement of
+#: *not available*, deliberately: a consumer branching `state == "available"`
+#: now takes its degraded branch, which is the safe direction to be wrong in.
+#: And it agrees with resolution rather than contradicting it — which is what
+#: ADR-052 rejected reporting `unavailable` here for. There *is* a candidate;
+#: it simply has not answered yet, and that is what this word says.
 FEED_AVAILABLE = "available"
 FEED_UNAVAILABLE = "unavailable"
+FEED_RECOVERING = "recovering"
 
-#: Topic on the existing Event Bus. Payload carries `tier`, `state` and an
-#: unavailability `reason` — never a provider name (Developer Rule 4).
+#: Topic on the existing Event Bus. Payload carries `tier`, `state`, an
+#: unavailability `reason` and — when the caller knows one — a
+#: :class:`FeedChangeReason` for the *transition*; never a provider name
+#: (Developer Rule 4).
 PROVIDER_STATUS_TOPIC = "provider.status"
 
 #: Broker lifecycle topics published by the Broker Gateway (D3). Subscribed
@@ -235,6 +260,55 @@ class UnavailableReason(str, Enum):
     ALL_PROVIDERS_DOWN = "all_providers_down"
 
 
+class FeedChangeReason(str, Enum):
+    """Why a consumer's feed *changed*, when a caller knows.
+
+    D5.13, and the closing half of LIM-D5.5-2. Distinct from
+    :class:`UnavailableReason` in the one way that matters: that enum is a
+    property of the current resolution and can always be re-derived from the
+    registry, while this one describes a *transition* whose cause is gone by
+    the time anyone could ask. An entitlement refusal unregisters the feed, so
+    a moment later there is no provider left to explain the tier that moved and
+    nothing in the Source Manager remembers there ever was one.
+
+    That is why this travels on the `provider.status` **event** and never on
+    :meth:`SourceManager.status`. A reason belongs to the change; a consumer
+    that reconnects an hour later and reads the steady state must be told what
+    is serving it now, not handed an explanation of something that stopped
+    being news. Keeping it off `status()` also keeps it out of the
+    change-gating comparison, so an unchanged feed still publishes nothing.
+
+    WHY THIS VOCABULARY IS THE PLATFORM'S AND NOT A BROKER'S
+    --------------------------------------------------------
+    Every value here is a statement about the *feed*: it names what the
+    platform did to the user's provider, never what a broker said to cause it.
+    That is what lets it sit on the surface Developer Rule 4 governs. The
+    broker's own words — a wire code, an error string, the broker's name — stay
+    where they already are, in the audit row and the admin diagnostics, because
+    a field a consumer can only render for the brokers somebody has read the
+    error tables of is not a consumer field.
+
+    Three values because there are exactly three paths that unregister a live
+    feed, and they are three different problems with three different fixes.
+    Collapsing them would tell a user whose token expired that their broker
+    refused them. Widening the enum needs the same bar ADR-042 set for
+    `UnavailableReason`: a caller that genuinely knows the cause, and a cause a
+    consumer can act on differently.
+    """
+
+    #: The broker refused this account the data the feed carries (D5.5).
+    #: Terminal for that stream; the way back is a D5.6 re-probe.
+    ENTITLEMENT_REFUSED = "entitlement_refused"
+
+    #: The account's session or token expired, so the feed cannot deliver
+    #: another tick. The way back is a new session.
+    SESSION_EXPIRED = "session_expired"
+
+    #: The user removed the broker account. Nothing is wrong and nothing is
+    #: coming back until they reconnect it.
+    FEED_DISCONNECTED = "feed_disconnected"
+
+
 @dataclass(frozen=True)
 class Resolution:
     """The outcome of one resolution — explicit in both directions.
@@ -258,11 +332,84 @@ class Resolution:
     def tier(self) -> Optional[SourceTier]:
         return self.provider.tier if self.provider else None
 
+    @property
+    def recovering(self) -> bool:
+        """Whether the selected provider has yet to demonstrate it can serve.
+
+        D5.13, and the closing half of LIM-D5.12-1. True exactly when
+        resolution picked a provider whose health is DOWN — which, since
+        `candidates_for` filters DOWN out unconditionally, can only be a
+        provider D5.7 re-admitted for one trial after its cool-down ran.
+
+        THE PREDICATE IS HEALTH, AND DELIBERATELY NOT "CAME FROM `probes`"
+        ------------------------------------------------------------------
+        Those two are equivalent today and are not the same statement. "It was
+        offered as a probe" is a fact about the mechanism that admitted it; "its
+        health is DOWN" is a fact about the provider, and it is the one the
+        consumer's question is actually about — nothing has recently succeeded
+        against this provider, whatever route it took into the chain. Reading
+        the mechanism would also make this surface a second consumer of D5.7's
+        internals, which is how two things that must agree start disagreeing.
+
+        WHY ONLY `DOWN`
+        ---------------
+        `UNKNOWN` must not qualify. A provider registered a moment ago has
+        never been called and is UNKNOWN until the first request — the Yahoo
+        baseline is UNKNOWN at every process start — and `HEALTH_RANK` has tied
+        UNKNOWN with UP since D2 precisely because "unproven" is not "failing".
+        Reporting the platform as recovering at every boot would be a larger
+        and far more visible falsehood than the one this property removes.
+
+        `DEGRADED` must not qualify either. A degraded provider has had some
+        failures and is still being handed every request; calling that an
+        outage on the consumer surface would disagree with the resolution that
+        is still selecting it, which is exactly the property ADR-052 declined
+        to give up.
+
+        This is a *projection* and changes no resolution: the probe is still
+        offered, still ranked last and still spent by the request that reaches
+        it. A status surface that suppressed it to look tidy would suppress the
+        recovery too, restoring the ADR-029 deadlock D5.7 closed.
+        """
+        return (
+            self.provider is not None
+            and self.provider.health().state is ProviderState.DOWN
+        )
+
+    @property
+    def state(self) -> str:
+        """The consumer-facing feed state — the three-way answer.
+
+        `recovering` is checked first because it is a refinement of the
+        `available` branch: the provider is set, so `available` is true, and the
+        question this surface is answering is the narrower one.
+        """
+        if self.recovering:
+            return FEED_RECOVERING
+        return FEED_AVAILABLE if self.available else FEED_UNAVAILABLE
+
     def as_status(self) -> Dict[str, Any]:
-        """Consumer-safe summary. Contains no provider identity."""
+        """Consumer-safe summary. Contains no provider identity.
+
+        `tier` is a claim about the freshness of data a consumer is receiving,
+        so it is reported only in the state where data is actually being
+        served. In `recovering` there is a provider with a tier attribute and
+        no data to make the claim about, and stamping `delayed` there is
+        precisely what told a user they were on the delayed feed while eight
+        consecutive calls had returned nothing (LIM-D5.12-1).
+
+        `reason` stays `None` in `recovering`, and that is a decision rather
+        than an omission. :class:`UnavailableReason` means "why no provider
+        could be resolved", and here one was; overloading it would make the
+        field answer two different questions depending on a sibling field. The
+        state is self-describing, and the diagnosis an operator wants —
+        which providers, which cool-downs — is on `diagnostics()`, where
+        provider detail is allowed to be.
+        """
+        state = self.state
         return {
-            "state": FEED_AVAILABLE if self.available else FEED_UNAVAILABLE,
-            "tier": self.tier.value if self.tier else None,
+            "state": state,
+            "tier": self.tier.value if (self.tier and state == FEED_AVAILABLE) else None,
             "reason": self.reason.value if self.reason else None,
         }
 
@@ -594,10 +741,15 @@ class SourceManager:
         quotes = self.resolve_feed(Capability.QUOTES, ctx)
         return {
             **quotes.as_status(),
+            # D5.13 — `state`, not `available`. This list is read as "what can
+            # I ask for right now", so a capability whose only provider is a
+            # DOWN one awaiting its trial must not appear: advertising it here
+            # while `state` said `recovering` would put the contradiction back
+            # one field to the right.
             "capabilities": sorted(
                 capability.value
                 for capability in Capability
-                if self.resolve_feed(capability, ctx).available
+                if self.resolve_feed(capability, ctx).state == FEED_AVAILABLE
             ),
         }
 
@@ -634,6 +786,7 @@ class SourceManager:
         *,
         force: bool = False,
         user_id: Optional[str] = None,
+        change_reason: Optional["FeedChangeReason"] = None,
     ) -> Optional[Dict[str, Any]]:
         """Publish `provider.status` when the feed state, tier or reason changed.
 
@@ -673,11 +826,21 @@ class SourceManager:
         payload = {**current, "previous_tier": (previous or {}).get("tier")}
         if key is not None:
             payload["user_id"] = key
+        # D5.13 — closes LIM-D5.5-2. Present only when the caller actually knows
+        # why, and absent rather than guessed otherwise: most tier movements —
+        # a promotion, a stale-feed demotion, a link drop — have no single cause
+        # worth naming, and inventing one would be fabricated provenance on the
+        # surface least able to afford it. The key is omitted entirely when
+        # there is no reason, so every existing consumer sees the payload it
+        # saw before this sprint.
+        if change_reason is not None:
+            payload["change_reason"] = FeedChangeReason(change_reason).value
         await event_bus.publish(PROVIDER_STATUS_TOPIC, payload)
         logger.info(
-            "Market feed status%s: state=%s tier=%s reason=%s (was tier=%s)",
+            "Market feed status%s: state=%s tier=%s reason=%s change=%s (was tier=%s)",
             f" for user {key}" if key else "",
             current["state"], current["tier"], current["reason"],
+            payload.get("change_reason"),
             (previous or {}).get("tier"),
         )
         return current

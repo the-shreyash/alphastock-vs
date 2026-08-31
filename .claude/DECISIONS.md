@@ -2411,7 +2411,7 @@ Alternatives considered
 
 **Demote the provider (`mark_link_down`) rather than unregister it.** Rejected — see the Decision. A demoted feed remains a candidate; it also remains able to *deliver*, since the sink stays bound, so a socket the user has not disconnected could go on pushing into the gateway. `unregister_streaming_provider` disconnects, unbinds and unregisters, which is the behaviour an ended entitlement has always had.
 
-**Give the user a dedicated notification or a new `provider.status` reason.** Rejected as out of scope and unnecessary. Unregistration already publishes a user-scoped `provider.status`, whose payload shape is unchanged, and the frontend already renders the tier flip from it. A new field on a consumer payload is a frontend contract change, and D5.5 has no frontend work. Recorded as LIM-D5.5-2.
+**Give the user a dedicated notification or a new `provider.status` reason.** Rejected as out of scope and unnecessary. Unregistration already publishes a user-scoped `provider.status`, whose payload shape is unchanged, and the frontend already renders the tier flip from it. *(D5.13: the second half of that sentence is false and was never verified — the frontend has no `provider.status` consumer at all; see ADR-053. The rejection stands on scope; its supporting claim does not.)* A new field on a consumer payload is a frontend contract change, and D5.5 has no frontend work. Recorded as LIM-D5.5-2.
 
 **Fix DB-5-adjacent flap behaviour, or add a give-up-after-N policy for repeated non-terminal failures.** Rejected as separable and left as remaining D5 work. The audit specifically checked whether entitlement classification was inseparable from reconnect pacing and found the opposite: entitlement is terminal by classification and never reaches the ladder, so the two do not interact. DB-5 itself was closed in D5.1.
 
@@ -3055,6 +3055,98 @@ None.
 Review Date
 
 At the sprint that owns the consumer feed contract, where LIM-D5.12-1 and LIM-D5.5-2 are the same surface and should be decided together. Also whenever a **second polled provider** is registered: every argument above for why the "offered but never reached" tail is benign rests on the polled baseline being the only provider of its kind, and a second one makes that a question again rather than an observation.
+
+Authoritative document
+
+MARKET_DATA_ARCHITECTURE.md
+
+---
+
+# ADR-053
+
+Title
+
+`available` Is a Claim About Data, Not About Candidates: The Consumer Feed Contract (Sprint D5.13)
+
+Date
+
+2026-08-31
+
+Status
+
+Accepted — production change in four files; **live validation not performed**
+
+Context
+
+Two limitations reached D5.13 open, recorded by different sprints, on what ADR-052 already suspected was one surface:
+
+• **LIM-D5.12-1** — during a sustained total outage the consumer feed state flips to `available` at each cool-down expiry, before anything has answered, and back to `unavailable` when the trial fails.
+• **LIM-D5.5-2** — after an entitlement refusal the user sees their tier drop from `streaming` to `delayed` with `reason: null`; the explanation exists only in an audit row.
+
+The audit reproduced both through the real resolution path and found **one root cause**, not two.
+
+`Resolution.as_status()` answered the **resolution** question — *"is there a provider I will try?"* — on a surface whose consumers ask the **delivery** question — *"is my feed serving me usable data?"*. For every provider that has passed health, readiness, freshness and coverage those two questions have the same answer, which is why the collapse survived from D1 to D5.12 without anyone noticing. They come apart in exactly one place, and D5.7 created it: a provider re-admitted at `DOWN` for one trial is a genuine candidate and a genuine non-answer. The two-value contract had to call it one of the two, and called it `available` — stamping a `delayed` freshness tier on a provider whose last eight calls had all failed.
+
+The same collapse explains LIM-D5.5-2 from the other side. `UnavailableReason` is a property of the *current* resolution and can always be re-derived; the cause of a *transition* cannot, because the path that moves the tier — `detach_market_feed` — **unregisters the provider**. One line later there is nothing left in the Source Manager that knows the feed ever existed, let alone why it went. A reason for the change was not missing from the payload by oversight; there was no place in the model for it to be derived from.
+
+Three findings shaped the decision:
+
+1. **ADR-052 weighed two options and there was a third.** It considered reporting `available` (optimistic, chosen) against reporting `unavailable` (late, rejected because the surface would then disagree with resolution). Both are wrong for the same reason: they force a three-valued fact into two values. A third state agrees with resolution — there *is* a candidate — and claims nothing about data.
+
+2. **The frontend has never consumed `provider.status`.** DECISIONS.md:2414 justified deferring LIM-D5.5-2 partly on the grounds that "the frontend already renders the tier flip from it". It does not. `provider.status` has domain `provider`, which `DOMAIN_CHANNEL` does not map, so the platform-scoped event broadcasts to a channel `RealtimeProvider.jsx` never subscribes to; the user-scoped event *is* delivered to the owner's sockets, and `realtimeStore.applyEvent` drops it at `default: break`. The frontend learns the tier only from `source_tier` on REST payloads. That claim is corrected below.
+
+3. **A defect found while wiring the fix, which would have made the sprint a silent no-op.** `unregister_streaming_provider` disconnected the provider *before* publishing. Disconnecting drives readiness backwards, firing `_on_provider_readiness`, which published the user-scoped demotion **from inside the teardown and without a reason**. Change gating then suppressed the real, explained publish as a repeat — so the explanation would never have reached the bus, while every test that only asserted "the owner was told" stayed green.
+
+Decision
+
+**1. A third consumer-facing feed state, `recovering`, derived and not stored.**
+
+`Resolution.recovering` is true exactly when the selected provider's health is `DOWN` — which, since `candidates_for` filters `DOWN` unconditionally, can only be a provider D5.7 re-admitted for a trial. It is a refinement of *not available*: a consumer branching `state == "available"` now takes its degraded branch, which is the safe direction to be wrong in. `tier` is `null` in that state, because a tier is a claim about the freshness of data and there is no data.
+
+The predicate is **health**, deliberately not "came from `probes`". Those are equivalent today and are not the same statement: the consumer's question is about the provider, not about the mechanism that admitted it, and reading D5.7's internals here would make this surface a second consumer of them.
+
+**Only `DOWN` qualifies.** `UNKNOWN` must not — the Yahoo baseline is `UNKNOWN` at every process start, and `HEALTH_RANK` has tied `UNKNOWN` with `UP` since D2 precisely because *unproven* is not *failing*; reporting the platform as recovering at every boot would be a larger falsehood than the one being removed. `DEGRADED` must not — a degraded provider is still being handed every request.
+
+**2. A transition reason on the `provider.status` event, and never on `status()`.**
+
+`FeedChangeReason` — `entitlement_refused`, `session_expired`, `feed_disconnected` — one value per path that unregisters a live feed. It is the platform's vocabulary about the *feed*, never the broker's about itself: no broker name, no wire code, no transport error text. `publish_status` coerces through the enum, so an off-vocabulary string is refused rather than published.
+
+It rides the event because a reason belongs to a *change*. A consumer that reconnects an hour later and reads `status()` must be told what is serving it now, not handed an explanation of something that stopped being news — and keeping it off `status()` is also what keeps it out of the change-gating comparison, so an unchanged feed still publishes nothing. It is **optional and absent rather than guessed**: most tier movements (a promotion, a stale-feed demotion, a link drop) have no single nameable cause, and inventing one would be fabricated provenance on the surface least able to afford it.
+
+**3. Unbind the readiness listener before disconnecting, in `unregister_streaming_provider`.**
+
+Independently correct: a readiness transition produced by tearing a provider down is an artifact of the teardown, not news about the user's feed. The authoritative statement is the one the unregistration makes once the provider is actually out of the registry. This turns two events — one carrying `previous_tier`, one carrying the reason — into one carrying both.
+
+Alternatives Rejected
+
+**Make `status()` ignore probes.** ADR-052's rejected option, rejected again and for its own reason: the surface would report `unavailable` for a request that would in fact succeed. `recovering` gets the honesty without the disagreement.
+
+**Suppress the probe in `resolve_feed`.** The failure mode strictly worse than LIM-D5.12-1. The trial is how a `DOWN` provider recovers at all, so a status surface that removed it to look tidy would restore the ADR-029 deadlock D5.7 closed. Resolution is untouched; this sprint changes only the projection.
+
+**Carry `ALL_PROVIDERS_DOWN` as the `reason` while `recovering`.** Tempting — every candidate genuinely is down — and rejected to keep each field answering one question. `UnavailableReason` means *"why no provider could be resolved"*, and in `recovering` one was. The state is self-describing, and the provider-level diagnosis stays on `diagnostics()`, where provider detail is allowed to be.
+
+**Store the last demotion reason per user on the Source Manager.** Duplicated state with an invalidation problem and no owner. The reason travels with the transition that caused it instead.
+
+**Expose what the broker actually said.** A field a consumer can only render for the brokers somebody has read the error tables of is not a consumer field, and it is the exact leak Developer Rule 4 exists to prevent. The broker's words stay in the audit row and the admin diagnostics.
+
+**Build the frontend explanation.** Out of scope and identified rather than assumed: no `provider.status` consumer exists in the frontend at all, so this is a new UI surface (which banner, which copy, which dismissal) and a product decision, not a contract fix. Recorded as LIM-D5.13-1.
+
+Consequences
+
+• **`state` is now three-valued.** Any consumer branching on it must treat `recovering` as not-available; the enum was widened in the safe direction so a naive `== "available"` test already does.
+• **`status()`'s shape is unchanged** — same four keys — and `change_reason` appears only on the event, only when a caller supplied one.
+• **`active_tier()` / `source_tier()` are unchanged.** A REST payload's tier describes the provider that actually answered *it*, so it stays honest without this change; the composite routes already return `source_tier: null` when the fetch fails.
+• **24 tests added** in `tests/test_consumer_feed_contract.py`; three tests in `test_provider_health_recovery.py` updated, including the two that pinned LIM-D5.12-1 "so that changing it later has to be a decision" — this is that decision.
+• **19 mutations, 19 red.** Two were reported as malformed and reformed rather than counted: one used an `or` fallback that never fired on any path under test, and one removed the enum coercion while every call site still passed an enum member, making its output byte-identical. The second exposed a real gap and produced an additional test.
+• **LIM-D5.12-1 CLOSED. LIM-D5.5-2 CLOSED on the backend**, with its frontend half re-recorded as LIM-D5.13-1 rather than silently absorbed.
+
+Requires Approval
+
+None.
+
+Review Date
+
+Whenever a **second polled provider** is registered — ADR-052's condition still stands and now applies to `recovering` too: a probe candidate that is not the only provider of its kind changes which state the feed reports. Also whenever a frontend consumer of `provider.status` is built, which is when LIM-D5.13-1's copy and dismissal behaviour have to be decided.
 
 Authoritative document
 

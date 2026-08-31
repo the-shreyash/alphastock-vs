@@ -74,7 +74,7 @@ from services.market_engine.providers import (
     provider_registry,
 )
 from services.market_engine.ticks import MarketTick
-from services.market_engine.source_manager import source_manager
+from services.market_engine.source_manager import FeedChangeReason, source_manager
 from services.market_engine.validator import (
     validate_stock_quote,
     validate_index_quote,
@@ -265,25 +265,53 @@ class MarketGateway:
         await source_manager.publish_status()
         return True
 
-    async def unregister_streaming_provider(self, name: str) -> bool:
+    async def unregister_streaming_provider(
+        self,
+        name: str,
+        *,
+        change_reason: Optional[FeedChangeReason] = None,
+    ) -> bool:
         """Drop a pushed feed. Returns True when one was actually removed.
 
         Disconnect and unbind before unregistering: an entitlement that has
         ended must stop being resolvable *and* stop being able to deliver, and
         doing only the first would leave a live socket pushing into a gateway
         that no longer lists its provider.
+
+        `change_reason` (D5.13) is the caller's answer to "why", passed
+        straight through to the owner's `provider.status` and nowhere else. It
+        exists because this is the last moment anyone can answer: one line
+        below, the provider is out of the registry and the tier that is about
+        to move has nothing left to explain it (LIM-D5.5-2). It is optional
+        because most callers genuinely do not know, and a guessed cause on a
+        consumer surface is worse than none.
         """
         provider = provider_registry.get(name)
         if provider is None:
             return False
+        # D5.13 — UNBIND THE READINESS LISTENER *BEFORE* DISCONNECTING.
+        # `disconnect()` drives the feed's readiness backwards, which fired
+        # `_on_provider_readiness` and published a user-scoped `provider.status`
+        # announcing the demotion — from inside the teardown, and therefore
+        # before the unregistration below could publish the same demotion *with
+        # its reason*. Change gating then suppressed the second one as a repeat,
+        # so the explained event never reached the bus at all: the user was told
+        # their tier had moved and never told why, which is precisely
+        # LIM-D5.5-2 reappearing one layer down from where it was fixed.
+        #
+        # Silencing it is also right on its own terms. A readiness transition
+        # produced by tearing a provider down is an artifact of the teardown,
+        # not news about the user's feed; the authoritative statement about
+        # what this user is now on is the one this method makes below, once the
+        # provider is actually out of the registry.
+        binder = getattr(provider, "bind_readiness_listener", None)
+        if callable(binder):
+            binder(None)
         try:
             await provider.disconnect()
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning("Streaming provider %s failed to disconnect cleanly: %s", name, exc)
         provider.bind_sink(None)
-        binder = getattr(provider, "bind_readiness_listener", None)
-        if callable(binder):
-            binder(None)
         provider_registry.unregister(name)
         # D5.7: drop any failure cool-down this feed was serving. Not a recovery
         # claim — a re-attached feed is a new instance with fresh UNKNOWN health
@@ -302,8 +330,11 @@ class MarketGateway:
             # clearing it first would make the last event look like a repeat of
             # nothing and be suppressed — the user would be dropped back to the
             # baseline without ever being told.
-            await source_manager.publish_status(user_id=owner)
+            await source_manager.publish_status(user_id=owner, change_reason=change_reason)
             source_manager.forget_user_status(owner)
+        # Scoped to the owner on purpose. The platform view changes too — the
+        # registry lost a provider — but one account's entitlement is not news
+        # about the platform's feed, and this publish is broadcast to everyone.
         await source_manager.publish_status()
         return True
 

@@ -48,6 +48,12 @@ from services.brokers.crypto import decrypt_token, encrypt_token, is_encrypted
 from services.brokers.errors import BrokerAuthError, BrokerError
 from services.brokers.instruments import InstrumentMap, canonical_ticks
 from services.brokers.market_feed import (
+    # D5.13 — the Market Engine's consumer-facing transition vocabulary,
+    # re-exported by the seam that already owns this layer's contact with it.
+    # Importing it from `market_engine.source_manager` here would give the
+    # broker engine a second, direct dependency on the engine's internals for
+    # no gain; `market_feed` is the one module allowed to know both sides.
+    FeedChangeReason,
     attach_market_feed,
     detach_market_feed,
     publish_market_ticks,
@@ -338,7 +344,11 @@ class BrokerEngine:
         # The entitlement has ended, so the feed must stop being resolvable now
         # rather than at the next health transition — a broker feed is legally
         # this user's own data (MARKET_DATA_ARCHITECTURE.md, Category 2).
-        await detach_market_feed(user_id, broker)
+        # D5.13 — the owner's tier is about to drop to the baseline; say why.
+        # Nothing is wrong here and the reason says so: the user removed the
+        # account, and the feed is not coming back until they reconnect it.
+        await detach_market_feed(
+            user_id, broker, change_reason=FeedChangeReason.FEED_DISCONNECTED)
         await self.db.broker_accounts.update_one(
             {"user_id": user_id, "broker": broker},
             {"$set": {**{field: "" for field in TOKEN_FIELDS},
@@ -996,7 +1006,11 @@ class BrokerEngine:
         # it is what stops the Source Manager resolving a priority-1 streaming
         # provider that can only answer with silence; the baseline below it then
         # serves the TICKS capability's absence honestly.
-        await detach_market_feed(user_id, broker)
+        # D5.13 — and it is a *different* reason from an entitlement refusal,
+        # which is the whole point of the vocabulary having three values: this
+        # user's way back is a new session, not a re-probe.
+        await detach_market_feed(
+            user_id, broker, change_reason=FeedChangeReason.SESSION_EXPIRED)
         # The stream task is about to return on its own; drop the registry entry
         # with it (PH3.6). Without this the manager retained a finished
         # BrokerStream — and the expired access token inside its `session` — for
@@ -1052,7 +1066,12 @@ class BrokerEngine:
         that is delivering prices perfectly well.
         """
         if self._channel_carries_ticks(broker, channel):
-            await detach_market_feed(user_id, broker)
+            # D5.13 — closes the backend half of LIM-D5.5-2. Until now this
+            # unregistration moved the owner's tier from `streaming` to
+            # `delayed` with `reason: null`, and the explanation existed only in
+            # the audit row two lines below, which no consumer can read.
+            await detach_market_feed(
+                user_id, broker, change_reason=FeedChangeReason.ENTITLEMENT_REFUSED)
         # D5.10 — THE REFUSAL ENDS EVERY CONNECTION OF THIS CHANNEL, AND ONLY
         # THIS CHANNEL. An entitlement is a statement about a *capability*, and
         # every shard of one channel serves the same capability with the same
