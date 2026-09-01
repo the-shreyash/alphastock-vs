@@ -1345,3 +1345,124 @@ different number.
   level and a baseline percentage. Both are true; they are true at slightly
   different instants. Closing it needs a previous close on the canonical path,
   which is LIM-D5.16-1's territory.
+
+---
+
+# D5.18 — The pipeline, observed live (2026-09-01)
+
+Everything below was measured against a live NSE session with a real Upstox
+account, not reasoned about. It is the first live confirmation of the D4/D5
+architecture and it supersedes nothing — it is evidence for what was already
+specified.
+
+## The chain, with live values
+
+```
+Upstox WebSocket
+  → adapter decode
+  → canonical MarketTick            RELIANCE 1308.30 · NIFTY 24112.10 · SENSEX 77168.78
+  → StreamingTickProvider           brokerfeed:upstox:6a5e6228…  priority 1
+  → provider registry               ready, 35 subscriptions, 345 accepted / 0 rejected
+  → SourceManager resolution        per-user context
+  → market.tick bus event           source_tier: streaming, user_id: 6a5e6228…
+  → WebSocket bridge
+  → realtimeStore.priceTicks
+  → React                           574 numeric DOM changes in 113s
+```
+
+266 `market.tick` events were observed in 40 seconds. Every one carried
+`source_tier: streaming` and the owning `user_id`. Zero rejected records, zero
+flaps in 130 seconds.
+
+## Promotion takes ~40 seconds, by design
+
+The single most confusing thing an operator can see here, recorded so nobody
+re-derives it as a bug:
+
+```
+t+ 30s stability=probation  user_tier=delayed    RELIANCE winner=yahoo       tier=delayed
+t+ 40s stability=stable     user_tier=streaming  RELIANCE winner=brokerfeed  tier=streaming
+```
+
+`_selection_rank` is `(health, probation, latency)`. While both providers are
+healthy, **probation decides**, and `PROBATION_WINDOW_SECONDS = 30`. So for
+roughly the first 40 seconds after a broker connects, that user is legitimately
+served the baseline — the make-before-break gate D4.5/D5.2 specify — and a
+probe that runs for less than the window will report the window as a broken
+ranking. It is not. It has to be waited out.
+
+Corollary, since it is the second thing that misleads: **`/api/market/engine/status`
+is global.** It takes no user, resolves in `GLOBAL_CONTEXT` where Yahoo is the
+only provider, and therefore reports `tier: delayed` while a user's own feed is
+streaming. Per-user tier is `source_manager.status(user_id=…)`.
+
+## Where the boundary actually leaks
+
+The gateway is not bypassed. What is missing is *user context* on surfaces that
+have every right to it — a resolution without a `user_id` can only ever choose a
+global provider, so a connected broker is unreachable no matter how healthy it is:
+
+| Surface | Call | Consequence |
+|---|---|---|
+| `/api/market/overview` | `get_indices()` — no user | index **level** arrives by tick, **day change** stays Yahoo's (LIM-D5.17-4) |
+| `/api/market/ranking` | ~~`get_universe_quotes()` — no user~~ **FIXED D5.19** | now `get_universe_quotes(user_id=…)` and stamps `source_tier` |
+| `/api/market/scanner` | ~~`scan()` — no user~~ **FIXED D5.19** | now `scan(user_id=…)`, tier read for the same identity |
+| `/api/stocks/{symbol}` | ~~`real_quote()` — no user~~ **FIXED D5.19** | the surface index cards open and the order ticket sits on |
+
+These are **not** direct-provider bypasses — `real_market.fetch_yahoo_quote` is
+called from inside the Yahoo provider's own `fetch_indices`, which is exactly
+where a provider is allowed to call its vendor. (Audited and initially
+mis-called a bypass; corrected on inspection.) The defect is a missing argument,
+not a missing choke point.
+
+## What the universe path may be asked to describe (D5.19)
+
+A quote answers two different questions and D5.19 found them answered by two
+different fetches with opposite defects.
+
+**The universe path** (`fetch_all_universe_quotes`, behind `/market/scanner`
+and `/market/ranking`) fetched a **2-day** window: correct day change, and no
+RSI, MACD, average volume or volume ratio, because two bars cannot produce a
+14-period anything. **The single-quote path** (`fetch_real_stock_quote`, behind
+`/api/stocks/{symbol}`) fetched `3mo`: real indicators, and a day change that
+was actually a three-month change, because `prev_close` came from Yahoo's
+`meta.chartPreviousClose` — *the close before the requested window*, and
+therefore a function of `range_str`.
+
+Each path had exactly the defect the other did not, and both are now one rule:
+
+* **`prev_close` is a property of the series**, not of the request. It is the
+  close of the bar before the one the live price belongs to, which is the same
+  number at every range. The vendor field remains the fallback for a
+  single-bar window, where the series genuinely cannot answer.
+* **The universe fetches `TECHNICALS_RANGE`** — `3mo`, the smallest window that
+  satisfies every indicator (`1mo` is ~21 bars, one short of a MACD) — and
+  derives indicators through the shared `derive_technicals`.
+
+The order matters: widening the window without fixing `prev_close` first would
+have silently converted every universe day-change into a three-month change.
+
+**`derive_technicals` returns `None`, never a plausible default.** This is the
+load-bearing half. A fabricated RSI of 50 is invisible while it is only an
+input to arithmetic and becomes a published claim the moment a surface explains
+itself — see ADR-058 and `ranking_engine.dimension_is_supported`.
+
+**Known: `volume_ratio` compares a partial session against complete ones**
+(LIM-D5.19-1). Measured at 12:47 IST the median across 31 stocks was 0.50, so
+volume-gated scanner presets under-match before the close.
+
+## The market clock is not market data
+
+`market_status` used to be read off Yahoo's `marketState`. It is now
+`validator.is_market_hours()` — see ADR-057. **A provider field must never be
+promoted to a platform fact.** The provider answers "what is this instrument
+worth"; it does not answer "is the exchange open", and when D5.18 measured it,
+Yahoo answered `CLOSED` while quoting a live moving price at 11:45 IST.
+
+## Liveness is `source_tier`, never an animation
+
+The dashboard's price highlight was being read as evidence the feed was live. It
+never was — the tween fired identically on a 15-second delayed baseline poll.
+The only honest liveness signal is the tier the Source Manager computes:
+`streaming` / `delayed` / `recovering` / unavailable. D5.18 removed the
+animation (ADR-057) and left the tier labelling alone.

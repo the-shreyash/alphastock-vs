@@ -133,7 +133,7 @@ def test_momentum_task_publishes_contract_once(monkeypatch):
         {"symbol": "INFY", "change_pct": 0.4, "price": 1500.0},
     ]
 
-    async def fake_universe():
+    async def fake_universe(*, user_id=None):
         return quotes
 
     monkeypatch.setattr(real_market, "fetch_all_universe_quotes", fake_universe)
@@ -185,7 +185,7 @@ def test_breakout_task_dedupes_repeat_cycle(monkeypatch):
 
     quotes = [{"symbol": "SBIN", "price": 999.0, "high": 1000.0, "change_pct": 2.0}]
 
-    async def fake_universe():
+    async def fake_universe(*, user_id=None):
         return quotes
 
     monkeypatch.setattr(real_market, "fetch_all_universe_quotes", fake_universe)
@@ -212,7 +212,7 @@ def test_scanner_sweep_publishes_single_worker_update(monkeypatch):
          "volume_ratio": 1.6, "volume": 1_000_000, "sector": "IT"},
     ]
 
-    async def fake_universe():
+    async def fake_universe(*, user_id=None):
         return quotes
 
     monkeypatch.setattr(market_gateway, "get_universe_quotes", fake_universe)
@@ -240,7 +240,7 @@ def test_scan_publish_flag_and_api_source(monkeypatch):
     from services.market_engine import scanner_engine
     from services.market_engine.gateway import market_gateway
 
-    async def fake_universe():
+    async def fake_universe(*, user_id=None):
         return [{"symbol": "TCS", "price": 4100.0, "change_pct": 2.0,
                  "rsi": 60, "volume_ratio": 1.6, "volume": 1_000_000, "sector": "IT"}]
 

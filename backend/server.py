@@ -577,6 +577,54 @@ async def get_current_user(request: Request) -> dict:
     user.pop("password_hash", None)
     return user
 
+async def get_optional_user_id(request: Request) -> Optional[str]:
+    """The requesting user's id when a valid credential is presented, else None.
+
+    D5.19 — WHY OPTIONAL AUTH, AND WHY IT RETURNS AN ID RATHER THAN A USER.
+
+    The market-wide reads — `/market/ranking`, `/market/scanner` — resolved in
+    `GLOBAL_CONTEXT` because they took no user, so a connected broker's feed
+    could never be a candidate to serve them no matter how it ranked (D5.18's
+    D-4, LIM-D5.18-3). Passing an identity is the fix.
+
+    But these endpoints are legitimately readable signed out — they describe the
+    market, not an account — and putting `Depends(get_current_user)` on them
+    would 401 a visitor who could read them yesterday. That is a behaviour
+    change dressed up as a scoping fix. So: a valid token resolves the user's
+    own feed, no token resolves the platform baseline, and the endpoint behaves
+    for an anonymous caller exactly as it did for everybody before.
+
+    **An invalid or expired token is treated as no token, deliberately.** This
+    dependency guards no private data — the worst outcome of getting it wrong is
+    serving the baseline instead of a broker feed. Raising 401 here would let a
+    stale tab break a public market page, and would give an unauthenticated
+    caller a way to distinguish a real user id from a forged one by watching
+    which failure it produces.
+
+    It returns the id and not the document because that is all the gateway
+    takes, and because a market endpoint has no business holding a user record
+    it will not read: the narrowest thing that answers the question is the one
+    that cannot leak the rest of it.
+    """
+    token = request.cookies.get("access_token")
+    if not token:
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            token = auth_header[7:]
+    if not token:
+        return None
+    try:
+        payload = jwt_service.decode_token(token, expected_type="access")
+    except jwt_service.TokenError:
+        # Includes TokenExpired. See the docstring: unreadable means anonymous.
+        return None
+
+    user = await db.users.find_one({"_id": ObjectId(payload["sub"])})
+    if not user or not account_is_active(user):
+        return None
+    return str(user["_id"])
+
+
 # NOTE: authentication cookies are set/cleared exclusively via
 # security.cookies (imported above) — set_auth_cookies / set_access_cookie /
 # clear_auth_cookies. This keeps the hardened cookie policy in one place.
@@ -1714,8 +1762,13 @@ async def market_scanner(
     price_min: Optional[float] = None,
     price_max: Optional[float] = None,
     limit: int = 15,
+    user_id: Optional[str] = Depends(get_optional_user_id),
 ):
-    """Advanced market scanner with strategy presets and custom filters."""
+    """Advanced market scanner with strategy presets and custom filters.
+
+    D5.19 — user-scoped, so a connected broker's feed can serve the scan, and
+    the response carries the `source_tier` that actually did.
+    """
     from services.market_engine.scanner_engine import scan
 
     custom_filters = {}
@@ -1737,6 +1790,7 @@ async def market_scanner(
         filters=custom_filters if custom_filters else None,
         sector=sector,
         limit=min(limit, 30),
+        user_id=user_id,
     )
 
 
@@ -1751,16 +1805,18 @@ async def scanner_presets():
 async def market_ranking(
     top_n: int = 10,
     sector: Optional[str] = None,
+    user_id: Optional[str] = Depends(get_optional_user_id),
 ):
-    """Top-ranked stock opportunities by multi-dimensional scoring."""
-    from services.market_engine.ranking_engine import rank_universe
-    ranked = await rank_universe(top_n=min(top_n, 30), sector_filter=sector)
-    return {
-        "rankings": ranked,
-        "count": len(ranked),
-        "available": bool(ranked),
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-    }
+    """Top-ranked stock opportunities by multi-dimensional scoring.
+
+    D5.19 — user-scoped (D5.18's D-4) and tier-stamped (D-5). Each row carries
+    `evidence`: the actual scoring factors that placed it here, drawn only from
+    dimensions whose inputs were present. See `ranking_engine.build_evidence`.
+    """
+    from services.market_engine.ranking_engine import rank_universe_report
+    return await rank_universe_report(
+        top_n=min(top_n, 30), sector_filter=sector, user_id=user_id
+    )
 
 
 @market_router.get("/sector-analysis")
@@ -1874,9 +1930,20 @@ async def stock_universe():
     return STOCK_UNIVERSE
 
 @stocks_router.get("/{symbol}")
-async def stock_detail(symbol: str):
-    """Get stock details from live Yahoo Finance data. Explicit error when unavailable."""
-    quote = await real_quote(symbol)
+async def stock_detail(symbol: str, user_id: Optional[str] = Depends(get_optional_user_id)):
+    """Live details for one instrument, resolved through the Market Gateway.
+
+    D5.19 — user-scoped, so a connected broker's promoted feed can serve this
+    page. It is the surface D-3 sends index-card clicks to and the surface the
+    order ticket is mounted on, which makes it the one place where a user reads
+    a price immediately before acting on it. `real_quote` already accepts the
+    identity and already stamps `source_tier`; only the route was anonymous.
+
+    Answers for indices as well as equities — `NIFTY`, `BANKNIFTY`, `SENSEX`
+    and `INDIAVIX` all resolve here, which is what let D-3 reuse this page
+    rather than build a second index pipeline.
+    """
+    quote = await real_quote(symbol, user_id=user_id)
     if quote:
         return quote
     if not get_stock_meta(symbol):
@@ -2034,6 +2101,8 @@ async def morning_report():
     sectors = await fetch_real_sectors() or []
     sentiment = overview.get("market_sentiment")
     vix = overview.get("india_vix")
+    # The platform clock, never a vendor's marketState — D5.18's D-1 rule.
+    session_open = overview.get("market_status") == "OPEN"
 
     report = ""
     if claude_configured() or gemini_configured():
@@ -2042,7 +2111,20 @@ async def morning_report():
             system_msg = ("You are AlphaPartner morning briefing AI. Create a concise, actionable morning "
                           "market report for Indian intraday traders. Professional tone, use data provided. "
                           "If a data point is marked unavailable, do not invent it.")
+            # D5.19 — the session state is given to the model, for the reason
+            # documented at `morning_report._session_instruction`: handed bare
+            # numbers with no time attached, a model narrates them in the past
+            # tense. Measured on this endpoint at 12:33 IST with NSE open, it
+            # wrote "Nifty closed at 24111.8" over a live, moving level.
+            session_line = (
+                "NSE is OPEN. The levels below are LIVE intraday levels, not closing "
+                "prices — write in the present tense and do not describe any level "
+                "below as a close."
+                if session_open else
+                "NSE is CLOSED. The levels below are the last available levels."
+            )
             prompt = f"""Generate morning market report:
+{session_line}
 Nifty: {overview['nifty']['value']} | Bank Nifty: {overview['bank_nifty']['value']}
 Sentiment: {f"{sentiment}/100" if sentiment is not None else "unavailable"} | VIX: {vix if vix is not None else "unavailable"}
 Top Sectors: {', '.join([f"{s['sector']} ({s['change_pct']}%)" for s in sectors[:3]]) or "unavailable"}
@@ -2053,10 +2135,20 @@ Top Picks: {', '.join([f"{p['name']} (Confidence: {p['confidence']}%)" for p in 
     else:
         top_pick_line = (f"Top pick: {picks[0]['name']} ({picks[0]['confidence']}% confidence)."
                          if picks else "Live pick data is unavailable right now.")
-        report = (f"Good morning! Nifty at {overview['nifty']['value']}. "
+        report = (f"Good morning! NSE is open — Nifty trading at {overview['nifty']['value']}. "
+                  f"{len(picks)} strong setups found. {top_pick_line}"
+                  if session_open else
+                  f"Good morning! Nifty at {overview['nifty']['value']}. "
                   f"{len(picks)} strong setups found. {top_pick_line}")
 
-    return {"available": True, "report": report, "picks": picks, "overview": overview, "generated_at": datetime.now(timezone.utc).isoformat()}
+    return {
+        "available": True,
+        "report": report,
+        "picks": picks,
+        "overview": overview,
+        "market_open": session_open,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 @analysis_router.get("/reports/morning")

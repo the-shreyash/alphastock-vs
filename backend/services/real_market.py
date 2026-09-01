@@ -7,6 +7,7 @@ import asyncio
 import json
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Dict, Optional
 
 from services.cache import cache_get, cache_set, cache_get_many
 from services import http_client
@@ -155,7 +156,48 @@ async def fetch_yahoo_quote(symbol: str, range_str: str = "2d"):
             indicators = result[0].get("indicators", {}).get("quote", [{}])[0]
 
             price = meta.get("regularMarketPrice", 0)
-            prev_close = meta.get("chartPreviousClose", meta.get("previousClose", 0))
+
+            # D5.19 — THE DAY'S CHANGE MUST BE THE DAY'S CHANGE.
+            #
+            # This used to read `meta.chartPreviousClose`, which is the close
+            # immediately BEFORE the requested window — a function of
+            # `range_str`, not of the calendar. Measured live on 2026-09-01
+            # against the real vendor, one symbol, one price, four windows:
+            #
+            #     RELIANCE  2d   prev_close=1277.0  ->  +2.62%
+            #     RELIANCE  5d   prev_close=1298.0  ->  +0.96%
+            #     RELIANCE  1mo  prev_close=1307.8  ->  +0.21%
+            #     RELIANCE  3mo  prev_close=1320.0  ->  -0.72%
+            #
+            # `fetch_real_stock_quote` asks for `3mo` because MACD needs 26+
+            # bars, so `GET /api/stocks/RELIANCE` — the stock detail page —
+            # served **-0.72%** while `/market/ranking` and `/market/overview`,
+            # which fetch `2d`, served **+2.62%** for the same instrument at
+            # the same instant. The detail page was labelling a three-month
+            # change "today".
+            #
+            # That is D5.18's D-1 defect in a second place: two surfaces of one
+            # product disagreeing about one fact, with the user given no way to
+            # tell which is lying. It also blocked D5.19's D-3 — making an index
+            # card navigable would have sent a user from a card reading
+            # NIFTY +0.13% to a page reading NIFTY +3.11%.
+            #
+            # The previous close is a property of the SERIES: the close of the
+            # bar before the one the live price belongs to. Derived that way it
+            # is the same number at every range, which is the invariant
+            # `tests/test_day_change_is_the_days_change.py` asserts.
+            #
+            # The vendor field stays as the fallback for a single-bar window,
+            # where the series genuinely cannot answer. Reporting a zero change
+            # there would render "unchanged" over a price that may have moved
+            # several percent — the fabrication the tick contract and
+            # `applyLivePrices` both exist to refuse.
+            daily_closes = [c for c in (indicators.get("close") or []) if c is not None]
+            prev_close = (
+                daily_closes[-2]
+                if len(daily_closes) >= 2
+                else meta.get("chartPreviousClose", meta.get("previousClose", 0))
+            )
             change = round(price - prev_close, 2) if prev_close else 0
             change_pct = round((change / prev_close) * 100, 2) if prev_close else 0
 
@@ -298,6 +340,27 @@ async def fetch_india_vix():
     return round(data["price"], 2)
 
 
+def _market_is_open() -> bool:
+    """Whether NSE is currently in its regular session, per the platform clock.
+
+    A thin indirection over `market_engine.validator.is_market_hours` so the
+    module attribute is resolved at call time: importing the function at module
+    scope would bind the original and make the market clock un-substitutable,
+    both for tests and for any future holiday-calendar implementation that
+    replaces it.
+
+    Failure is reported as closed. An unanswerable clock must not render a
+    market open — a user acting on "OPEN" when the platform cannot actually
+    tell is the costlier of the two mistakes.
+    """
+    try:
+        from services.market_engine import validator
+        return bool(validator.is_market_hours())
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning(f"Market clock unavailable, reporting CLOSED: {exc}")
+        return False
+
+
 async def fetch_real_market_overview():
     """Fetch real market overview with actual index values, live India VIX and
     breadth/sentiment derived from live universe quotes. Fields with no live
@@ -339,7 +402,26 @@ async def fetch_real_market_overview():
             "india_vix": vix if not isinstance(vix, Exception) else None,
             "market_sentiment": compute_market_sentiment(breadth, nifty_chg),
             "advance_decline": breadth,
-            "market_status": "OPEN" if (isinstance(nifty, dict) and nifty.get("market_state") == "REGULAR") else "CLOSED",
+            # D5.18 — THE MARKET CLOCK IS THE PLATFORM'S, NOT A PROVIDER'S.
+            #
+            # This used to read `nifty["market_state"] == "REGULAR"`, i.e. Yahoo's
+            # own `marketState` field. Observed live on 2026-09-01 at 11:45 IST —
+            # inside NSE hours, with Yahoo itself returning a moving 24,126.85 —
+            # that field read `CLOSED`, so the dashboard rendered "MARKET CLOSED"
+            # over live, ticking broker prices while `/api/market/engine/status`
+            # said `market_hours: true`. Two surfaces disagreeing about whether
+            # the market is open is what the user actually sees.
+            #
+            # Whether NSE is open is a fact about the exchange and the clock, not
+            # about which vendor answered a quote — so it comes from the same
+            # `is_market_hours()` the engine status endpoint already publishes.
+            # Sourcing it from a provider also made the answer depend on which
+            # provider won resolution, and a second vendor's vocabulary would
+            # have given a different answer to an identical question.
+            #
+            # Imported at call time, not at module scope, so a test can
+            # monkeypatch `validator.is_market_hours` and have this read it.
+            "market_status": "OPEN" if _market_is_open() else "CLOSED",
             # See the note in `fetch_yahoo_quote`: no provider name in a payload.
             # `/api/market/overview` stamps `source_tier` from the Source Manager.
         }
@@ -399,31 +481,97 @@ def calculate_macd(prices):
     return round(macd_line[-1], 2), round(macd_signal_line[-1], 2)
 
 
+#: Daily bars a quote must carry before each indicator is answerable.
+#:
+#: These are the windows the functions above actually need, stated once so
+#: "did we have enough history?" and "what did we compute?" cannot drift apart.
+#: RSI needs `period + 1` closes for 14 deltas; MACD needs 26 for its slow EMA;
+#: the average volume is a 20-day mean taken from the 21 most recent bars so
+#: that the latest (in-progress) session is excluded from its own baseline.
+_MIN_BARS_RSI = 15
+_MIN_BARS_MACD = 26
+_MIN_BARS_AVG_VOLUME = 21
+
+#: The window that satisfies all of the above. `1mo` returns ~21 bars, which is
+#: one short of a MACD, so `3mo` is the smallest Yahoo range that answers every
+#: indicator. Measured: 10 symbols in 0.48s, ~6.4 KB each before normalization.
+TECHNICALS_RANGE = "3mo"
+
+
+def derive_technicals(quote: Dict[str, Any]) -> Dict[str, Any]:
+    """RSI, MACD, average volume and volume ratio from a quote's own history.
+
+    D5.19 — WHY THIS IS A FUNCTION AND NOT TWO COPIES OF FOUR LINES
+    ---------------------------------------------------------------
+    Two paths priced equities and only one of them computed indicators.
+    `fetch_real_stock_quote` asked Yahoo for `3mo` and derived all four;
+    `fetch_all_universe_quotes` asked for `2d` and derived none, because two
+    bars cannot produce a 14-period RSI. Everything behind the universe path —
+    `/market/scanner`, `/market/ranking` — was therefore scoring on nulls.
+
+    Measured live on 2026-09-01, all 31 universe quotes carried
+    `rsi=None, macd=None, macd_signal=None, avg_volume=None, volume_ratio=None`,
+    and the consequences were not subtle: six of the scanner's eight strategy
+    presets matched 0 of 31 stocks, the other two returned the universe in
+    declaration order, and the ranking engine reported five of eight dimensions
+    identically for every stock it ranked.
+
+    **ABSENCE IS RETURNED AS ABSENCE.** Every field is `None` when its window is
+    not satisfied, rather than the plausible default the single-quote path used
+    to substitute (`rsi = 50.0`, `macd = 0.0`, `avg_volume = 1000000`). This is
+    the whole point of the helper. A null is visibly missing and a consumer can
+    say "unknown"; a fabricated 50 is silently wrong and scores as real — it is
+    what awarded an absent RSI +25 points for sitting "in the bullish zone", and
+    what put a stock with 8.3 million shares traded into the "Very low
+    liquidity" bucket. See CLAUDE.md's data rules: never simulate production
+    data, and `ranking_engine.dimension_is_supported`, which is the consumer
+    that depends on this distinction being preserved.
+    """
+    closes = quote.get("historical_closes") or []
+    volumes = quote.get("historical_volumes") or []
+
+    rsi = calculate_rsi(closes) if len(closes) >= _MIN_BARS_RSI else None
+
+    if len(closes) >= _MIN_BARS_MACD:
+        macd, macd_signal = calculate_macd(closes)
+    else:
+        macd, macd_signal = None, None
+
+    if len(volumes) >= _MIN_BARS_AVG_VOLUME:
+        # The latest bar is the in-progress session and is excluded: comparing
+        # a partial day's volume against an average that already contains it
+        # damps exactly the spike the ratio exists to detect.
+        avg_volume = int(sum(volumes[-_MIN_BARS_AVG_VOLUME:-1]) / (_MIN_BARS_AVG_VOLUME - 1))
+    else:
+        avg_volume = None
+
+    latest_volume = quote.get("volume") or 0
+    volume_ratio = round(latest_volume / avg_volume, 2) if avg_volume else None
+
+    return {
+        "rsi": rsi,
+        "macd": macd,
+        "macd_signal": macd_signal,
+        "avg_volume": avg_volume,
+        "volume_ratio": volume_ratio,
+    }
+
+
+def _vwap_of(quote: Dict[str, Any]) -> Optional[float]:
+    """The session's typical price. `None` when the day's range is unknown."""
+    high, low, price = quote.get("high"), quote.get("low"), quote.get("price")
+    if not high or low is None or price is None:
+        return price
+    return round((high + low + price) / 3, 2)
+
+
 async def fetch_real_stock_quote(symbol: str):
-    """Fetch real stock quote."""
-    # Fetch 3 months of daily data to compute indicators
-    data = await fetch_yahoo_quote(symbol, range_str="3mo")
+    """Fetch real stock quote, with indicators derived from 3 months of bars."""
+    data = await fetch_yahoo_quote(symbol, range_str=TECHNICALS_RANGE)
     if not data:
         return None
 
-    closes = data.get("historical_closes", [])
-    volumes = data.get("historical_volumes", [])
-    
-    # Compute technical indicators from historical data
-    rsi = calculate_rsi(closes) if closes else 50.0
-    macd, macd_signal = calculate_macd(closes) if len(closes) >= 26 else (0.0, 0.0)
-    
-    # Compute average volume & volume ratio
-    # Average of last 20 trading days (excluding the very latest day)
-    if len(volumes) >= 21:
-        avg_volume = int(sum(volumes[-21:-1]) / 20)
-    elif volumes:
-        avg_volume = int(sum(volumes) / len(volumes))
-    else:
-        avg_volume = 1000000
-        
-    latest_volume = data.get("volume", 0)
-    volume_ratio = round(latest_volume / avg_volume, 2) if avg_volume else 1.0
+    technicals = derive_technicals(data)
 
     # Strip out the historical lists so we don't return giant lists to frontend
     clean_data = {k: v for k, v in data.items() if not k.startswith("historical_")}
@@ -431,12 +579,20 @@ async def fetch_real_stock_quote(symbol: str):
     return {
         **clean_data,
         "symbol": symbol.upper(),
-        "rsi": rsi,
-        "vwap": round((data["high"] + data["low"] + data["price"]) / 3, 2) if data["high"] else data["price"],
-        "volume_ratio": volume_ratio,
-        "macd": macd,
-        "macd_signal": macd_signal,
-        "avg_volume": avg_volume,
+        "vwap": _vwap_of(data),
+        # D5.19 — the legacy non-null defaults, applied HERE and not inside
+        # `derive_technicals`. This endpoint's consumers (`_advisor_score`, the
+        # top-pick scorer) compare `macd > macd_signal` arithmetically and would
+        # raise on a None, so removing the defaults from this path is a wider
+        # change than this sprint should make in passing. Keeping them local
+        # means there is still exactly one definition of how an indicator is
+        # computed, and exactly one place where a substitute is knowingly used.
+        # Tracked as LIM-D5.19-2.
+        "rsi": technicals["rsi"] if technicals["rsi"] is not None else 50.0,
+        "macd": technicals["macd"] if technicals["macd"] is not None else 0.0,
+        "macd_signal": technicals["macd_signal"] if technicals["macd_signal"] is not None else 0.0,
+        "avg_volume": technicals["avg_volume"] if technicals["avg_volume"] is not None else 1000000,
+        "volume_ratio": technicals["volume_ratio"] if technicals["volume_ratio"] is not None else 1.0,
     }
 
 
@@ -755,10 +911,40 @@ async def detect_chart_patterns(symbol: str) -> dict:
 
 
 async def fetch_all_universe_quotes():
-    """Fetch 2d quotes for all stocks in STOCK_UNIVERSE in parallel, utilizing caching."""
+    """Quotes for every stock in STOCK_UNIVERSE, with technical indicators.
+
+    D5.19 — WHY THIS ASKS FOR THREE MONTHS AND NOT TWO DAYS
+    -------------------------------------------------------
+    It used to fetch `2d`, which is enough to price a stock and not enough to
+    describe one. Two bars produce no RSI, no MACD and no volume baseline, so
+    every consumer behind this function scored on nulls — and neither the
+    scanner nor the ranking engine could tell a null from a neutral reading.
+
+    Measured live on 2026-09-01 (31 symbols), the cost of that was total:
+    `intraday`, `swing`, `momentum`, `breakout`, `reversal` and `growth` each
+    matched **0 of 31** stocks because they filter on `volume_ratio_min`,
+    `rsi_min/max` or `macd_bullish`; `value` and `dividend` sort on `rsi` and
+    `volume_ratio`, where `q.get(key) or 0` made every stock equal and the
+    stable sort returned the universe in *declaration order*. A market scanner
+    that answers with a constant list is the "static/demo values" the product
+    was accused of, and this was its cause.
+
+    `TECHNICALS_RANGE` is the smallest window that answers every indicator —
+    `1mo` is ~21 bars, one short of a MACD. Measured: 10 symbols in 0.48s
+    against the live vendor, and the per-symbol cache key is now the same one
+    `fetch_real_stock_quote` uses, so the stock detail page and the universe
+    share a cache entry instead of holding two windows onto one series.
+
+    This widening is only safe because `fetch_yahoo_quote` no longer derives
+    `prev_close` from the vendor's range-dependent `chartPreviousClose`: before
+    that fix, moving this function to a 3-month window would have silently
+    turned every universe day-change into a three-month change. The two changes
+    are one change, and `test_universe_day_change_is_still_the_days_change`
+    pins the join.
+    """
     from market_data import STOCK_UNIVERSE
 
-    cache_key = "all_universe_quotes_2d"
+    cache_key = f"all_universe_quotes_{TECHNICALS_RANGE}"
     cached = await cache_get(cache_key)
     if cached:
         return cached
@@ -768,7 +954,7 @@ async def fetch_all_universe_quotes():
     # ~len(universe) sequential Redis GETs (one inside each fetch_yahoo_quote)
     # with a single MGET. Only true misses fall through to the HTTP fetch.
     per_symbol_keys = {
-        s["symbol"]: f"yahoo_{resolve_yahoo_ticker(s['symbol'])}_2d"
+        s["symbol"]: f"yahoo_{resolve_yahoo_ticker(s['symbol'])}_{TECHNICALS_RANGE}"
         for s in STOCK_UNIVERSE
     }
     warm = await cache_get_many(list(per_symbol_keys.values()))
@@ -777,7 +963,7 @@ async def fetch_all_universe_quotes():
         hit = warm.get(per_symbol_keys[stock["symbol"]])
         if hit:
             return hit
-        return await fetch_yahoo_quote(stock["symbol"], range_str="2d")
+        return await fetch_yahoo_quote(stock["symbol"], range_str=TECHNICALS_RANGE)
 
     tasks = [_quote_for(s) for s in STOCK_UNIVERSE]
     results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -787,11 +973,24 @@ async def fetch_all_universe_quotes():
         if isinstance(res, Exception) or res is None:
             # Live quote unavailable — skip. Never substitute simulated data.
             continue
+        # Indicators are derived here rather than inside `fetch_yahoo_quote`
+        # because that function is the raw vendor adapter and its result is
+        # cached per (ticker, range) and shared with callers that want the bars
+        # themselves. `derive_technicals` returns None for any indicator whose
+        # window this symbol's history does not satisfy — a newly listed stock
+        # gets nulls, not a fabricated RSI of 50.
+        quote = {**res, **derive_technicals(res)}
+        quote["vwap"] = _vwap_of(res)
+        # The historical series are the input to the line above, not part of
+        # the quote contract: 67 bars x 7 arrays x 31 symbols is a payload no
+        # consumer of this function reads, and it would be cached and shipped.
+        for key in [k for k in quote if k.startswith("historical_")]:
+            quote.pop(key)
         # Add sector and name from universe metadata
-        res["name"] = s["name"]
-        res["sector"] = s["sector"]
-        res["symbol"] = s["symbol"]
-        quotes.append(res)
+        quote["name"] = s["name"]
+        quote["sector"] = s["sector"]
+        quote["symbol"] = s["symbol"]
+        quotes.append(quote)
 
     if not quotes:
         return []  # do not cache an empty result — retry on next call

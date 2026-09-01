@@ -9,6 +9,9 @@ import {
 } from "lucide-react";
 import { Link } from "react-router-dom";
 import TradingChart from "../components/charts/TradingChart";
+import OrderTicket from "../components/stock/OrderTicket";
+import { useRealtimeStore, selectPriceTicks } from "../store/realtimeStore";
+import { applyLivePrices } from "../lib/livePrices";
 
 // ─── Pattern Signal Colours ───────────────────────────────────
 const SIGNAL_STYLE = {
@@ -135,6 +138,29 @@ export default function StockDetail() {
   const [inWatchlist, setInWatchlist] = useState(false);
   const [watchlistLoading, setWatchlistLoading] = useState(false);
 
+  const priceTicks = useRealtimeStore(selectPriceTicks);
+
+  /**
+   * D5.19 — the detail page follows the live feed.
+   *
+   * This page had no realtime subscription at all: it fetched once on mount and
+   * on a period change, so the screen a user opens to look closely at ONE
+   * instrument was the least live surface in the product, while the dashboard
+   * strip behind it moved. That matters more now that index cards open this
+   * page (D-3) — NIFTY's detail view is where a user lands expecting the number
+   * to keep moving.
+   *
+   * Routed through the shared `applyLivePrices` rather than a fifth inline
+   * effect, for the rule it carries: it writes `price` and `change_pct` and
+   * refuses to write a null. A canonical MarketTick has no day-change, and the
+   * header renders one — an unguarded merge would blank a true +2.62% at the
+   * exact moment the price started updating.
+   */
+  useEffect(() => {
+    if (!priceTicks) return;
+    setQuote((prev) => (prev ? applyLivePrices([prev], priceTicks)[0] : prev));
+  }, [priceTicks]);
+
   useEffect(() => {
     if (!symbol) return;
     fetchData();
@@ -258,11 +284,26 @@ export default function StockDetail() {
         </div>
         <div className="ml-auto flex items-center gap-3">
           <div className="text-right">
-            <div className="stat-value">{formatCurrency(quote.price)}</div>
-            <div className="flex items-center gap-1.5 justify-end text-[13px] font-mono font-semibold" style={{ color: isPos ? "var(--gain)" : "var(--loss)" }}>
+            <div data-testid="detail-price" className="stat-value">{formatCurrency(quote.price)}</div>
+            <div data-testid="detail-change" className="flex items-center gap-1.5 justify-end text-[13px] font-mono font-semibold" style={{ color: isPos ? "var(--gain)" : "var(--loss)" }}>
               {isPos ? <TrendingUp size={13} /> : <TrendingDown size={13} />}
               {isPos ? "+" : ""}₹{formatNumber(Math.abs(quote.change))} ({isPos ? "+" : ""}{quote.change_pct?.toFixed(2)}%)
             </div>
+            {/* Freshness, never provenance (Developer Rule 4). The same claim
+                the ranking table and the feed indicator make, in the same
+                words, so one product does not describe one fact two ways. */}
+            {quote.source_tier && (
+              <span
+                data-testid="detail-tier"
+                className="mt-1 inline-block text-[9px] font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded"
+                style={{
+                  background: quote.source_tier === "streaming" ? "var(--gain-bg, #10b98118)" : "var(--hover)",
+                  color: quote.source_tier === "streaming" ? "var(--gain)" : "var(--text-muted)",
+                }}
+              >
+                {quote.source_tier === "streaming" ? "Live" : "Delayed"}
+              </span>
+            )}
           </div>
           <button
             onClick={toggleWatchlist}
@@ -303,6 +344,12 @@ export default function StockDetail() {
           </motion.div>
         ))}
       </div>
+
+      {/* Order entry — D5.19 (D-7). The one screen that already knows exactly
+          which instrument the user means, so it is where order entry belongs.
+          The component itself refuses to place anything without an explicit
+          two-step confirmation; see components/stock/OrderTicket.jsx. */}
+      <OrderTicket symbol={quote.symbol} exchange={quote.exchange === "BSE" ? "BSE" : "NSE"} price={quote.price} />
 
       {/* Chart */}
       <motion.div

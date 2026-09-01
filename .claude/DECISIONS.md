@@ -3527,4 +3527,235 @@ MARKET_DATA_ARCHITECTURE.md
 
 ---
 
+## ADR-057 — The market clock is the platform's, and a tick is not an animation
+
+**Date:** 2026-09-01 (D5.18)
+**Status:** Accepted
+**Supersedes in part:** ADR-056 (D5.17) — unchanged, extended by live evidence.
+
+### Context
+
+D5.18 was the first sprint run against a live market with a live broker
+session: NSE open, Upstox connected, 11:45–15:00 IST on 2026-09-01. Everything
+D4.1–D5.17 built was designed and tested without ever being watched. It was
+watched, and the pipeline itself proved correct — 266 `market.tick` events in
+40 seconds at `source_tier: streaming`, correctly user-scoped, carrying real
+equities and all four indices including SENSEX.
+
+Two decisions had to be made about things that were wrong on the way from that
+pipeline to the screen.
+
+### Decision 1 — `market_status` comes from `is_market_hours()`, not a provider
+
+`fetch_real_market_overview` derived the platform's market status from Yahoo's
+own `marketState` field on the NIFTY quote. Measured live at 11:45 IST, Yahoo
+returned `market_state='CLOSED'` alongside a live, moving price of 24,126.85,
+while `validator.is_market_hours()` — which `/api/market/engine/status` already
+publishes — returned `True`. The dashboard rendered **MARKET CLOSED** over
+prices the user could watch ticking.
+
+We considered three options.
+
+**A. Trust the provider, fall back to the clock when the field is absent.**
+Rejected: the field was *present* and wrong, so the fallback never fires. It
+also leaves the answer dependent on which provider won resolution — a second
+vendor with different vocabulary answers the same question differently.
+
+**B. Reconcile the two (open only if both agree).** Rejected: it makes a
+vendor's bookkeeping able to veto the exchange calendar, and it produces a
+third state ("we disagree") that no consumer knows how to render.
+
+**C. The platform clock is the authority. (Chosen.)** Whether NSE is open is a
+fact about the exchange and the clock, not about which vendor answered a quote.
+The status now reads `validator.is_market_hours()` through a `_market_is_open()`
+indirection that resolves the module attribute at call time, so the clock stays
+substitutable — for tests today, and for a holiday calendar tomorrow. Failure
+reports CLOSED: a user acting on "OPEN" that the platform cannot vouch for is
+the costlier of the two errors.
+
+**Accepted cost (LIM-D5.18-1):** `is_market_hours()` knows weekday and time,
+not the NSE holiday calendar, so a gazetted holiday now reports OPEN where the
+vendor field would have said CLOSED. This is deliberately taken: the error moves
+from *every day* to *a dozen days a year*, and the fix has a clear home behind
+the same indirection. It is the natural D5.19.
+
+### Decision 2 — a price tick changes the number and nothing else
+
+`usePriceFlash` (Sprint R3/G7) ran a GSAP tween on every price change, writing
+inline `backgroundColor` (green up / red down) and `scale` (1.05/0.95). Measured
+in the browser with the broker feed stable: **24,968 class/style mutations in
+100 seconds**, ~250/sec. The number sat inside a box that never stopped
+flickering and the index cards visibly jumped as the glyphs scaled.
+
+The animation was not wrong when it was written — it was written for a feed
+that moved a few times a minute. A real broker socket is a different input, and
+the same code becomes a strobe.
+
+**Chosen:** a tick changes the number and does nothing else. Direction is still
+communicated, by the signed change and percentage already rendered beside the
+price, which hold their colour *between* ticks rather than repainting on each
+one. A colour that appears and disappears 250 times a second is not a stable
+direction cue.
+
+This also removes an epistemic trap the sprint brief names explicitly: the
+highlight was being read as evidence the data was live. It never was — the same
+tween fired just as happily on a 15-second delayed baseline poll. Liveness is
+`source_tier`, which the platform already computes and labels.
+
+**The hook is kept, as a documented no-op returning its ref.** Every price
+surface — Dashboard, Portfolio, Watchlist, TradeMonitor — already routes through
+it, so it is the single place the visual contract can be enforced and tested;
+deleting it would scatter that decision across four pages and leave nothing to
+assert against. Keeping the ref means no call site changed.
+
+### Consequences
+
+* The two surfaces that answer "is the market open" now agree by construction,
+  because there is one implementation.
+* `/api/market/overview` remains unscoped, so a connected user still sees a
+  broker index *level* beside a baseline *day change* (LIM-D5.17-4). D5.18 did
+  not close this.
+* The visual contract is now testable. `usePriceFlash.test.jsx` asserts on the
+  animation *request* rather than on inline style, because GSAP tweens
+  asynchronously and a style assertion races its ticker — six of seven tests in
+  the first draft passed against the buggy hook for exactly that reason.
+
+### Not decided here
+
+The make-before-break gate was investigated and **left alone**. A probe at
+t+20s showed the priority-1 broker feed ranked below Yahoo, which reads as a
+broken ranking; `PROBATION_WINDOW_SECONDS` is 30, and at t+40s the feed went
+stable and took over (`user_tier` delayed→streaming). D4.5/D5.2 behave as
+specified. Recorded because a probe shorter than the window it measures reports
+that window as a defect.
+
+---
+
+---
+
+# ADR-058 — The platform may not explain a decision with data it does not have (D5.19)
+
+**Status:** Accepted (2026-09-01). Uncommitted; HEAD remains `dc19514`.
+
+## Context
+
+D5.19's brief asked for a "Why is this a top opportunity?" panel beside every
+ranked stock, built from "actual scoring evidence" and explicitly not from
+invented reasons. The ranking engine already emitted a `reason` string per
+scoring dimension, so the implementation looked like a rendering task.
+
+It was not. Measured against the live system on 2026-09-01 at 12:30 IST, every
+one of the 31 universe quotes reached the scorer with
+`rsi=None, macd=None, macd_signal=None, avg_volume=None, volume_ratio=None` —
+the universe path fetched a **2-day** window, which is enough to price a stock
+and not enough to describe one. Every scorer coalesces (`quote.get("rsi") or
+50.0`, `macd or 0.0`, `avg_volume or 0`), so the engine was reporting, for
+RELIANCE, on a morning it had traded 8.3 million shares:
+
+```
+momentum   95.0  "RSI 50 in bullish zone; Strong +2.6% day move"
+trend      40.0  "MACD bearish"
+liquidity  25.0  "Very low liquidity"
+```
+
+One clause in three sentences came from the market. Five of the eight
+dimensions were byte-identical across all ten ranked stocks.
+
+The same root cause made the Scanner appear to be a fixture: six of its eight
+strategy presets matched **0 of 31** stocks because they filter on the absent
+fields, and the remaining two sort on them — `q.get(key) or 0` makes every
+stock equal, the sort is stable, and so `value` and `dividend` returned the
+universe in *declaration order*, identically, whatever the market did.
+
+## Decision
+
+**Three decisions, in dependency order.**
+
+**1. Supply the data.** `derive_technicals` computes RSI, MACD, average volume
+and volume ratio from a quote's own history, and the universe path fetches
+`TECHNICALS_RANGE` (`3mo`) rather than `2d`. One definition, shared with the
+single-quote path.
+
+This was only safe because of a defect found while auditing it: `prev_close`
+was read from Yahoo's `meta.chartPreviousClose`, which is the close *before the
+requested window* and therefore a function of `range_str`. Widening the
+universe window would have silently turned every day-change into a three-month
+change. `prev_close` is now derived from the bar series, which is
+range-independent by construction.
+
+That fix mattered on its own account. `fetch_real_stock_quote` already asked
+for `3mo`, so `GET /api/stocks/RELIANCE` had been serving **-0.72%** while
+`/market/ranking` served **+2.62%** for the same instrument at the same instant;
+for NIFTY, **+3.11%** against **+0.13%**.
+
+**2. Make absence answerable.** `derive_technicals` returns `None` for any
+indicator whose window is not satisfied, rather than the plausible default the
+old code substituted (`rsi = 50.0`, `avg_volume = 1000000`). `DIMENSION_INPUTS`
+records which quote fields each scorer reads, and a dimension is `available`
+only when **all** of them are present.
+
+All, not any — because the scorers append one clause per input. A momentum
+score computed from a real +2.6% day move and an absent RSI does not produce a
+shorter sentence; it produces the same sentence with `"RSI 50 in bullish zone"`
+inside it, and the invented half is the half a reader weighs most.
+
+**3. Explain only from what is available.** `build_evidence` draws on
+dimensions that are available, non-neutral and articulate, ordered by weighted
+contribution, capped at three. An empty list is a valid answer and renders as
+silence.
+
+**The scores are unchanged.** Withholding a reason changes what the platform
+claims; changing a weight changes what it recommends.
+
+## The general rule this establishes
+
+**A system that cannot distinguish "neutral" from "we do not know" must not be
+given a microphone.**
+
+Every defect above is one bug written eight times: `x or default`. It is
+invisible while the value is only ever an input to arithmetic — a fabricated
+RSI of 50 shifts a score a few points and nobody can see it. It becomes a
+different kind of defect the moment that value is rendered as a sentence,
+because a sentence asserts. "Very low liquidity" is a *claim about a company*,
+published under a recommendation to buy it, derived from a null.
+
+So the rule is not "compute the indicators" — D5.19 did that, and it fixes
+today. The rule is that **any surface which explains a decision must be able to
+say nothing**, and the mechanism for that is checking the inputs, never
+inspecting the output. A fabricated reason and a real one are both strings.
+
+## Consequences
+
+* Ranking evidence and scanner match reasons are honest by construction, and
+  stay honest for a newly listed stock with no 26-bar MACD.
+* The Scanner's presets discriminate again (live: `value` 19/31, `dividend`
+  25/31, `intraday` 1/31, `growth` 1/31).
+* Two surfaces of the product stopped disagreeing about the day's change.
+* **Accepted cost — LIM-D5.19-2:** `fetch_real_stock_quote` still applies the
+  legacy non-null defaults, because `_advisor_score` and the top-pick scorer
+  compare `macd > macd_signal` arithmetically and would raise on None. The
+  substitution is now in exactly one place and is named.
+* **Accepted cost — LIM-D5.19-3:** `rank_universe` still passes a literal
+  `news_sentiment=0.5`. The dimension is marked unavailable so it never becomes
+  evidence, but the constant still enters the weighted score.
+* **Accepted cost — LIM-D5.19-1:** `volume_ratio` compares a partial session
+  against complete ones (median 0.50 at 12:47 IST), so volume-gated presets
+  under-match intraday. Not changed: the fix alters what every strategy
+  recommends and needs its own validation window.
+
+## What this ADR does not claim
+
+**None of the eleven frontend changes has been rendered in a browser.** The
+session JWT had expired and authenticating on the user's behalf was out of
+bounds, so the index navigation, the evidence panel, the live ranking price,
+the order ticket and the tier badges rest on 47 unit tests (LIM-D5.19-4).
+
+**No broker session existed during this run**, so the user-scoped path was
+exercised by tests and by anonymous live calls and never by a real promoted
+broker feed (LIM-D5.19-5). D-4's fix is TEST VERIFIED, not LIVE VERIFIED.
+
+**No order was placed.** `OrderTicket` is verified to the mocked
+`brokerService.placeOrder` boundary and no further; crossing it is a real
+financial transaction.
+
 # End of Decisions Documentation

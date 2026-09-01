@@ -172,6 +172,78 @@ def _passes_filters(quote: Dict[str, Any], filters: Dict[str, Any]) -> bool:
     return True
 
 
+def match_evidence(quote: Dict[str, Any], filters: Dict[str, Any]) -> List[str]:
+    """Why this stock is in this scan — the filters it actually satisfied.
+
+    D5.19 — WHY A PICK HAS TO BE ABLE TO EXPLAIN ITSELF, AND WHY ONLY THE
+    SERVER CAN DO IT HONESTLY.
+
+    A scanner pick's reason IS its filter, and the filters are the scanner's
+    own. Reconstructing them in the browser would put the criteria in two
+    places and let them drift the first time a preset changed.
+
+    More importantly, only this side knows what was *skipped*. `_passes_filters`
+    ignores an RSI bound when `rsi` is None, so a stock with no RSI passes an
+    RSI-filtered scan — correctly, since refusing it would hide a real stock
+    over missing reference data. But it must not then be told it matched on an
+    RSI it does not have. That is precisely the fabricated-evidence failure the
+    ranking engine had ("RSI 50 in bullish zone" for a stock with no RSI), in
+    the scanner's shape, and every branch below therefore starts by checking
+    that the value exists.
+
+    The sector filter is deliberately excluded: a sector is the *scope* of a
+    scan, not a reason a stock was selected within it.
+    """
+    if not filters:
+        return []
+
+    reasons: List[str] = []
+    rsi = quote.get("rsi")
+    volume_ratio = quote.get("volume_ratio")
+    change_pct = quote.get("change_pct")
+    macd, macd_signal = quote.get("macd"), quote.get("macd_signal")
+    price = quote.get("price")
+
+    if rsi is not None:
+        lo, hi = filters.get("rsi_min"), filters.get("rsi_max")
+        if lo is not None and hi is not None:
+            reasons.append(f"RSI {rsi:.0f} within {lo:g}–{hi:g}")
+        elif lo is not None:
+            reasons.append(f"RSI {rsi:.0f} at or above {lo:g}")
+        elif hi is not None:
+            reasons.append(f"RSI {rsi:.0f} at or below {hi:g}")
+
+    if volume_ratio is not None and filters.get("volume_ratio_min") is not None:
+        reasons.append(
+            f"Volume {volume_ratio:g}x average, at or above {filters['volume_ratio_min']:g}x"
+        )
+
+    if change_pct is not None:
+        lo, hi = filters.get("change_pct_min"), filters.get("change_pct_max")
+        if lo is not None:
+            reasons.append(f"Day change {change_pct:+.2f}% at or above {lo:g}%")
+        if hi is not None:
+            reasons.append(f"Day change {change_pct:+.2f}% at or below {hi:g}%")
+
+    # Both legs, or nothing: `macd > macd_signal` against an absent signal line
+    # is the comparison D5.16 documented as silently true for every stock with
+    # positive momentum.
+    if filters.get("macd_bullish") and macd is not None and macd_signal is not None:
+        reasons.append(f"MACD {macd:g} above signal {macd_signal:g}")
+
+    if price is not None:
+        lo, hi = filters.get("price_min"), filters.get("price_max")
+        if lo is not None:
+            reasons.append(f"Price {price:g} at or above {lo:g}")
+        if hi is not None:
+            reasons.append(f"Price {price:g} at or below {hi:g}")
+
+    if quote.get("volume") is not None and filters.get("volume_min") is not None:
+        reasons.append(f"Volume {quote['volume']:,} at or above {filters['volume_min']:,}")
+
+    return reasons
+
+
 async def scan(
     strategy: Optional[str] = None,
     filters: Optional[Dict[str, Any]] = None,
@@ -179,6 +251,7 @@ async def scan(
     limit: int = 15,
     source: str = "api",
     publish: bool = True,
+    user_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Run the scanner with optional strategy preset and/or custom filters.
 
@@ -201,8 +274,15 @@ async def scan(
         }
     """
     from services.market_engine.gateway import market_gateway
+    from services.market_engine.providers.base import Capability
 
-    quotes = await market_gateway.get_universe_quotes()
+    # D5.19 — scoped, so a connected broker's feed is a candidate here. Absent
+    # a user this resolves the platform baseline, which is what every call did
+    # before. See `ranking_engine.rank_universe` for the full reasoning.
+    quotes = await market_gateway.get_universe_quotes(user_id=user_id)
+    source_tier = market_gateway.source_tier(
+        Capability.UNIVERSE_QUOTES, user_id=user_id
+    )
     if not quotes:
         return {
             "strategy": strategy,
@@ -213,6 +293,7 @@ async def scan(
             "filters_applied": {},
             "available": False,
             "note": "Live market data is temporarily unavailable.",
+            "source_tier": source_tier,
             "scanned_at": datetime.now(timezone.utc).isoformat(),
         }
 
@@ -245,7 +326,13 @@ async def scan(
         reverse=sort_desc,
     )
 
-    results = matched[:limit]
+    # Each pick carries the filters it satisfied. Attached to a copy so the
+    # gateway's normalized quote — which is shared with other consumers and may
+    # be cached — is not mutated by a presentational field.
+    results = [
+        {**q, "matched_on": match_evidence(q, effective_filters)}
+        for q in matched[:limit]
+    ]
 
     strategy_label = preset["label"] if preset else "Custom Scan"
 
@@ -268,5 +355,8 @@ async def scan(
         "total_matched": len(matched),
         "filters_applied": effective_filters,
         "available": True,
+        # The freshness of the data these picks were selected from, read with
+        # the same identity that resolved them. Never a provider name.
+        "source_tier": source_tier,
         "scanned_at": datetime.now(timezone.utc).isoformat(),
     }

@@ -241,6 +241,21 @@ export default function MarketScanner() {
                 {results.total_matched}/{results.total_scanned} matched
               </span>
             )}
+            {/* D5.19 — how fresh the scanned prices were, never which provider
+                supplied them (Developer Rule 4). The scan is user-scoped, so a
+                connected broker's promoted feed reads "Live" here. */}
+            {results?.source_tier && (
+              <span
+                data-testid="scanner-tier"
+                className="text-[9px] font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded"
+                style={{
+                  background: results.source_tier === "streaming" ? "var(--gain-bg, #10b98118)" : "var(--hover)",
+                  color: results.source_tier === "streaming" ? "var(--gain)" : "var(--text-muted)",
+                }}
+              >
+                {results.source_tier === "streaming" ? "Live" : "Delayed"}
+              </span>
+            )}
             {connected && lastLiveUpdate && (
               <span className="text-[10px] text-[var(--gain)] flex items-center gap-1">
                 <span className="w-1 h-1 rounded-full bg-[var(--gain)] animate-pulse" />
@@ -296,6 +311,26 @@ export default function MarketScanner() {
                         <div className="text-[10px] text-[var(--text-muted)] truncate max-w-[120px]">
                           {stock.name}
                         </div>
+                        {/* D5.19 — why this stock is in this scan. The strings
+                            are `scanner_engine.match_evidence`'s, chosen from
+                            the filters this stock actually satisfied and
+                            omitting any whose value it does not have. Rendered
+                            verbatim and composed nowhere: an unfiltered scan
+                            legitimately produces none, and silence is the
+                            honest output rather than a filler sentence. */}
+                        {stock.matched_on?.length > 0 && (
+                          <ul className="mt-1 space-y-0.5">
+                            {stock.matched_on.map((reason, r) => (
+                              <li
+                                key={r}
+                                data-testid={`scanner-evidence-${stock.symbol}-${r}`}
+                                className="text-[9px] leading-snug text-[var(--text-secondary)]"
+                              >
+                                {reason}
+                              </li>
+                            ))}
+                          </ul>
+                        )}
                       </td>
                       <td className="text-right px-3 py-2.5 font-mono text-[var(--text-primary)]">
                         {stock.price?.toLocaleString("en-IN", { minimumFractionDigits: 2 })}

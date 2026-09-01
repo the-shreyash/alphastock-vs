@@ -40,7 +40,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from services.ai_activity import AIRun
@@ -287,17 +287,117 @@ def _compute_mood(nifty_chg: float, banknifty_chg: float, sentiment: Optional[fl
     return {"market_mood": mood, "mood_score": score}
 
 
+def _market_is_open() -> bool:
+    """Whether NSE is in its regular session, per the platform clock.
+
+    Resolved at call time through the same `validator.is_market_hours` the
+    MARKET OPEN badge and `/api/market/engine/status` read, for D5.18's D-1
+    reason: whether the exchange is open is a fact about the exchange and the
+    clock, never a vendor's `marketState` field. An unanswerable clock reports
+    closed — the report then describes its numbers conservatively rather than
+    claiming a live session it cannot vouch for.
+    """
+    try:
+        from services.market_engine import validator
+        return bool(validator.is_market_hours())
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("Morning report: market clock unavailable (%s)", exc)
+        return False
+
+
+def build_session_context() -> Dict[str, Any]:
+    """What the market was doing when this report's numbers were observed.
+
+    D5.19 — WHY A REPORT HAS TO CARRY ITS OWN TIMESTAMP AND SESSION STATE.
+
+    The market layer is generated once per day and reused, which is correct: a
+    morning report is a morning snapshot, and regenerating it on every read
+    would make it a different product. What was missing is the moment it
+    describes. Today's document was written at 10:26 IST — 71 minutes after
+    NSE opened — and read at 12:35 with nothing on it to say so, so a
+    two-hour-old Nifty level was indistinguishable from a live one.
+
+    Both fields are labels on data the report already had. Nothing here
+    fabricates, extrapolates or refreshes a number.
+    """
+    now = datetime.now(timezone.utc)
+    return {
+        "market_open": _market_is_open(),
+        "observed_at": now.isoformat(),
+        # Rendered in the exchange's own timezone, because "10:26 IST" is the
+        # only form in which a reader can place it against the trading session.
+        "observed_at_str": (now + _IST_OFFSET).strftime("%H:%M IST"),
+    }
+
+
+#: IST is UTC+5:30 and has no DST, so a fixed offset is exact rather than an
+#: approximation — no timezone database is needed to render an NSE wall clock.
+_IST_OFFSET = timedelta(hours=5, minutes=30)
+
+
+def _session_instruction(market_is_open: bool, observed_at_str: str) -> str:
+    """The briefing instruction, in the tense the session actually justifies.
+
+    Split by session because the wrong half of this is precisely the defect:
+    "write a pre-market briefing" is a correct instruction before 09:15 and a
+    licence to invent a close at 10:26.
+    """
+    when = f" observed at {observed_at_str}" if observed_at_str else ""
+    if market_is_open:
+        return (
+            f"NSE is OPEN right now. The index levels above are LIVE intraday "
+            f"levels{when}, not closing prices. Write a 3-4 sentence intraday "
+            "briefing for Indian traders in the present tense. Do NOT describe "
+            "any level above as a close, and do NOT attribute today's sector "
+            "moves to a previous session."
+        )
+    return (
+        f"NSE is CLOSED. The levels above are the last available levels{when}. "
+        "Write a 3-4 sentence pre-market briefing for Indian traders."
+    )
+
+
 async def _generate_briefing(facts: Dict[str, Any]) -> str:
     """AI briefing from the centralized prompt library, with a grounded fallback.
 
     The fallback is not a degraded experience — it restates real collected
     numbers. The AI adds narrative, never data.
+
+    D5.19 — THE SESSION IS PART OF THE FACTS.
+    This used to ask for a "pre-market briefing" and hand the model a list of
+    bare numbers with no timestamp and no session state. Asked for a pre-market
+    note about untimed numbers, a model writes the only tense available to it,
+    and on 2026-09-01 the platform published:
+
+        "Indian markets closed with Nifty at 24,058 ... Yesterday's
+         top-performing sectors included Telecom (+2.69%)"
+
+    at 10:26 IST, 71 minutes into an open session, about a level that had not
+    closed and a sector move that was happening as it was written. A market
+    event that did not occur is a fabrication whether a model or a template
+    produced it, so the session state and the observation time are now facts
+    the briefing is given, exactly like the Nifty level is.
     """
-    fallback = (
-        f"Good morning. Nifty at {facts['nifty_str']} ({_pct(facts['nifty_chg'])}), "
-        f"Bank Nifty {_pct(facts['banknifty_chg'])}. Market mood: {facts['market_mood']}. "
-        f"{facts['picks_count']} quality setups identified. Stay disciplined and respect your stops."
-    )
+    market_is_open = bool(facts.get("market_is_open"))
+    observed_at_str = facts.get("observed_at_str") or ""
+    when = f" as of {observed_at_str}" if observed_at_str else ""
+
+    if market_is_open:
+        # "trading at", never "closed at": the number is a live level.
+        fallback = (
+            f"Good morning. NSE is open — these are live levels{when}. "
+            f"Nifty trading at {facts['nifty_str']} ({_pct(facts['nifty_chg'])}), "
+            f"Bank Nifty {_pct(facts['banknifty_chg'])}. Market mood: {facts['market_mood']}. "
+            f"{facts['picks_count']} quality setups identified. "
+            "Stay disciplined and respect your stops."
+        )
+    else:
+        fallback = (
+            f"Good morning. Nifty at {facts['nifty_str']} ({_pct(facts['nifty_chg'])}), "
+            f"Bank Nifty {_pct(facts['banknifty_chg'])}. Market mood: {facts['market_mood']}. "
+            f"{facts['picks_count']} quality setups identified. "
+            "Stay disciplined and respect your stops."
+        )
 
     try:
         from server import claude_configured, gemini_configured, get_debate_engine
@@ -324,8 +424,9 @@ async def _generate_briefing(facts: Dict[str, Any]) -> str:
             f"Economic events today: {facts['events_str']}\n"
             f"Leading sectors: {facts['sectors_str']}\n"
             f"Top picks: {facts['picks_str']}\n\n"
-            "Write a 3-4 sentence pre-market briefing for Indian traders. Use only the "
-            "numbers above. Anything marked unavailable must be omitted, never guessed."
+            + _session_instruction(market_is_open, observed_at_str)
+            + " Use only the numbers above. Anything marked unavailable must be "
+            "omitted, never guessed."
         )
         engine = get_debate_engine()
         briefing = await engine.simple_chat(
@@ -426,7 +527,13 @@ async def _build_market_layer(db, run: AIRun) -> Dict[str, Any]:
             f"{gift_nifty['value']:,.0f} ({_pct(gift_nifty.get('change_pct'))})"
             if gift_nifty.get("available") else "unavailable"
         )
+        session = build_session_context()
         briefing = await _generate_briefing({
+            # D5.19 — the session is a fact the briefing is given, so the
+            # narration matches what the market was actually doing. See
+            # `_session_instruction`.
+            "market_is_open": session["market_open"],
+            "observed_at_str": session["observed_at_str"],
             "nifty_str": f"{nifty_val:,.0f}" if nifty_val is not None else "unavailable",
             "sensex_str": f"{sensex_val:,.0f}" if sensex_val is not None else "unavailable",
             "nifty_chg": nifty_chg,
@@ -449,6 +556,11 @@ async def _build_market_layer(db, run: AIRun) -> Dict[str, Any]:
             "date": _today(),
             "type": REPORT_TYPE,
             "available": True,
+            # D5.19 — when these numbers were observed and what the market was
+            # doing then. The market layer is cached for the day by design, so
+            # this is what lets a reader at 12:35 tell a 10:26 level from a
+            # live one instead of assuming the report is current.
+            "session": session,
             **mood,
             "nifty": {"value": nifty_val, "change_pct": nifty_chg},
             "banknifty": {"value": bnk_val, "change_pct": banknifty_chg},

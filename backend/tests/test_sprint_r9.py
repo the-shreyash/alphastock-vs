@@ -122,11 +122,21 @@ def test_universe_quotes_warm_hits_skip_http_fetch(monkeypatch):
         return None
 
     async def fake_get_many(keys):
-        return {"yahoo_AAA.NS_2d": {"price": 101.0, "change_pct": 1.2}}
+        # D5.19 — keyed off the constant, not a literal `_2d`. The universe now
+        # fetches `TECHNICALS_RANGE` so it has the bars to compute RSI/MACD
+        # (see test_universe_technicals.py); a hardcoded range here made this
+        # test assert the warm-cache optimisation against a key the code no
+        # longer writes, so it failed for a reason that had nothing to do with
+        # the batched read it exists to protect.
+        return {
+            f"yahoo_AAA.NS_{real_market.TECHNICALS_RANGE}": {
+                "price": 101.0, "change_pct": 1.2,
+            }
+        }
 
     fetched = []
 
-    async def fake_fetch(symbol, range_str="2d"):
+    async def fake_fetch(symbol, range_str=real_market.TECHNICALS_RANGE):
         fetched.append(symbol)
         return {"price": 202.0, "change_pct": -0.4}
 
@@ -149,7 +159,7 @@ def test_universe_quotes_warm_hits_skip_http_fetch(monkeypatch):
     assert by_symbol["BBB"]["price"] == 202.0
     # Universe metadata is applied to warm and cold quotes alike.
     assert by_symbol["AAA"]["sector"] == "IT"
-    assert "all_universe_quotes_2d" in stored
+    assert f"all_universe_quotes_{real_market.TECHNICALS_RANGE}" in stored
 
 
 # ---------------------------------------------------------------------------

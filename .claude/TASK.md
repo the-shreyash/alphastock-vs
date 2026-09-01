@@ -3968,3 +3968,671 @@ close together and the product objective is met.
 The reference-data refresh mechanism (LIM-D5.17-1) is the natural D5.19: it is
 scoped, it has an opt-in check to grow from, and it is the difference between
 one corrected symbol and a universe that stays correct.
+
+---
+
+# D5.18 — REAL MARKET PLATFORM ACCEPTANCE (2026-09-01) — PARTIAL, uncommitted
+
+Decision record: **ADR-057**. HEAD remains `dc19514`; nothing committed or pushed.
+
+**Run window: 11:45–15:00 IST on Tuesday 2026-09-01, with NSE open and a valid
+Upstox session** (user `6a5e6228…`, connected 10:27 IST, token valid to 22:00
+UTC). This is the first D5 sprint executed against a live market, and it is the
+sprint in which the last hop was finally observed.
+
+## Headline
+
+**The D5 market-data pipeline works, end to end, on real broker data.** It was
+built blind across D4.1–D5.17 and had never once been watched. It was watched
+today and it is correct. The defects D5.18 found are *around* it — a market
+clock read off a vendor field, an animation built for a feed that moved twice a
+minute, and several surfaces that were never connected to the pipeline at all.
+
+## Phase 1 — Live runtime audit (read-only)
+
+### The chain, observed
+
+Four probes drove production code against the real session
+(`scratchpad/d518_probe{1..4}.py`; probe 1 initially reported a false defect —
+it ran without `backend/.env`, so `BROKER_TOKEN_KEY` was absent and every token
+failed to decrypt. Re-run with the server's own `load_dotenv` it restored
+cleanly. Recorded because the failure mode — "session fresh, access_token
+empty" — is indistinguishable from a real production bug in a log).
+
+| Hop | Evidence (06:18–06:26 UTC) |
+|---|---|
+| broker socket | `load_sessions restored=1` |
+| canonical `MarketTick` | 266 `market.tick` bus events in 40s |
+| `source_tier` | `streaming` on every event |
+| user scoping | `user_id: 6a5e6228…` on every event |
+| equities | RELIANCE 1308.30, HDFCBANK 712.00→712.10, POWERGRID 263.30→263.40, HCLTECH 1353.50→1354.00, BHARTIARTL, MARUTI, TECHM, M&M, NTPC, ADANIENT, ASIANPAINT, TMCV |
+| indices | NIFTY 24112.10→.15→.30→.50→.85→24113.10; BANKNIFTY 57637.25→57640.50→57641.30; INDIAVIX 11.00→11.01; **SENSEX 77168.78** |
+| provider registration | `brokerfeed:upstox:6a5e6228…`, priority 1, ready, 35 subscriptions, 345 accepted / 0 rejected records |
+| browser DOM | 574 numeric text changes in 113s |
+
+**LIM-D5.17-2 and LIM-D5.17-3 are answered for Upstox** — a broker index tick
+was observed, including SENSEX on BSE. Fyers was **not** exercised (see below).
+
+### The finding that was nearly a false positive
+
+At t+20s the per-user QUOTES tier still resolved to **yahoo**, with the chain
+`['yahoo', 'brokerfeed:upstox:…']` — the priority-1 broker feed ranked *below*
+the baseline it was supposed to displace, for RELIANCE, TCS, NIFTY, SENSEX and
+INFY, while `_fresh_tick` held a live price for every one of them and
+`fetch_quote` succeeded.
+
+That reads exactly like a broken ranking, and it is not one. `_selection_rank`
+is `(health, probation, latency)`; both providers were healthy, so **probation
+decided**, and `PROBATION_WINDOW_SECONDS = 30`. The probe had waited 20.
+
+Probe 4 ran the same question past the window:
+
+```
+t+ 30s stability=probation  user_tier=delayed    RELIANCE winner=yahoo       price=1308.3 tier=delayed
+t+ 40s stability=stable     user_tier=streaming  RELIANCE winner=brokerfeed  price=1307.7 tier=streaming
+t+130s stability=stable     user_tier=streaming  RELIANCE winner=brokerfeed  price=1308.2 tier=streaming
+```
+
+The make-before-break gate works exactly as D4.5/D5.2 specify: a connected
+broker serves the baseline for its first ~40 seconds and then takes over. Zero
+flaps in 130s. **No change was made here, and none is warranted.**
+
+The general lesson is recorded because it nearly cost a correct subsystem a
+rewrite: *a probe shorter than the window it is measuring reports the window as
+a defect.*
+
+### `/api/market/engine/status` is global, and that is correct
+
+It reports `tier: delayed` during all of the above. It takes no user, so it
+resolves in `GLOBAL_CONTEXT`, where the only provider is Yahoo. The per-user
+resolution is the one that flips. Not a defect; noted because it is the first
+thing an operator reads and it invites exactly the wrong conclusion.
+
+## Phase 2 — Defects found
+
+| # | Defect | Status |
+|---|---|---|
+| D-1 | `market_status` read off Yahoo's `marketState` — "MARKET CLOSED" over live ticking prices | **FIXED** |
+| D-2 | `usePriceFlash` wrote `backgroundColor` + `scale` per tick — ~250 style mutations/sec | **FIXED** |
+| D-3 | Index cards (NIFTY/BANKNIFTY/SENSEX/VIX) are not clickable | audited, not fixed |
+| D-4 | `/market/ranking` unscoped (`get_universe_quotes()` takes no user) → never broker data | audited, not fixed |
+| D-5 | `/market/ranking` carries no `source_tier` → Top Opportunities cannot label its source | audited, not fixed |
+| D-6 | Top Opportunities fetches once on mount, never subscribes to `priceTicks` → prices frozen | audited, not fixed |
+| D-7 | `brokerService.placeOrder` has **no caller anywhere in the frontend** | audited, not fixed |
+| D-8 | Stock detail page has no broker buy/sell action and no tier label | audited, not fixed |
+| D-9 | Morning Report renders an overnight body ("markets closed with Nifty at 24,058") during an open session | audited, not fixed |
+
+### D-1 — the market clock (fixed)
+
+`real_market.fetch_real_market_overview` derived `market_status` from
+`nifty["market_state"] == "REGULAR"`, i.e. Yahoo's own field. Measured live at
+11:45 IST, inside NSE hours:
+
+```
+NIFTY  market_state='CLOSED'  price=24126.85   (a live, moving price)
+SENSEX market_state='CLOSED'  price=77165.37
+platform is_market_hours() = True
+```
+
+So the dashboard rendered **MARKET CLOSED** over prices that were visibly
+ticking, while `/api/market/engine/status` said `market_hours: true` — two
+surfaces of one product disagreeing about whether the market was open.
+
+Whether NSE is open is a fact about the exchange and the clock, not about which
+vendor answered a quote; sourcing it from a provider also made the answer
+depend on which provider won resolution. It now comes from the same
+`validator.is_market_hours()` the engine-status endpoint already publishes, via
+a `_market_is_open()` indirection that resolves the module attribute at call
+time (so the clock stays substitutable, for tests and for a future holiday
+calendar). An unanswerable clock reports CLOSED — a user acting on "OPEN" the
+platform cannot actually vouch for is the costlier mistake.
+
+Verified live: `/api/market/overview` → `market_status: OPEN`, and the badge
+renders **MARKET OPEN**.
+
+**New limitation, LIM-D5.18-1:** `is_market_hours()` knows weekday and time,
+not the NSE holiday calendar, so a trading holiday now reports OPEN where the
+vendor field would have said CLOSED. This is a narrower error than the one it
+replaces (wrong every day vs. wrong on gazetted holidays) but it is a real
+regression on those days and is the natural D5.19.
+
+### D-2 — the blink (fixed)
+
+`usePriceFlash` ran a GSAP tween per price change, writing inline
+`backgroundColor` (green/red tint) and `scale` (1.05/0.95). Measured in the
+browser with the feed stable: **24,968 class/style mutations in 100 seconds**,
+~250/sec — the number sitting inside a box that never stopped flickering, and
+the index cards visibly jumping as the glyphs scaled.
+
+It was written for a feed that moved a few times a minute. A real broker socket
+is a different thing. A tick now changes the number and does nothing else;
+direction is carried by the signed change and percentage already rendered
+beside the price, which hold their colour between ticks instead of strobing.
+
+This also removes the animation-as-evidence trap the brief names: the highlight
+was being read as proof the data was live, which it never was — the same tween
+fired just as happily on a 15-second delayed baseline poll.
+
+The hook is kept as a documented no-op returning its ref: it is the one place
+every price surface (Dashboard, Portfolio, Watchlist, TradeMonitor) routes
+through, so it is the one place the contract can be enforced and tested, and
+keeping the ref means no call site changed.
+
+### D-7 — order placement (audited)
+
+The brief reports "connected Upstox, cannot place an order". The boundary is
+**the frontend, not the broker**:
+
+* `POST /api/brokers/{broker}/orders` exists, is user-scoped (`user["_id"]`),
+  broker-neutral, and Upstox declares `place_order`. Every broker *read*
+  endpoint returned 200 live (funds, orders, positions, holdings, profile), and
+  `/api/brokers/status` reports `connected: true, streaming: true, mode: live`.
+* `services/brokerService.js:27` defines `placeOrder`. **Nothing calls it** —
+  a repository-wide search returns the definition and no consumer.
+* The only live-order path a user can actually reach is TradeMonitor's *New
+  Trade* modal → `POST /api/trades`, which places a live broker entry order
+  **only when `data.broker` is set**, and `EMPTY_FORM.broker` is `""`. So the
+  default action records a journal entry and places nothing.
+* The "Buy" beside each Top Opportunity is **not a button** — it is the
+  `SIGNAL_CONFIG.buy` badge (a `<span>`). The brief reads it as a trade action;
+  it has never been one.
+
+No order was placed. Placing one is a live financial transaction and was out of
+bounds for this run; the path was traced to the exact missing wire instead.
+
+### Top Opportunities / Scanner — the brief's premise is partly wrong
+
+Both are **real**, not hardcoded. `/market/ranking` runs `rank_universe` over
+`get_universe_quotes()` with the real multi-dimensional scorer; `/market/scanner`
+scanned 31 symbols live and returns real prices, and it already stamps
+`source_tier: delayed` honestly. The symbols in the screenshot (BHARTIARTL,
+RELIANCE, ITC, HINDUNILVR, ONGC) are simply today's top five by score.
+
+What is actually wrong is narrower and different: both resolve **without a
+user**, so a connected broker can never serve them (D-4); ranking carries no
+`source_tier` (D-5); and the dashboard card fetches once on mount with no
+`priceTicks` subscription, so its prices are frozen at page load (D-6).
+
+## Regression
+
+| | D5.17 baseline | D5.18 |
+|---|---|---|
+| Backend | 4366 passed, 15 failed, 50 skipped, 4 xfailed | **4370 passed, 15 failed, 50 skipped, 4 xfailed** |
+| Frontend | 536 passed, 4 failed | **544 passed, 4 failed** |
+
+Both deltas are exactly the new tests: +4 backend (`test_market_status_clock.py`),
++8 frontend (`usePriceFlash.test.jsx`).
+
+The 15 backend failures are the pre-existing Docker-dependent
+`test_entrypoint_log_level.py` set, unchanged in count and identity from D5.17.
+
+The 4 frontend failures are the pre-existing `Landing.test.jsx` set. Verified
+rather than assumed: with the original `usePriceFlash` restored via
+`git stash`, Landing fails the identical 4 — so the D-2 change is not
+implicated.
+
+## Falsification
+
+**D-1 — 4 mutations, 4 red.** always-OPEN (3 failed), always-CLOSED (2 failed),
+regression to the provider field (3 failed), inverted clock (4 failed);
+restored green.
+
+**D-2 — the tests were rewritten because the first version could barely fail.**
+Six of seven initially passed *against the buggy hook*: GSAP tweens
+asynchronously, so asserting on inline style races its ticker and the tween had
+not written yet. Rewritten to spy on the animation *request* (`gsap.fromTo/to/set`),
+the contract became deterministic — 6 of 8 failed against the old hook, 8/8
+pass against the new one, with "the number still updates" and "an unchanged
+value is inert" as controls so the fix cannot be "render nothing".
+
+## Live validation
+
+**LIVE VERIFIED (Upstox, 2026-09-01, NSE open):** broker authentication,
+session restore, stream connect, subscription, real equity ticks, real index
+ticks incl. SENSEX, canonical `MarketTick`, `market.tick` bus event at
+`source_tier: streaming` with `user_id`, per-user tier promotion
+delayed→streaming, browser DOM price movement (NIFTY, BANK NIFTY, SENSEX,
+SUNPHARMA, INFY), stock click-through to `/stock/AXISBANK`, MARKET OPEN badge
+after D-1.
+
+**NOT PERFORMED:** Fyers (and every broker other than Upstox) — no session
+exists; live order placement — a financial transaction, deliberately not
+executed; the post-fix visual no-blink re-measurement — the browser JWT
+expired (~1h lifetime) before it could be taken, so D-2 rests on its 8
+deterministic unit tests; multi-user isolation with two live broker accounts —
+only one account exists.
+
+**NOT TRUE OF THIS RUN:** "individual stocks are static". Measured over 45s in
+the browser, NIFTY, BANK NIFTY, SENSEX, SUNPHARMA and INFY all moved; AXISBANK
+and INDIA VIX did not move in that window. Coverage is uneven, not absent, and
+the frozen surfaces are D-6's (fetch-once components), not the tick path's.
+
+## Limitations
+
+**Closed:** LIM-D5.17-2 (broker index tick observed, Upstox).
+
+**Partially closed:** LIM-D5.15-1 — the DOM assertion was finally made, on
+Upstox only.
+
+**Carried:** LIM-D5.16-1, LIM-D5.16-3, LIM-D5.16-4, LIM-D5.17-1, LIM-D5.17-3
+(Fyers still unverified), LIM-D5.17-4 (a live index level beside a baseline
+day-change — still true, and now visible: `/api/market/overview` is unscoped, so
+the change/percentage is Yahoo's while the level is the broker's).
+
+**New:** LIM-D5.18-1 (no NSE holiday calendar behind the market clock),
+LIM-D5.18-2 (no frontend caller for `placeOrder`), LIM-D5.18-3 (ranking and
+scanner resolve without a user, so a broker can never serve them),
+LIM-D5.18-4 (Top Opportunities does not subscribe to `priceTicks`),
+LIM-D5.18-5 (index cards are not navigable).
+
+## Next sprint — D5.19
+
+D5.18 proved the pipeline and fixed what it broke on the way to the screen.
+What remains is wiring surfaces to a pipeline that now demonstrably works:
+user-scope ranking/scanner (D-4/D-5), subscribe Top Opportunities to
+`priceTicks` (D-6), wire an order-entry action to the working
+`POST /brokers/{broker}/orders` (D-7), make index cards navigable (D-3), and
+put an NSE holiday calendar behind the market clock (LIM-D5.18-1). A Fyers
+session during market hours closes LIM-D5.17-3, which is the one identifier no
+offline evidence can settle.
+
+---
+
+# D5.19 — MARKET PLATFORM COMPLETION (2026-09-01) — PARTIAL, uncommitted
+
+Decision record: **ADR-058**. HEAD remains `dc19514`; nothing committed or pushed.
+
+**Run window: 12:28–15:00 IST on Tuesday 2026-09-01, NSE open**, against the
+running dev stack (`uvicorn --reload` on :8000, craco on :3000, MongoDB
+`alpha_stock_db`). Backend behaviour was verified live against the real vendor
+and the running server. **The browser leg was not completed — the session JWT
+had expired and re-authenticating is not an action taken on the user's behalf.**
+
+## Headline
+
+**The premise of the brief was half right, and the half it got wrong was the
+more interesting one.** Top Opportunities and the Scanner were not hardcoded —
+D5.18 had already established that — but they were being scored on data that
+did not exist, and the engine could not tell the difference.
+
+Measured live at 12:30 IST: all 31 universe quotes carried
+`rsi=None, macd=None, macd_signal=None, avg_volume=None, volume_ratio=None`.
+The universe path fetched a **2-day** window, which prices a stock and cannot
+describe one. Everything downstream coalesced the nulls and carried on:
+
+* **Six of the Scanner's eight strategy presets matched 0 of 31 stocks** —
+  `intraday`, `swing`, `momentum`, `breakout`, `reversal`, `growth` all filter
+  on `volume_ratio_min`, `rsi_min/max` or `macd_bullish`. The other two,
+  `value` and `dividend`, sort on `rsi` and `volume_ratio`; `q.get(key) or 0`
+  made all 31 equal, the sort is stable, and so they returned the universe in
+  **declaration order** — RELIANCE, TCS, HDFCBANK, INFY — regardless of the
+  market. That constant list is exactly what "static/demo values" looks like
+  from the outside, and it is where the brief's suspicion came from.
+
+* **The ranking engine was fabricating its evidence.** For RELIANCE — 8.3
+  million shares traded that morning — it reported `momentum 95.0 "RSI 50 in
+  bullish zone"` (RSI was null, `or 50.0`), `trend 40.0 "MACD bearish"` (null,
+  `None or 0.0 > None or 0.0`), `liquidity 25.0 "Very low liquidity"`
+  (`avg_volume or 0`). Five of eight dimensions were byte-identical across all
+  ten ranked stocks.
+
+The brief asked for a "Why is this a top opportunity?" panel built from actual
+scoring evidence. **Piping the existing `reason` strings to the browser would
+have shipped those three sentences under a "why this stock" heading.** The
+feature the brief asked for was, on the code as it stood, a mechanism for
+publishing fabricated evidence about real money.
+
+A second defect was found while auditing D-3 and blocks it:
+**`/api/stocks/{symbol}` reported a three-month change as the day's change.**
+
+## Phase 1 — Audit
+
+Answers to the fifteen questions, from the repository and the running system.
+
+| # | Question | Finding |
+|---|---|---|
+| 1 | Surfaces bypassing the gateway | **None.** D5.16 closed the last four. Re-swept: no market surface calls a provider directly. |
+| 2 | Surfaces using Yahoo directly | **None in acquisition.** Commodities/forex remain on the documented Yahoo path and are labelled `Delayed` (ADR-056) — deliberate, no broker publishes a spot instrument for them. |
+| 3 | Broker ticks that fail to render | **Top Opportunities** (no `priceTicks` subscription) and **the stock detail page** (no realtime subscription of any kind). |
+| 4 | Surfaces polling instead of receiving | Scanner (event-driven + 60s fallback — correct by design, R4). |
+| 5 | Surfaces with no realtime subscription | `RankingTable`, `StockDetail`. |
+| 6 | Static/demo values | **None hardcoded.** The Scanner's *appearance* of a fixture was the null-technicals defect above. |
+| 7 | Components computing prices independently | None. All read the store or the gateway. |
+| 8 | User-scoping bugs | **Every market and stock endpoint was anonymous** — `/market/ranking`, `/market/scanner`, `/market/overview`, `/stocks/{symbol}` and 25 others. Only `/analysis/reports/morning` took a user. |
+| 9 | Global that should be per-user | `/market/ranking`, `/market/scanner`, `/stocks/{symbol}` — fixed. The rest are D6's. |
+| 10 | Per-user that should be global | **None found.** `/market/engine/status` is global and correct (D5.18 established this). |
+| 11 | D5 limitations still real | See Phase 12. |
+| 12 | Crosses closable now | D-3, D-4, D-5, D-6, D-7 (to the execution boundary), D-9. |
+| 13 | Crosses needing live market hours | The browser leg — **not completed this run**. |
+| 14 | Crosses needing a second broker | LIM-D5.17-3 (Fyers topic prefix); live multi-user isolation. |
+| 15 | D6, not D5 | Per-user broker account management, multiple accounts per user, OAuth lifecycle, encrypted token rotation. |
+
+### The two defects the audit found that the brief did not name
+
+**A-1 — the day's change was a function of the requested range.**
+`fetch_yahoo_quote` derived `prev_close` from Yahoo's `meta.chartPreviousClose`,
+which is the close *before the requested window*. Measured live, one symbol,
+one price, four windows:
+
+```
+RELIANCE  2d   prev_close=1277.0  ->  +2.62%
+RELIANCE  5d   prev_close=1298.0  ->  +0.96%
+RELIANCE  1mo  prev_close=1307.8  ->  +0.21%
+RELIANCE  3mo  prev_close=1320.0  ->  -0.72%
+```
+
+`fetch_real_stock_quote` asks for `3mo` (MACD needs 26+ bars), so
+`GET /api/stocks/RELIANCE` served **-0.72%** while `/market/ranking` and
+`/market/overview`, which fetch `2d`, served **+2.62%** for the same instrument
+at the same instant. For NIFTY the split was **+3.11% vs +0.13%**.
+
+This is D5.18's D-1 in a second place — two surfaces of one product disagreeing
+about one fact — and it **blocked D-3**: making an index card navigable would
+have sent a user from a card reading NIFTY +0.13% to a page reading +3.11%.
+
+**A-2 — the universe path had no technical indicators.** The root cause of the
+Scanner and ranking defects above.
+
+The two are coupled: widening the universe window to get indicators would have
+silently turned every universe day-change into a three-month change had A-1 not
+been fixed first. `test_universe_day_change_is_still_the_days_change` pins the
+join.
+
+## Phase 2 — What was fixed
+
+| # | Defect | Status |
+|---|---|---|
+| A-1 | Day change was range-dependent | **FIXED** — derived from the bar series |
+| A-2 | Universe path carried no technicals | **FIXED** — `TECHNICALS_RANGE`, shared `derive_technicals` |
+| D-3 | Index cards not navigable | **FIXED** — `/stock/{canonical}`, keyboard-reachable |
+| D-4 | Ranking/scanner unscoped | **FIXED** — `get_optional_user_id` |
+| D-5 | No `source_tier` on ranking | **FIXED** — `rank_universe_report`, badge rendered |
+| D-6 | Top Opportunities frozen | **FIXED** — `applyLivePrices` on `priceTicks` |
+| D-7 | `placeOrder` had no caller | **FIXED** — `OrderTicket`, two-step confirm |
+| D-8 | Detail page: no action, no tier | **FIXED** — ticket mounted, tier badge, live ticks |
+| D-9 | Morning Report narrated live levels as closes | **FIXED** — session-aware prompt + stamp |
+| — | "Why is this a top opportunity?" | **ADDED** — `build_evidence`, availability-gated |
+| — | Scanner match reasons | **ADDED** — `match_evidence` |
+
+### The evidence design, and why it is not the obvious one
+
+`ranking_engine` now records **`available`** per dimension from
+`DIMENSION_INPUTS` — the quote fields each scorer actually reads — and
+`build_evidence` draws only on dimensions that are available, non-neutral and
+have a non-empty reason, ordered by weighted contribution and capped at three.
+
+`dimension_is_supported` requires **all** of a dimension's inputs, not any.
+That was a correction made during the sprint: with `any`, momentum scoring on a
+real +2.6% day move and an absent RSI still rendered *"RSI 50 in bullish zone;
+Strong +2.6% day move"* — the scorers append one clause per input, so a
+partially-supported dimension does not produce a shorter sentence, it produces
+the same sentence with a fabricated clause in it, and the invented half is the
+half a reader weighs most.
+
+**The scores are unchanged.** Withholding a reason changes what the platform
+claims; changing a weight changes what it recommends, and the brief is explicit
+that the scoring logic stands unless the audit proves it wrong. The audit
+proved the explanations wrong, not the arithmetic.
+
+Measured live at 13:05 IST, after the fix:
+
+```
+TATASTEEL   score=70.2  [+5.40] trend     MACD bullish crossover
+                        [+4.00] momentum  RSI 46 neutral-constructive; Positive +0.6% today
+                        [+3.60] risk      Moderate risk profile
+SUNPHARMA   score=67.1  [+7.20] trend     MACD bullish crossover; MACD above zero line
+ICICIBANK   score=65.6  [+7.20] trend     MACD bullish crossover; MACD above zero line
+```
+
+and the scanner presets discriminate again — `value` 19/31, `dividend` 25/31,
+`intraday` 1/31, `growth` 1/31.
+
+### Order placement — the boundary
+
+`OrderTicket` is deliberately built around one property: **a single click
+cannot spend money.** The control that submits the form is not the control that
+sends the order; the review panel restates side, quantity, instrument, order
+type and account, and warns that the action is irreversible. The broker starts
+**unselected** and review stays disabled until one is chosen — the
+`EMPTY_FORM.broker = ""` shape, refused. Only brokers that are `connected` for
+this user *and* declare `place_order` are offered.
+
+**No order was placed.** The path is verified by 22 tests up to
+`brokerService.placeOrder`, which is mocked. Crossing that boundary is a real
+financial transaction and was out of scope.
+
+## Phase 3 — Price update quality
+
+D5.18's `usePriceFlash` no-op is intact and now falsified properly: the
+original round's M40 only changed the import line and stayed green, which was
+an **inert mutation, not a passing test**. Re-run with the GSAP tween genuinely
+restored (M40'), it turns **6 of 8 red**.
+
+No new animation was introduced. `RankingTable` and `StatCard` use
+`framer-motion` for mount-time entry only, keyed on the row, not on price.
+
+**Browser measurement of repaint behaviour was NOT re-taken** — see Phase 10.
+
+## Phase 4 — Broker data priority
+
+**No change made, and none warranted.** D5.18 established that the 30-second
+probation window is correct and that a probe shorter than the window reports
+the window as a defect. `_selection_rank` is `(health, probation, latency)`;
+this sprint did not touch it. Yahoo remains registered and is the baseline.
+
+What D5.19 changed is *eligibility*, not ranking: three surfaces that resolved
+in `GLOBAL_CONTEXT` — where a user's broker feed is not a candidate at any rank
+— now resolve in the user's context. That is the difference between a feed
+losing a comparison and never being entered into one.
+
+## Phase 5 — Multi-broker
+
+**Verified, not rebuilt.** `test_instrument_catalogue.py` (31 tests) already
+covers `symbol → (segment, exchange, symbol) → broker instrument` for all five
+adapters, including the identifier formats the brief names: Kite's numeric
+token, Angel One's token, Dhan's segment-qualified security id, Upstox's
+instrument key, Fyers' HSM topic, and NSE/BSE ambiguity. With
+`test_feed_instrument_universe.py` and `test_watchlist_stream_isolation.py`:
+**89 passed.** Nothing in D5.19 touched the resolution path.
+
+**LIVE VALIDATION NOT PERFORMED for any broker this run** (see Phase 10).
+
+## Phase 6 — User isolation
+
+`test_market_surface_user_isolation.py` (9 tests) covers the three surfaces
+this sprint opened to identity. The gateway double answers a **different price
+per user**, deliberately: a fake returning one payload for every caller cannot
+tell a correctly-scoped call from an unscoped one, which is how falsification
+M16 survived the first round.
+
+Covered: two users' requests do not cross; only the caller's identity reaches
+the resolver; an anonymous request resolves the baseline and **does not inherit
+the previous caller** (a sticky identity would pass every single-user test);
+interleaved concurrent requests stay separate; no user id and no provider name
+appears in either payload.
+
+**TEST VERIFIED. Not live multi-user validated — only one real account exists.**
+
+## Phase 7 — Security
+
+Established suite: **452 passed** (`-m security`).
+
+`test_d519_surface_disclosure.py` (9 tests) sweeps the five new user-facing
+strings for provider names, credential material, provider internals
+(probation/cooldown/health/shard/p95) and broker-private instrument identifier
+*shapes* — the last because an Upstox instrument key or a Fyers HSM topic names
+its broker by format alone, defeating Rule 4 without containing the word.
+
+The order path is separately swept in the browser DOM
+(`OrderTicket.test.jsx`) — a broker rejection must not surface a raw upstream
+payload.
+
+## Phase 8 — Falsification
+
+**42 mutations, first pass: 36 RED, 6 GREEN.** Every survivor was investigated
+and resolved; the honest split was **3 inert mutations and 3 insufficient
+tests**, and the three test gaps were real.
+
+| Survivor | Verdict | Resolution |
+|---|---|---|
+| M6 evidence cites absent dimensions | **INERT** — a second guard (null reason) caught it | Re-run removing both guards (M6') → **RED** |
+| M9 neutral dimensions pad the list | **INSUFFICIENT TEST** | Two-layer problem: the neutral case was only ever reached with *absent* inputs, so the availability filter fired first; and once fixed, `MAX_EVIDENCE_ITEMS` truncated the zero-contribution row away anyway. Needed a fixture that is available, articulate and exactly neutral (`RSI 80` overbought −10 with `+0.6%` +10 = 50.0) **in a sparse quote** so there is room in the list. → **RED** |
+| M16 tier read for the wrong identity | **INSUFFICIENT TEST** | The scanner asserted the tier's *value*, not the identity it was read for; the fake returned one tier for all callers. Added the identity assertion. → **RED** |
+| M23 market clock replaced by a constant | **INSUFFICIENT TEST** | Every session test monkeypatched `_market_is_open` itself, so its body never ran. Added two tests driving the real function. → **RED** |
+| M39 in-flight order resent | **INERT** — `disabled={placing}` already blocked the second click | Re-run removing the guard *and* the attribute (M39') → **RED** |
+| M40 flash animation reintroduced | **INERT** — the mutation only changed an import; the hook body still returned a bare ref | Re-run restoring the actual tween (M40') → **RED, 6 of 8** |
+
+Second and third rounds: **5/5 isolation mutations RED**, **5/5 disclosure
+mutations RED**.
+
+**Final: 52/52 meaningful mutations RED.**
+
+## Phase 9 — Regression
+
+| | D5.18 baseline | D5.19 |
+|---|---|---|
+| Backend | 4370 passed, 15 failed, 50 skipped, 4 xfailed | **4452 passed, 15 failed, 50 skipped, 4 xfailed** |
+| Frontend | 544 passed, 4 failed | **591 passed, 4 failed** |
+| flake8 (changed files) | 62 / 1 / 0 / 3 / 253 | **58 / 1 / 0 / 3 / 253** |
+| New test files (flake8) | — | **0 findings** |
+| Frontend build | — | **succeeds** |
+
+Backend delta is **+82, and every one is a new test in this sprint** — 7 day
+change, 9 universe technicals, 17 ranking evidence, 8 user scope, 9 scanner
+evidence, 14 morning report, 9 isolation, 9 disclosure. The 15 failures are the pre-existing
+Docker-dependent `test_entrypoint_log_level.py` set, unchanged in count and
+identity. The 4 frontend failures are the pre-existing `Landing.test.jsx` set
+(dead `href="#"` links), untouched by this sprint.
+
+`real_market.py` **loses four flake8 findings** — the rewritten
+`fetch_real_stock_quote` removed trailing-whitespace lines.
+
+### Four pre-existing tests were updated, all for the same reason
+
+`test_sprint_r9.py` (2 assertions) hardcoded the `_2d` cache key;
+`test_scanner_worker.py` (4 doubles) had `fake_universe()` without the
+gateway's keyword-only `user_id`. Both now reference the constant / the real
+signature, so they break when the behaviour breaks rather than when the
+implementation is renamed.
+
+## Phase 10 — Live validation
+
+**LIVE VERIFIED (backend, 2026-09-01, NSE open, 12:28–13:15 IST):**
+
+* `market_hours: true`, `/api/market/overview` → `market_status: OPEN`
+* `prev_close` is now identical at every range against the **real vendor**:
+  RELIANCE 1277.0 / +2.57% at `2d`, `5d`, `1mo`, `3mo` (was four answers)
+* **The contradiction is gone**: `/api/stocks/NIFTY` −0.06% vs
+  `/api/market/overview` −0.05% (was +3.11% vs +0.13%)
+* `/api/market/ranking` returns `source_tier` and real, differentiated evidence
+* Scanner presets discriminate against live data (19/31, 25/31, 1/31, 1/31)
+* All 31 universe quotes now carry real RSI (31.2–72.7), MACD (9/31 bullish),
+  and volume ratio
+
+**NOT PERFORMED — and this is the sprint's largest gap:**
+
+* **The browser leg.** The dashboard redirected to `/login`: the session JWT had
+  expired. Signing in is an authentication action I do not perform on a user's
+  behalf, so the run stopped there. **Every frontend change in this sprint —
+  index navigation, the Top Opportunities evidence panel, the live ranking
+  price, the order ticket, the detail-page tier badge — rests on its 47 unit
+  tests and has NOT been seen in a browser.**
+* **No broker session existed at any point in this run.** `/api/market/ranking`
+  reported `source_tier: delayed` throughout, which is correct and expected
+  with no connected account — but it means the user-scoped path was exercised
+  by tests and by an anonymous live call, **never by a real promoted broker
+  feed**. D-4's fix is TEST VERIFIED, not LIVE VERIFIED.
+* Fyers and every broker other than Upstox — no session.
+* Live order placement — a financial transaction, deliberately not executed.
+* Post-fix visual repaint re-measurement — needs the browser.
+* Multi-user isolation with two live accounts — only one account exists.
+
+## Phase 11 — Acceptance matrix
+
+| Requirement | TEST | LIVE | Status |
+|---|---|---|---|
+| Broker data reaches the dashboard | ✅ | ✅ (D5.18) | ✅ VERIFIED |
+| Individual stock prices update on ticks | ✅ | ✅ (D5.18) | ✅ VERIFIED |
+| NIFTY / BANKNIFTY / SENSEX / VIX update | ✅ | ✅ (D5.18) | ✅ VERIFIED |
+| Price updates are visually smooth | ✅ 8 tests | ❌ not re-measured | ⚠️ PARTIAL |
+| No artificial blinking | ✅ M40' 6/8 red | ❌ not re-measured | ⚠️ PARTIAL |
+| Clicking an index opens its detail page | ✅ 7 tests | ❌ browser leg not run | ⚠️ PARTIAL |
+| Clicking a stock opens its detail page | ✅ | ✅ (D5.18) | ✅ VERIFIED |
+| Index detail shows price/change/chart/OHLC | ✅ | ⚠️ endpoint verified live, page not | ⚠️ PARTIAL |
+| Top Opportunities from real current data | ✅ | ✅ live endpoint | ✅ VERIFIED |
+| Top Opportunities shows why | ✅ 11 tests | ❌ browser leg not run | ⚠️ PARTIAL |
+| Scanner picks are real daily picks | ✅ 9 tests | ✅ live endpoint | ✅ VERIFIED |
+| Scanner shows why | ✅ | ❌ browser leg not run | ⚠️ PARTIAL |
+| Morning Report uses current data | ✅ 14 tests | ⚠️ prompt fixed, not re-generated live | ⚠️ PARTIAL |
+| Broker context respected where available | ✅ 9 tests | ❌ no broker session this run | ⚠️ PARTIAL |
+| Order placement has a real user path | ✅ 22 tests | ❌ deliberately not executed | ⚠️ PARTIAL — by design |
+| No automatic live order | ✅ 5 tests + M33 | N/A | ✅ VERIFIED |
+| Users remain isolated | ✅ 9 tests | ❌ one account only | ⚠️ PARTIAL |
+| Broker-neutral architecture intact | ✅ 89 tests | ❌ Upstox only, and not this run | ⚠️ PARTIAL |
+| Gateway never bypassed | ✅ | ✅ | ✅ VERIFIED |
+| Yahoo fallback preserved | ✅ | ✅ | ✅ VERIFIED |
+| No credential leakage | ✅ 461 tests | ❌ browser leg not run | ⚠️ PARTIAL |
+
+## Phase 12 — Limitations
+
+**Closed:**
+* **LIM-D5.18-2** — `placeOrder` has a caller: `OrderTicket`, mounted on the
+  stock detail page. *(Test verified; no live order placed.)*
+* **LIM-D5.18-3** — ranking and scanner are user-scoped.
+* **LIM-D5.18-4** — Top Opportunities subscribes to `priceTicks`.
+* **LIM-D5.18-5** — index cards are navigable.
+
+**Still open, unchanged:**
+* **LIM-D5.18-1** — no NSE holiday calendar behind the market clock. *Not
+  addressed; a trading holiday still reports OPEN.*
+* **LIM-D5.17-1** — no reference-data refresh mechanism.
+* **LIM-D5.17-3** — Fyers index topic prefix unverified. Needs a live session.
+* **LIM-D5.17-4** — a broker index *level* beside a baseline *day change*:
+  `/api/market/overview` is still unscoped.
+* **LIM-D5.16-1, -3, -4** — thin streaming quote; Kite series ambiguity;
+  headerless Fyers masters.
+* **LIM-D5.15-1** — narrowed but not closed: the DOM assertion was made in
+  D5.18 for the index strip; **the surfaces D5.19 added have no browser
+  evidence at all.**
+
+**New:**
+* **LIM-D5.19-1 — `volume_ratio` compares a partial session against complete
+  ones.** The ratio is today's running volume over a 20-day full-day mean, so
+  it is structurally depressed intraday: measured at 12:47 IST the median across
+  31 stocks was **0.50** and the maximum **1.49**. Presets requiring ≥1.0
+  (`swing`, `momentum`) or ≥1.3 (`intraday`, `breakout`) therefore match little
+  or nothing before the close. Deliberately **not** changed — a session-elapsed
+  normalisation would alter what every strategy recommends, and the brief is
+  explicit that scoring logic stands unless proven wrong. The *comparison* is
+  proven wrong; the fix needs its own validation window.
+* **LIM-D5.19-2 — `fetch_real_stock_quote` still substitutes non-null defaults**
+  (`rsi=50.0`, `macd=0.0`, `avg_volume=1000000`, `volume_ratio=1.0`) when
+  history is short. `derive_technicals` returns None honestly; the coalescing is
+  applied at that one call site because `_advisor_score` and the top-pick scorer
+  compare `macd > macd_signal` arithmetically and would raise on None.
+* **LIM-D5.19-3 — `rank_universe` passes a literal `news_sentiment=0.5`.** No
+  news signal reaches the ranking engine. The dimension is now marked
+  unavailable at exactly 0.5 so it never becomes evidence, but the 0.5 still
+  enters the weighted score for every stock.
+* **LIM-D5.19-4 — the D5.19 frontend has never been rendered.** All eleven
+  frontend changes rest on unit tests.
+* **LIM-D5.19-5 — the user-scoped path has never served a real broker feed.**
+  No broker session existed during this run.
+
+## Phase 13 — D6 boundary
+
+**Not started, and deliberately not designed for.** D5.19 changed no
+architecture: `get_optional_user_id` passes an id the gateway already accepted,
+and every scoping fix is a keyword argument on a call that already supported it.
+
+D6 owns: user identity and account management; per-user broker connections and
+multiple accounts per user; OAuth lifecycle and encrypted token rotation;
+per-user holdings/positions/orders; strict isolation at the persistence layer;
+multi-user realtime feeds at scale; platform vs user credentials; onboarding
+Paytm Money / INDmoney subject to partner access.
+
+**Recommended D6 starting point:** close **LIM-D5.19-4 and -5 first** — one
+authenticated browser session with a connected broker during market hours,
+walking the D5.19 surfaces. It is the cheapest possible evidence, it is the only
+thing standing between eight ⚠️ PARTIAL rows and ✅ VERIFIED, and D6's whole
+premise is that the per-user path works.

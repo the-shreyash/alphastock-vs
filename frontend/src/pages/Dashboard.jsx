@@ -78,11 +78,44 @@ function QuickActions() {
 }
 
 /* ====== Stat Card (Index strip) with optional sparkline ====== */
-function StatCard({ label, value, numericValue, change, changePct, sparkData, testId }) {
+/**
+ * One index in the dashboard strip — and, since D5.19, a link to its detail page.
+ *
+ * WHY `symbol` IS SEPARATE FROM `label` (D-3)
+ * -------------------------------------------
+ * The card renders "Bank Nifty" and routes to `/stock/BANKNIFTY`. Deriving one
+ * from the other is the obvious shortcut and it is wrong in both directions:
+ * the platform's canonical spellings (`NIFTY`, `BANKNIFTY`, `SENSEX`,
+ * `INDIAVIX`) are what `INDEX_OVERVIEW_KEYS` folds live ticks onto and what
+ * `brokers/catalogue.py` resolves against all five brokers' published masters,
+ * while the labels are display text with spaces in them. `/stock/Bank Nifty`
+ * matches nothing anywhere. See the D5.17 index alias table.
+ *
+ * A `<button>` rather than a `<div>` with an `onClick`: these are four of the
+ * most prominent numbers on the dashboard, and making them openable by mouse
+ * only would trade one usability defect for an accessibility one.
+ *
+ * `symbol` is optional. A card without one stays exactly what it was — an
+ * inert div — so this component is still usable for a number that has no
+ * detail page behind it.
+ */
+function StatCard({ label, value, numericValue, change, changePct, sparkData, testId, symbol }) {
   const isPos = (change ?? changePct ?? 0) >= 0;
   const flashRef = usePriceFlash(numericValue);
+  const navigate = useNavigate();
+
+  const Card = symbol ? "button" : "div";
+  const interactive = symbol
+    ? {
+        type: "button",
+        onClick: () => navigate(`/stock/${symbol}`),
+        "aria-label": `${label} details`,
+        className: "stat-card relative overflow-hidden w-full text-left cursor-pointer transition-transform hover:scale-[1.01]",
+      }
+    : { className: "stat-card relative overflow-hidden" };
+
   return (
-    <div data-testid={testId} className="stat-card relative overflow-hidden">
+    <Card data-testid={testId} {...interactive}>
       <span className="stat-label block mb-1.5">{label}</span>
       <div ref={flashRef} className="stat-value inline-block rounded-md px-0.5">{value || "—"}</div>
       {changePct != null && (
@@ -116,7 +149,7 @@ function StatCard({ label, value, numericValue, change, changePct, sparkData, te
           </ResponsiveContainer>
         </div>
       )}
-    </div>
+    </Card>
   );
 }
 
@@ -1125,16 +1158,16 @@ export default function Dashboard() {
       {/* ===== Index Strip ===== */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
         <Reveal delay={0}>
-          <StatCard testId="nifty-card" label="Nifty 50" value={formatNumber(overview?.nifty?.value)} numericValue={overview?.nifty?.value} change={overview?.nifty?.change} changePct={overview?.nifty?.change_pct} sparkData={niftyChart} />
+          <StatCard testId="nifty-card" symbol="NIFTY" label="Nifty 50" value={formatNumber(overview?.nifty?.value)} numericValue={overview?.nifty?.value} change={overview?.nifty?.change} changePct={overview?.nifty?.change_pct} sparkData={niftyChart} />
         </Reveal>
         <Reveal delay={0.05}>
-          <StatCard testId="banknifty-card" label="Bank Nifty" value={formatNumber(overview?.bank_nifty?.value)} numericValue={overview?.bank_nifty?.value} change={overview?.bank_nifty?.change} changePct={overview?.bank_nifty?.change_pct} />
+          <StatCard testId="banknifty-card" symbol="BANKNIFTY" label="Bank Nifty" value={formatNumber(overview?.bank_nifty?.value)} numericValue={overview?.bank_nifty?.value} change={overview?.bank_nifty?.change} changePct={overview?.bank_nifty?.change_pct} />
         </Reveal>
         <Reveal delay={0.1}>
-          <StatCard testId="sensex-card" label="Sensex" value={formatNumber(overview?.sensex?.value)} numericValue={overview?.sensex?.value} change={overview?.sensex?.change} changePct={overview?.sensex?.change_pct} />
+          <StatCard testId="sensex-card" symbol="SENSEX" label="Sensex" value={formatNumber(overview?.sensex?.value)} numericValue={overview?.sensex?.value} change={overview?.sensex?.change} changePct={overview?.sensex?.change_pct} />
         </Reveal>
         <Reveal delay={0.15}>
-          <StatCard testId="vix-card" label="India VIX" value={overview?.india_vix != null ? formatNumber(overview.india_vix) : "—"} numericValue={overview?.india_vix} />
+          <StatCard testId="vix-card" symbol="INDIAVIX" label="India VIX" value={overview?.india_vix != null ? formatNumber(overview.india_vix) : "—"} numericValue={overview?.india_vix} />
         </Reveal>
       </div>
 

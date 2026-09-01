@@ -1590,3 +1590,97 @@ The masters carry dated futures — `GOLD26OCTFUT`, `CRUDEOIL26SEPFUT`,
 `USDINR26SEPFUT` — a different instrument with a rolling identity, behind an
 MCX/CDS segment entitlement, at a price that is not the spot number the
 dashboard shows. This is a fact about the venues, not a deferral: see ADR-056.
+
+---
+
+# D5.18 — Upstox, live (2026-09-01)
+
+First live market-hours run against a real broker account.
+
+## Observed
+
+| Stage | Result |
+|---|---|
+| Authentication / session restore | `load_sessions restored=1` from the encrypted stored token |
+| Stream connect | market + orders channels, 1 connection |
+| Subscription | 35 instruments (30 dashboard equities + 4 indices + watchlist) |
+| Real equity ticks | RELIANCE, HDFCBANK, POWERGRID, HCLTECH, BHARTIARTL, MARUTI, TECHM, M&M, NTPC, ADANIENT, ASIANPAINT, TMCV |
+| Real index ticks | NIFTY, BANKNIFTY, INDIAVIX, **SENSEX (BSE)** |
+| Records | 345 accepted, **0 rejected** |
+| Delivery latency | p50 0.147s, p95 0.233s |
+| Stability | 0 flaps in 130s; probation cleared at ~t+40s, feed promoted to primary |
+
+The index identifiers D5.17 resolved offline against Upstox's master are
+confirmed on the wire: all four indices arrived as canonical `MarketTick`s with
+the expected symbols. **LIM-D5.17-2 is closed for Upstox.**
+
+## Trading surface — reachable, but unreachable from the UI
+
+Every broker **read** endpoint answered 200 live: `funds`, `orders`,
+`positions`, `holdings`, `profile`. `/api/brokers/status` reported
+`connected: true, streaming: true, mode: live`, and Upstox declares the full
+capability set including `place_order`, `modify_order`, `cancel_order`.
+
+`POST /api/brokers/{broker}/orders` exists, is user-scoped and broker-neutral.
+**It has no caller in the frontend** — `services/brokerService.js:27` defines
+`placeOrder` and nothing imports it (LIM-D5.18-2). The only live-order path a
+user can reach is TradeMonitor's *New Trade* modal → `POST /api/trades`, which
+places a broker entry order **only when `broker` is set on the payload**, and
+the form's default is `""`. The "Buy" beside a Top Opportunity is a signal
+badge, not a control.
+
+**No order was placed during this run** — a live order is a real financial
+transaction and was deliberately out of scope. Order placement is therefore
+**NOT LIVE VERIFIED**; what is verified is that authentication, session,
+capability declaration and every read path are working, and that the missing
+piece is a frontend wire rather than a broker permission.
+
+## The order path has a user-reachable front end (D5.19)
+
+**LIM-D5.18-2 is closed.** `components/stock/OrderTicket.jsx` calls
+`brokerService.placeOrder` and is mounted on the stock detail page — the one
+screen that already knows exactly which instrument the user means.
+
+The backend was never the problem and is unchanged. What the component adds is
+a path to it that cannot be walked by accident, because placing an order is the
+only irreversible action in this product: it spends real money at a real
+exchange, and there is no undo, no confirmation email and no grace period.
+
+**The design is that property, made testable.**
+
+* **Two steps, two controls.** The button that submits the form is not the
+  button that sends the order. A single click anywhere in the component can
+  only produce a review panel restating side, quantity, instrument, order type
+  and account, with an explicit warning that the action is irreversible. This
+  is what turns "no automatic order placement" and "no AI-generated order
+  executes without explicit user confirmation" into properties a test holds
+  rather than intentions a reviewer hopes for. Falsification M33 removed the
+  review step and turned **12 of 22 tests red**.
+* **Nothing that costs money is defaulted.** The broker starts *unselected* and
+  review stays disabled until one is chosen — the `EMPTY_FORM.broker = ""`
+  shape, refused, because an order with no broker is not a smaller order.
+  Quantity, side and order type are all stated by the user; a LIMIT order
+  cannot be reviewed without a price.
+* **Only a broker that can actually place the order is offered.** It must be
+  `connected` for this user **and** declare `BrokerCapability.PLACE_ORDER`.
+  Two of the five adapters do not declare it; offering them would produce a
+  confident form and a rejection at the gateway. With none eligible the
+  component says so plainly and renders no submit control at all.
+* **The backend stays authoritative.** The component validates to keep a user
+  out of an obviously-doomed round trip. `BrokerOrderCreate` is where the rules
+  live, and the component deliberately does not reimplement product codes,
+  margin or exchange rules — those are the broker's answer to give.
+
+**No order was placed.** The path is verified by 22 tests up to
+`brokerService.placeOrder`, which is mocked, and the component has **not been
+rendered in a browser** (LIM-D5.19-4). Order placement remains **NOT LIVE
+VERIFIED**, by design: the acceptance test stops at the execution boundary and
+only the user may cross it.
+
+
+## Not exercised
+
+Fyers, Zerodha, Angel One, Dhan — no live session exists for any of them, so
+**LIM-D5.17-3 (Fyers index topic prefix) remains open**. It is the one
+identifier no offline evidence can settle and it needs a Fyers session inside
+market hours.
