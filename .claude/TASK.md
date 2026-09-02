@@ -4636,3 +4636,403 @@ authenticated browser session with a connected broker during market hours,
 walking the D5.19 surfaces. It is the cheapest possible evidence, it is the only
 thing standing between eight ⚠️ PARTIAL rows and ✅ VERIFIED, and D6's whole
 premise is that the per-user path works.
+
+---
+
+# D5.19L — LIVE BROWSER VALIDATION (2026-09-02) — market open, Upstox connected
+
+Decision record: **ADR-058 addendum**. Implementation landed as `ed9807e`; this
+run adds two fixes on top, uncommitted.
+
+**Run window: 10:04–10:50 IST, Wednesday 2026-09-02, NSE open.** Stack started
+from cold (MongoDB, `uvicorn --reload`, craco). Logged in as `shreyash`
+(`6a5e6228…`). **A fresh Upstox session was created at 04:35:42Z, expiring
+22:00Z** — the previous day's token had expired at 22:00Z on 09-01, which is
+the daily Upstox lifecycle and why yesterday's run found nothing connected.
+
+## Preconditions
+
+| # | Precondition | Evidence |
+|---|---|---|
+| 1 | User logged in | `shreyash`, sub `6a5e6228…`, valid JWT |
+| 2 | Broker connected + authenticated | `/api/brokers/status` → `upstox: connected true, streaming true, "Connected to Upstox (5HARB3)"` |
+| 3 | Market hours open | `/api/market/engine/status` → `market_hours: true`, 10:07 IST |
+| 4 | Feed promoted after probation | `delayed` → `streaming` observed; re-observed under a controlled restart (§J) |
+| 5 | Probation not shortened | `PROBATION_WINDOW_SECONDS` untouched; §J measured the wait |
+
+## Two defects found, both in D5.19's own code, both fixed
+
+### L-1 — a live broker price erased the trading day (REGRESSION, FIXED)
+
+D5.19 made `GET /api/stocks/{symbol}` user-scoped. It works — and that is what
+broke the page. One endpoint, two callers, the same instant (04:41:02Z):
+
+```
+AUTHED (broker)   tier=streaming  price=1304.0  change=None  prev_close=None  open=None  volume=None
+ANON   (baseline) tier=delayed    price=1303.5  change=-5.5  prev_close=1309  open=1298  volume=2368643
+```
+
+A canonical `MarketTick` carries a price and nothing else (LIM-D5.16-1); this
+page renders a previous close, a day change, OHLC and volume. Before D5.19 the
+route was anonymous, always got the baseline's complete quote, and the question
+never arose. **In the browser, RELIANCE rendered:**
+
+```
+₹1,303.70    ↗ +₹0.00 (+%)     [LIVE]
+OPEN —
+```
+
+`Math.abs(null)` is `0`, so a **fabricated "unchanged" in green** sat beside a
+live, moving price. That is precisely the fabrication the tick contract and
+`applyLivePrices` exist to refuse, reintroduced by the fix for a different
+problem — and no test caught it because every test served one quote shape.
+
+**Fixed** in `stock_detail`: the winning feed's price always stands, and the
+baseline is asked only for the fields that feed left absent, and only when some
+are. `source_tier` keeps describing the feed that supplied the *price* — that
+is the number the user is looking at, and downgrading it to `delayed` because a
+previous close was filled in would understate a live price. Frontend gains the
+`change_pct != null` guard the index strip already had, so an unknown change
+renders as nothing rather than as zero.
+
+### L-2 — the three numbers on screen did not agree (FIXED)
+
+Found by the §G consistency check the brief asks for. Filling `change` straight
+from the baseline left the page stating a change measured against a price it
+was not showing:
+
+```
+price 1306.3 (broker)   prev_close 1309.0 (baseline)   change -2.2 (baseline)
+but  1306.3 - 1309.0 = -2.7
+```
+
+~0.04%, and wrong in the way that matters: a reader who subtracts the two
+numbers on screen gets a third number the screen does not show. Both inputs are
+real facts, so their difference is the honest day change. **Fixed** by deriving
+`change`/`change_pct` from the live price against the real previous close, and
+only when a previous close actually exists — absent one, the change stays
+absent rather than becoming zero.
+
+Verified live across 7 symbols: `|change − (price − prev_close)| < 0.02` for
+RELIANCE, ICICIBANK, INFY, NIFTY, BANKNIFTY, SENSEX, INDIAVIX.
+
+## A third defect found, NOT fixed — pre-existing, not D5.19's
+
+**Top AI Picks renders a bare `%`.** `/analysis/top-picks` returns picks with
+**no `change_pct` field at all**, identically for authenticated and anonymous
+callers — so this is not broker-scoping and not a D5.19 regression. The card
+renders `{value}%` with no null guard, producing `KOTAKBANK ₹422.60 %`. It is
+the same *class* as L-1 and it predates this sprint. Recorded as
+**LIM-D5.19-6**; fixing it is a change to a surface D5.19 did not touch.
+
+## Section results
+
+**§A — dashboard equity prices. LIVE VERIFIED.** Over 108s: `ranking-price-COALINDIA`
+16 changes (418.60 → 418.50 → 418.60 → 418.50), `ranking-price-ICICIBANK` 7
+(1,425.70 → 1,425.80 → 1,426.00 → 1,426.10), plus ONGC, AXISBANK, POWERGRID;
+`top-picks-card` 40 (KOTAKBANK / SUNPHARMA / COALINDIA); `watchlist-widget` 8.
+Six equity surfaces, ≥3 changing values on each of five.
+
+**§B — indices. LIVE VERIFIED.** Over 108s: NIFTY **37** changes
+(23,846.45 → .85 → .70 → .80 → 23,848.30 → 23,849.90), BANKNIFTY **39**
+(57,069.40 → 57,072.05 → 57,069.15 → 57,068.40 → 57,070.00 → 57,086.45),
+SENSEX **34** (76,343.94 → 76,345.00 → 76,348.89 → 76,348.40 → 76,345.17 →
+76,359.09), INDIA VIX **13** (11.88 → 11.89 → 11.88 → 11.89 → 11.85 → 11.86).
+
+**§C — no blink. LIVE VERIFIED, and this is the strongest result of the run.**
+Measured under real broker ticks with a `MutationObserver` on the whole body:
+
+* **318 style/class mutations in 108 s = 2.95/sec**, against D5.18's measured
+  **~250/sec** before the fix — an **85× reduction**.
+* **12 elements changed their price. 5 elements received a style write. The
+  intersection is EMPTY.** Not one element whose number moved was written to.
+* Zero `background-color` writes on any price element; zero scale/transform on
+  any price element.
+* The 5 style targets are `ranking-row-*`, 4 writes each — the framer-motion
+  mount entry (`opacity 0→1, y 5→0`), once per row, not per tick. The
+  remaining SPAN writes are the marquee (`translateX`) and the AI button pulse.
+
+A tick changes the number and nothing else, exactly as the D5.18 contract
+specifies, now proven against a real feed rather than 8 unit tests.
+
+**§D — Top Opportunities. LIVE VERIFIED.** Five `<button>` rows. Today's real
+scored list, entirely different from yesterday's: COALINDIA 82.2 *Strong Buy*,
+ICICIBANK 67.1, ONGC, AXISBANK, POWERGRID. Evidence rendered per row and drawn
+from real inputs — "RSI 58 in bullish zone; Strong +4.0% day move", "MACD
+bullish crossover", "Very high volume 2.2x avg" — matching the live values
+(rsi 58.09, volume_ratio 2.19). Prices update from `priceTicks` (16 and 7
+changes above). Tier badge reads **Delayed**, which is truthful: see the
+capability note below.
+
+**§E — Scanner. LIVE VERIFIED (API); UI PENDING.** All eight presets exercised
+against live data. `intraday`, `swing`, `momentum` each matched **1 of 31**
+(COALINDIA) with honest reasons citing real values — "RSI 58 within 40–70",
+"Volume 2.19x average, at or above 1.3x", "MACD -4.33 above signal -5.96". The
+unfiltered scan returned 31/31 ordered by day change (COALINDIA, ADANIENT,
+ONGC, POWERGRID) — **not** the declaration order (RELIANCE, TCS, HDFCBANK,
+INFY) that D5.19 diagnosed as the fixture-like symptom.
+
+**§F — Morning Report. LIVE VERIFIED.** Rendered during the open session:
+
+> "Good morning. **As of 10:05 IST, Indian markets are trading** with a bearish
+> sentiment, with Nifty at 23,856, down 0.83%…"
+
+Present tense, timestamped, and *not* "markets closed with Nifty at…", which is
+the exact sentence D5.19 fixed. Global cues and key risk labelled; the
+commodities strip carries its permanent **DELAYED** badge.
+
+**§G — stock detail. LIVE VERIFIED after L-1/L-2.** RELIANCE renders
+**₹1,306.50 ↘ ₹2.20 (-0.17%)** with a **LIVE** tier badge, complete OHLC and
+volume, internally consistent. Chart renders (candlesticks, 1D/1W/1M).
+
+**§H — index detail. LIVE VERIFIED (NIFTY).** Clicking the NIFTY card navigated
+to `/stock/NIFTY` — canonical symbol, not the label. Page shows **₹23,857.20
+↘ ₹198.35 (-0.83%)**, OPEN ₹23,858.00, and a working candlestick chart. No
+vendor ticker (`^NSEI`) appears anywhere in the frontend path; the route, the
+store key and the rendered identity are all the platform's canonical `NIFTY`.
+**BANKNIFTY click PENDING.**
+
+**§I — order path. PARTIALLY VERIFIED.** The ticket renders on the detail page
+with the account **unselected** ("Select a broker account…"), quantity 1, order
+type MARKET, and **Review order disabled** until a broker is chosen. With the
+session expired it correctly fell back to its honest unavailable state. **No
+order was placed and none can be placed by a single click.** The full walk with
+a broker selected is **PENDING**.
+
+**§J — reconnect. LIVE VERIFIED with timing.** A controlled `uvicorn --reload`
+restart (mtime touch, no content change):
+
+```
+04:47:38.3  restart triggered
+04:47:46    backend accepting requests
+04:47:47.0  tier delayed   price 1306.2   <- fell back to baseline, prices never stopped
+04:47:58.0  tier delayed   price 1306.2
+04:48:06.0  tier delayed   price 1306.2
+04:48:13.4  tier STREAMING price 1306.0   <- promoted
+```
+
+The feed served the baseline for **≥26 s** across three samples before
+promotion, **27.4 s** after the process accepted requests — and the probation
+clock starts at provider *readiness*, which necessarily post-dates that. The
+measurement is consistent with the 30 s window and inconsistent with a bypass.
+Subscriptions restored, readiness re-earned, prices continuous throughout, and
+the tier label was truthful at every sample. **Nothing was shortened or
+skipped.**
+
+**§K — multi-user. LIVE MULTI-USER VALIDATION: NOT PERFORMED.** One broker
+account exists. Isolation remains TEST VERIFIED (9 tests, 5 mutations red).
+
+**§L — Fyers. NOT PERFORMED.** `/api/brokers/status` reports Fyers
+`configured: false` — no API keys in this deployment, so no session is possible.
+**LIM-D5.17-3 remains open.**
+
+## The capability finding — why Top Opportunities says "Delayed" and is right
+
+`/market/ranking` and `/market/scanner` resolve `Capability.UNIVERSE_QUOTES`.
+The broker streaming provider declares `{TICKS, QUOTES}` and **not**
+`UNIVERSE_QUOTES`, so those two surfaces resolve to the baseline even for a
+connected user — which is why their tier badge reads Delayed while the stock
+detail page reads Live.
+
+**This is correct, and declaring the capability would make the product worse.**
+A `MarketTick` has a price and no RSI, MACD, average volume or day change. The
+ranking engine scores on exactly those fields — and D5.19 exists because it was
+previously scoring on their absence and narrating the result. Serving
+`universe_quotes` from the tick stream would recreate that defect precisely.
+
+So the honest split, now observed live rather than argued: **the ranking's
+snapshot is the baseline's (which has technicals), its tier badge says so, and
+its prices then follow the broker feed** through `priceTicks`. Recorded as
+**LIM-D5.19-7**, and it is LIM-D5.16-1 surfacing in a new place rather than a
+new problem.
+
+D5.19's user-scoping fix is therefore **live-proven for `QUOTES`** — the same
+endpoint returned `streaming` to the authenticated caller and `delayed` to the
+anonymous one at the same instant — and **plumbed but not currently exercisable
+for `UNIVERSE_QUOTES`**.
+
+## Regression
+
+| | before this run | after L-1/L-2 |
+|---|---|---|
+| Backend | 4452 passed, 15 failed | **4465 passed, 15 failed** (+13 new) |
+| Frontend | 591 passed, 4 failed | **591 passed, 4 failed** |
+| flake8 `server.py` | 253 | **252** |
+| New test file | — | **0 findings** |
+
+The 15 backend failures are the pre-existing Docker `test_entrypoint_log_level.py`
+set; the 4 frontend failures the pre-existing `Landing.test.jsx` set.
+
+## Sections completed in the second window (11:46–11:50 IST)
+
+**§E — Scanner UI. LIVE VERIFIED.** Unfiltered scan: 15 rows with real RSI and
+volume-ratio columns populated (they read `—` before D5.19) and ordered by day
+change — COALINDIA +4.39%, POWERGRID +1.04%, ITC +0.34%, CIPLA +0.32% — **not**
+the declaration order that was the fixture-like symptom. Applying *Intraday
+Scalp* narrowed 15 → **1** and rendered the reasons in the table:
+
+> COALINDIA · "RSI 59 within 40–70" · "Volume 3.15x average, at or above 1.3x" ·
+> "Day change +4.39% at or above 0.3%"
+
+Each cites a value that matches that row's own columns (RSI 59, 3.1x, +4.39%).
+The unfiltered scan renders **no** evidence, which is the designed behaviour —
+there are no criteria to have met, and inventing one would be the fabrication
+this sprint exists to prevent. Tier badge: **Delayed** (see LIM-D5.19-7).
+
+**§G — second equity. LIVE VERIFIED.** ICICIBANK: 5 samples over 10 s, 3
+distinct (₹1,426.20 → ₹1,426.50 → ₹1,426.30), tier **Live**, change
+₹27.30 (-1.88%), full day context (Open ₹1,425.10, High ₹1,436.00, Low
+₹1,422.60, Prev Close ₹1,454.00, Volume 33,80,990), chart canvas present, order
+ticket in its form state.
+
+**§H — BANKNIFTY. LIVE VERIFIED.** Card click → `/stock/BANKNIFTY` (canonical
+symbol, not the "Bank Nifty" label). Price moved live ₹56,952.20 → ₹56,959.25
+in 6 s. Tier **Live**, change ₹456.45 (-0.80%), Open ₹57,006.45, High
+₹57,221.10, Low ₹56,823.20, Prev Close ₹57,409.60, chart renders.
+**No vendor ticker anywhere in the rendered DOM** — a regex sweep for
+`^NSEI|^NSEBANK|^BSESN|^INDIAVIX|yahoo|\.NS` over `documentElement.innerHTML`
+returned **false**.
+
+**§I — order path. VERIFIED TO THE EXECUTION BOUNDARY. NO ORDER PLACED.**
+
+The walk, on RELIANCE with a live Upstox session:
+
+| Step | Observed |
+|---|---|
+| Eligible accounts offered | **only** `Upstox · 5HARB3` — Zerodha excluded (connected `false`), Angel One / Fyers / Dhan excluded (`configured false`) |
+| Initial broker value | `""` — unselected |
+| Review button, unselected | **disabled** |
+| Confirm control, before review | **does not exist in the DOM** |
+| After selecting Upstox + qty 2 | review enabled; Confirm still absent |
+| After clicking Review | review panel appears; Confirm appears |
+
+The review panel, verbatim:
+
+> ⚠ This places a real order with real money at the exchange. It cannot be undone.
+> Action **BUY** · Quantity **2** · Instrument **RELIANCE · NSE** ·
+> Order type **MARKET** · Account **Upstox · 5HARB3**
+> `[ Confirm BUY 2 RELIANCE ]` `[ Cancel ]`
+
+**Cancel was clicked.** Confirm disappeared, the form returned, and
+`order-result` and `order-error` were both absent — no request was made and no
+order exists. `brokerService.placeOrder` was never called.
+
+The two-step gate is therefore live-proven, not merely unit-tested: the control
+that submits the form is not the control that sends the order, and the Confirm
+button is not in the document until a human has explicitly asked for it.
+
+## Residual observation — the change lags the tick
+
+Once a tick moves the price, the `change` computed server-side at fetch time
+becomes slightly stale against the displayed price (BANKNIFTY: displayed
+-₹456.45 while `price − prev_close` had become -₹450.35). Within a fraction of
+a percent, inherent to a tick that carries no day change, and the same shape as
+LIM-D5.17-4. Recorded as **LIM-D5.19-8**; closing it means recomputing the
+change client-side on each tick, which is a change to `applyLivePrices`'
+contract and is not this sprint's to make.
+
+# D5.19 FINAL ACCEPTANCE MATRIX
+
+Legend: **LIVE** = observed against a real broker feed in a browser ·
+**TEST** = test-verified only · **N/P** = not performed · **N/A** = not possible here
+
+| # | Requirement | Test | Live | Status |
+|---|---|---|---|---|
+| 1 | Broker data reaches the dashboard | ✅ | ✅ | **LIVE VERIFIED** |
+| 2 | Individual stock prices update on ticks | ✅ | ✅ 5 equities, ≥3 values each | **LIVE VERIFIED** |
+| 3 | NIFTY / BANKNIFTY / SENSEX / VIX update | ✅ | ✅ 37/39/34/13 changes in 108 s | **LIVE VERIFIED** |
+| 4 | Price updates visually smooth | ✅ | ✅ 2.95 style-mut/s vs ~250/s | **LIVE VERIFIED** |
+| 5 | No background flash / scale / blink | ✅ | ✅ price∩style **= ∅** | **LIVE VERIFIED** |
+| 6 | Clicking an index opens its detail page | ✅ | ✅ NIFTY + BANKNIFTY | **LIVE VERIFIED** |
+| 7 | Clicking a stock opens its detail page | ✅ | ✅ RELIANCE, ICICIBANK | **LIVE VERIFIED** |
+| 8 | Index detail: price/change/chart/OHLC | ✅ | ✅ both indices | **LIVE VERIFIED** |
+| 9 | Index detail updates live | ✅ | ✅ ₹56,952.20→₹56,959.25 | **LIVE VERIFIED** |
+| 10 | No Yahoo ticker in the frontend path | ✅ | ✅ DOM regex sweep false | **LIVE VERIFIED** |
+| 11 | Top Opportunities from real current data | ✅ | ✅ today's list, real scores | **LIVE VERIFIED** |
+| 12 | Top Opportunities shows why | ✅ | ✅ 3 reasons/row rendered | **LIVE VERIFIED** |
+| 13 | Explanation uses only available evidence | ✅ 17 tests | ⚠️ all inputs present today | **TEST VERIFIED** |
+| 14 | Top Opportunities prices update | ✅ | ✅ 16 + 7 changes | **LIVE VERIFIED** |
+| 15 | Scanner picks real / current | ✅ | ✅ 15→1 on preset | **LIVE VERIFIED** |
+| 16 | Scanner not declaration-order | ✅ | ✅ ordered by change | **LIVE VERIFIED** |
+| 17 | Scanner shows evidence honestly | ✅ | ✅ rendered, matches columns | **LIVE VERIFIED** |
+| 18 | Scanner tier correct | ✅ | ✅ Delayed (LIM-D5.19-7) | **LIVE VERIFIED** |
+| 19 | Morning Report current, not stale | ✅ 14 tests | ✅ "As of 10:05 IST … are trading" | **LIVE VERIFIED** |
+| 20 | Unavailable data labelled honestly | ✅ | ✅ Delayed badge, VWAP `--` | **LIVE VERIFIED** |
+| 21 | Stock detail change internally consistent | ✅ 13 tests | ✅ after L-1/L-2 | **LIVE VERIFIED** |
+| 22 | Source/tier truthful | ✅ | ✅ authed=streaming, anon=delayed | **LIVE VERIFIED** |
+| 23 | Order path reaches the broker boundary | ✅ 22 tests | ✅ review panel reached | **LIVE VERIFIED** |
+| 24 | No automatic / single-click order | ✅ M33 12-red | ✅ Confirm absent pre-review | **LIVE VERIFIED** |
+| 25 | No live order executed | — | ✅ cancelled, no request | **BY DESIGN** |
+| 26 | Stream reconnects, subs restore | ✅ | ✅ §J | **LIVE VERIFIED** |
+| 27 | 30 s probation respected | ✅ | ✅ ≥26 s baseline, 27.4 s to promote | **LIVE VERIFIED** |
+| 28 | Dashboard truthful during transition | ✅ | ✅ prices continuous, tier honest | **LIVE VERIFIED** |
+| 29 | Per-user feed scoping | ✅ 9 tests, 5 mut | ✅ same endpoint, two identities | **LIVE VERIFIED** |
+| 30 | Multi-user isolation (2 broker accounts) | ✅ 9 tests | ❌ one account exists | **TEST VERIFIED · LIVE N/P** |
+| 31 | Gateway never bypassed | ✅ | ✅ | **LIVE VERIFIED** |
+| 32 | Yahoo fallback preserved | ✅ | ✅ anon path serves it | **LIVE VERIFIED** |
+| 33 | No credential leakage | ✅ 461 tests | ✅ DOM sweep clean | **LIVE VERIFIED** |
+| 34 | Broker-neutral (Upstox) | ✅ | ✅ | **LIVE VERIFIED** |
+| 35 | Broker-neutral (Zerodha/Angel/Dhan) | ✅ 89 tests | ❌ no session | **TEST VERIFIED** |
+| 36 | Fyers topic prefix (LIM-D5.17-3) | ✅ | ❌ `configured: false` | **N/A HERE** |
+
+**32 of 36 LIVE VERIFIED.** The four that are not: multi-user with two broker
+accounts, three brokers with no session, Fyers with no API keys, and the
+"explanation withholds a fabricated reason" case — which cannot be observed on a
+day when every input is present, and is held by 17 tests and 6 red mutations.
+
+# FREEZE VERDICT
+
+## D5 IS COMPLETE ENOUGH TO FREEZE. Begin D6.
+
+The sprint's own question — *does the dashboard consume the real market-data
+architecture where real broker data exists, and say so honestly where it does
+not?* — is answered affirmatively **against a live feed, in a browser**, on
+every surface the brief named.
+
+The strongest single piece of evidence is not any one screen. It is that the
+same endpoint, at the same instant, returned `streaming` with a broker price to
+the authenticated caller and `delayed` with the baseline to the anonymous one.
+That is the per-user architecture working, observed rather than argued.
+
+**Nothing outstanding is a D5 defect.** The four unverified rows are: an
+environment limit (Fyers has no API keys here), an absence of sessions (three
+brokers), a deliberate refusal (no live order), and a case that needs a market
+day where data is missing. None is a design flaw, and none is fixable by more
+D5 work.
+
+### Accepted / deferred limitations at freeze
+
+* **LIM-D5.19-7** — the broker feed declares `{TICKS, QUOTES}`, not
+  `UNIVERSE_QUOTES`, so ranking and scanner resolve to the baseline and their
+  badge reads *Delayed*. **This is correct and must stay.** A tick has no RSI,
+  MACD or volume, and serving the ranking from it would recreate the exact
+  defect D5.19 was written to fix. Prices still follow the broker via ticks.
+* **LIM-D5.19-1** — `volume_ratio` compares a partial session against complete
+  ones (median 0.50 at midday), so volume-gated presets under-match intraday.
+* **LIM-D5.19-2** — `fetch_real_stock_quote` still substitutes non-null
+  indicator defaults; the substitution is in one named place.
+* **LIM-D5.19-3** — `news_sentiment` is a literal 0.5; the dimension is marked
+  unavailable so it never becomes evidence.
+* **LIM-D5.19-6** — Top AI Picks renders a bare `%`. Pre-existing, present for
+  authenticated and anonymous alike, **not** a D5.19 regression. Visible, and
+  worth fixing early in D6.
+* **LIM-D5.19-8** — the day change lags the tick by a fraction of a percent.
+* **LIM-D5.18-1** — no NSE holiday calendar behind the market clock.
+* **LIM-D5.17-1 / -3 / -4**, **LIM-D5.16-1 / -3 / -4** — carried unchanged.
+* **Session lifecycle (new, not D5's)** — the access token lasts ~1 h, the
+  refresh token expires with it, and a reload drops to `/login` rather than
+  refreshing. It interrupted this run three times. Not a market-data defect;
+  it belongs to D6's identity layer and should be its first fix.
+
+### D6 entry gate
+
+D6 owns the multi-user platform layer. Its **first acceptance gate, before any
+feature work**, should be the one thing D5 could not do:
+
+> Two users, each with their own authenticated broker account, live during
+> market hours — verify A receives none of B's feed, holdings, watchlist or
+> order state, and vice versa.
+
+D5 has proved this per-user by test and proved the *mechanism* live against the
+anonymous identity. Two real broker accounts is the evidence that remains, and
+it is D6's subject rather than D5's debt.

@@ -285,10 +285,21 @@ export default function StockDetail() {
         <div className="ml-auto flex items-center gap-3">
           <div className="text-right">
             <div data-testid="detail-price" className="stat-value">{formatCurrency(quote.price)}</div>
-            <div data-testid="detail-change" className="flex items-center gap-1.5 justify-end text-[13px] font-mono font-semibold" style={{ color: isPos ? "var(--gain)" : "var(--loss)" }}>
-              {isPos ? <TrendingUp size={13} /> : <TrendingDown size={13} />}
-              {isPos ? "+" : ""}₹{formatNumber(Math.abs(quote.change))} ({isPos ? "+" : ""}{quote.change_pct?.toFixed(2)}%)
-            </div>
+            {/* D5.19 live fix — ABSENCE IS NOT ZERO.
+                `Math.abs(null)` is 0, so an unguarded render put a green
+                "+₹0.00 (+%)" beside a live, moving price the moment a thin
+                broker quote served this page. The server now fills the day
+                context from the baseline, and this guard is the second half:
+                if the day's change is genuinely unknown, the page says nothing
+                about it rather than saying it was flat. Same rule, and same
+                shape, as the index strip's `changePct != null`. */}
+            {quote.change_pct != null && (
+              <div data-testid="detail-change" className="flex items-center gap-1.5 justify-end text-[13px] font-mono font-semibold" style={{ color: isPos ? "var(--gain)" : "var(--loss)" }}>
+                {isPos ? <TrendingUp size={13} /> : <TrendingDown size={13} />}
+                {quote.change != null && <>{isPos ? "+" : ""}₹{formatNumber(Math.abs(quote.change))} </>}
+                ({isPos ? "+" : ""}{quote.change_pct.toFixed(2)}%)
+              </div>
+            )}
             {/* Freshness, never provenance (Developer Rule 4). The same claim
                 the ranking table and the feed indicator make, in the same
                 words, so one product does not describe one fact two ways. */}

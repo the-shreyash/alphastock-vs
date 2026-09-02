@@ -1929,6 +1929,17 @@ async def search(q: str = ""):
 async def stock_universe():
     return STOCK_UNIVERSE
 
+#: The fields that describe a trading day rather than a moment.
+#:
+#: Exactly what a canonical `MarketTick` cannot carry: a tick is a price at an
+#: instant, and every one of these needs either a previous session's close or an
+#: aggregate over the current one. Named here rather than inlined because "what
+#: a tick structurally cannot tell you" is the whole reason the fallback below
+#: exists, and a future richer tick shortens this list rather than deleting the
+#: mechanism.
+_DAY_CONTEXT_FIELDS = ("change", "change_pct", "prev_close", "open", "high", "low", "volume")
+
+
 @stocks_router.get("/{symbol}")
 async def stock_detail(symbol: str, user_id: Optional[str] = Depends(get_optional_user_id)):
     """Live details for one instrument, resolved through the Market Gateway.
@@ -1942,9 +1953,70 @@ async def stock_detail(symbol: str, user_id: Optional[str] = Depends(get_optiona
     Answers for indices as well as equities — `NIFTY`, `BANKNIFTY`, `SENSEX`
     and `INDIAVIX` all resolve here, which is what let D-3 reuse this page
     rather than build a second index pipeline.
+
+    D5.19 LIVE FIX — A PRICE SOURCE MAY SUPPLY A PRICE, NOT ERASE A DAY.
+    ------------------------------------------------------------------
+    Making this route user-scoped worked, and broke the page. Measured in the
+    browser on 2026-09-02 at 04:41:02Z with a live broker session, one endpoint
+    answered two callers differently at the same instant:
+
+        AUTHED (broker)   tier=streaming  price=1304.0  change=None  prev_close=None
+        ANON   (baseline) tier=delayed    price=1303.5  change=-5.5  prev_close=1309.0
+
+    A canonical `MarketTick` carries a price and nothing else (LIM-D5.16-1) —
+    no previous close, no OHLC, no volume — and this page renders all of them.
+    So RELIANCE rendered as:
+
+        ₹1,303.70   ↗ +₹0.00 (+%)      OPEN —
+
+    `Math.abs(null)` is 0, so a **fabricated "unchanged"** appeared in green
+    beside a live, moving price. That is the exact fabrication the tick contract
+    exists to refuse, reintroduced by the fix for a different problem.
+
+    The winning feed's price always stands — it is the freshest true statement
+    available. The baseline is asked only for the fields that feed left absent,
+    and only when some are, so a richer future tick costs no second call. Both
+    resolutions go through the Market Gateway; neither bypasses it.
+
+    `source_tier` keeps describing the feed that supplied the **price**, because
+    that is the number the user is looking at. Downgrading it to `delayed`
+    because a previous close was filled in would understate a live price.
+
+    This is the shape the architecture already documents and accepts for the
+    overview — a live index level beside a baseline day change (LIM-D5.17-4) —
+    applied to the surface that renders both.
     """
     quote = await real_quote(symbol, user_id=user_id)
     if quote:
+        missing = [f for f in _DAY_CONTEXT_FIELDS if quote.get(f) is None]
+        if missing and user_id:
+            baseline = await real_quote(symbol)
+            if baseline:
+                # Fill, never replace: a field the feed answered is not touched,
+                # so a stale baseline price can never displace a live one.
+                for field in missing:
+                    if baseline.get(field) is not None:
+                        quote[field] = baseline[field]
+                # The three numbers on screen have to agree with each other.
+                #
+                # Taking `change` straight from the baseline leaves the page
+                # stating a change measured against a price it is not showing —
+                # observed live: price 1306.3 (broker), prev_close 1309.0
+                # (baseline), change -2.2 (baseline, measured against its own
+                # 1303.6), while 1306.3 - 1309.0 is -2.7. Small, and wrong in
+                # the way that matters: a reader who subtracts the two numbers
+                # on the screen gets a third number the screen does not show.
+                #
+                # Both inputs are real facts — a live broker price and a real
+                # previous close — so their difference is the honest day change
+                # and nothing is invented by taking it. Only done when the
+                # previous close actually came from somewhere; absent one, the
+                # change stays absent rather than becoming zero.
+                if quote.get("prev_close") and quote.get("price") is not None:
+                    quote["change"] = round(quote["price"] - quote["prev_close"], 2)
+                    quote["change_pct"] = round(
+                        (quote["change"] / quote["prev_close"]) * 100, 2
+                    )
         return quote
     if not get_stock_meta(symbol):
         raise HTTPException(status_code=404, detail="Stock not found")
