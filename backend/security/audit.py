@@ -124,6 +124,14 @@ PASSWORD_RESET_SUCCESS = "password_reset_success"
 PASSWORD_RESET_FAILURE = "password_reset_failure"
 OAUTH_LOGIN_SUCCESS = "oauth_login_success"
 OAUTH_LOGIN_FAILURE = "oauth_login_failure"
+# Broker authorization (D6.1 / S1). Distinct from the two above: those are the
+# user signing in to StockAssist, these are the user attaching a live brokerage
+# account. Conflating them would put "someone tried to graft a broker account
+# onto another user" in the same bucket as a failed Google sign-in, which is the
+# kind of taxonomy collapse that makes an audit trail unreadable during an
+# incident. `BROKER_AUTH_REJECTED` is the one every S1 ownership check emits.
+BROKER_AUTH_SUCCESS = "broker_auth_success"
+BROKER_AUTH_REJECTED = "broker_auth_rejected"
 
 # Sessions
 SESSION_CREATED = "session_created"
@@ -169,6 +177,11 @@ _EVENT_REGISTRY: dict[str, tuple[str, str, str]] = {
     PASSWORD_RESET_FAILURE: (Category.IDENTITY, Severity.WARNING, Outcome.FAILURE),
     OAUTH_LOGIN_SUCCESS: (Category.IDENTITY, Severity.INFO, Outcome.SUCCESS),
     OAUTH_LOGIN_FAILURE: (Category.IDENTITY, Severity.WARNING, Outcome.FAILURE),
+    BROKER_AUTH_SUCCESS: (Category.IDENTITY, Severity.NOTICE, Outcome.SUCCESS),
+    # SECURITY, not IDENTITY: a rejection here is an ownership check refusing to
+    # bind a real brokerage account, and it is the signal an operator wants
+    # alerted on.
+    BROKER_AUTH_REJECTED: (Category.SECURITY, Severity.WARNING, Outcome.FAILURE),
     # Sessions
     SESSION_CREATED: (Category.SESSION, Severity.INFO, Outcome.SUCCESS),
     SESSION_REVOKED: (Category.SESSION, Severity.NOTICE, Outcome.SUCCESS),

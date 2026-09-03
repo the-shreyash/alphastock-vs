@@ -324,9 +324,22 @@ class BrokerAdapter(ABC):
 
     # -- authentication ----------------------------------------------------
     @abstractmethod
-    def get_login_url(self, user_id: str = None) -> dict:
+    def get_login_url(self, state: str = None) -> dict:
         """OAuth login URL for the browser redirect flow.
         Returns {url, configured, message?}.
+
+        ``state`` is an **opaque, single-use handle** minted by
+        ``security.oauth_state`` and echoed back by the broker on the redirect.
+        It is not, and must never again become, the app's user id.
+
+        D6.1 / S1. This parameter used to be ``user_id``, and every adapter
+        wrote it into the provider's echoed parameter as the literal string
+        ``uid=<mongo object id>``. The public callback then read that value back
+        and believed it, so rewriting one query parameter re-pointed a live
+        brokerage authorization at any account in the system. The value an
+        adapter puts on the wire is now meaningless to anyone who does not hold
+        the server-side record it names, and adapters no longer know — and no
+        longer need to know — which user is connecting.
 
         Abstract rather than capability-gated: a broker StockAssist cannot
         authenticate against is not a broker it can integrate at all, so there

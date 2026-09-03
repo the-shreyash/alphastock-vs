@@ -84,6 +84,8 @@ _LIVE_SERVER_SUITES = frozenset({
 #: exists so the security gate can be run *alone*, not to exclude it.
 _SECURITY_SUITES = frozenset({
     "test_audit.py",
+    # D6.1 — the S1..S7 regression matrix (ownership, isolation, fail-closed).
+    "test_d61_security.py",
     "test_auth_hardening.py",
     "test_cookie_security.py",
     "test_cors_hardening.py",

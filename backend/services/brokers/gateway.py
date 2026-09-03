@@ -174,9 +174,16 @@ class BrokerGateway:
     # no capability to check and an auth failure here is the expected outcome of
     # a user cancelling a login rather than a health signal.
 
-    def login_url(self, broker: str, user_id: str = None) -> Dict[str, Any]:
+    def login_url(self, broker: str, state: str = None) -> Dict[str, Any]:
+        """The browser redirect URL, carrying an opaque single-use ``state``.
+
+        D6.1 / S1. The parameter used to be ``user_id`` and was written into the
+        provider URL verbatim. Nothing below this line has any business knowing
+        which user is connecting: the identity lives in the server-side state
+        record the route minted, and only the route reads it back.
+        """
         adapter = self.resolve(broker)
-        return adapter.get_login_url(user_id=user_id)
+        return adapter.get_login_url(state=state)
 
     def parse_callback_params(self, broker: str, params: Dict[str, str]) -> Optional[dict]:
         """The `exchange_token` payload for a broker's OAuth redirect, or None

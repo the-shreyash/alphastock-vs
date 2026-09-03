@@ -371,7 +371,7 @@ async def fetch_real_market_overview():
         return cached
 
     try:
-        from services.activity_logger import log_activity
+        from services.activity_logger import log_platform_activity as log_activity
         log_activity("Fetching live Nifty/BankNifty data", "scan", "done")
 
         nifty, banknifty, sensex, vix, universe = await asyncio.gather(

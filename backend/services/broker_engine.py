@@ -167,8 +167,9 @@ class BrokerEngine:
     def adapter(self, broker: str) -> BrokerAdapter:
         """DEPRECATED — the registered adapter for `broker`.
 
-        Kept for `zerodha_service.py` (the legacy single-session shim) and for
-        tests that patch adapter methods directly. The engine itself no longer
+        Kept for tests that patch adapter methods directly (the legacy
+        single-session `zerodha_service` shim that was its other consumer is
+        deleted — D6.1 / S3). The engine itself no longer
         calls broker methods through it; it goes through `broker_gateway`, which
         is what guarantees capability enforcement, canonical shapes and error
         normalization. New code must not reach for an adapter.
@@ -200,10 +201,18 @@ class BrokerEngine:
         except Exception as e:
             logger.error(f"Audit log write failed for {action}: {e}")
 
-    def _activity(self, message: str):
+    def _activity(self, user_id: str, message: str):
+        """Append a PRIVATE activity entry owned by `user_id` (D6.1 / S4).
+
+        Every message this method carries is about one account — an order that
+        was placed, a portfolio that was synced, a broker that was connected.
+        These were previously written to the process-global feed and broadcast
+        to every socket, which is how "Order placed on Zerodha: BUY 10 RELIANCE"
+        became readable by other users and by anonymous callers.
+        """
         try:
             from services.activity_logger import log_activity
-            log_activity(message, "monitor", "done")
+            log_activity(message, "monitor", "done", user_id=user_id)
         except Exception:
             pass
 
@@ -291,8 +300,14 @@ class BrokerEngine:
         when the user cancelled."""
         return broker_gateway.parse_callback_params(broker, params)
 
-    def get_login_url(self, broker: str, user_id: str) -> dict:
-        return broker_gateway.login_url(broker, user_id=user_id)
+    def get_login_url(self, broker: str, state: str = None) -> dict:
+        """The broker's browser login URL for a flow identified by ``state``.
+
+        ``state`` is the opaque handle minted by ``security.oauth_state`` and
+        held in a server-side record bound to the initiating user. The engine
+        never puts a user id on the wire (D6.1 / S1).
+        """
+        return broker_gateway.login_url(broker, state=state)
 
     async def complete_auth(self, broker: str, user_id: str, auth_payload: dict) -> dict:
         """Exchange the OAuth callback payload, store the encrypted session,
@@ -302,7 +317,7 @@ class BrokerEngine:
         await self._save_account(user_id, broker, session)
         await self._audit(user_id, "broker.connected", {
             "broker": broker, "account_id": session.get("account_id")})
-        self._activity(f"{adapter.display_name} account connected — live broker session active")
+        self._activity(user_id, f"{adapter.display_name} account connected — live broker session active")
         await self._push(user_id, {"type": "broker_status", "data": {
             "broker": broker, "connected": True}})
         await self._publish_connection(user_id, broker, connected=True)
@@ -357,7 +372,7 @@ class BrokerEngine:
             {"$set": {**{field: "" for field in TOKEN_FIELDS},
                       "connected": False, "disconnected_at": _now_iso()}})
         await self._audit(user_id, "broker.disconnected", {"broker": broker})
-        self._activity(f"{adapter.display_name} account disconnected")
+        self._activity(user_id, f"{adapter.display_name} account disconnected")
         await self._push(user_id, {"type": "broker_status", "data": {
             "broker": broker, "connected": False}})
         await self._publish_connection(user_id, broker, connected=False)
@@ -517,7 +532,7 @@ class BrokerEngine:
 
         await self._audit(user_id, "broker.portfolio.synced", {
             "broker": broker, "holdings": len(holdings), "positions": len(positions)})
-        self._activity(f"{adapter.display_name} portfolio synced — "
+        self._activity(user_id, f"{adapter.display_name} portfolio synced — "
                        f"{len(holdings)} holdings, {len(positions)} positions")
         result = {
             "success": True, "broker": broker, "synced_at": now,
@@ -556,7 +571,7 @@ class BrokerEngine:
             "broker": broker, "order_id": result.get("order_id"),
             "symbol": order.get("symbol"), "transaction_type": order.get("transaction_type"),
             "quantity": order.get("quantity"), "order_type": order.get("order_type")})
-        self._activity(f"Order placed on {adapter_display(broker)}: "
+        self._activity(user_id, f"Order placed on {adapter_display(broker)}: "
                        f"{order.get('transaction_type', 'BUY')} {order.get('quantity')} {order.get('symbol')}")
         return result
 
@@ -1323,24 +1338,23 @@ class BrokerEngine:
         await self.stop_recovery()
         await stream_manager.stop_all()
 
-    # -- legacy compatibility (single-session zerodha_service shim) ------------------------------------------
-    async def any_connected_session(self, broker: str) -> Optional[tuple]:
-        """(user_id, session) of the most recently connected fresh account for
-        `broker` — used only by the legacy zerodha_service module API."""
-        if self.db is None:
-            return None
-        docs = await self.db.broker_accounts.find(
-            {"broker": broker, "connected": {"$ne": False}}
-        ).sort("connected_at", -1).to_list(1)
-        doc = docs[0] if docs else None
-        if not doc:
-            return None
-        user_id = doc.get("user_id")
-        try:
-            session = await self.get_session(user_id, broker)
-            return user_id, session
-        except BrokerAuthError:
-            return None
+    # -- ownership invariant (D6.1 / S3) ---------------------------------------------------------------
+    #
+    # `any_connected_session(broker)` used to live here. It answered "the most
+    # recently connected fresh account for this broker — of ANY user" to a caller
+    # that supplied no identity, and `services/zerodha_service.py` was built
+    # entirely on top of it: `get_holdings()`, `get_positions()`, `get_funds()`,
+    # `get_profile()`, `get_orders()`, `cancel_order()` and — worst —
+    # `place_order()` all took no `user_id`. A live order would have gone to
+    # whichever user happened to have connected most recently.
+    #
+    # Both the method and its only consumer are deleted. The invariant that
+    # replaces them: **every broker operation is addressed by an explicit
+    # `(user_id, broker)` pair**, which is the key of `self._sessions`, the
+    # unique index on `broker_accounts`, and the first parameter of every public
+    # method on this class. There is no implicit or default broker account, and
+    # there is no supported way to ask this engine for "a session" without
+    # saying whose. `tests/test_d61_security.py` asserts the absence.
 
 
 broker_engine = BrokerEngine()

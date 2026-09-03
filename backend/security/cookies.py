@@ -55,13 +55,21 @@ from fastapi import Response
 ACCESS_TOKEN_COOKIE = "access_token"
 REFRESH_TOKEN_COOKIE = "refresh_token"
 OAUTH_STATE_COOKIE = "g_oauth_state"
+# Broker OAuth `state` double-submit cookie (D6.1 / S1). A separate name and a
+# separate path from the Google one because they guard different flows and must
+# never be interchangeable: a state minted for Google sign-in being accepted by
+# the broker callback would reintroduce exactly the cross-flow confusion the
+# namespaced server-side record exists to prevent.
+BROKER_OAUTH_STATE_COOKIE = "b_oauth_state"
 
 ACCESS_TOKEN_MAX_AGE = 86400        # 24h — matches create_access_token() exp
 REFRESH_TOKEN_MAX_AGE = 604800      # 7d  — matches create_refresh_token() exp
 OAUTH_STATE_MAX_AGE = 600           # 10m — single-use CSRF state, short-lived
+BROKER_OAUTH_STATE_MAX_AGE = 600    # 10m — mirrors the server-side record's TTL
 
 AUTH_COOKIE_PATH = "/"              # access/refresh: readable app-wide, cleared in one shot
 OAUTH_STATE_PATH = "/api/auth"      # state: only ever read on the auth routes
+BROKER_OAUTH_STATE_PATH = "/api/brokers"  # broker state: only read on the broker routes
 
 SameSite = Literal["lax", "strict", "none"]
 
@@ -189,6 +197,36 @@ def set_oauth_state_cookie(response: Response, state: str) -> None:
     )
 
 
+def set_broker_oauth_state_cookie(response: Response, state: str) -> None:
+    """Plant the short-lived broker-OAuth ``state`` cookie (D6.1 / S1).
+
+    Scoped to ``/api/brokers`` (the only routes that read it) and never
+    ``Strict``, for the same reason the Google state cookie is not: the broker
+    performs a **top-level redirect** back to
+    ``GET /api/brokers/{broker}/callback``, and ``Strict`` would withhold the
+    cookie on exactly that navigation — turning a correct callback into a
+    rejected one.
+
+    This cookie is planted on the response to ``GET /api/brokers/{broker}/login-url``,
+    which the SPA fetches with credentials. Without ``withCredentials`` the
+    browser discards a cross-origin ``Set-Cookie`` silently, so this control and
+    the frontend cookie fix (D6-L1) are one change, not two.
+    """
+    secure, samesite = _resolved_flags()
+    if samesite == "strict":
+        samesite = "lax"
+    response.set_cookie(
+        key=BROKER_OAUTH_STATE_COOKIE,
+        value=state,
+        httponly=True,
+        secure=secure,
+        samesite=samesite,
+        max_age=BROKER_OAUTH_STATE_MAX_AGE,
+        path=BROKER_OAUTH_STATE_PATH,
+        domain=cookie_domain(),
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Clearers — mirror the set attributes so the browser actually deletes them     #
 # --------------------------------------------------------------------------- #
@@ -206,6 +244,26 @@ def clear_auth_cookies(response: Response) -> None:
             httponly=True,
             samesite=samesite,
         )
+
+
+def clear_broker_oauth_state_cookie(response: Response) -> None:
+    """Burn the broker ``state`` cookie after the callback (matches its scope).
+
+    Called on **every** exit path of the callback — success, rejection and
+    error alike. A state cookie that outlives its flow is a state cookie that
+    can be paired with a second attempt.
+    """
+    secure, samesite = _resolved_flags()
+    if samesite == "strict":
+        samesite = "lax"
+    response.delete_cookie(
+        key=BROKER_OAUTH_STATE_COOKIE,
+        path=BROKER_OAUTH_STATE_PATH,
+        domain=cookie_domain(),
+        secure=secure,
+        httponly=True,
+        samesite=samesite,
+    )
 
 
 def clear_oauth_state_cookie(response: Response) -> None:

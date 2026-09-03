@@ -147,17 +147,28 @@ def test_channel_broadcast_only_reaches_subscribers():
     assert b_sent == []
 
 
-def test_wildcard_channel_subscriber_receives_all():
+def test_the_wildcard_channel_is_refused():
+    """D6.1 / S6. `"*"` matched every channel in `broadcast_to_channel`,
+    including the five that carry private domains — so it was not a convenience,
+    it was an exemption from the subscription check. `subscribe` refuses it.
+
+    `broadcast_to_channel` still honours a `"*"` subscription if one somehow
+    exists; the control is at the point of entry, which is the only place a
+    client can influence.
+    """
     async def run():
         mgr = _new_manager()
         w = FakeWS()
         await mgr.connect(w, "u1")
-        mgr.subscribe(w, ["*"])
+        accepted, refused = mgr.subscribe(w, ["*"])
         await mgr.broadcast_to_channel("scanner", {"type": "event"})
         await mgr.broadcast_to_channel("news", {"type": "event"})
-        return w.sent
+        return accepted, refused, w.sent
 
-    assert len(_run(run())) == 2
+    accepted, refused, sent = _run(run())
+    assert accepted == []
+    assert refused == ["*"]
+    assert sent == [], "a wildcard subscription still received channel broadcasts"
 
 
 def test_unsubscribe_stops_delivery():

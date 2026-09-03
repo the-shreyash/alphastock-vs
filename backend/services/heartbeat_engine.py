@@ -9,6 +9,14 @@ result summary with status `"done"` (or `"warning"` on failure) when it
 finishes — so the AI Activity feed is an honest trace of work actually done,
 never canned strings.
 
+Every task here is **market-wide**, owned by nobody, and therefore imports
+`activity_logger.log_platform_activity` under the local alias `log_activity`
+(D6.1 / S4). The unaliased `log_activity` now requires a `user_id` and is for
+per-account work only. When a task in this module starts producing per-account
+content, it must switch to the private logger rather than reach for the alias —
+the surface that leaked one user's orders to every socket was exactly a
+per-account entry sitting in the platform stream.
+
 A second loop streams live prices over the WebSocket, and the trade/portfolio
 tasks push `trade_update`, `portfolio_update` and `alert` messages that match
 the contracts the frontend (`hooks/useWebSocket.js`) already understands.
@@ -117,7 +125,7 @@ def _next_volume_batch():
 # ═══════════════════════════════════════════════════════════════════════════
 
 async def task_global_markets():
-    from services.activity_logger import log_activity
+    from services.activity_logger import log_platform_activity as log_activity
     from services.real_market import fetch_real_global_markets
     log_activity("Reading Global Markets", "scan", "running")
     try:
@@ -139,7 +147,7 @@ async def task_global_markets():
 
 
 async def task_us_markets():
-    from services.activity_logger import log_activity
+    from services.activity_logger import log_platform_activity as log_activity
     from services.real_market import fetch_yahoo_quote
     log_activity("Reading US Markets", "scan", "running")
     try:
@@ -163,7 +171,7 @@ async def task_us_markets():
 
 
 async def task_fii_dii():
-    from services.activity_logger import log_activity
+    from services.activity_logger import log_platform_activity as log_activity
     from services.real_market import fetch_real_fii_dii
     log_activity("Checking FII/DII Data", "scan", "running")
     try:
@@ -182,7 +190,7 @@ async def task_fii_dii():
 
 
 async def task_scan_news():
-    from services.activity_logger import log_activity
+    from services.activity_logger import log_platform_activity as log_activity
     from services.news_service import fetch_news, filter_breaking_novel
     log_activity("Scanning News", "news", "running")
     try:
@@ -211,7 +219,7 @@ async def task_scan_news():
 
 
 async def task_find_breakouts():
-    from services.activity_logger import log_activity
+    from services.activity_logger import log_platform_activity as log_activity
     from services.real_market import fetch_all_universe_quotes
     log_activity("Finding Breakouts", "scan", "running")
     try:
@@ -246,7 +254,7 @@ async def task_find_breakouts():
 
 
 async def task_check_volume():
-    from services.activity_logger import log_activity
+    from services.activity_logger import log_platform_activity as log_activity
     from services.real_market import fetch_real_stock_quote
     log_activity("Checking Volume", "scan", "running")
     try:
@@ -282,7 +290,7 @@ async def task_check_volume():
 
 
 async def task_scan_momentum():
-    from services.activity_logger import log_activity
+    from services.activity_logger import log_platform_activity as log_activity
     from services.real_market import fetch_all_universe_quotes
     log_activity("Scanning Momentum", "scan", "running")
     try:
@@ -319,7 +327,7 @@ async def task_scanner_sweep():
     scanner results table without polling (Sprint R4). Preset scans reuse the
     30s-cached universe quotes, so a sweep costs ~zero extra upstream calls."""
     global _sweep_ptr
-    from services.activity_logger import log_activity
+    from services.activity_logger import log_platform_activity as log_activity
     from services.market_engine import scanner_engine
     log_activity("Sweeping Scanner Strategies", "scan", "running")
     try:
@@ -369,7 +377,7 @@ async def task_monitor_trades():
     correctly). Paper trades keep a side-aware crossing alert here — the
     engine never touches them, so this is their only watchdog."""
     from services import trade_stream
-    from services.activity_logger import log_activity
+    from services.activity_logger import log_platform_activity as log_activity
     log_activity("Monitoring Open Trades", "monitor", "running")
     try:
         open_trades = await _db.trades.find({"status": "OPEN"}).to_list(200)
@@ -427,7 +435,7 @@ async def task_monitor_portfolio():
     event through the bus/bridge (Sprint R5 — replaces the pre-R5 legacy
     `portfolio_update` push that covered manual trades only)."""
     from services import portfolio_stream
-    from services.activity_logger import log_activity
+    from services.activity_logger import log_platform_activity as log_activity
     log_activity("Monitoring Portfolio", "monitor", "running")
     try:
         open_trades = await _db.trades.find({"status": "OPEN"}).to_list(200)
@@ -475,7 +483,7 @@ async def task_monitor_portfolio():
 
 
 async def task_top_picks():
-    from services.activity_logger import log_activity
+    from services.activity_logger import log_platform_activity as log_activity
     from services.real_market import fetch_real_top_picks
     log_activity("Finding Top Picks", "rank", "running")
     try:
@@ -500,7 +508,7 @@ async def task_top_picks():
 
 
 async def task_sentiment():
-    from services.activity_logger import log_activity
+    from services.activity_logger import log_platform_activity as log_activity
     from services.real_market import fetch_all_universe_quotes
     log_activity("Analyzing Sentiment", "rank", "running")
     try:
@@ -532,7 +540,7 @@ async def task_sentiment():
 
 
 async def task_sector_rotation():
-    from services.activity_logger import log_activity
+    from services.activity_logger import log_platform_activity as log_activity
     from services.real_market import fetch_real_sectors
     log_activity("Checking Sector Rotation", "scan", "running")
     try:
@@ -555,7 +563,7 @@ async def task_sector_rotation():
 
 
 async def task_economic_calendar():
-    from services.activity_logger import log_activity
+    from services.activity_logger import log_platform_activity as log_activity
     from services.news_service import fetch_news
     log_activity("Watching Economic Calendar", "news", "running")
     keywords = ("rbi", "inflation", "gdp", "repo rate", "fed", "interest rate",
@@ -576,7 +584,7 @@ async def task_economic_calendar():
 
 
 async def task_earnings():
-    from services.activity_logger import log_activity
+    from services.activity_logger import log_platform_activity as log_activity
     from services.news_service import fetch_news
     log_activity("Checking Earnings", "news", "running")
     keywords = ("earnings", "quarterly result", "q1 result", "q2 result", "q3 result",
@@ -683,7 +691,7 @@ async def task_watchlist_stream():
     watchlist for an absent user would be a per-user query with a platform-wide
     cost.
     """
-    from services.activity_logger import log_activity
+    from services.activity_logger import log_platform_activity as log_activity
     log_activity("Refreshing Watchlists", "monitor", "running")
     try:
         users = list(getattr(_ws, "user_connections", {}) or {})
@@ -728,7 +736,7 @@ async def task_watchlist_stream():
 
 
 async def task_morning_report():
-    from services.activity_logger import log_activity
+    from services.activity_logger import log_platform_activity as log_activity
     from services.real_market import fetch_real_market_overview
     log_activity("Preparing Morning Report", "rank", "running")
     try:

@@ -613,15 +613,17 @@ class UpstoxAdapter(BrokerAdapter):
         return payload.get("data") if payload.get("data") is not None else payload
 
     # -- authentication ----------------------------------------------------
-    def get_login_url(self, user_id: str = None) -> dict:
+    def get_login_url(self, state: str = None) -> dict:
         api_key, _, redirect = self._credentials()
         if not (api_key and redirect):
             return {"url": None, "configured": False,
                     "message": "Upstox not configured. Add UPSTOX_API_KEY, "
                                "UPSTOX_API_SECRET and UPSTOX_REDIRECT_URL to .env"}
         params = {"response_type": "code", "client_id": api_key, "redirect_uri": redirect}
-        if user_id:
-            params["state"] = f"uid={user_id}"  # echoed back on the callback
+        if state:
+            # The opaque state handle, echoed back on the callback. It used to be
+            # `uid=<app user id>` — see BrokerAdapter.get_login_url (D6.1 / S1).
+            params["state"] = state
         return {"url": f"{AUTH_URL}?{urlencode(params)}", "configured": True}
 
     async def exchange_token(self, auth_payload: dict) -> dict:

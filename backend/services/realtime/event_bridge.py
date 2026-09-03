@@ -10,8 +10,8 @@ This module registers a single catch-all subscriber that:
 
 1. Maps each event to a **socket channel** (market/sectors/scanner/news/…).
 2. Wraps it in a stable ``event`` envelope and delivers it to the right sockets
-   — per-user when the payload carries a ``user_id`` (e.g. notifications),
-   otherwise to every socket subscribed to the event's channel.
+   — per-user when the payload carries a ``user_id``, and, for the domains that
+   are inherently private, **only** then (see ``PRIVATE_DOMAINS``).
 3. Mirrors the event to Redis Pub/Sub so **other processes** deliver it to their
    own local sockets (gap G2). A per-process ``ORIGIN_ID`` guard prevents a
    process from re-delivering its own event, and remote delivery never
@@ -36,6 +36,37 @@ REDIS_EVENT_CHANNEL = "sa:events"
 # Unique per-process id used to drop our own echoes coming back over Redis.
 ORIGIN_ID = uuid.uuid4().hex
 
+#: Domains whose every event is about ONE account and can never be broadcast.
+#:
+#: D6.1 / S6 (was HIGH, structural). Delivery used to read:
+#:
+#:     if user_id:  send_to_user(...)
+#:     else:        broadcast_to_channel(...)
+#:
+#: i.e. "private if the publisher remembered to say so". `trade`, `portfolio`,
+#: `broker`, `notification` and `watchlist` are all routed here, all carry one
+#: user's business, and all fell through to a broadcast channel the moment a
+#: publisher omitted one keyword argument — with nothing failing and nothing
+#: logged. D5.16's watchlist P0 was exactly that failure, already realised once.
+#:
+#: The rule is now the domain's, not the publisher's: an event in one of these
+#: domains without a `user_id` is DROPPED. A publisher that forgets loses its
+#: event — loudly, at WARNING — rather than sending it to everybody.
+#:
+#: WHY A DENY-LIST OF DOMAINS RATHER THAN AN ALLOW-LIST OF EVENTS.
+#: `resolve_channel` deliberately falls through to the domain name for unlisted
+#: domains so a new event family routes somewhere sensible without editing this
+#: file. That fall-through is load-bearing for public market families
+#: (`provider.status` relies on it) and would be a hazard for private ones — but
+#: a private domain is not one a new event family arrives in by accident:
+#: `trade`, `portfolio`, `broker`, `notification` and `watchlist` already exist
+#: and are already named here. `tests/test_d61_security.py` asserts every
+#: DOMAIN_CHANNEL entry is classified one way or the other, so adding a sixth
+#: private domain to the map without deciding its scope fails the suite.
+PRIVATE_DOMAINS: frozenset = frozenset({
+    "trade", "portfolio", "broker", "notification", "watchlist",
+})
+
 # Map an event's leading domain segment to a socket channel. Unlisted domains
 # fall through to the domain name itself, so new event families still route
 # somewhere sensible without a code change here.
@@ -57,6 +88,25 @@ DOMAIN_CHANNEL: Dict[str, str] = {
     # channel every dashboard already subscribes to (Sprint R8).
     "morningreport": "ai",
 }
+
+
+#: Socket channels that carry private domains. `ConnectionManager.subscribe`
+#: refuses these: after the fix above nothing is ever broadcast to them, so a
+#: subscription grants nothing — but a channel nobody can subscribe to is also a
+#: channel a future broadcast cannot leak through.
+PRIVATE_CHANNELS: frozenset = frozenset(
+    channel for domain, channel in DOMAIN_CHANNEL.items() if domain in PRIVATE_DOMAINS
+)
+
+
+def domain_of(event_type: str) -> str:
+    """The leading domain segment of an event type (``trade.closed`` -> ``trade``)."""
+    return (event_type or "").split(".", 1)[0]
+
+
+def is_private_event(event_type: str) -> bool:
+    """True when this event family may only ever be delivered to one user."""
+    return domain_of(event_type) in PRIVATE_DOMAINS
 
 
 def resolve_channel(event_type: str) -> str:
@@ -93,8 +143,22 @@ async def _deliver(ws_manager, event: Dict[str, Any]) -> None:
     if user_id:
         # Per-user events (notifications, per-user portfolio/broker updates).
         await ws_manager.send_to_user(str(user_id), envelope)
-    else:
-        await ws_manager.broadcast_to_channel(channel, envelope)
+        return
+    if is_private_event(event_type):
+        # FAIL CLOSED (D6.1 / S6). The publisher did not say whose event this
+        # is, and the domain says it belongs to somebody. Broadcasting it is the
+        # one outcome that is certainly wrong, so it is dropped.
+        #
+        # WARNING, not debug: this is a publisher bug and it is silent by nature
+        # — the event simply does not arrive, which looks like a realtime
+        # hiccup. This line is the only thing that will point at the real cause.
+        logger.warning(
+            "Dropped private event %r: no user_id in payload. A %s.* event must "
+            "carry the owning user's id; see PRIVATE_DOMAINS in this module.",
+            event_type, domain_of(event_type),
+        )
+        return
+    await ws_manager.broadcast_to_channel(channel, envelope)
 
 
 def make_bridge(ws_manager):

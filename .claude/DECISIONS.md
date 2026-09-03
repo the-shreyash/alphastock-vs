@@ -3759,3 +3759,258 @@ broker feed (LIM-D5.19-5). D-4's fix is TEST VERIFIED, not LIVE VERIFIED.
 financial transaction.
 
 # End of Decisions Documentation
+
+---
+
+# ADR-059 — A broker authorization belongs to the session that started it, not to a query parameter (D6.0)
+
+**Status:** Accepted (audit only — no code changed in D6.0)
+**Date:** 2026-09-02
+**Supersedes nothing. Constrains all of D6.**
+
+## Context
+
+D5 froze with the per-user market-data path proven live. D6 owns the user
+dimension. The D6.0 audit asked whether the platform outside market data is
+per-user, and found that the *ownership model* is right — `owner_user_id` on
+providers, `(user_id, broker)` on accounts, `user_id` threaded through the
+engine and the gateway — while four unauthenticated surfaces breach it in
+practice.
+
+One of them is not a data leak. `GET /api/brokers/{broker}/callback` resolves
+the owning user from `uid` in the query string, or from `state` when `state`
+begins `uid=`. Zerodha echoes that value back through `redirect_params`; Upstox
+carries it as an unsigned `state`. There is no nonce, no signature, no binding
+to the session that began the flow, no single use, and no expiry. So a broker
+authorization can be attached to any user id an attacker names — in either
+direction. The serious direction is that a victim's live brokerage session can
+be grafted onto an attacker's account: holdings, positions, funds, and order
+placement, in a real account.
+
+The same file already does this correctly for Google: `_store_oauth_state` /
+`_consume_oauth_state`, single-use, TTL'd, server-side, plus an HttpOnly
+`g_oauth_state` cookie. The broker flow simply does not use it.
+
+## Decision
+
+**A broker authorization is owned by the authenticated session that initiated
+it. Ownership may never be read from client-supplied data.**
+
+Three consequences, binding on D6:
+
+1. **The callback must resolve its owner from a server-side, single-use,
+   TTL'd state record bound to the initiating session by an HttpOnly cookie.**
+   A callback whose state does not resolve is rejected, not defaulted. The
+   Google primitive is reused rather than reimplemented.
+2. **No API may accept "some user's broker session".**
+   `BrokerEngine.any_connected_session` and `services/zerodha_service.py` are
+   deleted, not maintained. Every broker entry point takes an explicit
+   `(user_id, broker_account_id)` with no default and no "most recent"
+   fallback. `zerodha_service.place_order` — which would have placed a real
+   order in whichever user connected last — is the reason this is a rule and
+   not a preference.
+3. **A market-data value carries its redistribution class, not a remembered
+   licence.** Providers declare `personal-use-only` or `redistributable`, so
+   "may this be shown to a caller who is not its owner?" is answered by data.
+   `GET /api/data-sources` publishing a real user's Kite profile — name, email,
+   client id — to anonymous callers is what a remembered licence looks like
+   when it is forgotten.
+
+## Why not just add an auth dependency to the callback
+
+Because the callback is a browser redirect from the broker and cannot carry a
+credential the app controls. That is exactly what OAuth `state` is for, and the
+codebase already has the mechanism. Adding `Depends(get_current_user)` would
+break the flow; signing the state fixes it.
+
+## Consequences
+
+* D6.1 is security-only and blocks every other D6 phase.
+* The D6 entry gate gains a row that is a regression test for this ADR: replay
+  A's callback with `uid=B` and require rejection.
+* Six of the entry gate's twelve rows fail against today's code, which is why
+  the gate precedes feature work rather than following it.
+* LIM-D5.19-7 (ranking/scanner resolve to the baseline, badged *Delayed*) is
+  now load-bearing for a second reason: it is the Zerodha personal-use posture,
+  not only correct engineering. It must stay.
+
+## Amendment (2026-09-02) — verification pass
+
+ADR-059 was written before its session was cleared. Its claims were
+subsequently re-derived from source rather than from the report: **eleven of
+eleven substantive findings re-confirmed at their cited lines** (S1's `uid`
+read at `server.py:4292-4306`, the broker echoes at `zerodha.py:302` and
+`upstox.py:624`, the unauthenticated `/api/data-sources`, the order string in
+`broker_engine.py:559`, the missing `withCredentials`, the missing
+`X-CSRF-Token`, the 900 s access TTL against an 86400 s cookie, the
+`(user_id, broker)` unique index, and `PLACE_ORDER` declared by Zerodha and
+Upstox only). Regression re-measured at 4465 passed / 15 pre-existing
+environmental failures — unchanged, as it must be for a read-only sprint.
+
+**One correction.** The audit recommended adding order-capability gating "so a
+broker with no `PLACE_ORDER` does not reach an adapter". That control already
+exists: `BrokerGateway.place_order` calls
+`require_capability(broker, BrokerCapability.PLACE_ORDER)`
+(`services/brokers/gateway.py:281`, raising at `gateway.py:98-103`) before any
+adapter call, on place, modify and cancel alike. What remains open is the HTTP
+shape that guard produces at the route, and that the order route is exposed for
+all five brokers when three declare no order capability — a UX and route-shape
+task, not a missing security control. **This does not weaken the ADR**; it
+narrows one recommendation. It is recorded because "the control is missing" and
+"the control exists but is untested at the boundary" lead to different work, and
+only the second is true here.
+
+**Two brief requirements the audit omitted, now binding on D6:**
+
+4. **Data quality is a state, not a null.** The brief's six states —
+   AVAILABLE / MISSING / INSUFFICIENT_HISTORY / STALE / PROVIDER_ERROR /
+   UNAVAILABLE — do not exist; `dimension_is_supported` is a two-state check
+   layered over `quote.get("rsi") or 50.0`. D5.19 fixed the instance and said
+   in its own comment that it had not fixed the class. **STALE is the state
+   that matters most**, because a real reading from a dead feed currently
+   scores as fresh. D6.8 is restored to Data Quality / Intelligence Isolation.
+5. **A mock broker is part of the architecture, not a convenience.** No
+   `MockBrokerProvider` exists. `services/paper_trade.py` is not one — it is
+   correctly user-scoped but writes `db.trades` directly and never crosses
+   `BrokerGateway`, so it exercises no routing, capability, session or error
+   path. Without a mock adapter that declares the full capability set, gate row
+   9 ("A's order routes to A's account") is only assertable by placing a live
+   order, which the brief forbids. D6.6 owns it.
+
+
+---
+
+# ADR-060 — Ownership is resolved from server-side state, and every private channel fails closed (D6.1)
+
+**Status:** Accepted (implemented)
+**Date:** 2026-09-03
+**Implements:** ADR-059. **Constrains:** every subsequent D6 phase.
+
+## Context
+
+ADR-059 recorded what D6.0 found and forbade; it changed no code. D6.1 is the
+implementation, scoped to the CRITICAL and HIGH findings (S1–S6), the two
+MEDIUM ones that were cheap and genuinely cross-user (S7's credential half, S8),
+and the session-lifecycle defects (L1–L4) that had to land as one change.
+
+Seven defects, but only **three distinct root causes**, and naming them is what
+made the fix a design rather than seven patches:
+
+1. **An identifier was treated as a capability.** The broker callback's `uid`
+   (S1) and the chat `session_id` (S5) were both client-supplied names that the
+   server acted on as though holding the name proved the right to the thing.
+2. **An answer was computed without asking whose it was.** `kite_status()`
+   scanning every session (S2), `any_connected_session(broker)` returning the
+   most recent account of any user (S3), and one process-global activity deque
+   serving every caller (S4) are the same shape: a question with no subject.
+3. **The absence of ownership information was read as permission.** The event
+   bridge broadcast a private event when its publisher omitted `user_id` (S6),
+   and `ConnectionManager.subscribe` authorized nothing at all.
+
+## Decision
+
+### 1. Ownership comes from a server-side record, never from callback input
+
+`security/oauth_state.py` is the Google PH1.2 primitive, lifted out so both
+flows share one implementation: a 256-bit opaque handle naming a namespaced,
+single-use, TTL-bounded record. `GET /api/brokers/{broker}/login-url` is
+authenticated, mints the handle, stores `{user_id, broker}` against it, and
+plants it in an HttpOnly `b_oauth_state` cookie. The public callback resolves
+the owner by consuming the record, and additionally requires the echoed handle
+to equal the cookie.
+
+**Both checks are mandatory, because they defeat different attacks.** The
+record stops *"graft the attacker's broker onto a victim"* — an attacker cannot
+mint a victim-bound state without authenticating as them. The **cookie** stops
+the mirror image, *"graft a victim's broker onto the attacker"*, in which the
+attacker mints a perfectly valid state bound to themselves and lures the victim
+through the broker login with it. That state verifies; only the cookie living
+in the wrong browser rejects it. That attack hands over a real brokerage
+account, so the cookie check is not defence in depth — it is load-bearing.
+
+No adapter puts a user id on the wire any more. `get_login_url(user_id)` became
+`get_login_url(state)` in the base class and all five adapters, and the
+`uid=` convention is gone from the codebase.
+
+### 2. Every broker operation is addressed by `(user_id, broker)`
+
+`BrokerEngine.any_connected_session` and `services/zerodha_service.py` are
+**deleted**, not deprecated. The invariant that replaces them is asserted
+mechanically: `user_id` is the first positional parameter of every public data
+and order method on the engine, and there is no supported way to ask it for "a
+session" without saying whose.
+
+### 3. Private-by-domain, fail-closed
+
+`event_bridge.PRIVATE_DOMAINS` = `{trade, portfolio, broker, notification,
+watchlist}`. An event in one of those domains **without** a `user_id` is
+DROPPED and logged at WARNING. The rule belongs to the domain, not to the
+publisher's memory. `ConnectionManager.subscribe` refuses the five channels
+those domains route to, and refuses `"*"` — which was not a convenience but an
+exemption from the check.
+
+### 4. The scope of an activity entry is a required argument, not a convention
+
+`log_activity(action, category, status, *, user_id)` — keyword-only, no
+default. A caller that does not know whose activity it is gets a `TypeError` at
+the call site. `log_platform_activity` is the deliberate exemption for
+market-wide work, and a test sweeps which modules may import it.
+
+**This is the strongest form of enforcement available and it was chosen over a
+lint rule or a review checklist on purpose.** D6.0's standing complaint about
+the event bridge was that it sat "one omitted keyword argument away from
+recurring, and nothing would fail". Here, omitting it fails immediately.
+
+### 5. The frontend is cookie-capable, and a dead session says so
+
+`withCredentials: true`, `X-CSRF-Token` echoed on mutations and added to the
+server's CORS `ALLOWED_HEADERS`, one promise-coalescing refresh queue, and an
+explicit `SESSION_EXPIRED` signal that is not the same thing as
+`USER_SIGNED_OUT`. The WebSocket distinguishes a handshake rejection (closed
+before `accept()` — a credential problem) from a drop after open (a network
+problem) and stops re-offering a dead token.
+
+The Bearer token is kept as a bootstrap credential and dropped on the first
+successful refresh, after which the SPA is purely cookie-authenticated. That
+transition is deliberate: it is the point at which cookies are *proven* to
+work, so it is the earliest moment a long-lived credential can safely leave
+JavaScript's reach.
+
+## Why the CORS header and the cookie fix had to be one change
+
+`security/csrf.py` requires `X-CSRF-Token` on cookie-authenticated mutations,
+and that header was **not** in `ALLOWED_HEADERS`. Latent only while the SPA
+authenticated with a Bearer token and never sent it. Fixing `withCredentials`
+alone would have moved the client onto the cookie path and then had the
+browser's preflight refuse the header — 403 on every mutation in the
+application. A session fix that breaks the app is not a fix.
+
+## What this ADR does not claim
+
+* **S1 was closed by reading the code path and by hermetic regression tests**,
+  not by firing a real broker callback. LIM-D6.0-3 is inherited unchanged.
+* **Dhan cannot use the public callback at all.** Its consent flow has no
+  echoed state parameter, so the callback cannot establish ownership and
+  refuses it. That is the correct fail-closed answer and not a working Dhan
+  integration (LIM-D6.1-1).
+* **S7 is half done by design.** The credential teardown is closed; the
+  orphaned-data cascade needs the ownership registry and stays D6.4's
+  (LIM-D6.1-2).
+* **The access cookie still outlives its token 96×** (D6-L5, LOW). Out of the
+  brief's scope, and the token's own `exp` is the authoritative control — a
+  cookie `Max-Age` is not a security boundary.
+
+## Consequences
+
+* `/api/data-sources` now requires authentication and returns `brokers` (this
+  caller's own per-broker status) in place of the flat `zerodha` key that was
+  one arbitrary user's live Kite profile.
+* Three activity endpoints stay readable signed out and return the platform
+  stream only. The leak was closed by scoping the content, not by withdrawing
+  the endpoint — 401-ing a public surface would be a behaviour change dressed
+  up as a scoping fix.
+* Adding a sixth private domain to `DOMAIN_CHANNEL` without classifying it
+  fails `test_d61_security.py`. So does a new publisher of a private event that
+  omits `user_id`, and a per-account module importing the platform logger.
+* D5 is untouched. No market-data, gateway, ranking, scanner or feed-state code
+  was modified.

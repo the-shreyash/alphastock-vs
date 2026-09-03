@@ -44,7 +44,9 @@ Design decisions:
   ``*``. ``OPTIONS`` is included so the middleware can answer preflight.
 * **Request headers** — restricted to the headers the frontend actually sends
   (``Authorization``, ``Content-Type``, ``Accept``, ``Origin``,
-  ``X-Requested-With``) rather than reflecting ``*``.
+  ``X-Requested-With``, ``X-CSRF-Token``) rather than reflecting ``*``. The
+  CSRF header is load-bearing, not decorative: see the note on
+  ``ALLOWED_HEADERS`` below.
 * **Exposed response headers** — none. Authentication is cookie-based, so the
   client never needs to read a custom response header; nothing extra is
   exposed.
@@ -88,7 +90,17 @@ ALLOWED_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
 
 # Request headers the frontend actually sends. Anything else is rejected at
 # preflight instead of being blanket-reflected.
-ALLOWED_HEADERS = ["Authorization", "Content-Type", "Accept", "Origin", "X-Requested-With"]
+#
+# X-CSRF-Token (D6.1 / L4): the CSRF layer (security/csrf.py) requires this
+# header on every cookie-authenticated mutation, and it was NOT on this list.
+# That was latent only for as long as the SPA authenticated with a Bearer token
+# and never sent it. The moment the frontend was moved onto the cookie path
+# (D6-L1, `withCredentials`), the browser's preflight would have refused to send
+# the header and **every mutation in the application would have 403'd** — a
+# session fix that breaks the app instead. The two changes therefore land
+# together, and this entry is why they had to.
+ALLOWED_HEADERS = ["Authorization", "Content-Type", "Accept", "Origin",
+                   "X-Requested-With", "X-CSRF-Token"]
 
 # Response headers the browser is permitted to read. Cookie-based auth needs
 # none; the one exception is the request-correlation ID.
