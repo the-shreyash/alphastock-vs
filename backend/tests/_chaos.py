@@ -388,7 +388,7 @@ class ChaosAdapter(BrokerAdapter):
     #: need a per-connection limit (sharding) or a handshake verdict.
     channel_class = ChaosChannel
 
-    def get_login_url(self, user_id: str = None) -> dict:
+    def get_login_url(self, state: str = None) -> dict:
         return {"url": "https://chaos.example/login", "configured": True}
 
     async def exchange_token(self, auth_payload: dict) -> dict:

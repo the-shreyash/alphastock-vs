@@ -92,7 +92,9 @@ async def generate_close_intelligence(
             review_func = _default_review
 
         from services.activity_logger import log_activity
-        log_activity(f"Reviewing closed {trade.get('symbol')} trade", "monitor", "running")
+        # Private: names the user's own traded symbol (D6.1 / S4).
+        log_activity(f"Reviewing closed {trade.get('symbol')} trade", "monitor", "running",
+                     user_id=str(trade.get("user_id")))
         review = await review_func(trade)
         if not review or not review.get("content"):
             return None
@@ -126,7 +128,8 @@ async def generate_close_intelligence(
         except Exception as e:
             logger.warning(f"Trade review notification failed: {e}")
 
-        log_activity(f"Trade review ready for {trade.get('symbol')}", "monitor", "done")
+        log_activity(f"Trade review ready for {trade.get('symbol')}", "monitor", "done",
+                     user_id=str(trade.get("user_id")))
         return review
     except Exception as e:
         logger.error(f"Trade review generation failed for {trade_id}: {e}")

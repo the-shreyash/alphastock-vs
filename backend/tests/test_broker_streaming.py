@@ -450,7 +450,7 @@ class NovaAdapter(BrokerAdapter):
     default_product = "DELIVERY"
     stream_protocol = "nova_feed"
 
-    def get_login_url(self, user_id: str = None) -> dict:
+    def get_login_url(self, state: str = None) -> dict:
         return {"url": "https://nova.example/login", "configured": True}
 
     async def exchange_token(self, auth_payload: dict) -> dict:
@@ -4697,22 +4697,22 @@ def test_the_angelone_login_flow_is_a_browser_redirect_and_holds_no_user_secret(
     """
     monkeypatch.setenv("ANGELONE_API_KEY", "app-key")
     monkeypatch.setenv("ANGELONE_REDIRECT_URL", "https://app.test/api/brokers/angelone/callback")
-    login = _angelone().get_login_url("user-123")
+    login = _angelone().get_login_url("opaque-handle-123")
 
     assert login["configured"] is True
     assert login["url"].startswith("https://smartapi.angelone.in/publisher-login?")
     assert "api_key=app-key" in login["url"]
-    # `uid=` is the platform's own convention for the state parameter, and the
-    # shared callback route reads it — a broker that spelled it differently
-    # would connect to nobody.
-    assert "state=uid%3Duser-123" in login["url"]
+    # D6.1 / S1: `state` carries the opaque single-use handle the route minted.
+    # It used to carry `uid=<app user id>`, which the public callback trusted.
+    assert "state=opaque-handle-123" in login["url"]
+    assert "uid" not in login["url"], "a user id is back on the wire (D6-S1)"
     for absent in ("password", "totp", "pin"):
         assert absent not in login["url"].lower()
 
     # SmartAPI will not redirect without a registered URL, so a deployment
     # missing one is reported as unconfigured rather than sent to a dead link.
     monkeypatch.setenv("ANGELONE_REDIRECT_URL", "")
-    assert _angelone().get_login_url("user-123")["configured"] is False
+    assert _angelone().get_login_url("opaque-handle-123")["configured"] is False
     assert _angelone().is_configured() is False
 
 
@@ -6013,17 +6013,19 @@ def test_the_fyers_login_flow_is_a_browser_redirect_and_holds_no_user_secret(mon
     monkeypatch.setenv("FYERS_APP_ID", "APP-100")
     monkeypatch.setenv("FYERS_SECRET_ID", "SECRET-XYZ")
     monkeypatch.setenv("FYERS_REDIRECT_URL", "https://app.example/api/brokers/fyers/callback")
-    login = _fyers().get_login_url("u1")
+    login = _fyers().get_login_url("opaque-handle-1")
 
     assert login["configured"] is True
     assert login["url"].startswith("https://api-t1.fyers.in/api/v3/generate-authcode?")
-    assert "client_id=APP-100" in login["url"] and "uid%3Du1" in login["url"]
+    # D6.1 / S1: opaque handle, never the app's user id.
+    assert "client_id=APP-100" in login["url"] and "state=opaque-handle-1" in login["url"]
+    assert "uid" not in login["url"], "a user id is back on the wire (D6-S1)"
     # The app SECRET is never in a URL a browser follows — only its digest ever
     # travels, and only on the server-to-server exchange.
     assert "SECRET-XYZ" not in login["url"]
 
     monkeypatch.setenv("FYERS_SECRET_ID", "")
-    assert _fyers().get_login_url("u1")["configured"] is False
+    assert _fyers().get_login_url("opaque-handle-1")["configured"] is False
 
 
 def test_the_fyers_callback_reads_auth_code_and_not_the_status_named_code():

@@ -111,10 +111,10 @@ class AcmeBrokerAdapter(BrokerAdapter):
     #: would have silently placed every Acme order with Upstox's product code.
     default_product = "DELIVERY"
 
-    def get_login_url(self, user_id: str = None) -> dict:
+    def get_login_url(self, state: str = None) -> dict:
         if not self.is_configured():
             return {"url": None, "configured": False, "message": "Acme not configured"}
-        return {"url": f"https://acme.example/login?uid={user_id}", "configured": True}
+        return {"url": f"https://acme.example/login?state={state}", "configured": True}
 
     async def exchange_token(self, auth_payload: dict) -> dict:
         return {

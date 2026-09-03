@@ -563,7 +563,7 @@ class AngelOneAdapter(BrokerAdapter):
         return payload.get("data")
 
     # -- authentication ------------------------------------------------------
-    def get_login_url(self, user_id: str = None) -> dict:
+    def get_login_url(self, state: str = None) -> dict:
         credentials = self.credentials
         if not credentials.api_key:
             return {"url": None, "configured": False,
@@ -573,13 +573,13 @@ class AngelOneAdapter(BrokerAdapter):
                     "message": "Angel One not configured. Add ANGELONE_API_KEY and "
                                "ANGELONE_REDIRECT_URL to .env"}
         params = {"api_key": credentials.api_key, "redirect_url": credentials.redirect_url}
-        if user_id:
-            # SmartAPI echoes `state` back on the redirect, which is how the
-            # public callback maps the session to the right app user — the same
-            # role Upstox's `state` plays and Kite's `redirect_params` plays.
-            # The `uid=` prefix is the platform's own convention for that
-            # parameter, not SmartAPI's, and the shared callback route reads it.
-            params["state"] = f"uid={user_id}"
+        if state:
+            # SmartAPI echoes `state` back on the redirect. What it carries is an
+            # opaque single-use handle naming a server-side record; the callback
+            # resolves the owning user from that record, never from this value.
+            # It used to carry `uid=<app user id>` — see
+            # BrokerAdapter.get_login_url (D6.1 / S1).
+            params["state"] = state
         return {"url": f"{LOGIN_URL}?{urlencode(params)}", "configured": True}
 
     def parse_callback_params(self, params: Dict[str, str]) -> Optional[dict]:

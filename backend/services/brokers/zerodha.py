@@ -292,16 +292,18 @@ class ZerodhaAdapter(BrokerAdapter):
         return payload.get("data") or {}
 
     # -- authentication ----------------------------------------------------
-    def get_login_url(self, user_id: str = None) -> dict:
+    def get_login_url(self, state: str = None) -> dict:
         api_key, _ = self._credentials()
         if not api_key:
             return {"url": None, "configured": False,
                     "message": "Zerodha API key not configured. Add KITE_API_KEY to .env"}
         url = f"{LOGIN_URL}?v=3&api_key={api_key}"
-        if user_id:
-            # Kite echoes redirect_params back onto the registered redirect
-            # URL, letting the public callback identify the app user.
-            url += f"&redirect_params={quote(f'uid={user_id}')}"
+        if state:
+            # Kite echoes redirect_params back onto the registered redirect URL.
+            # What rides in it is the opaque state handle and nothing else — see
+            # BrokerAdapter.get_login_url for why this used to be `uid=<user id>`
+            # and why that was a critical defect (D6.1 / S1).
+            url += f"&redirect_params={quote(f'state={state}')}"
         return {"url": url, "configured": True}
 
     async def exchange_token(self, auth_payload: dict) -> dict:

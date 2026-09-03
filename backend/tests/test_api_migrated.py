@@ -137,16 +137,19 @@ class TestGoogleSessionValidation:
 # Data sources (from test_phase2 / 4 / 5)                                       #
 # --------------------------------------------------------------------------- #
 class TestDataSources:
-    def test_status_lists_every_integration(self, client, fake_db):
-        resp = client.get("/api/data-sources")
+    def test_status_lists_every_integration(self, authenticated_client, fake_db):
+        resp = authenticated_client.get("/api/data-sources")
         assert resp.status_code == 200
         body = resp.json()
-        for source in ("alpha_vantage", "zerodha", "ai", "whatsapp"):
+        # D6.1 / S2: the flat `zerodha` key (which was one arbitrary user's live
+        # Zerodha profile, PII included) is replaced by `brokers`, the CALLER's
+        # own per-broker connection status from `broker_engine.get_status`.
+        for source in ("alpha_vantage", "brokers", "ai", "whatsapp"):
             assert source in body, f"{source} missing from the data-source status"
 
     @pytest.mark.parametrize("smtp_port", ["", "  ", "587"])
     def test_a_blank_smtp_port_does_not_break_the_status_page(
-            self, client, fake_db, monkeypatch, smtp_port):
+            self, authenticated_client, fake_db, monkeypatch, smtp_port):
         """PH3.3 defect D-11. `SMTP_PORT` was read with
         `os.environ.get("SMTP_PORT", "587")`, whose default applies only when
         the key is *absent*. A declared-but-empty value — what every deployment
@@ -155,7 +158,7 @@ class TestDataSources:
         outbound email including password reset.
         """
         monkeypatch.setenv("SMTP_PORT", smtp_port)
-        resp = client.get("/api/data-sources")
+        resp = authenticated_client.get("/api/data-sources")
         assert resp.status_code == 200, resp.text[:200]
 
     def test_email_status_defaults_the_port_when_blank(self, monkeypatch):
@@ -164,11 +167,11 @@ class TestDataSources:
         assert get_status()["configured"] is False
 
     def test_every_integration_reports_unconfigured_in_a_hermetic_run(
-            self, client, fake_db):
+            self, authenticated_client, fake_db):
         """The counterpart to the network guard: `_testenv.py` blanks every
         third-party credential, so anything reporting `configured: true` here
         means a real key reached the suite."""
-        body = client.get("/api/data-sources").json()
+        body = authenticated_client.get("/api/data-sources").json()
         assert body["ai"]["configured"] is False, \
             "an AI provider is configured during a hermetic run — a real key leaked in"
         assert body["alpha_vantage"]["configured"] is False

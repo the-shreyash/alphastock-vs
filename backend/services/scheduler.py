@@ -155,7 +155,7 @@ async def trade_monitor_job(db, ws_broadcast):
         from services.real_market import fetch_real_stock_quote
         from services.portfolio_monitor import run_monitoring_cycle
         from services.whatsapp_service import send_whatsapp, is_configured as wa_configured
-        from services.activity_logger import log_activity
+        from services.activity_logger import log_platform_activity as log_activity
 
         # Use real stock quote function with async wrapper
         async def real_quote_func(symbol: str):

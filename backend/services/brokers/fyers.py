@@ -1234,7 +1234,7 @@ class FyersAdapter(BrokerAdapter):
         return payload
 
     # -- authentication ------------------------------------------------------
-    def get_login_url(self, user_id: str = None) -> dict:
+    def get_login_url(self, state: str = None) -> dict:
         credentials = self.credentials
         if not credentials.api_key or not credentials.api_secret:
             return {
@@ -1249,12 +1249,13 @@ class FyersAdapter(BrokerAdapter):
             "redirect_uri": credentials.redirect_url,
             "response_type": "code",
         }
-        if user_id:
-            # Fyers echoes `state` back on the redirect, which is how the public
-            # callback maps the session to the right app user — the same role it
-            # plays for Upstox and Angel One. The `uid=` prefix is the platform's
-            # own convention for that parameter, not Fyers'.
-            params["state"] = f"uid={user_id}"
+        if state:
+            # Fyers echoes `state` back on the redirect. It carries an opaque
+            # single-use handle naming a server-side record; the callback resolves
+            # the owning user from that record, never from this value. It used to
+            # carry `uid=<app user id>` — see BrokerAdapter.get_login_url
+            # (D6.1 / S1).
+            params["state"] = state
         return {"url": f"{BASE_URL}/generate-authcode?{urlencode(params)}", "configured": True}
 
     def parse_callback_params(self, params: Dict[str, str]) -> Optional[dict]:

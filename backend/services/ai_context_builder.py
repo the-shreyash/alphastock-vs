@@ -437,9 +437,12 @@ async def _assemble(db, user: dict, quotes_map_func: QuotesMapFunc) -> ChatConte
     pnl = portfolio_engine.compute_pnl(holdings) if holdings else None
     risk = portfolio_engine.compute_risk_score(holdings) if holdings else None
 
-    # Recent platform AI activity (in-memory, synchronous).
+    # Recent AI activity for THIS user: the platform stream plus their own
+    # private entries (D6.1 / S4). Passing the id is what keeps another user's
+    # orders and questions out of this user's model context — the unscoped call
+    # here put the global deque, private entries and all, into every prompt.
     try:
-        activity = get_recent_activity()
+        activity = get_recent_activity(str(user_id) if user_id else None)
     except Exception:  # noqa: BLE001
         activity = []
 

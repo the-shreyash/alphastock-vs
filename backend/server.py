@@ -77,7 +77,6 @@ from urllib.parse import urlencode
 from services.alpha_vantage import get_global_quote as av_get_quote, get_intraday_data as av_intraday, is_configured as av_configured
 # Legacy single-session Zerodha shim (data-sources status + startup log only).
 # All broker routes go through services.broker_engine (Sprint 7).
-from services.zerodha_service import get_status as kite_status, is_configured as kite_configured
 from services.broker_engine import broker_engine
 from services.brokers.base import BrokerAuthError, BrokerError
 from services.brokers.stream import stream_manager
@@ -95,12 +94,16 @@ from services.market_engine import Capability, SourceTier, market_gateway
 # posture stays consistent across login, register, refresh, logout and OAuth.
 from security.cookies import (
     ACCESS_TOKEN_COOKIE,
+    BROKER_OAUTH_STATE_COOKIE,
     set_auth_cookies,
     set_access_cookie,
     clear_auth_cookies,
     set_oauth_state_cookie,
     clear_oauth_state_cookie,
+    set_broker_oauth_state_cookie,
+    clear_broker_oauth_state_cookie,
 )
+from security import oauth_state as oauth_state_store
 from security import api_docs
 from security.cors import apply_cors
 from security.headers import apply_security_headers
@@ -703,10 +706,24 @@ async def ai_chat(message: str, session_id: str, user_context: dict, run_id: str
     system_msg = get_prompt("ai_chat", memory="", live_context=live_context)
 
     # Step 2 — Load this session's recent turns for continuity.
+    #
+    # D6.1 / S5 (was HIGH). This query used to filter on `session_id` ALONE, and
+    # `session_id` is supplied by the client (`models.ChatMessage`) with a
+    # default of `chat-<user_id>` — i.e. guessable from a user id. A caller who
+    # named another user's session got that user's last ten turns loaded as the
+    # model's context, and the model would readily quote them back. Ownership is
+    # now part of the filter, so a foreign session id selects nothing and the
+    # reply is simply context-free.
+    #
+    # `GET /api/chat/history` was always scoped correctly; only this write-path
+    # context load was not, which is why it survived review.
+    owner_id = str(user_context.get("_id") or "")
     messages_list = []
     try:
         async with run.step():
-            history = await db.chat_messages.find({"session_id": session_id}).sort("created_at", -1).to_list(10)
+            history = await db.chat_messages.find(
+                {"session_id": session_id, "user_id": owner_id}
+            ).sort("created_at", -1).to_list(10)
             history.reverse()
             messages_list = [AIMessage(role=h["role"], content=h["content"]) for h in history]
     except Exception as e:
@@ -1744,9 +1761,22 @@ async def market_summary():
     return {"summary": summary, "generated_at": datetime.now(timezone.utc).isoformat()}
 
 @market_router.get("/activity-feed")
-async def activity_feed():
+async def activity_feed(caller_id: Optional[str] = Depends(get_optional_user_id)):
+    """The AI Activity feed for THIS caller.
+
+    D6.1 / S4. This used to return the process-global deque to anyone — signed
+    in or not — and that deque held other users' orders, portfolio sizes and AI
+    questions. It now returns the platform stream merged with the caller's own
+    private entries, and there is no argument that reaches anyone else's.
+
+    Deliberately `get_optional_user_id` rather than `get_current_user`: the
+    platform stream ("Scanning News", "Finding Breakouts") is a legitimate
+    signed-out surface and 401-ing it would be a behaviour change dressed up as
+    a scoping fix. The leak is closed by scoping the *content*, not by
+    withdrawing the endpoint.
+    """
     from services.activity_logger import get_recent_activity
-    return get_recent_activity()
+    return get_recent_activity(caller_id)
 
 
 # ── Market Engine endpoints ──────────────────────────
@@ -2032,8 +2062,12 @@ async def stock_chart(symbol: str, period: str = "1D"):
 async def stock_patterns(symbol: str):
     """Detect classic chart patterns for a given symbol using 3 months of OHLCV data."""
     from services.real_market import detect_chart_patterns
-    from services.activity_logger import log_activity
-    log_activity(f"Scanning chart patterns for {symbol.upper()}", "scan", "done")
+    # PLATFORM scope (D6.1 / S4): this route takes no identity at all and the
+    # symbol it names is public reference data the same endpoint returns. There
+    # is no user to own the entry. If this endpoint ever gains a caller
+    # identity, this must become the private logger and take their id.
+    from services.activity_logger import log_platform_activity
+    log_platform_activity(f"Scanning chart patterns for {symbol.upper()}", "scan", "done")
     result = await detect_chart_patterns(symbol)
     return result
 
@@ -2539,7 +2573,8 @@ async def _generate_coaching_background(trade_id: str):
         coaching = await generate_trade_coaching(trade, ai_func=ai_func)
         await db.trades.update_one({"_id": ObjectId(trade_id)}, {"$set": {"coaching": coaching}})
         from services.activity_logger import log_activity
-        log_activity(f"AI coaching generated for {trade['symbol']} trade", "monitor", "done")
+        log_activity(f"AI coaching generated for {trade['symbol']} trade", "monitor", "done",
+                     user_id=str(trade.get("user_id")))
     except Exception as e:
         logger.error(f"Background coaching generation failed for {trade_id}: {e}")
 
@@ -2779,7 +2814,8 @@ async def get_trade_coaching(trade_id: str, user: dict = Depends(get_current_use
     # Cache in DB
     await db.trades.update_one({"_id": trade_oid}, {"$set": {"coaching": coaching}})
     from services.activity_logger import log_activity
-    log_activity(f"AI coaching generated for {trade['symbol']} trade", "monitor", "done")
+    log_activity(f"AI coaching generated for {trade['symbol']} trade", "monitor", "done",
+                 user_id=str(user["_id"]))
     return coaching
 
 @trades_router.get("/{trade_id}/live-tip")
@@ -2974,7 +3010,29 @@ async def mark_read(notif_id: str, user: dict = Depends(get_current_user)):
 
 @chat_router.post("")
 async def chat_endpoint(data: ChatMessage, user: dict = Depends(get_current_user)):
+    """Send a chat turn. The conversation is the caller's or it is refused.
+
+    D6.1 / S5. `session_id` is client-supplied and its default (`chat-<user_id>`)
+    is derivable from any user id, so it is an identifier, never a capability.
+    Two independent guards:
+
+    1. **Here** — a session id that already has turns belonging to someone else
+       is a 403, an explicit authorization failure rather than a silent
+       reinterpretation. This also stops one user squatting on another's
+       conversation id.
+    2. **In `ai_chat`** — the context load filters on `user_id` as well as
+       `session_id`, so even if this check were removed the model could not be
+       fed another user's turns.
+
+    Two guards because they fail differently: this one gives the caller a
+    truthful answer, and that one is the invariant that holds regardless of
+    which routes exist.
+    """
     session_id = data.session_id or f"chat-{user['_id']}"
+    foreign = await db.chat_messages.find_one(
+        {"session_id": session_id, "user_id": {"$ne": user["_id"]}})
+    if foreign:
+        raise HTTPException(status_code=403, detail="This conversation belongs to another account")
     response = await ai_chat(data.message, session_id, user, run_id=data.run_id)
 
     # Save to DB
@@ -3046,11 +3104,15 @@ async def ai_prompts():
 
 
 @ai_router.get("/activity")
-async def ai_activity():
-    """AI Activity Timeline — the truthful running/done trace of background AI
-    work (heartbeat engine, scans, monitoring). Reuses the activity logger."""
+async def ai_activity(caller_id: Optional[str] = Depends(get_optional_user_id)):
+    """AI Activity Timeline — the truthful running/done trace of AI work.
+
+    Platform-wide background work (heartbeat engine, scans, monitoring) merged
+    with this caller's own private entries. See `activity_feed` for why the
+    endpoint stays readable signed out (D6.1 / S4).
+    """
     from services.activity_logger import get_recent_activity
-    return get_recent_activity()
+    return get_recent_activity(caller_id)
 
 
 @ai_router.get("/memory")
@@ -3096,7 +3158,10 @@ async def ai_learn(data: LearnRequest, user: dict = Depends(get_current_user)):
     """Learning Mentor — teach a concept in beginner-friendly language."""
     from services.model_router import get_model_router
     from services.activity_logger import log_activity
-    log_activity(f"Teaching concept: {data.topic}", "monitor", "running")
+    # The topic IS the user's own question — the single most obviously private
+    # string that was being broadcast to every socket before D6.1 (S4).
+    log_activity(f"Teaching concept: {data.topic}", "monitor", "running",
+                 user_id=str(user["_id"]))
     router = get_model_router()
     result = await router.run(
         "learning_mentor",
@@ -3104,7 +3169,8 @@ async def ai_learn(data: LearnRequest, user: dict = Depends(get_current_user)):
         level=data.level,
         max_tokens=700,
     )
-    log_activity(f"Explained concept: {data.topic}", "monitor", "done")
+    log_activity(f"Explained concept: {data.topic}", "monitor", "done",
+                 user_id=str(user["_id"]))
     return {"topic": data.topic, "level": data.level, **result}
 
 
@@ -3142,7 +3208,8 @@ async def ai_trade_review(data: TradeReviewRequest, user: dict = Depends(get_cur
     run = AIRun(user["_id"], None, steps, run_id=data.run_id)
     await run.start()
     try:
-        log_activity(f"Reviewing {trade.get('symbol')} trade", "monitor", "running")
+        log_activity(f"Reviewing {trade.get('symbol')} trade", "monitor", "running",
+                     user_id=str(user["_id"]))
         async with run.step():
             router = get_model_router()
             result = await router.run(
@@ -3155,7 +3222,8 @@ async def ai_trade_review(data: TradeReviewRequest, user: dict = Depends(get_cur
         if data.trade_id:
             async with run.step():
                 await db.trades.update_one({"_id": trade_oid}, {"$set": {"ai_review": review}})
-        log_activity(f"Trade review ready for {trade.get('symbol')}", "monitor", "done")
+        log_activity(f"Trade review ready for {trade.get('symbol')}", "monitor", "done",
+                     user_id=str(user["_id"]))
         await run.complete()
         return {"trade_id": data.trade_id, "cached": False, **review}
     except Exception:
@@ -3213,11 +3281,13 @@ async def ai_portfolio_review(data: Optional[PortfolioReviewRequest] = None,
                 )
             summary = "\n".join(lines)
 
-        log_activity("Reviewing portfolio allocation & risk", "monitor", "running")
+        log_activity("Reviewing portfolio allocation & risk", "monitor", "running",
+                     user_id=str(user["_id"]))
         async with run.step():
             router = get_model_router()
             result = await router.run("portfolio_manager", summary, max_tokens=800)
-        log_activity("Portfolio AI review ready", "monitor", "done")
+        log_activity("Portfolio AI review ready", "monitor", "done",
+                     user_id=str(user["_id"]))
         await run.complete()
         return {"holdings_count": len(portfolio), "health": health, **result}
     except Exception:
@@ -3243,7 +3313,8 @@ async def ai_reflect(user: dict = Depends(get_current_user)):
     summary = "Recent closed trades:\n" + "\n\n".join(
         _summarize_trade_for_review(t) for t in closed
     )
-    log_activity("Reflecting on recent trades", "rank", "running")
+    log_activity("Reflecting on recent trades", "rank", "running",
+                 user_id=str(user["_id"]))
     router = get_model_router()
     result = await router.run("reflection", summary, max_tokens=500)
 
@@ -3252,7 +3323,8 @@ async def ai_reflect(user: dict = Depends(get_current_user)):
                if l.strip().startswith(("-", "•")) and len(l.strip()) > 4][:3]
     for lesson in lessons:
         await add_lesson(db, user["_id"], lesson)
-    log_activity("Reflection complete — lessons saved", "rank", "done")
+    log_activity("Reflection complete — lessons saved", "rank", "done",
+                 user_id=str(user["_id"]))
     return {"lessons_added": len(lessons), "lessons": lessons, **result}
 
 
@@ -3304,7 +3376,8 @@ async def advisor_recommend(data: AdvisorRequest, user: dict = Depends(get_curre
     reasons, news impact, sector strength and an AI summary. All price levels
     are derived from LIVE market data; the AI only narrates the real numbers."""
     from services.activity_logger import log_activity
-    log_activity(f"AI Advisor scanning for {data.horizon} opportunities", "rank", "running")
+    log_activity(f"AI Advisor scanning for {data.horizon} opportunities", "rank", "running",
+                 user_id=str(user["_id"]))
     result = await build_advisor_recommendations(
         horizon=data.horizon,
         risk_appetite=data.risk_appetite,
@@ -3419,11 +3492,42 @@ class ConnectionManager:
                 del self.user_connections[user_id]
 
     def subscribe(self, ws: WebSocket, channels):
-        """Add one or more channels to a socket's subscription set."""
+        """Add channels to a socket's subscription set. Returns (accepted, refused).
+
+        D6.1 / S6. This used to accept any channel name from any authenticated
+        socket, with no authorization of any kind — so a socket could subscribe
+        to `trades`, `portfolio`, `broker`, `notifications` or `watchlist` and
+        receive whatever was broadcast there.
+
+        Those five channels carry the private domains (`event_bridge.PRIVATE_CHANNELS`)
+        and are refused. After the bridge's fail-closed fix nothing is broadcast
+        to them at all — private events are delivered by `send_to_user`, which
+        needs no subscription — so refusing costs a client nothing it was
+        legitimately getting. It is the second half of the same control: the
+        bridge stops anything being *sent* to a private channel, and this stops
+        anything being *received* on one. Either alone would leave a future
+        broadcast one mistake away from a leak.
+
+        Refusals are returned rather than raised: a client asking for a mix of
+        public and private channels gets its public ones, and a truthful list of
+        what it did not get.
+        """
+        from services.realtime.event_bridge import PRIVATE_CHANNELS
         subs = self.channels.setdefault(ws, set())
+        accepted, refused = [], []
         for ch in channels or []:
-            if ch:
-                subs.add(str(ch))
+            if not ch:
+                continue
+            name = str(ch)
+            # "*" is the wildcard subscription and would match every private
+            # channel by definition, so it is refused for the same reason they
+            # are — it is not a channel, it is an exemption from the check.
+            if name in PRIVATE_CHANNELS or name == "*":
+                refused.append(name)
+                continue
+            subs.add(name)
+            accepted.append(name)
+        return accepted, refused
 
     def unsubscribe(self, ws: WebSocket, channels):
         """Remove one or more channels from a socket's subscription set."""
@@ -3519,11 +3623,24 @@ ws_manager = ConnectionManager()
 broker_engine.configure(db, ws_push=ws_manager.send_to_user)
 
 
-async def ws_activity_broadcast(entry: dict):
-    await ws_manager.broadcast({
-        "type": "activity_feed",
-        "data": entry
-    })
+async def ws_activity_broadcast(entry: dict, user_id: Optional[str] = None):
+    """Deliver one activity entry to the sockets entitled to see it (D6.1 / S4).
+
+    `user_id is None` means PLATFORM scope — market-wide AI work, identical for
+    every viewer, so it broadcasts. Anything else is a private entry and goes to
+    that user's sockets alone.
+
+    This function used to take the entry only and call `ws_manager.broadcast()`
+    unconditionally, which is how "Order placed on Zerodha: BUY 10 RELIANCE"
+    reached every connected client. The owner is now a parameter rather than a
+    thing the callback has to infer, and `activity_logger` cannot produce a
+    private entry without one.
+    """
+    message = {"type": "activity_feed", "data": entry}
+    if user_id:
+        await ws_manager.send_to_user(str(user_id), message)
+    else:
+        await ws_manager.broadcast(message)
 
 
 from services.activity_logger import register_broadcast_callback
@@ -3704,9 +3821,14 @@ async def websocket_endpoint(websocket: WebSocket):
 
             elif msg.get("type") == "subscribe":
                 # Channel subscription (Sprint R2): {"type":"subscribe","channels":[...]}
+                # D6.1 / S6: `channels` is what the client ASKED for; the reply
+                # reports what it actually got. Echoing the request back (which
+                # is what this did) would have told a client it was subscribed to
+                # `trades` when it was not.
                 channels = msg.get("channels", [])
-                ws_manager.subscribe(websocket, channels)
-                await websocket.send_json({"type": "subscribed", "channels": channels})
+                accepted, refused = ws_manager.subscribe(websocket, channels)
+                await websocket.send_json({"type": "subscribed", "channels": accepted,
+                                           "refused": refused})
 
             elif msg.get("type") == "unsubscribe":
                 channels = msg.get("channels", [])
@@ -3806,7 +3928,10 @@ async def ai_monitoring_loop():
     - Breaking events (VIX spike, gap-up/down)
     Sends real-time push notifications via WebSocket to all connected users.
     """
-    from services.activity_logger import log_activity
+    # PLATFORM scope (D6.1 / S4): index moves and VIX spikes are facts about
+    # the market, identical for every viewer, produced by a background loop that
+    # has no user.
+    from services.activity_logger import log_platform_activity as log_activity
     prev_nifty = None
     while True:
         try:
@@ -4273,9 +4398,72 @@ async def brokers_list(user: dict = Depends(get_current_user)):
 async def brokers_status(user: dict = Depends(get_current_user)):
     return await broker_engine.get_status(str(user["_id"]))
 
+# ---------------------------------------------------------------------------
+# Broker OAuth ownership (D6.1 / S1 — was CRITICAL)
+# ---------------------------------------------------------------------------
+# The flow, and what each half is for:
+#
+#   1. `GET /{broker}/login-url` is AUTHENTICATED. It mints a 256-bit opaque
+#      `state`, stores `{user_id, broker}` against it server-side (single-use,
+#      600s TTL, `security.oauth_state`), plants the handle in an HttpOnly
+#      `b_oauth_state` cookie, and puts the handle — and nothing else — into the
+#      provider URL.
+#   2. `GET /{broker}/callback` is necessarily PUBLIC (it is the browser's
+#      redirect target). It resolves the owning user by *consuming the record*,
+#      and additionally requires the echoed handle to equal the cookie.
+#
+# WHY BOTH CHECKS. They defeat different attacks, and each is useless against
+# the other's:
+#
+#   * The server-side record stops "graft the attacker's broker onto a victim":
+#     the attacker cannot mint a state bound to someone else, because minting
+#     requires authenticating as them.
+#   * The cookie stops the mirror image, "graft a victim's broker onto the
+#     attacker": there the attacker mints a perfectly valid state bound to
+#     *themselves* and lures the victim through the broker login with it. The
+#     record verifies; only the fact that the matching cookie is in the
+#     attacker's browser and not the victim's rejects it. That attack hands over
+#     a real brokerage account, so this check is not belt-and-braces.
+#
+# WHAT WAS THERE BEFORE. `uid = params.get("uid") or state[4:]`, taken verbatim
+# from the query string, with no nonce, no signature, no binding, no expiry and
+# no single-use. Rewriting one query parameter re-pointed a live brokerage
+# authorization — holdings, positions, funds and order placement — at any
+# account in the system, in either direction.
+#
+# The correct primitive already existed in this file for Google sign-in
+# (PH1.2). `security/oauth_state.py` is that primitive, lifted out so both flows
+# share one implementation instead of one having it and the other not.
+
+#: TTL of a broker OAuth state record. Matches `BROKER_OAUTH_STATE_MAX_AGE`; the
+#: server-side record is the authoritative expiry (a cookie Max-Age is set by,
+#: and therefore trusted from, the client).
+BROKER_OAUTH_STATE_TTL = 600
+
+
 @brokers_router.get("/{broker}/login-url")
-async def broker_login_url(broker: str, user: dict = Depends(get_current_user)):
-    return broker_engine.get_login_url(_require_broker(broker), str(user["_id"]))
+async def broker_login_url(broker: str, response: Response,
+                           user: dict = Depends(get_current_user)):
+    """The broker's login URL, carrying a single-use state bound to this user.
+
+    The `b_oauth_state` cookie is planted on THIS response, which means the SPA
+    must fetch it with credentials — see `frontend/src/services/api.js`
+    (`withCredentials`). The two changes are one change: without the cookie the
+    callback fails closed, which is the correct direction to fail but not a
+    working product.
+    """
+    broker = _require_broker(broker)
+    state = await oauth_state_store.issue(
+        oauth_state_store.FLOW_BROKER,
+        {"user_id": str(user["_id"]), "broker": broker},
+        ttl_seconds=BROKER_OAUTH_STATE_TTL,
+    )
+    result = broker_engine.get_login_url(broker, state)
+    # Plant the cookie even when the broker is unconfigured and `url` is None:
+    # the record exists either way and a stale cookie is harmless (it is
+    # single-use and short-lived), whereas a missing one is a failed connect.
+    set_broker_oauth_state_cookie(response, state)
+    return result
 
 @brokers_router.post("/{broker}/session")
 async def broker_session(broker: str, request: Request, user: dict = Depends(get_current_user)):
@@ -4289,41 +4477,98 @@ async def broker_session(broker: str, request: Request, user: dict = Depends(get
     return {"success": True, "broker": broker, "profile": result.get("profile", {}),
             "sync": (result.get("sync") or {}).get("summary")}
 
+#: The one outcome every S1 rejection reports. Deliberately identical for a
+#: missing, forged, expired, replayed, cross-flow, cross-user or orphaned state:
+#: a caller probing the callback learns only that it failed, never which check
+#: it tripped. Ownership failures are not a debugging surface.
+BROKER_CALLBACK_REJECTED = "invalid_or_expired_login_request"
+
+
 @brokers_router.get("/{broker}/callback")
 async def broker_oauth_callback(broker: str, request: Request):
     """Public browser redirect target for broker OAuth.
-    Zerodha sends ?request_token=&status=&uid=; Upstox sends ?code=&state=uid=...
-    Always bounces back to the frontend Settings page with the outcome."""
+
+    Ownership comes from the server-side state record and the `b_oauth_state`
+    cookie — see the block comment above `broker_login_url` for the threat model
+    and for what this route used to do (D6.1 / S1). Nothing in the query string
+    identifies a user, and `uid` is not read at all.
+
+    Always bounces back to the frontend Settings page with the outcome, and
+    burns the state cookie on every exit path: a state cookie that outlives its
+    flow is one that can be paired with a second attempt.
+    """
     from starlette.responses import RedirectResponse
     broker = _require_broker(broker)
     params = request.query_params
     frontend = _frontend_base()
 
-    uid = params.get("uid")
-    state = params.get("state", "")
-    if not uid and state.startswith("uid="):
-        uid = state[4:]
+    def _finish(query: str) -> RedirectResponse:
+        response = RedirectResponse(url=f"{frontend}/settings?broker={broker}&{query}")
+        clear_broker_oauth_state_cookie(response)
+        return response
 
-    # The adapter parses its own redirect shape (Kite sends request_token +
-    # status; standard OAuth2 brokers send code + error). This route used to
-    # branch on the broker name, with an `else` that assumed every future broker
-    # speaks Upstox's dialect.
+    async def _reject(reason: str) -> RedirectResponse:
+        """Refuse the callback and audit why. The user-visible error is constant."""
+        await log_auth_event(audit.BROKER_AUTH_REJECTED, request,
+                             reason=f"broker_callback_{reason}", detail={"broker": broker})
+        logger.warning("Rejected %s OAuth callback: %s", broker, reason)
+        return _finish(f"status=failed&error={BROKER_CALLBACK_REJECTED}")
+
+    # 1. The echoed state handle. Absent => this callback proves nothing.
+    state = (params.get("state") or "").strip()
+    if not state:
+        return await _reject("missing_state")
+
+    # 2. Double-submit against the HttpOnly cookie planted at login-url time.
+    #    Checked BEFORE consuming the record, so a probe with a guessed handle
+    #    cannot burn a legitimate in-flight state.
+    if not oauth_state_store.matches_cookie(state, request.cookies.get(BROKER_OAUTH_STATE_COOKIE)):
+        return await _reject("state_cookie_mismatch")
+
+    # 3. Consume the server-side record: single-use, TTL-bounded, namespaced to
+    #    the broker flow. None covers unknown, expired and replayed alike.
+    record = await oauth_state_store.consume(oauth_state_store.FLOW_BROKER, state)
+    if not record:
+        return await _reject("unknown_expired_or_replayed_state")
+
+    # 4. The record names the broker its flow started for. A state minted for
+    #    one broker must not complete another's callback.
+    if record.get("broker") != broker:
+        return await _reject("broker_mismatch")
+
+    # 5. The owning user comes from the record and from nowhere else. It must
+    #    still resolve to a real, active account: a state can outlive the user
+    #    that minted it (deletion, an admin block) by up to its TTL.
+    uid = str(record.get("user_id") or "")
+    owner = None
+    if uid:
+        try:
+            owner = await db.users.find_one({"_id": ObjectId(uid)})
+        except Exception:
+            owner = None
+    if not owner:
+        return await _reject("unknown_user")
+    if not account_is_active(owner):
+        return await _reject("account_blocked")
+
+    # 6. Only now: parse the broker's own redirect shape. The adapter does it
+    #    (Kite sends request_token + status; standard OAuth2 brokers send code +
+    #    error) — this route used to branch on the broker name, with an `else`
+    #    that assumed every future broker speaks Upstox's dialect.
     auth_payload = broker_engine.parse_callback_params(broker, dict(params))
     if not auth_payload:
-        return RedirectResponse(url=f"{frontend}/settings?broker={broker}&status=cancelled")
+        return _finish("status=cancelled")
 
     try:
         await broker_engine.complete_auth(broker, uid, auth_payload)
-        if uid:
-            try:
-                await db.users.update_one({"_id": ObjectId(uid)}, {"$set": {f"{broker}_connected": True}})
-            except Exception:
-                pass
-        return RedirectResponse(url=f"{frontend}/settings?broker={broker}&status=connected")
+        await db.users.update_one({"_id": ObjectId(uid)}, {"$set": {f"{broker}_connected": True}})
+        await log_auth_event(audit.BROKER_AUTH_SUCCESS, request, user_id=uid,
+                             detail={"broker": broker})
+        return _finish("status=connected")
     except (BrokerError, Exception) as e:
         message = getattr(e, "user_message", "connection failed")
         logger.error(f"{broker} OAuth callback failed: {e}")
-        return RedirectResponse(url=f"{frontend}/settings?broker={broker}&status=failed&error={message}")
+        return _finish(f"status=failed&error={message}")
 
 @brokers_router.post("/{broker}/disconnect")
 async def broker_disconnect(broker: str, user: dict = Depends(get_current_user)):
@@ -4769,16 +5014,52 @@ async def stock_intraday(symbol: str, interval: str = "5min"):
 
 # ============ DATA SOURCE STATUS ============
 
+def _broker_is_configured(broker: str) -> bool:
+    """Whether the PLATFORM has credentials for `broker`.
+
+    A fact about this deployment's environment, not about any user's account, so
+    it carries no ownership. Asks the Broker Registry rather than importing a
+    broker module — the last thing that answered this question was the
+    `zerodha_service` shim, deleted in D6.1 (S3).
+    """
+    try:
+        from services.brokers import broker_registry
+        return bool(broker_registry.require(broker).is_configured())
+    except Exception:
+        return False
+
+
 @app.get("/api/data-sources")
-async def data_sources():
-    """Get status of all external data sources."""
+async def data_sources(user: dict = Depends(get_current_user)):
+    """Status of the external data sources, for THIS user.
+
+    D6.1 / S2 (was CRITICAL). This endpoint had no authentication dependency and
+    returned `zerodha_service.get_status()`, which scanned the process-global
+    session cache across **every user** and handed back the first fresh Zerodha
+    session it found — including that account's `user_name`, `email` and client
+    id. An anonymous internet caller therefore received a real user's PII and
+    broker-account identity from one unauthenticated GET.
+
+    Two changes, and both are load-bearing:
+
+    * **Authentication is required.** The response now describes an account, so
+      it needs one.
+    * **The broker section comes from `broker_engine.get_status(user_id)`**,
+      which resolves `(user_id, broker)` explicitly. Nothing here scans all
+      sessions; that whole shape of answer — "find any connected session" — is
+      gone from the codebase (S3).
+
+    Every other section (Alpha Vantage, AI providers, notification channels) is
+    platform configuration with no per-user content and is unchanged, except
+    that it too now requires a caller.
+    """
     from services.whatsapp_service import get_status as wa_status
     from services.email_service import get_status as email_status
     from services.telegram_service import get_status as tg_status
     engine_status = get_debate_engine().get_status()
     return {
         "alpha_vantage": {"configured": av_configured(), "mode": "live" if av_configured() else "yahoo_finance"},
-        "zerodha": kite_status(),
+        "brokers": await broker_engine.get_status(str(user["_id"])),
         "ai": {
             "configured": engine_status["debate_ready"],
             "full_debate": engine_status["full_debate"],
@@ -5439,7 +5720,8 @@ class BacktestRequest(BaseModel):
     initial_capital: float = 100000.0
 
 @backtest_router.post("")
-async def run_backtest_route(data: BacktestRequest):
+async def run_backtest_route(data: BacktestRequest,
+                             caller_id: Optional[str] = Depends(get_optional_user_id)):
     """Run a strategy over real historical bars.
 
     PH3.9: this used to be incapable of failing. Any problem fetching history —
@@ -5456,8 +5738,19 @@ async def run_backtest_route(data: BacktestRequest):
     on its own and that a client should offer to retry.
     """
     from services.backtest_engine import HistoricalDataUnavailable, run_backtest
-    from services.activity_logger import log_activity
-    log_activity(f"Running backtest: {data.strategy} on {data.symbol}", "scan", "running")
+    # D6.1 / S4. A signed-in user's backtest names their strategy and their
+    # symbol, and that went to every socket. The route stays readable signed out
+    # (`get_optional_user_id`, not `get_current_user`) so no public behaviour
+    # changes, but an identified caller's backtests are now theirs alone.
+    from services.activity_logger import log_activity, log_platform_activity
+
+    def _log_backtest(message: str, status: str) -> None:
+        if caller_id:
+            log_activity(message, "scan", status, user_id=caller_id)
+        else:
+            log_platform_activity(message, "scan", status)
+
+    _log_backtest(f"Running backtest: {data.strategy} on {data.symbol}", "running")
     try:
         result = await run_backtest(
             symbol=data.symbol,
@@ -5469,10 +5762,9 @@ async def run_backtest_route(data: BacktestRequest):
             initial_capital=data.initial_capital,
         )
     except HistoricalDataUnavailable as exc:
-        log_activity(f"Backtest failed: no historical data for {data.symbol}",
-                     "scan", "warning")
+        _log_backtest(f"Backtest failed: no historical data for {data.symbol}", "warning")
         raise HTTPException(status_code=503, detail=exc.reason)
-    log_activity(f"Backtest complete: {result.get('win_rate', 0)}% win rate on {data.symbol}", "scan", "done")
+    _log_backtest(f"Backtest complete: {result.get('win_rate', 0)}% win rate on {data.symbol}", "done")
     return result
 
 
@@ -5748,12 +6040,68 @@ async def admin_unblock_user(user_id: str, user: dict = Depends(require_admin)):
 
 @admin_router.delete("/users/{user_id}")
 async def admin_delete_user(user_id: str, user: dict = Depends(require_admin)):
+    """Delete a user, tearing down their live credentials first.
+
+    D6.1 / S7 (was MEDIUM). This used to be `db.users.delete_one(...)` and
+    nothing else. What it left behind was not merely orphaned rows: the
+    `broker_accounts` document kept its **encrypted, still-valid broker tokens**,
+    and `broker_engine.load_sessions()` selects on `{"connected": {"$ne": False}}`
+    — so the deleted user's live broker session and market-data stream were
+    restored on every restart, indefinitely, for an account that no longer
+    exists and nobody can revoke from the UI.
+
+    Order matters. The teardown runs BEFORE the user row is removed, because
+    `broker_engine.disconnect` is the primitive that revokes at the broker,
+    blanks the token fields, stops the stream, detaches the market feed and
+    forgets the recovery candidate — and a half-deleted user whose disconnect
+    failed is recoverable, whereas a deleted user whose broker session survived
+    is not. Each broker is best-effort and independent: one broker refusing to
+    revoke an already-dead token must not leave the other brokers connected.
+
+    Sessions are revoked too, so outstanding refresh tokens die with the
+    account rather than seven days later.
+
+    SCOPE. This closes the *credential* half of S7. The user's remaining data
+    (trades, holdings, orders, watchlist, notifications, chat_messages,
+    ai_user_memory, portfolio_snapshots, payments) is still orphaned; that
+    cascade needs the ownership registry and is D6.4's, per the D6.0 roadmap.
+    Recorded as LIM-D6.1-2 rather than half-done here.
+    """
     if user.get("role") != "super_admin":
         raise HTTPException(status_code=403, detail="Only super_admin can delete users")
     oid = parse_object_id(user_id, "user")
+    target = await db.users.find_one({"_id": oid})
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    revoked_brokers, broker_errors = [], {}
+    try:
+        accounts = await db.broker_accounts.find(
+            {"user_id": user_id, "connected": {"$ne": False}}).to_list(50)
+    except Exception as e:
+        accounts = []
+        logger.error(f"Could not list broker accounts for deleted user {user_id}: {e}")
+    for account in accounts:
+        broker = account.get("broker")
+        if not broker:
+            continue
+        try:
+            await broker_engine.disconnect(broker, user_id)
+            revoked_brokers.append(broker)
+        except Exception as e:
+            broker_errors[broker] = str(e)
+            logger.error(f"Broker teardown failed for deleted user {user_id} / {broker}: {e}")
+
+    try:
+        sessions_revoked = await SessionStore(db).revoke_all_for_user(user_id, reason="user_deleted")
+    except Exception as e:
+        sessions_revoked = 0
+        logger.error(f"Session revocation failed for deleted user {user_id}: {e}")
+
     await db.users.delete_one({"_id": oid})
     await log_admin_action(user["_id"], "user.deleted", user_id)
-    return {"success": True}
+    return {"success": True, "brokers_revoked": revoked_brokers,
+            "broker_errors": broker_errors, "sessions_revoked": sessions_revoked}
 
 
 @admin_router.post("/users/{user_id}/grant-plan")
@@ -6090,7 +6438,7 @@ async def admin_api_health(user: dict = Depends(require_admin)):
         # credential separately rather than as the gateway's status.
         "market_data": None,
         "news": None,
-        "broker_zerodha": bool(kite_configured()),
+        "broker_zerodha": _broker_is_configured("zerodha"),
         "email": bool(email_service.is_configured()),
         "whatsapp": bool(whatsapp_service.is_configured()),
         "telegram": bool(telegram_service.is_configured()),
@@ -6698,9 +7046,10 @@ async def api_root():
 
 
 @app.get("/api/ai-activity")
-async def get_recent_ai_activity():
+async def get_recent_ai_activity(caller_id: Optional[str] = Depends(get_optional_user_id)):
+    """Legacy alias for `GET /api/ai/activity`. Same scoping (D6.1 / S4)."""
     from services.activity_logger import get_recent_activity
-    return get_recent_activity()
+    return get_recent_activity(caller_id)
 
 
 # Security middleware pipeline (see SECURITY_ARCHITECTURE.md §27). Starlette runs
@@ -7195,7 +7544,8 @@ async def startup():
             "health_checks": obs_health.registered_checks(),
         },
     )
-    logger.info(f"Data sources: Alpha Vantage={'ON' if av_configured() else 'OFF'}, Zerodha={'ON' if kite_configured() else 'OFF'}")
+    logger.info(f"Data sources: Alpha Vantage={'ON' if av_configured() else 'OFF'}, "
+                f"Zerodha={'ON' if _broker_is_configured('zerodha') else 'OFF'}")
 
 @app.on_event("shutdown")
 async def shutdown():

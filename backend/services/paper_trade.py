@@ -228,8 +228,11 @@ async def execute_paper_trade(
     trade_doc["_id"] = str(result.inserted_id)
 
     from services.activity_logger import log_activity
+    # Private: a paper trade is still this user's trade flow — side, size and
+    # symbol (D6.1 / S4).
     log_activity(
-        f"Paper trade: {trade_type} {quantity} {symbol} @ ₹{entry_price}", "monitor", "done"
+        f"Paper trade: {trade_type} {quantity} {symbol} @ ₹{entry_price}", "monitor", "done",
+        user_id=str(user_id),
     )
     return trade_doc
 
@@ -302,5 +305,6 @@ async def reset_paper_capital(user_id: str, db):
         upsert=True,
     )
     from services.activity_logger import log_activity
-    log_activity("Paper trading capital reset to ₹1,00,000", "monitor", "done")
+    log_activity("Paper trading capital reset to ₹1,00,000", "monitor", "done",
+                 user_id=str(user_id))
     return {"message": "Paper capital reset to ₹1,00,000", "new_balance": DEFAULT_CAPITAL}

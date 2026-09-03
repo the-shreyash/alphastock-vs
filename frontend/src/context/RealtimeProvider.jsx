@@ -18,6 +18,7 @@
  */
 import { useEffect, useRef } from "react";
 import { useAuth } from "./AuthContext";
+import { refreshSession, sessionIsDead } from "../services/api";
 import { useRealtimeStore } from "../store/realtimeStore";
 
 const WS_URL = process.env.REACT_APP_BACKEND_URL
@@ -27,17 +28,18 @@ const WS_URL = process.env.REACT_APP_BACKEND_URL
 // Channels this app consumes. Per-user events (notifications, per-user
 // portfolio/broker) are delivered regardless of subscription; public channel
 // broadcasts (market indices, sectors, scanner, news) require this subscribe.
+// D6.1 / S6. `notifications`, `portfolio`, `trades`, `watchlist` and `broker`
+// were requested here and are no longer: the server refuses them
+// (`ConnectionManager.subscribe`) because they carry the private domains, and
+// nothing is broadcast to them any more — per-user events are delivered by
+// `send_to_user`, which needs no subscription at all. Asking for them was
+// always a no-op dressed as a capability; now it is an honest one.
 const CHANNELS = [
   "market",
   "sectors",
   "scanner",
   "news",
-  "notifications",
-  "portfolio",
-  "trades",
-  "watchlist",
   "ai",
-  "broker",
   // D5.14. `provider.status` has no entry in the bridge's DOMAIN_CHANNEL map,
   // so `resolve_channel` falls through to the domain name — the platform-scoped
   // feed state is broadcast on a channel literally called "provider". Without
@@ -73,14 +75,34 @@ export function RealtimeProvider({ children }) {
   const closedByUsRef = useRef(false);
   const batchRef = useRef([]); // queued inbound messages (Sprint R9 batching)
   const batchTimerRef = useRef(null);
+  const lastIdentityRef = useRef(null); // previous socket identity (D6.1 / S8)
+  // D6.1 / L3. True once a socket has actually opened for the current attempt.
+  // A close that happens with this still false is a HANDSHAKE REJECTION — the
+  // server closed with 1008 before `accept()` — which is a credential problem,
+  // not a network problem, and must not be answered by offering the same dead
+  // credential again on a backoff timer.
+  const openedRef = useRef(false);
+  const authRetryRef = useRef(0);
 
   useEffect(() => {
     const store = useRealtimeStore.getState();
 
+    // D6.1 / S8. Reset the WHOLE store on an identity change, not just the feed
+    // slice. `setFeedIdentity` clears `feedState` and nothing else, so
+    // `portfolioUpdate`, `brokerStatus`, `brokerOrders`, `brokerTicks`,
+    // `tradeUpdates`, `alerts` and `unreadCount` survived A -> logout -> B login
+    // in the same tab and were rendered as B's until fresh events replaced them.
+    // AuthContext resets on login/logout too; this covers the transitions that
+    // do not pass through either (a reload, a restored session, an expiry).
+    if (lastIdentityRef.current !== null && lastIdentityRef.current !== userId) {
+      store.reset();
+    }
+    lastIdentityRef.current = userId;
+
     // Bind the feed state to this account before any event can land (D5.14).
     // Done for the anonymous case too, so signing out clears the previous
     // account's feed state instead of leaving it on screen.
-    store.setFeedIdentity(isAnon(userId) ? null : userId);
+    useRealtimeStore.getState().setFeedIdentity(isAnon(userId) ? null : userId);
 
     if (!WS_URL || isAnon(userId)) {
       store.setConnection("offline");
@@ -120,6 +142,38 @@ export function RealtimeProvider({ children }) {
       reconnectRef.current = setTimeout(connect, backoff + jitter);
     };
 
+    /**
+     * A close that happened before the socket ever opened: the server rejected
+     * the handshake (1008) because the credential is expired or invalid.
+     *
+     * D6.1 / L3. This used to be indistinguishable from a network drop, so the
+     * reconnect loop re-offered the SAME expired token forever, backing off to
+     * 30s and retrying until the tab closed. Realtime never recovered and
+     * nothing on screen said so.
+     *
+     * The response is bounded and useful instead: try ONCE to restore
+     * authentication through the shared refresh queue (the same single in-flight
+     * promise the REST client uses, so a page-wide expiry produces one refresh,
+     * not one per subsystem). If that works, reconnect immediately with the
+     * fresh cookie. If it does not, stop — the api client has already announced
+     * SESSION_EXPIRED, AuthContext will drop `user`, and this effect will tear
+     * the socket down. Retrying past that point cannot succeed by definition:
+     * nothing changes a credential except re-authentication.
+     */
+    const handleAuthRejection = () => {
+      if (closedByUsRef.current) return;
+      useRealtimeStore.getState().setConnection("unauthenticated");
+      if (sessionIsDead() || authRetryRef.current >= 1) return;
+      authRetryRef.current += 1;
+      refreshSession()
+        .then(() => {
+          if (closedByUsRef.current) return;
+          attemptRef.current = 0;
+          connect();
+        })
+        .catch(() => { /* api client announced SESSION_EXPIRED; stay stopped */ });
+    };
+
     const startHeartbeat = (ws) => {
       if (heartbeatRef.current) clearInterval(heartbeatRef.current);
       heartbeatRef.current = setInterval(() => {
@@ -135,6 +189,7 @@ export function RealtimeProvider({ children }) {
 
     function connect() {
       const s = useRealtimeStore.getState();
+      openedRef.current = false;
       s.setConnection("connecting");
       let ws;
       try {
@@ -165,6 +220,8 @@ export function RealtimeProvider({ children }) {
       wsRef.current = ws;
 
       ws.onopen = () => {
+        openedRef.current = true;
+        authRetryRef.current = 0; // a successful handshake re-arms the auth path
         attemptRef.current = 0; // reset backoff on a clean connection
         const st = useRealtimeStore.getState();
         st.setConnection("live", { lastPongAt: Date.now() });
@@ -199,6 +256,12 @@ export function RealtimeProvider({ children }) {
           useRealtimeStore.getState().setConnection("offline");
           return;
         }
+        // Never opened => the handshake was rejected, which is an auth problem
+        // (D6.1 / L3). Opened and then closed => a network event; back off.
+        if (!openedRef.current) {
+          handleAuthRejection();
+          return;
+        }
         scheduleReconnect();
       };
 
@@ -209,6 +272,7 @@ export function RealtimeProvider({ children }) {
 
     closedByUsRef.current = false;
     attemptRef.current = 0;
+    authRetryRef.current = 0;
     connect();
 
     return () => {

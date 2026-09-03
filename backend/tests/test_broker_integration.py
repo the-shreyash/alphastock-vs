@@ -64,13 +64,22 @@ def test_normalize_status_maps_broker_specific_values():
 
 # ---------------------------------------------------------------- login URLs
 
-def test_zerodha_login_url_carries_uid(monkeypatch):
+def test_zerodha_login_url_carries_the_opaque_state_and_no_user_id(monkeypatch):
+    """D6.1 / S1. This asserted `uid%3Duser42` — the app's user id, in clear
+    text, in a URL the user's browser follows and the broker echoes back to a
+    public callback that believed it. What travels now is an opaque handle that
+    means nothing without the server-side record it names.
+
+    The negative half of this assertion is the point: an adapter that put a user
+    id back on the wire would still satisfy "carries state" and must not pass.
+    """
     monkeypatch.setenv("KITE_API_KEY", "testkey")
     monkeypatch.setenv("KITE_API_SECRET", "testsecret")
-    result = ZerodhaAdapter().get_login_url(user_id="user42")
+    result = ZerodhaAdapter().get_login_url(state="opaque-handle-xyz")
     assert result["configured"] is True
     assert "api_key=testkey" in result["url"]
-    assert "uid%3Duser42" in result["url"]  # redirect_params is URL-encoded
+    assert "state%3Dopaque-handle-xyz" in result["url"]  # redirect_params is URL-encoded
+    assert "uid" not in result["url"], "a user id is back on the wire (D6-S1)"
 
 
 def test_zerodha_login_url_unconfigured(monkeypatch):
@@ -84,10 +93,12 @@ def test_upstox_login_url_carries_state(monkeypatch):
     monkeypatch.setenv("UPSTOX_API_KEY", "upx-key")
     monkeypatch.setenv("UPSTOX_API_SECRET", "upx-secret")
     monkeypatch.setenv("UPSTOX_REDIRECT_URL", "https://app.example.com/api/brokers/upstox/callback")
-    result = UpstoxAdapter().get_login_url(user_id="user42")
+    result = UpstoxAdapter().get_login_url(state="opaque-handle-xyz")
     assert result["configured"] is True
     assert "client_id=upx-key" in result["url"]
-    assert "state=uid%3Duser42" in result["url"]
+    # D6.1 / S1: the state is the opaque handle verbatim, not `uid=<user id>`.
+    assert "state=opaque-handle-xyz" in result["url"]
+    assert "uid" not in result["url"], "a user id is back on the wire (D6-S1)"
 
 
 def test_upstox_login_url_unconfigured(monkeypatch):

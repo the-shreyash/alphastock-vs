@@ -432,7 +432,10 @@ export default function SettingsPage() {
             {[
               { label: "Yahoo Finance (Market Data)", status: "LIVE", active: true },
               { label: "Alpha Vantage (Technical)", status: dataSources.alpha_vantage?.mode?.toUpperCase(), active: dataSources.alpha_vantage?.configured },
-              { label: "Zerodha (Trading)", status: dataSources.zerodha?.mode?.toUpperCase(), active: dataSources.zerodha?.connected },
+              // D6.1 / S2: `dataSources.zerodha` used to be whichever user's live
+              // Zerodha session the server found first. `brokers` is this
+              // account's own per-broker status, keyed by broker name.
+              { label: "Zerodha (Trading)", status: dataSources.brokers?.zerodha?.mode?.toUpperCase(), active: dataSources.brokers?.zerodha?.connected },
               { label: "AI (Claude + Gemini)", status: dataSources.ai?.configured ? "ACTIVE" : "OFF", active: dataSources.ai?.configured },
               { label: "Gemini Direct", status: dataSources.gemini_direct?.mode?.toUpperCase(), active: dataSources.gemini_direct?.configured },
               { label: "WhatsApp (Twilio)", status: dataSources.whatsapp?.mode?.toUpperCase(), active: dataSources.whatsapp?.configured },

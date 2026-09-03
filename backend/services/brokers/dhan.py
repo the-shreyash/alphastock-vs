@@ -756,8 +756,16 @@ class DhanAdapter(BrokerAdapter):
         return payload
 
     # -- authentication ------------------------------------------------------
-    def get_login_url(self, user_id: str = None) -> dict:
+    def get_login_url(self, state: str = None) -> dict:
         """Dhan's login cannot be a bare URL, and this says so rather than inventing one.
+
+        ``state`` is accepted for signature conformance and deliberately unused:
+        Dhan's consent flow has no echoed state parameter and its redirect
+        carries only ``tokenId``. A callback that cannot carry state cannot
+        prove which user started the flow, so the public callback route rejects
+        Dhan outright (D6.1 / S1, LIM-D6.1-1) — a Dhan connection must be
+        completed through the authenticated ``POST /api/brokers/dhan/session``
+        route, where ownership comes from the caller's own session.
 
         Every other broker here publishes a single URL a browser can be sent to,
         with the app's identity in the query string. Dhan's partner login is
@@ -786,7 +794,7 @@ class DhanAdapter(BrokerAdapter):
             "message": "Dhan login needs a consent id — request one to obtain the login URL.",
         }
 
-    async def generate_consent(self, user_id: str = None) -> dict:
+    async def generate_consent(self, state: str = None) -> dict:
         """Step 1 and 2 of Dhan's partner consent flow: mint a consent id, return its login URL.
 
         The partner secret is sent as a **header** and never as a query parameter,

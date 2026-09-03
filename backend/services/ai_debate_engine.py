@@ -83,7 +83,14 @@ class AIDebateEngine:
         if session_id and session_id.startswith("explain-"):
             symbol = session_id.split("explain-", 1)[1].upper()
 
-        from services.activity_logger import log_activity
+        # PLATFORM scope, deliberately (D6.1 / S4). The debate is reached only
+        # from `/api/analysis/explain` and `/api/analysis/full-report`, which
+        # take no identity at all — there is no user to own this entry, and the
+        # symbol it names is public reference data the same endpoints already
+        # serve anonymously. Should either endpoint gain an authenticated
+        # caller, this must become the private logger and take their id: an
+        # un-ownable entry is only safe while it is genuinely un-owned.
+        from services.activity_logger import log_platform_activity as log_activity
         log_activity(f"Running dual-AI debate for {symbol}", "rank", "running")
 
         # ── Round 1: Independent Analysis ──────────────────────────

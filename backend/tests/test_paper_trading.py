@@ -93,13 +93,22 @@ def test_execute_paper_trade_deducts_from_balance():
     asyncio.run(run())
 
 
-def test_paper_trade_never_calls_zerodha():
+def test_paper_trade_never_places_a_live_broker_order():
+    """A paper trade must never reach a real brokerage account.
+
+    D6.1 / S3. This used to patch `services.zerodha_service.place_order`, a
+    module that has been deleted — it was the "find any connected session"
+    single-broker shim whose `place_order()` would have sent a live order to
+    whichever user happened to have connected most recently. Patching
+    `broker_engine.place_order` is both the surviving path and the stronger
+    assertion: it covers EVERY broker, not just Zerodha.
+    """
     async def run():
         # ARRANGE
         db = FakeDB()
         user_id = _new_user_id(db)
 
-        with patch("services.zerodha_service.place_order", new_callable=AsyncMock) as mock_place, \
+        with patch("services.broker_engine.broker_engine.place_order", new_callable=AsyncMock) as mock_place, \
              patch("services.real_market.fetch_real_stock_quote", new_callable=AsyncMock, return_value={"price": 105.0}):
             # ACT
             trade = await execute_paper_trade(
