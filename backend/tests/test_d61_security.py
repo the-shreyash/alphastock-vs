@@ -1002,8 +1002,17 @@ class TestSessionLifecycleServerSide:
         assert client.cookies.get("refresh_token") != first_refresh_cookie, \
             "the refresh token did not rotate"
 
-    def test_a_replayed_refresh_token_kills_the_family(self, client, fake_db):
-        """Reuse detection, which is what makes single-use meaningful."""
+    def test_a_replayed_refresh_token_kills_the_family(self, client, fake_db,
+                                                       monkeypatch):
+        """Reuse detection, which is what makes single-use meaningful.
+
+        D6.2 / F added a short rotation grace window so that two browser tabs
+        refreshing the same cookie at the same instant are not read as theft.
+        This test is about the case that IS theft, so it configures the window
+        to zero rather than racing it; the grace path has its own coverage in
+        `test_d62_session_lifecycle.py`.
+        """
+        monkeypatch.setenv("JWT_REFRESH_GRACE_SECONDS", "0")
         client.post("/api/auth/register", json={
             "name": "Replay User", "email": "replay-d61@example.com",
             "password": "S3cure!Passw0rd"})

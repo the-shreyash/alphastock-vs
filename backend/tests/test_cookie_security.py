@@ -128,7 +128,13 @@ class TestSessionCookieFlags:
     def test_register_sets_both_hardened_cookies(self, client, fake_db, dev_env):
         r = _register(client)
         assert r.status_code == 200
-        for name, max_age in (("access_token", "86400"), ("refresh_token", "604800")):
+        # D6.2 / D. The access cookie's Max-Age is the ACCESS TOKEN's lifetime
+        # (900s), derived from `jwt.access_ttl_seconds()` rather than hardcoded.
+        # It used to be 86400 with a comment claiming it matched the token — it
+        # had not since PH1.6 — so the browser kept re-sending a dead credential
+        # for another 23¾ hours. Asserting the derived value is what keeps the
+        # two from drifting apart again.
+        for name, max_age in (("access_token", "900"), ("refresh_token", "604800")):
             header = _cookie_header(r, name)
             assert header is not None, f"{name} not set"
             attrs = _attrs(header)
@@ -213,7 +219,7 @@ class TestRefresh:
         assert attrs.get("httponly") is True
         assert attrs.get("samesite") == "lax"
         assert attrs.get("path") == "/"
-        assert attrs.get("max-age") == "86400"
+        assert attrs.get("max-age") == "900"  # D6.2 / D — the token's own lifetime
         # PH1.6: refresh now ROTATES — a fresh refresh token is re-issued through
         # the same hardened cookie policy on every refresh (the old one is dead).
         refresh_header = _cookie_header(r, "refresh_token")

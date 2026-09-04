@@ -6337,3 +6337,458 @@ the limitations table:
 ---
 
 **D6.1 STATUS: COMPLETE.**
+
+---
+
+# D6.2 — SESSION LIFECYCLE HARDENING (2026-09-03) — COMPLETE
+
+Decision record: **ADR-061** (extends ADR-060). Scope: make the authenticated
+browser session lifecycle production-safe — HTTP refresh, an explicit session
+state machine, WebSocket re-authentication, the cookie/CSRF/CORS topology,
+identity transitions and the server's session semantics. **D5 frozen and
+untouched; no market-data, broker or feed code changed.**
+
+## Headline
+
+D6.1 made the session *work*. D6.2 is about the six places where the machinery
+that recovers a session reached the **wrong conclusion** — and in five of the
+six, the wrong conclusion was reached silently.
+
+The one that mattered most is the smallest: `refreshSession()` treated every
+rejection identically. A network error, a 502 from a proxy, a backend restart
+and the refresh endpoint's own 429 rate limit all latched the refresh machinery
+off for the life of the page and told the user their session had expired — while
+their perfectly valid seven-day refresh cookie sat untouched in the browser.
+**Only the server answering 401 or 403 is now definitive.** Everything else is
+transient: it does not latch, does not announce an expiry, and leaves a later
+401 free to try again after a five-second cool-down.
+
+The one with the largest blast radius is `D6.2-B`. A request that 401'd, parked
+on the shared refresh promise, and was then replayed after the user signed out
+and signed in as somebody else was re-sent **carrying the new user's cookies**.
+For a GET that renders A's page with B's data. For `POST /trades` — a route this
+platform exposes — it is an order replayed into the wrong brokerage account.
+Every request now carries the auth epoch it was dispatched under, and a replay
+whose epoch is stale is abandoned, not sent.
+
+## 1. The six defects
+
+| # | Defect | Symptom | Fix |
+|---|--------|---------|-----|
+| **A** | Any refresh failure was read as a dead session | A backend restart signed the user out and told them their session expired; no refresh was ever attempted again on that page | `isDefinitiveRefusal` — 401/403 only; transient failures hold a 5 s cool-down and never announce |
+| **B** | A queued request replayed under the next identity | A's request re-sent with B's cookies after a sign-out/sign-in; for a mutation, an order in the wrong account | Auth-epoch stamp at dispatch; epoch checked before **and** after the refresh; `SessionChangedError` |
+| **C** | No observable REFRESHING state | "Recovering" and "logged out" were indistinguishable to the UI for the length of a round trip | Four-state machine (`SESSION_STATE`) announced on `SESSION_STATE_EVENT`, held in `AuthContext` |
+| **D** | A dead session left a live access cookie | A refresh refused because the family was revoked left an access cookie minutes from expiring — another tab still looked signed in | Definitive expiry best-effort calls `POST /api/auth/logout` (the only thing that can clear HttpOnly cookies) |
+| **E** | Every failed WebSocket handshake was read as an auth failure | **A backend restart left realtime permanently dead** — the single auth retry was spent and no reconnect was ever scheduled again | Diagnose with `GET /api/auth/me`, which reports a real status code; refresh only on 401 |
+| **F** | An identity change could leave two live sockets | A's pending refresh resolved after B's socket was up and connected again, orphaning a socket that kept writing to the shared store | Per-effect-run `disposed` flag; every handler refuses to act unless its socket is `wsRef.current` |
+
+Three further gaps, found while auditing rather than from the brief's list:
+
+* **Bootstrap.** `GET /auth/me` is (correctly) exempt from the automatic refresh
+  path, so a 401 on mount meant "signed out" — and **reloading the tab any time
+  after the first fifteen minutes signed the user out**, with a seven-day
+  refresh cookie in the browser. That is the original "my session keeps dying"
+  report in its purest form and D6.1 could not have fixed it: the interceptor is
+  the wrong layer. `AuthContext.checkAuth` now probes, and on a 401 attempts one
+  **silent** refresh before probing again. Silent because a first-time visitor
+  has no cookies either, and telling them their session expired is worse than
+  saying nothing.
+* **Google sign-in skipped both halves of an identity transition.**
+  `AuthCallback` stored the token and called `checkAuth()` directly, so it never
+  re-armed the refresh queue (a `refreshFailed` latch from the previous
+  account's expiry would have survived) and never reset the realtime store.
+  `AuthContext.adoptSession` is now the single convergence point for every
+  sign-in.
+* **A replayed request carried the stale bearer token.** The bootstrap token is
+  dropped by a successful refresh, but the replayed request was built with the
+  header already on it and the request interceptor only *sets* the header, never
+  clears it. Authentication was unaffected (`get_current_user` prefers the
+  cookie), but `security/csrf.py` exempts any Bearer-carrying request — so a
+  replayed **mutation** quietly skipped the CSRF layer on the strength of a
+  credential that no longer worked. The interceptor now removes the header when
+  there is no token.
+
+## 2. Session state semantics
+
+| State | Meaning | Reached from |
+|---|---|---|
+| `AUTHENTICATED` | Normal API + WebSocket operation | sign-in, registration, OAuth adoption, a successful bootstrap probe, a successful refresh |
+| `REFRESHING` | A recovery is in flight. **The UI must not appear logged out** — `user` is deliberately untouched | a 401 that started a refresh |
+| `SESSION_EXPIRED` | A refresh was attempted and the server **refused** it | a 401/403 answer to `POST /auth/refresh` — never a network error |
+| `USER_SIGNED_OUT` | The user pressed the button | `logout()` |
+
+`SESSION_EXPIRED` and `USER_SIGNED_OUT` are terminal for the page: a stray
+`AUTHENTICATED` signal cannot resurrect a finished session. Only a fresh
+sign-in moves the machine forward, and it does so through `resetRefreshState()`,
+which also starts a new auth epoch.
+
+The distinction is now visible to the user, not just to the code: the login
+screen renders a session-expired notice for `SESSION_END.EXPIRED` and says
+nothing for a deliberate sign-out or a first visit. D6.1 built the state and
+nothing consumed it.
+
+## 3. Refresh coalescing
+
+Unchanged from D6.1 in shape — one in-flight promise, N awaiters, one replay
+each — with three additions:
+
+1. **Failure classification** decides whether the shared promise's rejection
+   latches and announces (§1-A).
+2. **A silent joiner cannot silence a real caller.** The announcement decision
+   is made when the promise is created and can only be raised: a bootstrap probe
+   that a genuine authenticated request joins still announces the expiry.
+3. **Exemptions are matched by exact path**, not `String.includes`. Substring
+   matching silently exempts any future route that merely *contains* an exempt
+   path, and a route that quietly stops refreshing is a bug nobody notices until
+   a session dies on that page alone.
+
+## 4. WebSocket auth / reconnect semantics
+
+**Why the close code is useless here.** The server closes an unauthenticated
+handshake with 1008 *before* `accept()` (PH3.10, so an anonymous caller never
+occupies a connection slot). At the ASGI layer that is answered as an HTTP 403
+to the upgrade request, and a browser surfaces a handshake that never completed
+as `CloseEvent` code 1006 — **identical to what it reports for a server that is
+not listening**. D6.1's "never opened ⇒ bad credential" inference was therefore
+right for the case it was written for and wrong for every outage.
+
+The client asks the question the close code cannot answer:
+
+| `GET /api/auth/me` | Verdict | Action |
+|---|---|---|
+| 200 | the session is fine | ordinary backoff reconnect, unbounded |
+| 401 | the credential is stale | **one** coordinated refresh through the shared queue; reconnect on success; stop on a definitive refusal; ordinary reconnect if the refresh itself was unreachable |
+| 403 | the account is blocked | stop — no refresh can fix this |
+| no response / 5xx | the API is unreachable | ordinary backoff reconnect |
+
+An ordinary drop *after* a successful open never probes and never refreshes, so
+the common path costs nothing extra.
+
+**Server-side teardown.** A socket authenticates exactly once, at the handshake,
+and then lives as long as the tab. Every other authentication path in the
+platform re-resolves the identity per request, so revoking a session took effect
+within the access token's 15-minute life — except here, where it took effect
+when the user happened to close the browser. `ConnectionManager` now groups
+sockets by the refresh-token family (`sid`) that authorized them:
+
+* `close_session(sid)` — logout. Scoped to one session, because the user's other
+  devices did not sign out and their sockets are still legitimately authorized.
+* `close_user(user_id)` — logout-all, password change/reset, administrator
+  block, account deletion.
+
+The administrator block is the sharpest of these: PH3.10 made `blocked`
+effective everywhere an identity is re-resolved, and the socket was the one
+place it did not reach — while carrying the private domains, and while being
+what an operator reaches for during an active incident.
+
+## 5. Cookie / CSRF / CORS decisions
+
+* **Access-cookie `Max-Age` is now derived from `jwt.access_ttl_seconds()`**
+  (900 s), not a hardcoded 86400 with a comment claiming it matched the token.
+  It had not matched since PH1.6. Nothing accepted the stale credential — the
+  JWT's own `exp` is what authenticates — so the cost was a long-lived bearer
+  credential persisted on disk for no reason, and a comment that would have
+  misled the next reader. `REFRESH_TOKEN_MAX_AGE` is derived the same way.
+* **CORS, CSRF and the cookie policy were audited and left alone.** The exact
+  origin allowlist with credentials is correct and cannot become a wildcard by
+  construction; `X-CSRF-Token` is in `ALLOWED_HEADERS` (D6.1/L4); the signed
+  double-submit token is bound to the session; `/api/auth/logout` is CSRF-exempt,
+  which is what makes D6.2-D's cookie clear possible from a client whose CSRF
+  cookie is by then stale.
+* **A startup topology check was added** (`cookies.cookie_policy_warnings`).
+  These three files only work as one system and a mismatch between them fails
+  silently and totally: the API answers, CORS matches, and every
+  cookie-authenticated mutation 403s because the SPA is looking for a
+  `csrf_token` the browser filed under a host the page is not on. The check
+  names the decidable problems (a `COOKIE_DOMAIN` that does not cover an allowed
+  origin or the API itself; host-only cookies with a split frontend;
+  `SameSite=None` silently degraded to `Lax`; a cross-domain split on `Lax`) and
+  **says so when it could only check partially** — an empty warning list must
+  never read as a clean bill of health. Logged at WARNING, never fatal.
+* **New optional env `API_PUBLIC_ORIGIN`.** Purely declarative; nothing reads it
+  at request time. Without it the module knows every browser origin that may
+  talk to the API but not the origin the API answers on, which is exactly the
+  comparison the sharpest check needs.
+
+### Supported topologies
+
+| Frontend | API | `COOKIE_DOMAIN` | `COOKIE_SAMESITE` | Works |
+|---|---|---|---|---|
+| `localhost:3000` | `localhost:8000` | unset | `lax` | ✅ (same site — port is not part of a site) |
+| `app.example.com` | `api.example.com` | `.example.com` | `lax` | ✅ |
+| `app.example.com` | `api.example.com` | unset | `lax` | ❌ flagged — the SPA cannot read `csrf_token` |
+| `app.vercel.app` | `api.example.com` | any | `lax` | ❌ flagged — genuinely cross-site |
+| `app.vercel.app` | `api.example.com` | — | `none` + `Secure` | ✅ |
+
+## 6. Server session semantics (scope F)
+
+Seven of the eight audited behaviours were already correct and are now pinned by
+tests rather than rewritten: cookie-only refresh, rotation, single-use, reuse
+detection, expiry, revocation, logout, deleted-user, and the sliding absolute
+expiry that keeps an actively-used session alive.
+
+The eighth — **concurrent refresh** — was not. Strict single-use rotation treats
+two browser tabs as a token thief: cookies are shared across tabs, the access
+token expires for all of them at the same instant, and each tab runs its own
+refresh queue, so both POST the same refresh token milliseconds apart. One
+rotated; the other presented a retired token against a live family, which is
+bit-for-bit the signature of theft — so the family was revoked, **every tab was
+signed out, and a CRITICAL "token replay detected" record was written, for
+opening a second tab.**
+
+**The rotation grace window** (`JWT_REFRESH_GRACE_SECONDS`, default 10 s)
+forgives exactly one case: the *immediately previous* `jti`, replayed within the
+window of the rotation that retired it. The response re-issues the pair that is
+**already current** — minting a new `jti` would hand the second tab a token the
+store does not consider current, so its next refresh would trip reuse detection
+and revoke the family one round trip later, which would look like "logging out
+at random, fifteen minutes after opening a second tab".
+
+It does not weaken theft detection in any way that matters. An attacker holding
+a stolen refresh token does not need to race the legitimate client — it can use
+the token first and get a full rotation, which is what reuse detection catches
+on the victim's next refresh. What the window forgives is the case that carries
+no information: a replay so close to the rotation that it is indistinguishable
+from the same browser asking twice. A replay outside the window, a replay of a
+token two generations old, a second replay of the same retired token, and a
+fabricated `jti` all still revoke the family. RFC 9700 §4.14.2 contemplates
+exactly this. `JWT_REFRESH_GRACE_SECONDS=0` restores strict single-use, and the
+theft tests configure it that way so the strict path is exercised rather than
+assumed.
+
+## 7. Files changed
+
+**Frontend (7)**
+* `src/services/api.js` — failure classification, auth epoch, four-state
+  announcements, exact-path exemptions, server-side cookie clear.
+* `src/context/AuthContext.jsx` — bootstrap refresh recovery, `sessionState`,
+  `adoptSession`.
+* `src/context/RealtimeProvider.jsx` — handshake diagnosis, per-run `disposed`,
+  stale-socket guards, previous-socket close on reconnect.
+* `src/pages/AuthCallback.jsx` — routed through `adoptSession`.
+* `src/pages/Login.jsx` — the session-expired notice.
+* `src/test-utils/index.js` — `mockUnauthenticatedUser` also stubs the bootstrap
+  refresh refusal.
+* Test updates: `AuthContext.test.jsx`, `Login.test.jsx`, `Register.test.jsx`,
+  `sessionLifecycle.test.jsx` (assertions filtered by endpoint; the WS section
+  rewritten around the new diagnosis).
+
+**Frontend tests added (2)**
+* `src/__tests__/sessionLifecycleD62.test.jsx` — 38 tests.
+* `src/__tests__/sessionWebSocketD62.test.jsx` — 14 tests.
+
+**Backend (5)**
+* `security/sessions.py` — rotation grace window, `previous_jti` bookkeeping,
+  `RotationResult.issued_jti`.
+* `security/cookies.py` — derived `Max-Age`, `cookie_policy_warnings`,
+  `API_PUBLIC_ORIGIN`.
+* `server.py` — grace outcome wired into `POST /auth/refresh`; session-scoped
+  socket tracking + `close_session`/`close_user`; teardown wired into logout,
+  logout-all, password change/reset, admin block and account deletion; topology
+  check at startup.
+* Test updates: `test_jwt_sessions.py`, `test_cookie_security.py`,
+  `test_ws_authentication.py`, `test_audit.py`, `test_d61_security.py`.
+
+**Backend tests added (1)**
+* `tests/test_d62_session_lifecycle.py` — 38 tests.
+
+## 8. Verification
+
+Every new control was mutation-checked. 21 mutants, **20 killed**:
+
+* Backend (9 run against the new suite): `close_session` no-op → 2 red; grace
+  ignoring the rotation timestamp → 2; grace issuing the new `jti` → 3; grace
+  forgiving any `jti` → 2; no session tracking on connect → 3; logout not
+  closing sockets → 1; the host-only-split topology check removed → 1; the
+  access-cookie `Max-Age` hardcoded back to 86400 → 2 (in
+  `test_cookie_security.py`).
+* Frontend (11): every refresh failure definitive → 8 red; no epoch check before
+  replay → 2; no epoch re-check after the refresh → 1; no bootstrap recovery →
+  2; handshake always an auth failure → 4; stale sockets may write to the store
+  → 1; `connect` leaving the previous socket open → 1; a silent probe announcing
+  anyway → 2; substring exemption matching → 1; no server-side cookie clear → 1;
+  no transient cool-down → 1; the stale bearer header left on a replay → 1.
+
+**One surviving mutant, and it is equivalent.** Changing `if grace <= 0` to
+`if grace < 0` in `_within_rotation_grace` left the suite green — because
+`rotation_grace_seconds()` already clamps negatives to zero, and with a grace of
+zero the timestamp comparison `(_now() - rotated_at) <= 0` is false for any real
+elapsed time. The early return is a clarity guard, not a load-bearing branch;
+the *behaviour* it guarantees is asserted by
+`test_grace_zero_restores_strict_single_use`.
+
+**Two test defects were found by mutation and fixed rather than papered over:**
+
+1. `test_logout_closes_the_socket_for_that_session` asserted the close with a
+   bare `ws.receive_json()`. Against a regressed control the socket simply stays
+   open and the read blocks forever, so the mutation run **hung until it was
+   killed** — a broken control produced a hung suite instead of a red test.
+   Replaced with `_expect_closed`, a deadline read on a daemon thread.
+2. Two tests could not fail. `abandons a queued request…` bumped the epoch
+   before the interceptor had started its refresh, so it only ever exercised the
+   *pre*-refresh check — deleting the post-refresh one left the suite green. And
+   the refresh-storm test issued its requests concurrently, so the coalescing
+   queue absorbed them and the cool-down was never reached. Both rewritten to
+   hit the window they claim to.
+
+### Results
+
+| Suite | Result |
+|---|---|
+| Backend targeted (`test_d62_session_lifecycle`) | **38 passed** |
+| Backend auth/session/cookie/CSRF/WS/admin | **all green** |
+| Backend full | **4606 passed / 15 failed / 50 skipped / 4 xfailed** (263 s) |
+| Frontend targeted (D6.2 files) | **52 passed** |
+| Frontend full | **667 passed / 4 failed** (671 total) |
+| flake8 | new file clean (black + isort + flake8, the CI gate for added files); blocking subset `E9,F63,F7,F82,F811,F632` zero repo-wide |
+| Frontend production build | **succeeds** |
+
+**Failure classification — nothing new is hiding in either number.**
+
+* The 15 backend failures are all `tests/test_entrypoint_log_level.py`, the
+  documented pre-existing set (`entrypoint.sh` needs `python` on `PATH`, which
+  exists only inside the container). The pass count moves 4568 → 4606, which is
+  exactly the 38 tests this sprint adds.
+* The 4 frontend failures are the **pre-existing** Landing-page tests: verified
+  by stashing the entire D6.2 change and re-running, which reproduces the same
+  four failures on a clean tree. They are the same four recorded in D6.1.
+* **Two backend failures WERE caused by D6.2 and were fixed, not reclassified.**
+  `test_audit.py::test_refresh_rotation_and_replay_detection_audited` and
+  `test_d61_security.py::test_a_replayed_refresh_token_kills_the_family` both
+  replay a rotated token *immediately*, which is now the benign concurrent case.
+  Both now set `JWT_REFRESH_GRACE_SECONDS=0` — configuring the window away
+  rather than racing it, so the outcome does not depend on how fast the machine
+  is — and both assert the same thing they always did.
+* `frontend/build` compiles (warnings only, all pre-existing).
+
+Six test *files* were modified for a behaviour change that is deliberate and one
+that is not a behaviour change at all:
+
+* An unauthenticated mount now also fires one silent bootstrap refresh, so
+  assertions counting *every* POST had to name the endpoint they meant.
+* The WS section of `sessionLifecycle.test.jsx` was rewritten because "closed
+  before open" is no longer synonymous with "auth failure".
+* The two refresh-replay tests now age the rotation past the grace window
+  (store-level) or configure the window to zero (endpoint-level), because
+  replaying a token *immediately* is now the benign concurrent case.
+* `test_cookie_security.py` asserts `max-age=900` instead of `86400`.
+
+## 9. Limitations
+
+* **LIM-D6.2-1 — a deployment where the browser cannot send cookies on the
+  WebSocket handshake loses realtime after the first refresh.** The SPA drops
+  its localStorage bearer token on the first successful refresh (D6.1, for XSS
+  reasons), after which the socket authenticates by cookie only. On a genuinely
+  cross-site split without `COOKIE_SAMESITE=none`, the handshake then carries no
+  credential. The client behaves correctly — it diagnoses a healthy session and
+  reconnects on backoff — but never connects. The topology checker flags exactly
+  this configuration at startup; it is not otherwise detected at runtime.
+* **LIM-D6.2-2 — cross-tab refresh is coordinated on the server, not the
+  client.** Each tab still runs its own refresh queue and the grace window
+  absorbs the collision. A `BroadcastChannel` lock would avoid the duplicate
+  round trip entirely; it was not built because the server-side window is the
+  robust fix (it also covers two *browsers* on one account) and the client lock
+  would be an optimisation on top.
+* **LIM-D6.2-3 — an open socket is not re-validated on a timer.** It is closed
+  on every *event* that invalidates it (logout, logout-all, password
+  change/reset, block, deletion). A revocation that happens by some future path
+  which does not call `close_session`/`close_user` would not be noticed until
+  the socket closes for another reason. Enforcement is by call site, not by
+  signature.
+* **LIM-D6.2-4 — no browser-level verification.** Everything here is asserted at
+  the transport boundary (the real axios instance, the real interceptors, the
+  real `ConnectionManager`) with a stubbed `WebSocket` and a mocked adapter. The
+  cookie attributes, the preflight and the actual `SameSite` behaviour are
+  asserted from the `Set-Cookie` headers and the CORS configuration, **not** by
+  driving a real browser against a real server. The topology checker exists
+  precisely because that last mile is not covered by tests.
+* **LIM-D6.2-5 — `POST /api/auth/logout` on a definitive expiry is
+  best-effort.** If it fails, the access cookie survives until its own `Max-Age`
+  (now 900 s rather than 86400 s, which is why that change belongs to this
+  sprint).
+* **LIM-D6.2-6 — `SessionStore.rotate()` reads, decides, then writes; the
+  sequence is not atomic (TOCTOU).** Two concurrent refreshes presenting the
+  same `current_jti` can both pass the initial read before either write lands, so
+  a real asynchronous database can answer **both with `ROTATED`**. Not a
+  privilege escalation: only the last-written `jti` remains current, and the
+  client holding the loser fails closed on its next refresh — that `jti` is
+  neither current nor the retired generation the grace window forgives, so it
+  revokes the family.
+
+  **`JWT_REFRESH_GRACE_SECONDS=0` does NOT solve this race.** The interleaving
+  is decided inside the `ROTATED` path, before the grace check is reached;
+  zeroing the window removes only the forgiveness that lets the losing client's
+  *next* request survive, which makes the symptom worse.
+
+  **The correct future fix is an atomic conditional update / compare-and-swap:**
+  perform the rotation as one update matching
+
+  ```
+  session_id  == sid
+  current_jti == presented_jti
+  family is not revoked and not expired
+  ```
+
+  and branch on `modified_count` (or a re-read of the resulting state) rather
+  than on the values read beforehand — zero matched documents *is* the
+  "somebody rotated first" answer that the present read/decide/write shape
+  discards. Out of scope for D6.2: it rewrites the write on the sprint's most
+  security-sensitive path after that path's verification was complete. It is
+  also not constructible against this suite — the in-memory `FakeDB` is
+  single-threaded with no await point between the read and the write, so the
+  defect cannot be reproduced without a real async driver. See ADR-061 §5.
+
+## 10. Recommended next phase
+
+**D6.3**, per the D6.0 roadmap. **Not started** — the brief forbids starting it
+automatically.
+
+---
+
+## 11. Final freeze — grace-window verification
+
+Post-sprint, test-and-documentation only. **No production code was changed**;
+`backend/security/sessions.py` is byte-identical to the state it was verified in.
+
+* **Grace-window verdict: SAFE-NON-BRANCHING.** A `GRACE_REPLAY` performs no
+  write to the family at all, so it cannot extend a session, re-anchor the
+  window, or be walked forward by repeated replay.
+* **`JWT_REFRESH_GRACE_SECONDS=10` retained** as the default. The window is not
+  a branching risk and does not need tuning down.
+* **The no-lifetime-extension invariant is now regression-tested, not argued.**
+  `test_a_grace_replay_extends_nothing` (store) and
+  `test_the_second_tab_does_not_extend_the_session` (HTTP endpoint) snapshot the
+  stored family immediately before and after a grace replay and require
+  `expires_at`, `last_used_at`, `refresh_count`, `previous_jti`,
+  `previous_jti_at`, `current_jti` and the family id — and the whole document —
+  to be unchanged. `test_the_no_extension_snapshot_can_actually_fail` runs the
+  identical snapshot across a real rotation and requires every one of those
+  fields to move, so an empty diff means "nothing changed" rather than "the
+  snapshot observes nothing".
+* **`test_grace_zero_restores_strict_single_use` now proves the branch it is
+  named after.** It previously passed for the wrong reason: with the window at
+  zero, a few microseconds of real time had already elapsed by the time the
+  replay was evaluated, so `elapsed <= 0` was False and the replay fell through
+  to theft *whether or not* the `grace <= 0` guard existed. The rotation instant
+  is now pinned in the future, making elapsed negative — inside a zero-second
+  window — so the guard is the only thing in the code that can produce
+  `REUSE_DETECTED`. Parametrised over `"0"` and `"-60"`, with
+  `test_the_zero_window_construction_lands_inside_the_window` as the falsifying
+  twin (same setup, positive window, expects `GRACE_REPLAY`).
+* **Mutation-verified.** Deleting the `grace <= 0` guard turns both parametrised
+  strict-single-use cases red; making the grace path share the rotation's
+  `last_used_at`/`expires_at` write, or increment `refresh_count`, turns both
+  no-extension tests red. `security/sessions.py` was restored and re-verified
+  byte-identical afterwards.
+* **The `rotate()` TOCTOU remains a separate known limitation, LIM-D6.2-6**, not
+  fixed here by instruction. See §9 and ADR-061 §5 for the compare-and-swap
+  shape that closes it.
+
+| Suite | Result |
+| --- | --- |
+| `backend/tests/test_d62_session_lifecycle.py` | **43 passed** (38 → 43) |
+| Backend session/auth/cookie/CSRF/WS/audit targeted set | **all green** |
+
+---
+
+**D6.2 STATUS: COMPLETE — FROZEN.**

@@ -102,6 +102,7 @@ from security.cookies import (
     clear_oauth_state_cookie,
     set_broker_oauth_state_cookie,
     clear_broker_oauth_state_cookie,
+    cookie_policy_warnings,
 )
 from security import oauth_state as oauth_state_store
 from security import api_docs
@@ -470,7 +471,7 @@ async def malformed_json_handler(request, exc: _json.JSONDecodeError):
 from security import jwt as jwt_service
 from security.sessions import (
     SessionStore,
-    ROTATED, REUSE_DETECTED, REVOKED, EXPIRED, NOT_FOUND,
+    ROTATED, GRACE_REPLAY, REUSE_DETECTED, REVOKED, EXPIRED, NOT_FOUND,
     REASON_LOGOUT,
 )
 
@@ -1351,6 +1352,12 @@ async def logout(request: Request, response: Response):
         try:
             payload = jwt_service.decode_token(token, expected_type="refresh")
             await SessionStore(db).revoke(payload["sid"], reason=REASON_LOGOUT)
+            # D6.2 / E. Revoking the family kills the refresh token; it does
+            # nothing to a WebSocket that authenticated at its handshake and has
+            # been open ever since. That socket is a live private event stream
+            # for a session that no longer exists, so close it here — scoped to
+            # this session, because the user's other devices did not log out.
+            await ws_manager.close_session(payload["sid"])
             await log_auth_event(audit.SESSION_REVOKED, request,
                                  user_id=payload.get("sub"), session_id=payload.get("sid"),
                                  reason=REASON_LOGOUT)
@@ -1369,6 +1376,8 @@ async def logout_all(request: Request, response: Response, user: dict = Depends(
     (≤15 min) drain on their own; the service-layer primitive
     (``SessionStore.revoke_all_for_user``) is what PH1.10's UI will call."""
     revoked = await SessionStore(db).revoke_all_for_user(user["_id"], reason="logout_all")
+    # Every device, so every socket (D6.2 / E).
+    await ws_manager.close_user(str(user["_id"]))
     clear_auth_cookies(response)
     clear_csrf_cookie(response)
     await log_auth_event(audit.LOGOUT_ALL, request, email=user.get("email"),
@@ -1410,7 +1419,11 @@ async def refresh_token(request: Request, response: Response):
         raise HTTPException(status_code=401, detail="Invalid refresh token")
 
     # Rotate: the presented token is single-use. Replaying an already-rotated
-    # token (reuse) revokes the whole family — see security.sessions.
+    # token (reuse) revokes the whole family — see security.sessions. The one
+    # exception is a replay of the immediately-previous token inside the
+    # rotation grace window (D6.2 / F): two tabs sharing one cookie jar refresh
+    # at the same instant, and that is not theft. It is answered with the pair
+    # that is already current rather than a new rotation.
     new_jti = jwt_service.new_jti()
     result = await SessionStore(db).rotate(payload["sid"], payload["jti"], new_jti)
     if not result.ok:
@@ -1430,14 +1443,25 @@ async def refresh_token(request: Request, response: Response):
 
     user_id = str(user["_id"])
     access = jwt_service.create_access_token(user_id, user["email"], payload["sid"])
-    refresh = jwt_service.create_refresh_token(user_id, payload["sid"], new_jti)
+    # `issued_jti` is the new generation for a clean rotation and the ALREADY
+    # current one for a grace replay — minting `new_jti` unconditionally would
+    # hand the second tab a refresh token the store does not consider current,
+    # so its next refresh would trip reuse detection and revoke the family. The
+    # store, not the route, decides which generation is live.
+    refresh = jwt_service.create_refresh_token(user_id, payload["sid"], result.issued_jti)
     # Re-issue BOTH cookies through the central hardened policy: rotation means
     # the refresh token changes on every use, not just the access token.
     set_auth_cookies(response, access, refresh)
     # Refresh the session-bound CSRF token alongside (same sid → same binding).
     set_csrf_cookie(response, payload["sid"])
+    # A grace replay is audited under its own reason so the security log never
+    # shows it as a rotation that did not happen — and so an operator can see
+    # whether the window is being used at the rate two-tab usage predicts, or
+    # at a rate that warrants a closer look.
     await log_auth_event(audit.REFRESH_ROTATION, request, user_id=user_id,
-                         session_id=payload["sid"])
+                         session_id=payload["sid"],
+                         reason=("concurrent_refresh_grace"
+                                 if result.outcome == GRACE_REPLAY else None))
     return {"message": "Token refreshed"}
 
 
@@ -1685,6 +1709,10 @@ async def _apply_password_change(user: dict, new_password: str) -> None:
     # Sign out everywhere: revoke refresh families; password_changed_at handles
     # the still-live access tokens on their next use.
     await SessionStore(db).revoke_all_for_user(user_id, reason="password_changed")
+    # A password change is the strongest "this is no longer that person" signal
+    # the platform has. Leaving their sockets open would keep streaming private
+    # data to whoever the change was made to lock out (D6.2 / E).
+    await ws_manager.close_user(user_id)
     await _send_recovery_email("PASSWORD_CHANGED", user.get("email", ""), name=user.get("name", ""))
 
 
@@ -3451,8 +3479,17 @@ class ConnectionManager:
         # each page listen to just the topics it needs (market/sectors/scanner/
         # news/…) instead of every global broadcast.
         self.channels: dict[WebSocket, Set[str]] = {}
+        # Sockets grouped by the refresh-token FAMILY that authorized them
+        # (D6.2 / C). A socket is authenticated exactly once, at the handshake,
+        # and then lives for as long as the tab stays open — so without this,
+        # revoking a session left its private event stream running until the
+        # user closed the browser. Keyed by `sid` rather than by user because
+        # signing out on one device must not tear down another device's socket:
+        # that session was not revoked, and its socket is still legitimate.
+        self.session_connections: dict[str, Set[WebSocket]] = {}
 
-    async def connect(self, ws: WebSocket, user_id: str = None, subprotocol: str = None):
+    async def connect(self, ws: WebSocket, user_id: str = None, subprotocol: str = None,
+                      session_id: str = None):
         # `subprotocol` is echoed back on the handshake. A browser that offered
         # subprotocols CLOSES the connection unless the server selects one of
         # them, so this is load-bearing for the auth path in
@@ -3462,13 +3499,16 @@ class ConnectionManager:
         self.channels.setdefault(ws, set())
         if user_id:
             self.user_connections.setdefault(user_id, set()).add(ws)
+        if session_id:
+            self.session_connections.setdefault(session_id, set()).add(ws)
         # PH3.7. The gauges below say how many sockets exist right now; this
         # counter says how many arrived. A gauge alone cannot distinguish "200
         # stable connections" from "200 clients reconnecting every second",
         # and those are very different incidents.
         obs_instruments.record_ws_connection("accepted")
 
-    def disconnect(self, ws: WebSocket, user_id: str = None, reason: str = "client"):
+    def disconnect(self, ws: WebSocket, user_id: str = None, reason: str = "client",
+                   session_id: str = None):
         # `reason` distinguishes a clean close from a socket that raised. Both
         # empty the same structures, but only one of them is normal: a spike in
         # reason="error" against a flat reason="client" is a network or
@@ -3490,6 +3530,49 @@ class ConnectionManager:
             # only thing that ever emptied it was a process restart.
             if not conns:
                 del self.user_connections[user_id]
+        if session_id and session_id in self.session_connections:
+            session_conns = self.session_connections[session_id]
+            session_conns.discard(ws)
+            if not session_conns:
+                del self.session_connections[session_id]
+
+    async def close_session(self, session_id: str, *, code: int = None) -> int:
+        """Close every socket authorized by one refresh-token family.
+
+        D6.2 / C+E. Called when that family is revoked — a logout, or reuse
+        detection firing. The socket authenticated once at the handshake and has
+        no idea its credential died; nothing else in the system would ever tell
+        it. Returns the number of sockets closed.
+
+        Closing with the same policy-violation code the handshake rejection uses
+        means the client's existing "never opened / closed by policy" recovery
+        path handles it: it diagnoses, finds the credential gone, and stops
+        rather than reconnecting in a loop.
+        """
+        return await self._close_all(self.session_connections.get(session_id, set()), code)
+
+    async def close_user(self, user_id: str, *, code: int = None) -> int:
+        """Close every socket belonging to a user, across all their sessions.
+
+        For the events that invalidate a whole identity rather than one login:
+        sign-out-everywhere, a password change, an administrator block, account
+        deletion. Returns the number of sockets closed."""
+        return await self._close_all(self.user_connections.get(user_id, set()), code)
+
+    async def _close_all(self, sockets, code) -> int:
+        # Snapshot: closing a socket triggers its endpoint's disconnect, which
+        # mutates the very set being iterated.
+        targets = list(sockets)
+        closed = 0
+        for ws in targets:
+            try:
+                await ws.close(code=code or WS_CLOSE_POLICY_VIOLATION)
+                closed += 1
+            except Exception:
+                # Already gone. The endpoint's own teardown reaps the tracking
+                # entry; a failure to close a dead socket is not an error.
+                pass
+        return closed
 
     def subscribe(self, ws: WebSocket, channels):
         """Add channels to a socket's subscription set. Returns (accepted, refused).
@@ -3608,6 +3691,10 @@ class ConnectionManager:
             conns -= dead
             if not conns:
                 emptied.append(user_id)
+        for sid in list(self.session_connections):
+            self.session_connections[sid] -= dead
+        for sid in [s for s, conns in self.session_connections.items() if not conns]:
+            del self.session_connections[sid]
         # Same retention bug as `disconnect` (PH3.6): a socket that dies without
         # a clean close is reaped here, and before this the user's now-empty set
         # stayed keyed forever. This is the path a *dropped* connection takes, so
@@ -3742,8 +3829,8 @@ def _websocket_credential(websocket: WebSocket) -> tuple[Optional[str], Optional
     return None, None
 
 
-async def authenticate_websocket(websocket: WebSocket) -> Optional[tuple[str, Optional[str]]]:
-    """Resolve ``(user_id, subprotocol)`` for a WebSocket handshake, or ``None``.
+async def authenticate_websocket(websocket: WebSocket) -> Optional[tuple[str, Optional[str], Optional[str]]]:
+    """Resolve ``(user_id, session_id, subprotocol)`` for a handshake, or ``None``.
 
     PH3.10 (S-2, carried since PH1.9). The identity this returns is the key
     `ConnectionManager.send_to_user` fans per-user events out on — notifications,
@@ -3781,7 +3868,11 @@ async def authenticate_websocket(websocket: WebSocket) -> Optional[tuple[str, Op
         return None
     if jwt_service.token_issued_before(payload, user.get("password_changed_at")):
         return None
-    return str(user["_id"]), subprotocol
+    # D6.2 / C. The `sid` is carried through so the manager can group sockets by
+    # the refresh-token family that authorized them, and close exactly that
+    # group when the family is revoked. Without it a revoked session's private
+    # event stream stays open for as long as the tab does.
+    return str(user["_id"]), payload.get("sid"), subprotocol
 
 
 @app.websocket("/api/ws")
@@ -3798,8 +3889,9 @@ async def websocket_endpoint(websocket: WebSocket):
         obs_instruments.record_ws_connection("rejected")
         await websocket.close(code=WS_CLOSE_POLICY_VIOLATION)
         return
-    user_id, subprotocol = identity
-    await ws_manager.connect(websocket, user_id, subprotocol=subprotocol)
+    user_id, session_id, subprotocol = identity
+    await ws_manager.connect(websocket, user_id, subprotocol=subprotocol,
+                             session_id=session_id)
     try:
         while True:
             # Keep connection alive, listen for client messages
@@ -3839,7 +3931,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 await websocket.send_json({"type": "pong", "timestamp": datetime.now(timezone.utc).isoformat()})
 
     except WebSocketDisconnect:
-        ws_manager.disconnect(websocket, user_id)
+        ws_manager.disconnect(websocket, user_id, session_id=session_id)
     except Exception as exc:
         # PH3.7. This branch was previously indistinguishable from a clean
         # close — same call, no log line — so a socket dying on a malformed
@@ -3853,7 +3945,7 @@ async def websocket_endpoint(websocket: WebSocket):
             exc_info=exc,
             extra={"event": "websocket_abnormal_close", "error_class": error_class},
         )
-        ws_manager.disconnect(websocket, user_id, reason="error")
+        ws_manager.disconnect(websocket, user_id, reason="error", session_id=session_id)
 
 
 # Background task: broadcast market data every 10 seconds
@@ -6026,6 +6118,13 @@ async def admin_update_user(user_id: str, request: Request, user: dict = Depends
 async def admin_block_user(user_id: str, user: dict = Depends(require_admin)):
     oid = parse_object_id(user_id, "user")
     await db.users.update_one({"_id": oid}, {"$set": {"blocked": True}})
+    # PH3.10 made `blocked` take effect within the access token's 15-minute life
+    # on every path that re-resolves an identity. A WebSocket resolves its
+    # identity exactly once, at the handshake, so a blocked user's socket kept
+    # streaming their private events indefinitely — the one place the block did
+    # not reach. Blocking is what an operator reaches for during an active
+    # incident, so it has to reach there too (D6.2 / C).
+    await ws_manager.close_user(user_id)
     await log_admin_action(user["_id"], "user.blocked", user_id)
     return {"success": True}
 
@@ -6097,6 +6196,11 @@ async def admin_delete_user(user_id: str, user: dict = Depends(require_admin)):
     except Exception as e:
         sessions_revoked = 0
         logger.error(f"Session revocation failed for deleted user {user_id}: {e}")
+
+    try:
+        await ws_manager.close_user(user_id)
+    except Exception as e:  # pragma: no cover - defensive; teardown is best-effort
+        logger.error(f"Socket teardown failed for deleted user {user_id}: {e}")
 
     await db.users.delete_one({"_id": oid})
     await log_admin_action(user["_id"], "user.deleted", user_id)
@@ -7386,6 +7490,16 @@ async def startup():
     # opens — unchanged from the pre-PH3.4 ordering, now one call instead of
     # forty inline statements. See `ensure_indexes()` for why it was extracted.
     await ensure_indexes()
+
+    # Browser-session topology check (D6.2 / D). The cookie policy, the CORS
+    # allowlist and the CSRF double-submit only work as one coherent system, and
+    # a mismatch between them fails silently: the API answers, CORS matches, and
+    # every cookie-authenticated mutation 403s because the SPA is on a host the
+    # cookies were never filed under. Logged at WARNING, never fatal — a running
+    # deployment must not refuse to boot over a configuration the operator may
+    # be midway through changing.
+    for problem in cookie_policy_warnings():
+        logger.warning("Cookie/CORS topology: %s", problem)
 
     # Outbound HTTP connection pooling (PH3.4). Enabled here, on the application's
     # own event loop, because an httpx client's connections belong to the loop

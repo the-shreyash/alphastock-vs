@@ -216,7 +216,16 @@ class TestAuthIntegration:
 
 
 class TestSessionAndReplayIntegration:
-    def test_refresh_rotation_and_replay_detection_audited(self, client, fake_db):
+    def test_refresh_rotation_and_replay_detection_audited(self, client, fake_db,
+                                                           monkeypatch):
+        # D6.2 / F. Strict single-use, with the concurrency grace window
+        # configured away. The window forgives one case — the immediately
+        # previous token replayed within seconds, which is two tabs sharing a
+        # cookie jar, not a thief — and this test is about the CRITICAL audit
+        # record that the other case must still produce. Racing the window
+        # instead of disabling it would make the test's outcome depend on how
+        # fast the machine is.
+        monkeypatch.setenv("JWT_REFRESH_GRACE_SECONDS", "0")
         _seed_password_user(fake_db, email="replay_audit@example.com")
         login = client.post("/api/auth/login",
                             json={"email": "replay_audit@example.com", "password": "S3cure!Passw0rd"})

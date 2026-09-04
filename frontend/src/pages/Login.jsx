@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useNavigate, Link } from "react-router-dom";
 import { motion } from "framer-motion";
-import { useAuth } from "../context/AuthContext";
+import { useAuth, SESSION_END } from "../context/AuthContext";
 import { Eye, EyeOff, ArrowRight } from "lucide-react";
 import { resolveApiErrorMessage } from "../utils/apiError";
 import { startGoogleLogin } from "../services/googleAuth";
@@ -142,7 +142,7 @@ export default function Login() {
   const [showPw, setShowPw] = useState(false);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
-  const { login } = useAuth();
+  const { login, sessionEnd } = useAuth();
   const navigate = useNavigate();
 
   const handleSubmit = async (e) => {
@@ -263,6 +263,34 @@ export default function Login() {
           >
             Sign In
           </h2>
+
+          {/*
+            D6.2 / B. A session that expired is not a user who signed out, and
+            until now the app knew the difference and never said so — both
+            landed on this page with no explanation, which is exactly what the
+            original "it just logs me out" report was describing. The notice is
+            shown only for EXPIRED; a deliberate sign-out is owed no message,
+            and a first-time visitor (sessionEnd === null) must never be told a
+            session ended that they never had.
+          */}
+          {!error && sessionEnd === SESSION_END.EXPIRED && (
+            <div
+              data-testid="login-session-expired"
+              role="status"
+              style={{
+                background: "rgba(250,204,21,0.07)",
+                color: "var(--sa-text-secondary)",
+                border: "1px solid rgba(250,204,21,0.18)",
+                padding: "12px 16px",
+                borderRadius: 12,
+                fontSize: 13,
+                marginBottom: 20,
+                fontFamily: "Inter, sans-serif"
+              }}
+            >
+              Your session expired for security. Please sign in again to continue.
+            </div>
+          )}
 
           {error && (
             <div

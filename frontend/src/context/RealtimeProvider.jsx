@@ -12,13 +12,38 @@
  *     `send` on the store.
  *   - Route inbound messages: the R2 `event` envelope → `applyEvent`, every
  *     legacy flat type → `applyLegacy`.
- *   - Connection state machine: connecting → live → reconnecting → offline.
+ *   - Connection state machine: connecting → live → reconnecting → offline,
+ *     plus `unauthenticated` for a socket that cannot be authenticated at all.
  *   - 30s heartbeat (`ping`/`pong`); reconnect if a pong is missed.
  *   - Exponential backoff with jitter on reconnect (reset on a clean open).
+ *
+ * D6.2 — WEBSOCKET AUTH LIFECYCLE. Two defects, opposite in shape:
+ *
+ *   D6.2-E — **every failed handshake was read as an auth failure.** D6.1
+ *     classified "closed before it ever opened" as a credential problem, which
+ *     is true when the server rejects the handshake — and equally true of a
+ *     backend that is restarting, a proxy that is down, or a laptop that just
+ *     lost Wi-Fi, because a browser reports ALL of them identically. (It has
+ *     to: Starlette answers a pre-`accept()` close with an HTTP 403, so the
+ *     browser never sees close code 1008 at all — it sees a failed handshake,
+ *     code 1006.) So an ordinary outage burned the single auth retry and then
+ *     stopped reconnecting **permanently**: realtime never came back until the
+ *     tab was reloaded. The close code cannot tell these apart, so the client
+ *     asks the question the close code cannot answer — it probes `/auth/me`,
+ *     the same credential over a transport that reports real status codes.
+ *
+ *   D6.2-F — **an identity change could leave two live sockets.** The
+ *     "are we still wanted?" flag was a ref shared across effect runs. Tearing
+ *     down for user A set it, and A's in-flight `refreshSession().then(connect)`
+ *     resolved *after* B's effect had already cleared it and connected — so it
+ *     connected again, orphaning a socket that stayed open and kept writing
+ *     into the shared store. Each effect run now owns a private `disposed`
+ *     flag, and every handler additionally refuses to touch the store unless
+ *     its socket is still the current one.
  */
 import { useEffect, useRef } from "react";
 import { useAuth } from "./AuthContext";
-import { refreshSession, sessionIsDead } from "../services/api";
+import api, { refreshSession, sessionIsDead } from "../services/api";
 import { useRealtimeStore } from "../store/realtimeStore";
 
 const WS_URL = process.env.REACT_APP_BACKEND_URL
@@ -72,19 +97,26 @@ export function RealtimeProvider({ children }) {
   const heartbeatRef = useRef(null);
   const pongTimerRef = useRef(null);
   const attemptRef = useRef(0);
-  const closedByUsRef = useRef(false);
   const batchRef = useRef([]); // queued inbound messages (Sprint R9 batching)
   const batchTimerRef = useRef(null);
   const lastIdentityRef = useRef(null); // previous socket identity (D6.1 / S8)
-  // D6.1 / L3. True once a socket has actually opened for the current attempt.
-  // A close that happens with this still false is a HANDSHAKE REJECTION — the
-  // server closed with 1008 before `accept()` — which is a credential problem,
-  // not a network problem, and must not be answered by offering the same dead
-  // credential again on a backoff timer.
+  // True once a socket has actually opened for the current attempt. A close
+  // that happens with this still false means the connection never came up —
+  // which may be a rejected credential OR an unreachable server, and D6.2-E is
+  // about the fact that a browser cannot tell you which.
   const openedRef = useRef(false);
+  // Refresh attempts spent on handshake recovery since the last clean open.
+  // Bounded at one: nothing but re-authentication changes a credential, so a
+  // second attempt with the same one cannot succeed.
   const authRetryRef = useRef(0);
+  // One handshake diagnosis at a time (the probe below is a round trip).
+  const diagnosingRef = useRef(false);
 
   useEffect(() => {
+    // Owned by this effect run alone: true once React has torn it down. Every
+    // async continuation below (reconnect timer, refresh promise, probe) checks
+    // it before touching the socket or the store (D6.2-F).
+    let disposed = false;
     const store = useRealtimeStore.getState();
 
     // D6.1 / S8. Reset the WHOLE store on an identity change, not just the feed
@@ -133,7 +165,7 @@ export function RealtimeProvider({ children }) {
     };
 
     const scheduleReconnect = () => {
-      if (closedByUsRef.current) return;
+      if (disposed) return;
       const attempt = attemptRef.current;
       const backoff = Math.min(BACKOFF_BASE_MS * 2 ** attempt, BACKOFF_MAX_MS);
       const jitter = Math.random() * 0.3 * backoff; // ±30% to avoid thundering herd
@@ -143,35 +175,100 @@ export function RealtimeProvider({ children }) {
     };
 
     /**
-     * A close that happened before the socket ever opened: the server rejected
-     * the handshake (1008) because the credential is expired or invalid.
+     * Ask the API which kind of failure we just had.
      *
-     * D6.1 / L3. This used to be indistinguishable from a network drop, so the
-     * reconnect loop re-offered the SAME expired token forever, backing off to
-     * 30s and retrying until the tab closed. Realtime never recovered and
-     * nothing on screen said so.
+     * D6.2-E — WHY A PROBE AND NOT THE CLOSE CODE. The server closes an
+     * unauthenticated handshake with 1008 *before* `accept()` (PH3.10, so an
+     * anonymous caller never occupies a connection slot). At the ASGI layer
+     * that is answered as an HTTP 403 to the upgrade request, and a browser
+     * surfaces a handshake that never completed as `CloseEvent` code 1006 —
+     * exactly what it reports for a server that is not listening at all. The
+     * close code therefore carries no information here, and the previous code's
+     * "never opened ⇒ bad credential" inference was wrong for every network
+     * failure. `GET /api/auth/me` carries the same credential over a transport
+     * that *does* report a status code, so it answers the question directly:
      *
-     * The response is bounded and useful instead: try ONCE to restore
-     * authentication through the shared refresh queue (the same single in-flight
-     * promise the REST client uses, so a page-wide expiry produces one refresh,
-     * not one per subsystem). If that works, reconnect immediately with the
-     * fresh cookie. If it does not, stop — the api client has already announced
+     *   200                 → the session is fine; the socket failed for some
+     *                         other reason. Reconnect normally.
+     *   401                 → the credential is stale. One coordinated refresh.
+     *   403                 → the account is blocked. Nothing to retry.
+     *   no response / 5xx   → the API is unreachable or broken, so the socket's
+     *                         failure was never about authentication either.
+     *
+     * `/auth/me` is on the api client's NEVER_REFRESH list, so this probe reads
+     * the raw answer instead of triggering a refresh of its own — the refresh
+     * below stays the single, deliberate one.
+     */
+    const diagnoseHandshakeFailure = async () => {
+      try {
+        await api.get("/auth/me");
+        return "authenticated";
+      } catch (err) {
+        const status = err?.response?.status;
+        if (status === 401) return "credential_expired";
+        if (status === 403) return "account_blocked";
+        return "api_unreachable";
+      }
+    };
+
+    /**
+     * A close that happened before the socket ever opened.
+     *
+     * The response is bounded and useful: diagnose first, then either reconnect
+     * normally (network) or spend the single re-authentication attempt
+     * (credential). The refresh goes through the shared queue the REST client
+     * uses, so a page-wide expiry produces one refresh, not one per subsystem.
+     * If it succeeds we reconnect immediately with the fresh cookie. If it is
+     * definitively refused we stop — the api client has already announced
      * SESSION_EXPIRED, AuthContext will drop `user`, and this effect will tear
      * the socket down. Retrying past that point cannot succeed by definition:
      * nothing changes a credential except re-authentication.
      */
-    const handleAuthRejection = () => {
-      if (closedByUsRef.current) return;
+    const handleHandshakeFailure = async () => {
+      if (disposed || diagnosingRef.current) return;
+      if (sessionIsDead()) {
+        useRealtimeStore.getState().setConnection("unauthenticated");
+        return;
+      }
+      diagnosingRef.current = true;
+      let verdict;
+      try {
+        verdict = await diagnoseHandshakeFailure();
+      } finally {
+        diagnosingRef.current = false;
+      }
+      if (disposed) return;
+
+      if (verdict === "authenticated" || verdict === "api_unreachable") {
+        // Not an authentication problem. This is the ordinary-reconnect path
+        // and it must stay unbounded-with-backoff: a backend restart has to
+        // heal on its own, without a page reload.
+        authRetryRef.current = 0;
+        scheduleReconnect();
+        return;
+      }
+
       useRealtimeStore.getState().setConnection("unauthenticated");
-      if (sessionIsDead() || authRetryRef.current >= 1) return;
+      if (verdict === "account_blocked") return; // refresh cannot fix a block
+      if (authRetryRef.current >= 1) return;
       authRetryRef.current += 1;
-      refreshSession()
-        .then(() => {
-          if (closedByUsRef.current) return;
-          attemptRef.current = 0;
-          connect();
-        })
-        .catch(() => { /* api client announced SESSION_EXPIRED; stay stopped */ });
+      try {
+        await refreshSession();
+      } catch {
+        if (disposed) return;
+        // A definitive refusal already announced SESSION_EXPIRED and this
+        // effect is about to be torn down — stay stopped. A transient failure
+        // (the refresh endpoint itself unreachable) is a network problem after
+        // all, so fall back to the ordinary reconnect path (D6.2-A).
+        if (!sessionIsDead()) {
+          authRetryRef.current = 0;
+          scheduleReconnect();
+        }
+        return;
+      }
+      if (disposed) return;
+      attemptRef.current = 0;
+      connect();
     };
 
     const startHeartbeat = (ws) => {
@@ -188,6 +285,15 @@ export function RealtimeProvider({ children }) {
     };
 
     function connect() {
+      if (disposed) return;
+      // D6.2-F. Never leave a previous attempt's socket behind: if one is still
+      // referenced here, it is superseded by definition, and two open sockets
+      // means duplicated frames and a private stream nobody is tracking.
+      const previous = wsRef.current;
+      if (previous) {
+        wsRef.current = null;
+        try { previous.close(); } catch { /* noop */ }
+      }
       const s = useRealtimeStore.getState();
       openedRef.current = false;
       s.setConnection("connecting");
@@ -220,6 +326,13 @@ export function RealtimeProvider({ children }) {
       wsRef.current = ws;
 
       ws.onopen = () => {
+        // D6.2-F. A socket that is no longer the current one has been
+        // superseded (identity change, or a reconnect that raced it). It must
+        // not adopt the store's `send`, and it must not report itself live.
+        if (disposed || ws !== wsRef.current) {
+          try { ws.close(); } catch { /* noop */ }
+          return;
+        }
         openedRef.current = true;
         authRetryRef.current = 0; // a successful handshake re-arms the auth path
         attemptRef.current = 0; // reset backoff on a clean connection
@@ -235,6 +348,9 @@ export function RealtimeProvider({ children }) {
       };
 
       ws.onmessage = (event) => {
+        // D6.2-F. A stale socket's frames are the previous identity's private
+        // data. Drop them rather than writing them into the shared store.
+        if (disposed || ws !== wsRef.current) return;
         let msg;
         try { msg = JSON.parse(event.data); } catch { return; }
         if (msg.type === "pong") {
@@ -249,17 +365,20 @@ export function RealtimeProvider({ children }) {
       };
 
       ws.onclose = () => {
+        // A superseded socket closing says nothing about the live one; it must
+        // not clear `send`, change the connection state, or start a reconnect.
+        // This also covers teardown, which nulls `wsRef` before closing and
+        // then sets the offline state itself.
+        if (disposed || ws !== wsRef.current) return;
         if (heartbeatRef.current) { clearInterval(heartbeatRef.current); heartbeatRef.current = null; }
         if (pongTimerRef.current) { clearTimeout(pongTimerRef.current); pongTimerRef.current = null; }
         useRealtimeStore.getState().setSend(null);
-        if (closedByUsRef.current) {
-          useRealtimeStore.getState().setConnection("offline");
-          return;
-        }
-        // Never opened => the handshake was rejected, which is an auth problem
-        // (D6.1 / L3). Opened and then closed => a network event; back off.
+        // Never opened => the connection never came up. That is either a
+        // rejected credential or an unreachable server and the close code
+        // cannot tell them apart, so ask (D6.2-E). Opened and then closed =>
+        // an ordinary network event; back off and reconnect.
         if (!openedRef.current) {
-          handleAuthRejection();
+          handleHandshakeFailure();
           return;
         }
         scheduleReconnect();
@@ -270,13 +389,21 @@ export function RealtimeProvider({ children }) {
       };
     }
 
-    closedByUsRef.current = false;
     attemptRef.current = 0;
     authRetryRef.current = 0;
+    // These are refs, so they outlive an effect run. Reset the diagnosis latch
+    // too: a run torn down mid-probe would otherwise leave it set until that
+    // probe settled, and a handshake failure in the next run would be dropped.
+    diagnosingRef.current = false;
     connect();
 
     return () => {
-      closedByUsRef.current = true;
+      // D6.2-F. `disposed` is local to THIS effect run, so a continuation left
+      // over from a previous identity can never be re-enabled by the next one.
+      // (A shared ref was: the teardown set it, and the next effect body
+      // cleared it again before A's pending refresh resolved — which then
+      // opened a second socket for an account that had already gone.)
+      disposed = true;
       clearTimers();
       const ws = wsRef.current;
       wsRef.current = null;

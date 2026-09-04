@@ -1,5 +1,13 @@
 import { createContext, useContext, useState, useEffect, useCallback, useRef } from "react";
-import api, { resetRefreshState, SESSION_EXPIRED_EVENT } from "../services/api";
+import api, {
+  announceAuthenticated,
+  announceSignedOut,
+  attemptSilentRefresh,
+  resetRefreshState,
+  SESSION_EXPIRED_EVENT,
+  SESSION_STATE,
+  SESSION_STATE_EVENT,
+} from "../services/api";
 import { useRealtimeStore } from "../store/realtimeStore";
 
 const AuthContext = createContext(null);
@@ -25,19 +33,71 @@ export const SESSION_END = {
   SIGNED_OUT: "USER_SIGNED_OUT",
 };
 
+export { SESSION_STATE };
+
 export function AuthProvider({ children }) {
   const [user, setUser] = useState(null); // null = checking
   const [loading, setLoading] = useState(true);
   const [sessionEnd, setSessionEnd] = useState(null);
+  // D6.2-C. The authoritative four-state session machine. `sessionEnd` is the
+  // narrower "how did it finish" signal the UI already consumed; this is the
+  // full state, including the REFRESHING transition that has no `sessionEnd`.
+  const [sessionState, setSessionState] = useState(SESSION_STATE.AUTHENTICATED);
   const hasChecked = useRef(false);
 
+  /**
+   * Resolve the signed-in user for this page load.
+   *
+   * D6.2 — BOOTSTRAP RECOVERY. This used to be a single `GET /auth/me`, and a
+   * 401 meant "signed out", full stop. But the access token lives 15 minutes
+   * and the refresh cookie lives seven days, so **reloading the tab any time
+   * after the first quarter of an hour signed the user out** — with a valid
+   * refresh cookie sitting unused in the browser. That is the original
+   * "my session keeps dying" report in its purest form, and D6.1's interceptor
+   * could not fix it because `/auth/me` is (correctly) exempt from the
+   * automatic refresh path.
+   *
+   * So the recovery is explicit and bounded: probe once, and on a 401 attempt
+   * exactly one **silent** refresh before probing again. Silent because a 401
+   * here is ambiguous — a first-time visitor has no cookies either — and
+   * telling somebody who never signed in that their session expired is worse
+   * than saying nothing. A visitor who was genuinely never authenticated ends
+   * up at `user === false` with `sessionEnd === null`, which is exactly the
+   * signed-out state the app has always rendered.
+   */
   const checkAuth = useCallback(async () => {
+    const probe = () => api.get("/auth/me");
     try {
-      const { data } = await api.get("/auth/me");
+      const { data } = await probe();
       setUser(data);
       setSessionEnd(null);
-    } catch {
-      setUser(false);
+      setSessionState(SESSION_STATE.AUTHENTICATED);
+      return data;
+    } catch (first) {
+      if (first?.response?.status !== 401) {
+        // Not an authentication answer — the API is unreachable or broken. Do
+        // not manufacture a session verdict out of a transport failure
+        // (D6.2-A); report signed-out for this render without claiming the
+        // session expired.
+        setUser(false);
+        return null;
+      }
+      try {
+        await attemptSilentRefresh();
+      } catch {
+        setUser(false);
+        return null;
+      }
+      try {
+        const { data } = await probe();
+        setUser(data);
+        setSessionEnd(null);
+        setSessionState(SESSION_STATE.AUTHENTICATED);
+        return data;
+      } catch {
+        setUser(false);
+        return null;
+      }
     } finally {
       setLoading(false);
     }
@@ -65,26 +125,60 @@ export function AuthProvider({ children }) {
     const onExpired = () => {
       setUser(false);
       setSessionEnd(SESSION_END.EXPIRED);
+      setSessionState(SESSION_STATE.SESSION_EXPIRED);
       setLoading(false);
     };
     window.addEventListener(SESSION_EXPIRED_EVENT, onExpired);
     return () => window.removeEventListener(SESSION_EXPIRED_EVENT, onExpired);
   }, []);
 
+  // D6.2-C. Transitions the api client observes but that are not session
+  // *endings*: REFRESHING while a recovery is in flight, and AUTHENTICATED when
+  // it succeeds. `user` is deliberately untouched here — a refresh must never
+  // make the UI flash a logged-out state for the length of a round trip.
+  useEffect(() => {
+    const onState = (event) => {
+      const next = event?.detail?.state;
+      if (next !== SESSION_STATE.REFRESHING && next !== SESSION_STATE.AUTHENTICATED) {
+        return; // expiry and sign-out are owned by the handlers above/below
+      }
+      setSessionState((current) => {
+        // Never resurrect a finished session: once it is expired or signed out,
+        // only a fresh sign-in moves it forward.
+        if (current === SESSION_STATE.SESSION_EXPIRED
+            || current === SESSION_STATE.USER_SIGNED_OUT) {
+          return current;
+        }
+        return next;
+      });
+    };
+    window.addEventListener(SESSION_STATE_EVENT, onState);
+    return () => window.removeEventListener(SESSION_STATE_EVENT, onState);
+  }, []);
+
+  /** State every successful sign-in converges on, whatever the mechanism. */
+  const adoptUser = useCallback((data) => {
+    setUser(data);
+    setSessionEnd(null);
+    setSessionState(SESSION_STATE.AUTHENTICATED);
+    announceAuthenticated();
+  }, []);
+
   const login = async (email, password) => {
+    // D6.1 / S8 + D6.2-B. `resetRefreshState` re-arms the refresh queue AND
+    // starts a new identity generation, so any request still queued under the
+    // previous account can never replay under this one. The realtime store is a
+    // module singleton that outlives an identity change in the same tab, so
+    // A -> logout -> B login left A's portfolio, broker status, orders, ticks,
+    // trades, alerts and unread badge on screen until fresh events happened to
+    // overwrite them. Clearing on the way IN as well as the way OUT means a
+    // stale account's data cannot survive either transition, including a login
+    // that follows a crash or a reload where no logout ever ran.
     resetRefreshState();
-    // D6.1 / S8. The realtime store is a module singleton that outlives an
-    // identity change in the same tab, so A -> logout -> B login left A's
-    // portfolio, broker status, orders, ticks, trades, alerts and unread badge
-    // on screen until fresh events happened to overwrite them. Clearing on the
-    // way IN as well as the way OUT means a stale account's data cannot survive
-    // either transition, including a login that follows a crash or a reload
-    // where no logout ever ran.
     useRealtimeStore.getState().reset();
     const { data } = await api.post("/auth/login", { email, password });
     if (data.token) localStorage.setItem("token", data.token);
-    setUser(data);
-    setSessionEnd(null);
+    adoptUser(data);
     return data;
   };
 
@@ -93,10 +187,30 @@ export function AuthProvider({ children }) {
     useRealtimeStore.getState().reset();
     const { data } = await api.post("/auth/register", { name, email, password });
     if (data.token) localStorage.setItem("token", data.token);
-    setUser(data);
-    setSessionEnd(null);
+    adoptUser(data);
     return data;
   };
+
+  /**
+   * Adopt a session established outside the login form — today, the Google
+   * OAuth code exchange (D6.2 / E).
+   *
+   * `AuthCallback` used to store the token and call `checkAuth()` directly,
+   * which skipped BOTH halves of an identity transition: the refresh queue was
+   * never re-armed (so a `refreshFailed` latch left over from the previous
+   * account's expiry would have kept the new session from ever refreshing) and
+   * the realtime store was never reset (so the previous account's portfolio,
+   * orders and broker state were still on screen). Signing in is signing in,
+   * whichever button was pressed.
+   */
+  const adoptSession = useCallback(async (token) => {
+    resetRefreshState();
+    useRealtimeStore.getState().reset();
+    if (token) localStorage.setItem("token", token);
+    const data = await checkAuth();
+    if (data) announceAuthenticated();
+    return data;
+  }, [checkAuth]);
 
   const logout = async () => {
     try {
@@ -107,11 +221,14 @@ export function AuthProvider({ children }) {
     resetRefreshState();
     setUser(false);
     setSessionEnd(SESSION_END.SIGNED_OUT);
+    setSessionState(SESSION_STATE.USER_SIGNED_OUT);
+    announceSignedOut();
   };
 
   return (
     <AuthContext.Provider value={{
-      user, loading, sessionEnd, login, register, logout, checkAuth,
+      user, loading, sessionEnd, sessionState, login, register, logout, checkAuth,
+      adoptSession,
       sessionExpired: sessionEnd === SESSION_END.EXPIRED,
     }}>
       {children}

@@ -95,8 +95,10 @@ describe("submission", () => {
     await fillCredentials(user);
     await user.click(screen.getByTestId("login-submit-btn"));
 
-    await waitFor(() => expect(mock.history.post).toHaveLength(1));
-    expect(JSON.parse(mock.history.post[0].data)).toEqual({
+    await waitFor(() => expect(
+      mock.history.post.filter((r) => r.url === "/auth/login")).toHaveLength(1));
+    expect(JSON.parse(
+      mock.history.post.filter((r) => r.url === "/auth/login")[0].data)).toEqual({
       email: "trader@test.invalid",
       password: "correct-horse-battery",
     });
@@ -124,7 +126,7 @@ describe("submission", () => {
     await waitFor(() => expect(submit).toBeDisabled());
     await user.click(submit);
 
-    expect(mock.history.post).toHaveLength(1);
+    expect(mock.history.post.filter((r) => r.url === "/auth/login")).toHaveLength(1);
   });
 
   it("declares both credentials required, so an empty form cannot validate", async () => {

@@ -4014,3 +4014,253 @@ application. A session fix that breaks the app is not a fix.
   omits `user_id`, and a per-account module importing the platform logger.
 * D5 is untouched. No market-data, gateway, ranking, scanner or feed-state code
   was modified.
+
+---
+
+# ADR-061 — A failed recovery is not a dead session, and a failed handshake is not a bad credential (D6.2)
+
+**Status:** Accepted · 2026-09-03 · Extends ADR-060 (D6.1), which extends ADR-059 (D6.0).
+
+## Context
+
+D6.1 made the browser session work end to end: cookies flow, one refresh serves
+N concurrent 401s, and a session that expired is distinguishable in state from a
+user who signed out. What it did not settle is what the client should *conclude*
+when a recovery attempt fails — and the machinery that recovers a session is
+exercised on exactly the paths where the network is least reliable.
+
+Six defects were found. Five of them shared one shape: **a failure the client
+could not classify was classified anyway, in the most destructive direction
+available, silently.**
+
+## Decision
+
+### 1. Only the server saying "no" ends a session
+
+`POST /api/auth/refresh` answering **401 or 403** is definitive: the refresh
+cookie is absent, expired, revoked, rotated-out, or belongs to a blocked
+account, and no amount of retrying changes any of those. Everything else — no
+response at all (DNS, TCP, TLS, CORS, an aborted request, an API that is not
+running), 5xx, and the endpoint's own 429 — is the transport or the server
+failing, **not the session**.
+
+A transient failure does not latch the refresh machinery, does not announce
+`SESSION_EXPIRED`, and does not call logout. It holds a five-second cool-down so
+an outage cannot become a request storm, and then a later 401 is free to try
+again.
+
+**Rejected: keeping the single catch and adding a retry.** Retrying does not
+address the defect. The defect is that the client *told the user their session
+had ended* on evidence that said nothing of the kind, and then made that
+conclusion permanent for the life of the page. A retry loop over the same wrong
+conclusion is a faster wrong conclusion.
+
+### 2. A request belongs to the identity that dispatched it
+
+Every request is stamped with an **auth epoch** at first dispatch; the epoch is
+incremented on sign-in, registration, OAuth adoption, sign-out and expiry. A
+replay whose epoch no longer matches is abandoned with `SessionChangedError`
+rather than sent. The epoch is checked twice — before the refresh is started and
+again after it resolves — because the sign-out can land in either window, and
+the second check is the one that covers a request already on the wire.
+
+This is the highest-severity item in the sprint. The pre-D6.2 replay path was
+"401 → await refresh → re-send", with nothing tying the request to an identity.
+A parked `POST /trades` re-sent after a sign-out/sign-in carries the **new**
+user's cookies: an order placed into the wrong brokerage account, from a client
+that believed it was retrying.
+
+**Rejected: cancelling in-flight requests on logout.** Axios cancellation would
+have to be threaded through every call site, and a call site that forgot would
+fail open — the same "enforcement by sweep" weakness ADR-060 replaced with a
+keyword-only argument. Stamping in the request interceptor is one place, cannot
+be forgotten, and fails closed: an unstamped request has `undefined !== epoch`.
+
+### 3. The WebSocket asks; it does not infer
+
+A browser reports "the server refused your credential" and "the server is not
+there" **identically**. It has to: the endpoint closes an unauthenticated
+handshake with 1008 before `accept()` (PH3.10, so an anonymous caller never
+occupies a slot), which at the ASGI layer is an HTTP 403 to the upgrade request,
+which a browser surfaces as `CloseEvent` code 1006 — the same code it reports
+for a connection that never reached a server. D6.1's `never opened ⇒ bad
+credential` was correct for the case it was written for and wrong for every
+outage: an ordinary backend restart spent the single auth retry and then
+scheduled no further reconnect, leaving **realtime permanently dead until the
+tab was reloaded**.
+
+On a close-before-open the client probes `GET /api/auth/me` — the same
+credential over a transport that reports real status codes — and acts on the
+answer: 200 or unreachable → ordinary backoff reconnect, unbounded; 401 → one
+coordinated refresh through the shared queue; 403 → stop. A drop *after* a
+successful open is a network event and never probes, so the common path costs
+nothing.
+
+**Rejected: accepting the handshake and then closing with 1008 so the code is
+visible.** That would make the failure self-describing at the price of letting
+an unauthenticated caller occupy a connection slot and enter the manager's
+tracking maps — reopening precisely what PH3.10 closed. A probe on a path that
+has already failed is cheaper than a security regression.
+
+### 4. Revoking a session closes its sockets
+
+A socket authenticates once, at the handshake, and then lives as long as the
+tab. Every other authentication path re-resolves the identity per request, so
+revocation took effect within the access token's 15-minute life — except on the
+socket, where it took effect when the user closed the browser.
+`ConnectionManager` now groups sockets by the refresh-token family (`sid`) that
+authorized them. Logout closes **that session's** sockets only, because the
+user's other devices did not sign out. Logout-all, a password change or reset,
+an administrator block and account deletion close all of the user's.
+
+The administrator block is the sharpest case: PH3.10 made `blocked` effective
+everywhere an identity is re-resolved, and the socket was the one place it never
+reached — while carrying the private domains, and while being the control an
+operator reaches for during an active incident.
+
+### 5. Two tabs are not a token thief
+
+Strict single-use rotation treats a benign, extremely common event as an attack.
+Cookies are shared across tabs, the access token expires for all of them at the
+same instant, and each tab runs its own refresh queue — so both POST the same
+refresh token milliseconds apart. One rotates; the other presents a retired
+token against a live family, which is bit-for-bit the signature of theft. The
+family is revoked, **every tab is signed out, and a CRITICAL "token replay
+detected" record is written, for opening a second tab.**
+
+A **rotation grace window** (`JWT_REFRESH_GRACE_SECONDS`, default 10 s) forgives
+exactly one thing: the immediately-previous `jti`, presented within the window
+of the rotation that retired it. It answers with the pair that is **already
+current** rather than rotating again — minting a new `jti` would hand the second
+tab a token the store does not consider current, so its next refresh would trip
+reuse detection and revoke the family one round trip later, which would present
+as "logging out at random, fifteen minutes after opening a second tab".
+
+This costs nothing real in theft detection. An attacker holding a stolen refresh
+token has no reason to race the legitimate client — it can use the token first
+and get a full rotation, which is what reuse detection catches on the victim's
+next refresh. What the window forgives is the case that carries no information:
+a replay so close to the rotation that it cannot be distinguished from the same
+browser asking twice. A replay outside the window, of a token two generations
+old, a second replay of the same retired token, and a fabricated `jti` all still
+revoke the family. RFC 9700 §4.14.2 contemplates exactly this.
+`JWT_REFRESH_GRACE_SECONDS=0` restores strict single-use, and the theft tests
+configure it that way so the strict path stays exercised rather than assumed.
+
+**Rejected: a client-side cross-tab lock (`BroadcastChannel`).** It would avoid
+the duplicate round trip, but it only covers tabs in one browser instance —
+two browsers, or a browser and a restored session, still collide — and it puts
+the correctness of a server-side security control in the client. The server-side
+window is the robust fix; the client lock would be an optimisation on top
+(LIM-D6.2-2).
+
+**Verification, D6.2 final freeze: SAFE-NON-BRANCHING.** The window was
+re-examined at the close of the sprint against the one question that decides
+whether any grace is safe: can forgiving a replay create a *second* live
+credential, or extend the life of the family it belongs to? It does neither. The
+grace path performs **no write at all** — it re-issues the `jti` that is already
+current and returns. `expires_at`, `last_used_at`, `refresh_count`,
+`previous_jti`, `previous_jti_at`, `current_jti` and the family id are all
+identical either side of a replay, so the branch cannot slide the absolute
+expiry forward, cannot re-anchor the window, and cannot be walked forward by
+repeated replay. That is now regression-tested rather than argued:
+`test_a_grace_replay_extends_nothing` snapshots the stored family immediately
+before and after a replay and requires the diff to be empty, and
+`test_the_no_extension_snapshot_can_actually_fail` runs the identical snapshot
+across a real rotation and requires every one of those fields to move — so an
+empty diff means "nothing changed", not "the snapshot observes nothing". The
+**10-second default is retained**; the window is not a branching risk and does
+not need to be tuned down.
+
+**Known limitation — the rotation read and write are not atomic
+(LIM-D6.2-6).** `rotate()` reads the family, decides, then writes. Two
+concurrent refreshes presenting the same `current_jti` can both pass the initial
+read before either write lands, so a genuinely asynchronous database can produce
+**two `ROTATED` responses for one token**. This is a correctness gap, not a
+privilege escalation: both responses carry access tokens the same client was
+entitled to obtain anyway, only the last-written `jti` remains current, and the
+client that presents the losing `jti` afterwards **fails closed** — it is not the
+current token and not the retired generation the window forgives, so it revokes
+the family.
+
+**`JWT_REFRESH_GRACE_SECONDS=0` does not solve this race.** The race is in the
+`ROTATED` path and is decided before the grace check is ever reached; setting the
+window to zero removes only the forgiveness that lets the losing client's *next*
+request survive, which makes the symptom worse rather than better. The correct
+fix is an **atomic conditional update (compare-and-swap)**: issue the rotation as
+a single update matching
+
+    session_id   == sid
+    current_jti  == presented_jti
+    family is neither revoked nor expired
+
+and branch on `modified_count` (or on a re-read of the resulting state) instead
+of on the values read beforehand — zero matched documents *is* the "somebody
+else rotated first" answer, which is the information the current read/decide/
+write shape throws away. Deliberately deferred out of D6.2: it rewrites the
+write on the sprint's most security-sensitive path after that path's
+verification was complete, and it cannot be exercised by this suite at all —
+the in-memory `FakeDB` is single-threaded with no await point between the read
+and the write, so the interleaving that produces the defect cannot be
+constructed against it.
+
+### 6. The bootstrap probe gets one refresh, silently
+
+`GET /auth/me` is correctly exempt from the automatic refresh path — a 401 there
+is the signed-out signal. But that made **reloading the tab any time after the
+first fifteen minutes a sign-out**, with a seven-day refresh cookie sitting
+unused in the browser: the original "my session keeps dying" report in its
+purest form, which D6.1 could not have fixed because the interceptor is the
+wrong layer for it. `AuthContext.checkAuth` now probes, and on a 401 attempts
+one **silent** refresh before probing again.
+
+Silent because the 401 is genuinely ambiguous: a first-time visitor has no
+cookies either, and greeting them with "your session expired" is worse than
+saying nothing. A silent caller can never *suppress* an expiry, though — the
+announcement decision is made when the shared promise is created and can only be
+raised, so a real authenticated request joining a bootstrap probe still gets the
+announcement.
+
+### 7. The cookie/CORS/CSRF configuration is checked as one system
+
+These three files only work together, and a mismatch fails silently and totally:
+the API answers, CORS matches, and every cookie-authenticated mutation 403s
+because the SPA is looking for a `csrf_token` the browser filed under a host the
+page is not on. `cookies.cookie_policy_warnings()` runs at startup and names the
+decidable problems. It **says when it could only check partially** rather than
+returning an empty list that would read as a clean bill of health, and it is
+logged at WARNING, never fatal — a running deployment must not refuse to boot
+over a configuration the operator may be midway through changing.
+
+The access cookie's `Max-Age` is now derived from `jwt.access_ttl_seconds()`.
+ADR-060 deferred this as D6-L5/LOW on the grounds that a cookie lifetime is not
+a security boundary, which is true — the token's `exp` is what authenticates.
+It is fixed here for the two reasons that *are* true: a bearer credential was
+being persisted to disk for 23¾ hours after it stopped being useful, and the
+constant carried a comment claiming it matched the token's lifetime, which it
+had not since PH1.6. A comment that lies about a security parameter is a defect
+independent of the parameter's severity.
+
+## Consequences
+
+* A network failure can no longer sign a user out. `SESSION_EXPIRED` now means
+  what it says: the server refused a refresh.
+* A queued request cannot execute under a different account than the one that
+  issued it. Callers may now see `SessionChangedError`, which is a deliberate
+  abandonment, not a server error.
+* Realtime recovers from a backend restart without a page reload.
+* `REFRESHING` exists as an observable state, and the login screen tells a user
+  whose session expired why they are there — D6.1 built that distinction and
+  nothing consumed it.
+* An administrator block, a password change and a logout now reach the
+  WebSocket. Enforcement is by call site, not by signature (LIM-D6.2-3).
+* Two tabs no longer revoke each other's session, and no longer generate a
+  CRITICAL security record for doing nothing wrong. The forgiveness is bounded
+  in a way that is now pinned by test: a grace replay extends nothing.
+* The rotation read/write remains non-atomic. Under a real async database two
+  simultaneous refreshes of the same token can both be answered `ROTATED`; the
+  losing client fails closed on its next request (LIM-D6.2-6).
+* Deployments that split the SPA and the API across hosts get a startup warning
+  naming the exact misconfiguration instead of a 403 on every mutation.
+* D5 is untouched. No market-data, gateway, ranking, scanner, feed-state or
+  broker code was modified.
