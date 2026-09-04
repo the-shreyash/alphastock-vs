@@ -4264,3 +4264,157 @@ independent of the parameter's severity.
   naming the exact misconfiguration instead of a 403 on every mutation.
 * D5 is untouched. No market-data, gateway, ranking, scanner, feed-state or
   broker code was modified.
+
+---
+
+# ADR-062 — A private value is owned by its subject, not by whoever remembered to filter (D6.3)
+
+**Status:** Accepted · 2026-09-04 · Extends ADR-061 (D6.2), which extends ADR-060 (D6.1) and ADR-059 (D6.0).
+
+## Context
+
+D6.1 closed the seven named holes the D6.0 audit found. D6.2 made the session
+lifecycle behave. Both were about *named* defects on *named* routes. D6.3 asks
+the harder question the invariant actually requires:
+
+> No private state, data, event, cache entry, background-job result, broker
+> object, realtime frame or frontend state belonging to user A may be read,
+> mutated, delivered or rendered by user B.
+
+An authenticated user is a hostile tenant. The question is therefore not "do the
+routes check authorization" — D6.1 settled that — but whether the invariant
+survives everything *indirect*: a repository method reached by a background task,
+a process-global dict, a cache key, a publisher that does not use the safe path,
+a browser that outlives an identity change.
+
+Five defects were found. Their distribution is the finding: **one was in a
+route, and four were not.**
+
+| | Where it lived | Class |
+|---|---|---|
+| D63-1 | `market_gateway.get_quote` | a broker-derived value published to everyone |
+| D63-2 | `services/api.js` response interceptor | a response that outlived its identity |
+| D63-3 | `localStorage` | private state the store reset never reached |
+| D63-4 | `OrderTicket` review panel | an intent with no identity, one click from real money |
+| D63-5 | `_websocket_credential` | (D6.2 lifecycle) the handshake the browser refused |
+
+## Decision
+
+### 1. Public and private are properties of the data, and the classification is written down
+
+Public/shared: market quotes, indices, sectors, movers, breadth, news,
+instrument metadata, exchange state, scanner and ranking output. These are facts
+about the market. They are cached by symbol, broadcast on the `market` channel,
+and **must not** be made user-scoped for convenience — doing so multiplies every
+fan-out by the user count and buys nothing.
+
+Private/owner-scoped: broker connections, sessions and tokens; holdings,
+positions, funds, orders and order history; trades and journal; portfolios;
+watchlists; alerts and notifications; preferences; AI chat, memory and
+conversations; private activity; per-user background results; and **anything
+derived from a broker feed**.
+
+Mixed: the morning report (a shared market layer, cached once per day, plus a
+per-user portfolio layer built fresh and never written to the shared document)
+and the activity feed (a broadcast platform stream merged, at read time, with
+the caller's own private entries).
+
+### 2. A quote resolved through a user's broker feed is that user's
+
+`_publish_ticks` already stamped `provider.owner_user_id` onto every tick, for
+the reason MARKET_DATA_ARCHITECTURE.md gives: a broker feed is legally the
+account holder's data, consumed under their own session and entitlement.
+`get_quote` published the same class of value — a price resolved through the
+same per-user promotion — with no owner at all, so the bridge broadcast it to
+every socket on the `market` channel.
+
+`price.updated` now carries `user_id` exactly when
+`baseline_prices_are_shared(user_id)` is False. That predicate is the Source
+Manager's own and already existed; nothing new was invented and no D5 semantics
+changed. A user on the shared baseline still broadcasts, byte for byte.
+
+**Rejected: stamping every quote with the caller.** It would make the most
+common market event per-user for no reason, and D5's fan-out economics depend on
+the shared case staying shared.
+
+### 3. The owner is stated at the write, not inferred from the read above it
+
+Several mutations reached their target through an owner-scoped read one or two
+statements earlier and then wrote by `_id` alone. None was exploitable. All are
+now scoped anyway, because the property being relied on — "a route-level check
+happened" — is invisible at the write, cannot be checked mechanically, and is
+the exact shape S5 had before D6.1 closed it.
+
+The exception is deliberate and stays: a background task that resolves the owner
+*from the document* (`_generate_coaching_background`, `generate_close_intelligence`)
+is not addressing a caller and has no owner to state. The test that asserts the
+scoped writes uses that function as its falsifying twin.
+
+### 4. A response belongs to the identity that dispatched it — on success too
+
+D6.2 stamped an auth epoch on every request and abandoned a *replay* whose epoch
+had moved. The check lived only on the 401 path, so the ordinary case — the
+request simply succeeds while the identity changes — resolved the previous
+account's data into the new account's UI. A dashboard fires many reads at once;
+that is not a narrow window.
+
+The guard now runs on the success path too, at the interceptor, because there is
+one interceptor and hundreds of call sites. The auth-lifecycle endpoints are
+exempt: those requests *are* the transition, and `/auth/refresh` in particular is
+issued by the machinery that bumps the epoch.
+
+### 5. Browser-local per-user state is cleared by a KEEP-list
+
+`localStorage` outlives the tab, so the store reset never reached it. Two keys —
+the symbols a user opened and the symbols they searched — were written per user
+and read back unconditionally.
+
+`lib/tenantState.clearTenantLocalState()` runs on the same four transitions that
+reset the realtime store and removes **every** key except an explicit keep-list
+(today: `ap-theme`). A list of keys to *remove* has to be extended by whoever
+adds the next per-user key, and forgetting leaks silently. A list of keys to
+*keep* fails the other way: forgetting costs a convenience and discloses
+nothing. Same reasoning as `event_bridge.PRIVATE_DOMAINS`.
+
+### 6. An order intent carries its own identity
+
+The review panel is the one screen where a stale confirmation spends real money,
+and the **server cannot catch it**: by the time the request is sent it carries
+the new account's cookie and is a perfectly valid order from that account. The
+intent is therefore stamped, at the moment Review is pressed, with the account,
+the broker and the auth epoch, and all three are re-checked synchronously inside
+the confirm handler before any await.
+
+### 7. The WebSocket echoes the subprotocol it was offered, whichever transport won
+
+`_websocket_credential` answered `(cookie_token, None)` the moment a cookie was
+present, without looking at the offer. The SPA offers
+`["stockassist.auth", <token>]` for as long as it holds the bootstrap credential —
+every session, from sign-in until the first refresh drops it — and D6.1's cookie
+fix made the cookie present on that same handshake. So the server selected no
+subprotocol and **the browser failed the connection**, immediately after the
+server had logged it as accepted. Realtime never connected.
+
+The marker is now resolved from the offer and echoed on every path. This is a
+D6.2 lifecycle correction, made under the D6.3 brief's §0 allowance, and nothing
+else in the session architecture was touched.
+
+## Consequences
+
+* A price resolved through a promoted broker feed reaches its owner and nobody
+  else. Users on the shared baseline are unaffected.
+* Ownership is stated where the write happens, so a future edit to either the
+  read or the write cannot silently widen the other.
+* A response that outlived its identity is rejected with `SessionChangedError`
+  rather than rendered. Callers already handle that class.
+* An unclassified `localStorage` key is forgotten on an identity change rather
+  than inherited.
+* A reviewed order cannot be confirmed after the account, the broker or the
+  identity generation moved.
+* Realtime connects in a real browser. Verified in Chrome, not argued.
+* `heartbeat_engine._broadcast` — an unused fan-out helper in a per-account
+  module — is removed rather than allow-listed.
+* D5 behaviour is otherwise untouched: no gateway resolution, ranking, scanner,
+  evidence, feed-state, probation, latency or tick-codec change.
+* The `SessionStore.rotate()` TOCTOU (LIM-D6.2-6) is untouched, as instructed:
+  D6.3 found no tenant-isolation failure that it causes.

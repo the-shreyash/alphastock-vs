@@ -9,6 +9,7 @@ import api, {
   SESSION_STATE_EVENT,
 } from "../services/api";
 import { useRealtimeStore } from "../store/realtimeStore";
+import { clearTenantLocalState } from "../lib/tenantState";
 
 const AuthContext = createContext(null);
 
@@ -176,6 +177,10 @@ export function AuthProvider({ children }) {
     // that follows a crash or a reload where no logout ever ran.
     resetRefreshState();
     useRealtimeStore.getState().reset();
+    // D6.3. The store lives in memory; `localStorage` outlives the tab. The
+    // previous account's browsing history was still on disk here — see
+    // `lib/tenantState`. Cleared BEFORE the new token is written.
+    clearTenantLocalState();
     const { data } = await api.post("/auth/login", { email, password });
     if (data.token) localStorage.setItem("token", data.token);
     adoptUser(data);
@@ -185,6 +190,7 @@ export function AuthProvider({ children }) {
   const register = async (name, email, password) => {
     resetRefreshState();
     useRealtimeStore.getState().reset();
+    clearTenantLocalState();
     const { data } = await api.post("/auth/register", { name, email, password });
     if (data.token) localStorage.setItem("token", data.token);
     adoptUser(data);
@@ -206,6 +212,7 @@ export function AuthProvider({ children }) {
   const adoptSession = useCallback(async (token) => {
     resetRefreshState();
     useRealtimeStore.getState().reset();
+    clearTenantLocalState();
     if (token) localStorage.setItem("token", token);
     const data = await checkAuth();
     if (data) announceAuthenticated();
@@ -218,6 +225,7 @@ export function AuthProvider({ children }) {
     } catch { /* ignore */ }
     localStorage.removeItem("token");
     useRealtimeStore.getState().reset();
+    clearTenantLocalState();
     resetRefreshState();
     setUser(false);
     setSessionEnd(SESSION_END.SIGNED_OUT);

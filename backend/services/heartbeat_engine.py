@@ -64,14 +64,13 @@ async def _send_user(user_id, message):
         logger.error(f"Heartbeat send_to_user error: {e}")
 
 
-async def _broadcast(message):
-    """Deliver a message to all connected WebSocket clients."""
-    if not _ws or not _ws.active:
-        return
-    try:
-        await _ws.broadcast(message)
-    except Exception as e:
-        logger.error(f"Heartbeat broadcast error: {e}")
+# D6.3 — a `_broadcast(message)` helper lived here, wrapping
+# `ws_manager.broadcast`. Nothing had ever called it. It is removed rather than
+# left dormant: this module's job is per-account work (`_send_to_user`, directly
+# above, is the one delivery primitive it needs), and an unused fan-out sitting
+# next to it is the exact shape D6.1 / S6 catalogued — a private payload is one
+# call away from every connected socket, with nothing failing and nothing logged.
+# Public, market-wide fan-out belongs to the two loops in `server.py` that own it.
 
 
 async def _publish(event_type, data):

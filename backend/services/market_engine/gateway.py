@@ -722,11 +722,36 @@ class MarketGateway:
         if not normalized:
             return None
 
-        await event_bus.publish("price.updated", {
+        # D6.3 — WHOSE PRICE IS THIS, AND WHO MAY BE TOLD.
+        #
+        # `price` is a public domain, so the bridge broadcasts an event with no
+        # `user_id` to every socket on the `market` channel. That is right when
+        # the platform baseline answered. It was wrong whenever a *broker* feed
+        # did: `_publish_ticks`, twenty lines up, already stamps
+        # `provider.owner_user_id` onto every tick for exactly this reason — a
+        # broker feed is legally the account holder's data, consumed under their
+        # own session and entitlement (MARKET_DATA_ARCHITECTURE.md, Category 2),
+        # and D6.0's S2 named republishing a broker-derived fact to non-owners as
+        # a defect in its own right. This path published the same class of value,
+        # resolved through the same per-user promotion, to everybody.
+        #
+        # The predicate is the Source Manager's own, not a new concept and not a
+        # guess from "does this user have a broker connected": `_quote` returns
+        # the quote and not the provider, and `baseline_prices_are_shared` is the
+        # documented answer to "are this user's prices the ones everybody else
+        # gets". False means a provider of their own is in play, so the event is
+        # addressed to them and the bridge delivers it by `send_to_user`.
+        #
+        # A user on the shared baseline still broadcasts, byte for byte as
+        # before, which is every user who has no broker feed promoted.
+        payload: Dict[str, Any] = {
             "symbol": symbol,
             "price": normalized.get("price"),
             "change_pct": normalized.get("change_pct"),
-        })
+        }
+        if user_id and not self.baseline_prices_are_shared(user_id):
+            payload["user_id"] = str(user_id)
+        await event_bus.publish("price.updated", payload)
 
         return normalized
 

@@ -255,8 +255,11 @@ async def close_paper_trade(trade_id: str, user_id: str, db) -> dict:
     pnl_pct = round(multiplier * ((exit_price - trade["entry_price"]) / trade["entry_price"]) * 100, 2)
 
     now = datetime.now(timezone.utc).isoformat()
+    # D6.3 — the owner is part of the write, not merely of the read above. The
+    # read that found this trade already filtered on `user_id`; stating the rule
+    # again here is what makes it survive an edit to either statement alone.
     await db.trades.update_one(
-        {"_id": ObjectId(trade_id)},
+        {"_id": ObjectId(trade_id), "user_id": user_id, "is_paper": True},
         {"$set": {
             "status": "CLOSED",
             "exit_price": exit_price,

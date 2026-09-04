@@ -6792,3 +6792,487 @@ Post-sprint, test-and-documentation only. **No production code was changed**;
 ---
 
 **D6.2 STATUS: COMPLETE — FROZEN.**
+
+---
+
+# D6.3 — MULTI-USER ISOLATION HARDENING (2026-09-04) — COMPLETE
+
+Decision record: **ADR-062** (extends ADR-061/D6.2, ADR-060/D6.1, ADR-059/D6.0).
+Scope: prove and harden the platform-wide tenant-isolation invariant.
+**D6.2 remains frozen** except for one lifecycle defect the brief's §0 browser
+check found and required to be fixed; `SessionStore.rotate()` was not touched.
+
+## Headline
+
+Five defects. **One of them was in a route; four were not** — and that
+distribution is the finding. D6.1 closed the named holes on named endpoints, so
+what was left was everything indirect: a value published by the market gateway, a
+response that outlived its identity, `localStorage`, an order-review panel, and a
+WebSocket handshake the server thought it had accepted.
+
+The single most important one was only findable in a browser. **Realtime never
+connected for any signed-in user**, for the first ~15 minutes of every session.
+The server authenticated the handshake by cookie, selected no subprotocol, logged
+`[accepted]`, and the browser then failed the connection at 1006 — because the
+SPA had offered `["stockassist.auth", <token>]` and a browser that offers
+subprotocols and receives none back tears the connection down. LIM-D6.2-4 said
+plainly that no browser-level verification had been done; this is what it was
+hiding.
+
+---
+
+## 0. Real-browser D6.2 entry check — PERFORMED, NOT SIMULATED
+
+Environment stood up locally: `mongod` on 27017, `uvicorn server:app` on 8000,
+`craco start` on 3000, real Chrome. Two real accounts registered through the API.
+Controlled expiry by restarting the API with `JWT_ACCESS_TTL_SECONDS=30` (D6.2
+derives the access cookie's `Max-Age` from that, so cookie and token expire
+together). **No order was placed and no broker was connected.**
+
+| Leg | Result |
+|---|---|
+| USER A login | 200, redirected to `/dashboard` |
+| authenticated API | `/auth/me`, `/portfolio/summary`, `/watchlist`, `/notifications` all 200 after a full page reload — proving the cookie, not the bootstrap token, is carrying the session |
+| authenticated WebSocket | **FAILED — defect D63-5, fixed, re-verified `Live`** |
+| controlled expiry | raw `fetch('/auth/me', {credentials:'include'})` → **401** with no app involvement |
+| silent refresh | app navigation fired 6 concurrent 401s → **exactly ONE `POST /auth/refresh` → 200** (L2 coalescing, observed in the server access log under real concurrency) |
+| API continues | the same raw probe → **200**; the user saw no interruption and the page rendered |
+| WebSocket survives | connection indicator stayed `Live` across the expiry (a socket authenticates once at the handshake — LIM-D6.2-3, by design) |
+| CSRF mutation | ambient cookie alone → **403**; cookie + `X-CSRF-Token` echoed from the (deliberately non-HttpOnly) `csrf_token` cookie → **200** |
+| CORS / preflight | credentialed cross-origin `:3000 → :8000` succeeded for GET and POST, including the CSRF header |
+| logout | `POST /auth/logout` 200, routed to `/login` |
+| USER B login | fresh authenticated state; B's server-side watchlist correctly **empty** while A's held three symbols |
+| no A state for B | **FAILED — defect D63-3, fixed, re-verified** |
+| bootstrap behaviour | an unauthenticated mount fired one `/auth/me` → 401, one silent `/auth/refresh` → 401, then one `POST /auth/logout` to clear the dead access cookie — D6.2-D working exactly as designed |
+
+### D63-5 — the WebSocket handshake the browser refused (HIGH, availability)
+
+**Before.** `_websocket_credential` returned `(cookie_token, None)` the moment an
+`access_token` cookie was present, without looking at what the client had
+offered. Both halves were individually reasonable and together they broke every
+browser session: the SPA offers the auth subprotocol whenever it still holds the
+bootstrap credential (every session, until the first refresh drops it — D6.1),
+and D6.1's own cookie fix made the cookie present on that same handshake.
+
+**Proof, A/B, same page, same cookie, real Chrome:**
+
+| Offer | Server | Browser |
+|---|---|---|
+| `["stockassist.auth", <anything>]` | `[accepted]`, no subprotocol selected | **CLOSED 1006** |
+| nothing | `[accepted]` | **OPEN** |
+
+The A probe used a deliberately invalid token and was still accepted server-side,
+because the cookie authenticated it — which is exactly the production path.
+
+**After.** The marker is resolved from the *offer* and echoed on every path,
+including the one where the cookie supplied the credential. Re-verified in the
+same browser: negotiated `stockassist.auth`, socket **OPEN**, connection
+indicator `Live` — the first time realtime has been observed working in a browser
+on this project.
+
+**Why no hermetic test saw it.** Starlette's test transport does not enforce the
+browser's subprotocol rule. The frontend's own comment states the contract
+correctly ("the server echoes the marker back … or the browser drops the
+connection"); the server did not honour it, and nothing on either side could
+observe the disagreement. Regression test:
+`test_d63_isolation.py::TestWebSocketIsolation::test_the_handshake_echoes_the_offered_subprotocol_on_the_cookie_path`,
+which asserts the negotiated value directly for all four offer/cookie
+combinations.
+
+**Scope discipline.** This is a one-function correction inside D6.2's area, made
+under the brief's §0 allowance. No other session code was touched.
+
+---
+
+## 1. Public vs private classification
+
+**PUBLIC / SHARED** — facts about the market, cached by symbol, broadcast on the
+`market`/`sectors`/`scanner`/`news`/`ai` channels: quotes, indices, sectors,
+movers, breadth, heatmap, calendar, news, instrument metadata and exchange state,
+scanner and ranking output, the platform activity stream, provider/engine status.
+These are deliberately **not** user-scoped: doing so multiplies every fan-out by
+the user count and buys nothing.
+
+**PRIVATE / OWNER-SCOPED** — broker connections, sessions and tokens; holdings,
+positions, funds, margins, orders, order history, trades; portfolios and
+snapshots; watchlists; alerts and notifications; preferences and settings; AI
+chat, memory and conversations; private activity; per-user background results;
+**and anything derived from a broker feed** (§2 below).
+
+**MIXED, with the private half named:**
+
+| Resource | Shared part | Private part |
+|---|---|---|
+| Morning report | the market layer, generated once per day and cached in `db.reports` by `(date, type)` | `portfolio` — built fresh per user by `_build_personal_layer` and never written into the shared document |
+| Activity feed | `activity_deque`, the platform stream | the caller's own per-user LRU, merged only at read time |
+| `market.tick` | ticks from a platform provider | ticks from a provider with `owner_user_id`, already stamped by `_publish_ticks` |
+| `price.updated` | a quote from the shared baseline | **a quote resolved through a promoted broker feed — this was the defect** |
+
+---
+
+## 2. Vulnerabilities discovered
+
+### D63-1 — a broker-derived price broadcast to every socket (MEDIUM)
+
+| | |
+|---|---|
+| **Before** | `market_gateway.get_quote(symbol, user_id=…)` published `price.updated` with no `user_id`. `price` is a public domain, so the bridge broadcast it to every socket on the `market` channel — including when the quote had been resolved through a provider whose `owner_user_id` is one specific user. |
+| **Root cause** | The asymmetry is the tell: `_publish_ticks`, twenty lines above in the same class, already stamps `provider.owner_user_id` onto every tick, for the reason MARKET_DATA_ARCHITECTURE.md gives — a broker feed is legally the account holder's data, consumed under their own session and entitlement. D6.0's S2 named republishing a broker-derived fact to non-owners as a defect in its own right. `get_quote` published the same class of value through the same per-user promotion and said nothing about whose it was. |
+| **After** | `payload["user_id"]` is set exactly when `baseline_prices_are_shared(user_id)` is False. That predicate is the Source Manager's own and already existed; no new concept, no D5 semantics changed. A user on the shared baseline still broadcasts, byte for byte. |
+| **Severity note** | Not an account-data leak: the payload is a symbol and a price. It is the *entitlement* that leaked — one user's broker feed serving strangers. |
+
+### D63-2 — a successful response that outlived its identity (MEDIUM)
+
+| | |
+|---|---|
+| **Before** | D6.2-B stamps an auth epoch on every request and abandons a **replayed** one whose epoch has moved. The check lived only on the 401 path. A request that simply *succeeded* across an identity change resolved normally — so A's portfolio, orders or broker status could be written into B's UI by a `.then()`. A dashboard fires many reads at once; the window is every one of them. |
+| **Root cause** | The guard was placed on the recovery path because that is where the defect it was written for lived, not on the path every response takes. |
+| **After** | The success interceptor rejects any response whose `config._authEpoch` no longer matches, with the same `SessionChangedError` the replay path uses. Enforced at the boundary rather than by call sites, because there is one interceptor and hundreds of consumers. The auth-lifecycle endpoints are exempt — those requests *are* the transition, and `/auth/refresh` is issued by the machinery that bumps the epoch, so rejecting its own response would make a freshly established session look like a transient network failure. |
+
+### D63-3 — private browsing history survives an identity change (MEDIUM)
+
+| | |
+|---|---|
+| **Before** | `sa_recent_stocks` (written by `StockDetail`, rendered by the Dashboard's Recent Stocks card) and `ap-recent-searches` (written and rendered by `SearchBox`) are per-user and were cleared by nothing. D6.1/S8 resets the Zustand store; D6.2/F closes stale sockets and responses. Both are about memory. `localStorage` outlives the tab. |
+| **Reproduced in Chrome** | Alice opened DIVISLAB → signed out → Bob signed in in the same tab → `/stock/DIVISLAB` was a link on **Bob's** dashboard. Bob's watchlist from the server was correctly empty, so the server-side boundary held; the leak was entirely client-side. |
+| **After** | `lib/tenantState.clearTenantLocalState()` runs on sign-in, registration, OAuth adoption and sign-out — the same four transitions that reset the store — and removes **every** key except an explicit keep-list (today `ap-theme`), plus `sessionStorage`. Re-verified in the same browser: research history gone on logout, theme retained, and after signing back in the only stock links on the dashboard were the user's own watchlist and the public movers. |
+| **Why a keep-list** | A remove-list has to be extended by whoever adds the next per-user key, and forgetting leaks silently. A keep-list fails the other way: forgetting costs a convenience and discloses nothing. Same reasoning as `event_bridge.PRIVATE_DOMAINS`. |
+
+### D63-4 — an order intent with no identity (MEDIUM, blast radius HIGH)
+
+| | |
+|---|---|
+| **Before** | `OrderTicket`'s review panel held broker, side, quantity and price in component state and nothing about *who*. It is the one screen where a stale confirmation spends real money, and the **server cannot catch it**: by the time the request is sent it carries the new account's cookie and is a perfectly valid order from that account. |
+| **After** | Pressing Review stamps the intent with `{userId, broker, epoch}`. `placeOrder` re-checks all three synchronously, before any await, and on a mismatch tears the panel down with a message rather than sending. |
+| **Note** | No order was placed anywhere in this work. Every order-path test stubs `broker_engine.place_order` and asserts on the call, and one test asserts that an unauthenticated request never reaches the stub at all. |
+
+### D63-5 — the WebSocket handshake (HIGH, availability) — see §0.
+
+### Also found and fixed, structurally rather than because it was exploitable
+
+* **`heartbeat_engine._broadcast`** — a fan-out helper wrapping
+  `ws_manager.broadcast`, in a module whose every other delivery is per-account,
+  **that nothing had ever called**. Removed rather than allow-listed: an unused
+  broadcast next to `_send_user` is the exact shape D6.1/S6 catalogued. Found by
+  the new AST sweep on its first run.
+* **Owner-scoped writes.** `update_trade`, `exit_trade`, `get_trade_coaching`,
+  `ai_trade_review` and `close_paper_trade` reached their target through an
+  owner-scoped read and then wrote by `_id` alone. None was exploitable. All now
+  state the owner at the write, because "a route-level check happened above" is
+  invisible at the write and cannot be checked mechanically.
+
+---
+
+## 3. What was audited and found sound
+
+### Database / persistence (§2)
+
+AST sweep of all 217 `db.<collection>.<op>` call sites across `server.py`,
+`services/`, `security/` and `analytics/`; 138 touch a private collection. Every
+private READ, UPDATE, DELETE, UPSERT, LIST and COUNT on a request path carries
+the owner. Specifically checked and correct:
+
+* `db.orders` upsert is keyed `(user_id, broker, order_id)` — two users whose
+  brokers issue the same order id get two rows, not one that the second write
+  stole. (Regression-tested; the mutation that drops `user_id` from that key is
+  killed.)
+* `db.broker_accounts` is keyed `(user_id, broker)` throughout.
+* `db.reports` is keyed `(date, type)` and holds **only** the shared market layer;
+  the personal layer is merged into a new dict per request and never written back.
+* The unfiltered reads that remain are deliberate and were each read by hand:
+  admin aggregates (`count_documents({})` behind `require_admin`), and the
+  platform-wide selections in the heartbeat, scheduler, trade stream and trading
+  engine — every one of which groups by user before it publishes or notifies.
+
+### In-memory state and caches (§4)
+
+Every module-level and instance-level mutable structure enumerated by AST sweep
+(118 module-level, plus the singletons). Findings:
+
+| Structure | Verdict |
+|---|---|
+| `broker_engine._sessions`, `._instrument_maps` | `(user_id, broker)` — correct |
+| `stream_manager._streams` | `(user_id, broker, channel, shard)` — correct |
+| `ai_context_builder._cache` | keyed by user id — correct, and the test now proves the cache is actually *hit* before asserting isolation |
+| `activity_logger._user_activity` | per-user LRU; `activity_deque` is platform-only |
+| `portfolio_stream._last_emit`, `trade_stream._last_emit` | per-user throttles; one shared stamp would starve every user but the first |
+| `source_manager._last_status_by_user`, `._connected_brokers` | per-user — correct |
+| `services/cache.py` `_memory`, `real_market`, `stock_details`, `news_service` | market data only, keyed by symbol/ticker — correctly shared, deliberately left shared |
+| `provider registry` | one namespace, but eligibility is `context.user_id == provider.owner_user_id`, which fails closed for the global context |
+
+### Broker isolation (§5) and one user with two brokers (§10)
+
+* `A + Zerodha` cannot reach `B + Zerodha`: B is told *they* are not connected
+  (409), with A's own connected status asserted first as the control.
+* `A + Zerodha` cannot silently become `A + Upstox`: the unconnected broker
+  raises `BrokerAuthError` rather than falling through to the session that does
+  exist. No first-connected, last-connected, global, singleton or implicit
+  default remains — `any_connected_session` is asserted absent **by name**, and
+  `user_id` is asserted to be a parameter of all 14 public engine methods.
+* Six users resolving the same broker concurrently each get their own token.
+* Order id is not a capability: a broker order id supplied by B is sent to *B's*
+  own session, which is a request B was always entitled to make and which cannot
+  touch A's order.
+
+### Background tasks (§6)
+
+`task_monitor_trades`, `task_monitor_portfolio`, `task_watchlist_stream`,
+`_publish_prices`, `trade_stream.publish_all`, `portfolio_stream.publish_all`,
+`scheduler.{market_scanner,trade_monitor,exit_reminder,eod_report}_job`,
+`morning_report.notify_users`, `broker_engine.load_sessions` and the reconnect /
+recovery paths were read. All select platform-wide and **fan out per user**, and
+every publish binds its owner at publish time. Specifically tested:
+
+* no mutable-loop-variable / late-binding closure: three users produce three
+  payloads with three different owners, which a late-bound closure cannot do;
+* `publish_all` gives each user only their own rows (the mutation that publishes
+  the whole collection to everyone is killed);
+* the EOD report sends each user their own P&L — the PH3.8 defect (a platform
+  aggregate delivered to everyone as "your P&L") is pinned so it cannot return;
+* the recipient set for the price and watchlist streams is the *connected socket
+  map*, which is fail-closed by construction.
+
+### Event bus / realtime / WebSocket (§7, §8)
+
+* All five private domains deliver to the owner and **drop** with no owner, with
+  falsy (`None`, `""`, `0`, `False`) and unknown owners covered; nine public
+  domains still broadcast (the falsifying twin — without it, "drops everything"
+  would pass).
+* An **AST sweep over the whole backend** now requires every
+  `.broadcast(...)`/`.broadcast_to_channel(...)` call site to be in a named,
+  reasoned allow-list. It found `heartbeat_engine._broadcast` on its first run.
+  Its blind spot is stated in the test rather than implied: a fan-out reached
+  through an *injected* callable (`scheduler.market_scanner_job` receives
+  `ws_broadcast=ws_manager.broadcast`) is a Call on a Name, not an Attribute; the
+  injection site is in the allow-listed module and the payload — market overview
+  plus the day's gainers — was read by hand.
+* Socket identity comes only from the signed credential: the query parameter is
+  supplied **and names user B** in the test, and the socket is still registered
+  under A.
+* Two tabs receive one copy each, not two.
+* `close_user` closes exactly the target's sockets and leaves another user's open.
+* A blocked, deleted, or password-changed identity is refused at the handshake.
+
+### Frontend (§9)
+
+`localStorage`/`sessionStorage`, the Zustand store, module singletons, the socket
+buffer and the request queue were audited. The store reset (D6.1/S8) and the
+stale-socket and stale-response guards (D6.2/F) are correct and were left alone;
+the two gaps are D63-2 and D63-3 above. There is no React Query / SWR cache in
+this app, so there is no query cache to key.
+
+### Concurrency (§15)
+
+Tested rather than reasoned: two users' snapshots built concurrently over the
+same shared quote map; ten interleaved private deliveries to two live sockets;
+six concurrent broker session resolutions. All hold. **What was not reproduced is
+stated in §7 below rather than faked.**
+
+---
+
+## 4. Adversarial test matrix
+
+`backend/tests/test_d63_isolation.py` — **77 tests**, and
+`frontend/src/__tests__/tenantIsolationD63.test.jsx` — **14 tests**.
+
+Every negative test creates A's resource, asserts **A's own view of it in the
+same test**, then attacks as B and (where the route exists) anonymously, then
+asserts A's resource is unchanged.
+
+| Row | Where |
+|---|---|
+| broker status / holdings / positions / funds / orders / profile | `TestBrokerIsolation` (5 routes × B + anonymous, with A's live session in the cache) |
+| order history | `TestPrivateReadsAreOwnerScoped[/api/orders]` |
+| trades, active, history, portfolio, journal | `TestPrivateReadsAreOwnerScoped` (10 surfaces, one marker) |
+| private activity | `TestInMemoryStateIsOwnerKeyed`, `TestTeardown` |
+| chat + conversations | `TestPrivateReadsAreOwnerScoped[/api/chat/history]`, `TestObjectIdIsolation` |
+| watchlists, alerts, notifications | `TestPrivateReadsAreOwnerScoped`, `TestObjectIdIsolation` |
+| preferences | covered by `test_api_authz.py` (D6.0/PH3.3), not duplicated |
+| private realtime frame | `TestRealtimeDelivery` (5 domains × delivered/dropped), `TestWebSocketIsolation` |
+| background result | `TestBackgroundTaskIsolation` (4) |
+| cached result | `TestInMemoryStateIsOwnerKeyed` (5) |
+| pending request | frontend `a successful response from the previous identity is discarded` |
+| object-ID access | `TestObjectIdIsolation` (trade, paper trade, notification, conversation) |
+| logout / login transition | frontend `per-user browser storage is forgotten on an identity change` (3 transitions) |
+| deleted user | `TestTeardown`, `TestWebSocketIsolation` |
+| disconnected broker | `TestTeardown::test_disconnecting_a_broker_forgets_the_session_and_the_instrument_map` |
+| same-user broker X vs Y | `TestBrokerIsolation::test_a_second_broker_does_not_answer_for_the_first` |
+| order path | `TestOrderPathIsolation` (3) + frontend order-intent tests (3) |
+| concurrency | `TestConcurrency` (3) |
+
+---
+
+## 5. Mutation / adversarial verification
+
+**Backend: 23 mutants, 23 killed.** **Frontend: 8 mutants, 8 killed.**
+
+Killed on the first pass (19): the WS subprotocol echo dropped; the
+`price.updated` owner stamp removed; the event bridge restored to fail-open; the
+paper-close and trade-update writes losing their owner; the order upsert key
+losing its owner; the broker session falling back to any connected session; the
+trade snapshot published once for everybody; private activity written to the
+platform deque; the heartbeat fan-out helper restored; the stream throttle keyed
+globally; socket identity taken from the query parameter again; `close_user`
+tearing down every socket; the EOD aggregate sent to everyone; a blocked account
+accepted at the handshake; a private domain reclassified as public; chat history
+unfiltered; the notification and conversation writes losing their owner.
+
+**Two survived, and both were test defects, fixed rather than explained away:**
+
+1. **The AI context cache test could not fail.** It made one call per user, and a
+   first call is a miss for a correctly-keyed cache and a badly-keyed one alike.
+   Rewritten to prove the cache is *hit* first — A is asked twice and the second
+   result must be the **same object** — before B's call means anything. Two
+   stronger mutants (constant key on both read and write; read taking any entry)
+   are now killed.
+2. **The order-route test proved less than it looked.** It injected `user_id`
+   into the body only, and `BrokerOrderCreate` drops unknown fields — so the body
+   channel was closed by the *model*, before the route, and a mutant reading the
+   owner from anywhere else survived. The attack now presses the body, the query
+   string **and** two headers, and a separate test asserts the model has no field
+   naming an account. Mutants reading the owner from a header, and adding a
+   `user_id` field to the model, are both killed.
+
+**Two process defects were found by mutation and fixed:**
+
+* **The first campaign was killed while a mutant was applied** and left
+  `authenticate_websocket` accepting blocked accounts — which then presented as
+  four unrelated test failures in three different classes. The harness now stashes
+  originals and restores them from `SIGTERM`/`SIGINT`/`SIGHUP` and `atexit`.
+* **A WebSocket test hung instead of failing.** Against a mutant that accepted a
+  refused handshake, `TestClient.websocket_connect` blocked inside `__enter__` on
+  the portal's own thread, which cannot be given a deadline from outside — so a
+  broken control produced a hung suite. This is the same failure D6.2 hit and
+  solved with `_expect_closed`. Those two tests now assert
+  `authenticate_websocket` directly, which is where the rule lives and which
+  returns `None` rather than blocking; every pytest invocation in the harness is
+  additionally bounded at 120 s and a hang is reported as its own verdict.
+
+---
+
+## 6. Test results
+
+| Suite | Result | Classification |
+|---|---|---|
+| `backend/tests/test_d63_isolation.py` | **77 passed** (deterministic and random order) | new |
+| `frontend/src/__tests__/tenantIsolationD63.test.jsx` | **14 passed** | new |
+| Backend full | **4 688 passed / 15 failed** / 50 skipped / 4 xfailed (245 s) | 15 **PRE-EXISTING** |
+| Frontend full | **681 passed / 4 failed** (685 total) | 4 **PRE-EXISTING** |
+| flake8, new file | **0 findings** | — |
+| flake8, modified files | `server.py` 249 → 249; gateway/paper_trade/heartbeat 0 → 0 | no new findings |
+| Frontend production build | compiles; `CI=true` fails on warnings-as-errors | **PRE-EXISTING** |
+
+**Failure classification — proven, not asserted.**
+
+* The 15 backend failures are all `tests/test_entrypoint_log_level.py`, failing
+  with `docker/entrypoint.sh: line 169: python: command not found` — the script
+  runs outside its container, and `python` (unversioned) exists only inside it.
+  This is the documented baseline recorded since D3 and again in D6.1 and D6.2.
+  Pass count moves **4 611 → 4 688**, which is exactly the 77 tests this sprint
+  adds (D6.2's post-freeze baseline was 4 606 + the 5 tests its own final
+  grace-window pass added).
+* The 4 frontend failures are all `Landing.test.jsx` (three sample-badge
+  assertions and one placeholder-`href` assertion). **Proven pre-existing by
+  stashing the entire D6.3 change and re-running that file on the clean tree**,
+  which reproduces the identical four. They are the same four recorded in D6.1
+  and D6.2. Pass count moves 667 → 681, which is exactly the 14 tests this sprint
+  adds.
+* The `CI=true` build failure is warnings-as-errors, 64 warnings, **none in any
+  file this sprint touched** (checked by name). The build compiles without
+  `CI=true`. Same condition D6.1 recorded at 61 warnings.
+
+---
+
+## 7. Limitations — what was NOT proven
+
+* **LIM-D6.3-1 — the browser leg covered one browser, one tab, no broker.** The
+  §0 chain was driven in real Chrome against a real server, but with **no broker
+  connected**: every broker-isolation result in §3 is from hermetic tests, not
+  from a live Zerodha/Upstox session. Two *browsers* on one account, and two
+  accounts in two browsers simultaneously, were not driven.
+* **LIM-D6.3-2 — a real database race was not reproduced.** `FakeDB` is
+  single-threaded with no await point inside an operation, so concurrent-write
+  interleavings cannot be constructed against it. The §15 tests exercise
+  concurrent *application* paths over shared state, which is real, and say
+  nothing about Mongo-level atomicity. Rather than write a test that cannot fail,
+  this is recorded. (Same constraint that put LIM-D6.2-6 out of reach.)
+* **LIM-D6.3-3 — the fan-out sweep cannot see an injected callable.** Stated in
+  the test itself, with the one instance named and read by hand.
+* **LIM-D6.3-4 — `price.updated` scoping uses a tier comparison.** A broker feed
+  occupying the *same tier* as the platform baseline would be judged "shared" and
+  broadcast. No such provider exists today (a broker feed is `streaming`, the
+  baseline is `polled`/`delayed`), and the predicate is the Source Manager's own
+  rather than a new one, but the property depends on tiers differing.
+* **LIM-D6.1-3 (inherited)** — private activity entries are process-local, so
+  `WEB_CONCURRENCY > 1` makes a user's own feed depend on which worker answers.
+  Fails toward missing data, not leaked data.
+* **LIM-D6.2-6 (inherited, untouched)** — the `SessionStore.rotate()` read/decide/
+  write TOCTOU. **D6.3 looked for and did not find any tenant-isolation failure
+  caused by it**: the losing client fails closed on its next refresh, which costs
+  that client its session and gives nobody else anything. Not redesigned, per the
+  freeze.
+
+---
+
+## 8. Found and deliberately deferred to D6.4
+
+* **LIM-D6.1-2** — the deleted-user data cascade (trades, holdings, orders,
+  watchlist, notifications, chat, memory, snapshots, payments). Still the largest
+  open item.
+* **`admin_block_user` is a partial teardown.** It writes `blocked: True` and
+  closes the sockets — and stops there. The blocked user's refresh-token family
+  is not revoked, their broker stream keeps running, and their market feed stays
+  registered. Not a cross-tenant defect (every read path 403s and the handshake
+  refuses them — both asserted), but block and delete should tear down the same
+  things. D6.4.
+* **`load_sessions()` restores broker accounts for users who no longer exist.**
+  It selects on `{"connected": {"$ne": False}}` and does not join to `db.users`.
+  Only the admin-delete path disconnects first (D6.1/S7), so a row orphaned any
+  other way has its tokens decrypted into memory and its socket opened on every
+  restart. Fail-closed for isolation — Mongo does not reuse `_id`s, so nobody can
+  become that owner — but it is credential hygiene and belongs with the cascade.
+* **`broker_accounts` keyed by `(user_id, broker)`** — one account per broker per
+  user. Unchanged, as instructed; `broker_account_id` remains D6.4's.
+* **Hard `.to_list(N)` caps in platform-wide fan-out** (`publish_all` 500,
+  `run_cycle` 200, the scheduler jobs 100). Past the cap a user can receive a
+  *partial* snapshot of their own positions presented as complete. Not
+  cross-tenant; a correctness and scale issue for the affected user.
+* **D6-S10** — `delete_conversation` returns `modified_count` from a
+  `delete_many`, so it reports `deleted: 0` on every success. Owner-scoped and
+  harmless; left where D6.1 put it.
+* **D6-S9 / D6-S11** — postback verification (needs a documentation answer from
+  Zerodha, not a guess) and `/api/zerodha/urls` topology disclosure. Unchanged.
+
+---
+
+## 9. Files changed
+
+**New (3)** — `backend/tests/test_d63_isolation.py`,
+`frontend/src/lib/tenantState.js`,
+`frontend/src/__tests__/tenantIsolationD63.test.jsx`.
+
+**Backend (4)** — `server.py` (WS subprotocol echo; four owner-scoped writes),
+`services/market_engine/gateway.py` (`price.updated` owner stamp),
+`services/paper_trade.py` (owner-scoped close write),
+`services/heartbeat_engine.py` (dead fan-out helper removed).
+
+**Frontend (3)** — `services/api.js` (success-path epoch guard),
+`context/AuthContext.jsx` (tenant-state clearing on four transitions),
+`components/stock/OrderTicket.jsx` (order intent carries its identity).
+
+**D5 is untouched.** No gateway resolution, ranking, scanner, evidence,
+feed-state, probation, latency, provider-registration or tick-codec change. The
+one gateway edit is the delivery scope of a single event.
+
+---
+
+## 10. Recommended next phase
+
+**D6.4** — the ownership registry and the deletion cascade, which now has four
+items pointing at it (§8). **Not started** — the brief forbids it.
+
+---
+
+**D6.3 STATUS: COMPLETE.**
+
+---

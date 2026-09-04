@@ -406,7 +406,37 @@ api.interceptors.request.use((config) => {
 });
 
 api.interceptors.response.use(
-  (res) => res,
+  (res) => {
+    // D6.3. The epoch check below existed ONLY on the 401 path, so it caught a
+    // request that had to be *replayed* across an identity change and missed the
+    // one that simply *succeeded* across it. A dashboard fires many reads at
+    // once; sign out mid-flight and sign in as somebody else, and every one of
+    // those responses — fetched with the previous account's cookie, answered
+    // 200 by the server, entirely correct as far as the server is concerned —
+    // resolves into the new account's UI.
+    //
+    // The stamp is applied once at first dispatch, so this compares the identity
+    // generation the request was *born* under with the one in force now. It is
+    // enforced here, at the boundary, rather than by every caller remembering to
+    // re-check after an await: there is one interceptor and hundreds of call
+    // sites, and the call sites are exactly where this gets forgotten.
+    //
+    // Rejected with the same `SessionChangedError` the replay path uses, so
+    // "we deliberately dropped this" stays distinguishable from a server error.
+    //
+    // The auth-lifecycle endpoints are exempt for the same reason they are
+    // exempt from the 401 path: those requests ARE the identity transition, so
+    // asking whether they outlived one is the wrong question. `/auth/refresh`
+    // in particular is issued by `refreshSession`, which would read a rejection
+    // as a transient network failure and impose a cool-down on a session that
+    // had just been established.
+    if (res.config && res.config._authEpoch !== undefined
+        && res.config._authEpoch !== authEpoch
+        && !isNeverRefresh(res.config.url)) {
+      return Promise.reject(new SessionChangedError());
+    }
+    return res;
+  },
   async (error) => {
     const originalRequest = error.config;
     const url = originalRequest?.url || "";

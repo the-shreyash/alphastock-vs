@@ -2712,8 +2712,10 @@ async def update_trade(trade_id: str, request: Request, background_tasks: Backgr
     if "notes" in body:
         update["notes"] = body["notes"]
 
-    await db.trades.update_one({"_id": trade_oid}, {"$set": update})
-    updated = await db.trades.find_one({"_id": trade_oid})
+    # D6.3 — the owner is part of the write, not merely of the read above.
+    owned = {"_id": trade_oid, "user_id": user["_id"]}
+    await db.trades.update_one(owned, {"$set": update})
+    updated = await db.trades.find_one(owned)
     updated["_id"] = str(updated["_id"])
 
     # If this update just closed the trade, announce the close and generate
@@ -2786,9 +2788,10 @@ async def exit_trade(trade_id: str, data: TradeExitRequest, background_tasks: Ba
         + (f" via {trade['broker']} (order {broker_order_id})" if broker_order_id else ""),
         exit_price))
     update["events"] = events
-    await db.trades.update_one({"_id": trade_oid}, {"$set": update})
+    owned = {"_id": trade_oid, "user_id": user["_id"]}   # D6.3
+    await db.trades.update_one(owned, {"$set": update})
 
-    updated = await db.trades.find_one({"_id": trade_oid})
+    updated = await db.trades.find_one(owned)
     updated["_id"] = str(updated["_id"])
     if updated.get("status") != "OPEN":
         from services.trade_review import generate_close_intelligence
@@ -2840,7 +2843,8 @@ async def get_trade_coaching(trade_id: str, user: dict = Depends(get_current_use
     coaching = await generate_trade_coaching(trade, ai_func=ai_func)
 
     # Cache in DB
-    await db.trades.update_one({"_id": trade_oid}, {"$set": {"coaching": coaching}})
+    await db.trades.update_one({"_id": trade_oid, "user_id": user["_id"]},   # D6.3
+                               {"$set": {"coaching": coaching}})
     from services.activity_logger import log_activity
     log_activity(f"AI coaching generated for {trade['symbol']} trade", "monitor", "done",
                  user_id=str(user["_id"]))
@@ -3249,7 +3253,9 @@ async def ai_trade_review(data: TradeReviewRequest, user: dict = Depends(get_cur
                   "symbol": trade.get("symbol")}
         if data.trade_id:
             async with run.step():
-                await db.trades.update_one({"_id": trade_oid}, {"$set": {"ai_review": review}})
+                await db.trades.update_one(
+                    {"_id": trade_oid, "user_id": user["_id"]},   # D6.3
+                    {"$set": {"ai_review": review}})
         log_activity(f"Trade review ready for {trade.get('symbol')}", "monitor", "done",
                      user_id=str(user["_id"]))
         await run.complete()
@@ -3811,21 +3817,48 @@ def _websocket_credential(websocket: WebSocket) -> tuple[Optional[str], Optional
 
     The server must echo one of the offered subprotocols or the browser closes
     the connection, so the marker — never the token — is returned for echoing.
-    """
-    cookie_token = websocket.cookies.get(ACCESS_TOKEN_COOKIE)
-    if cookie_token:
-        return cookie_token, None
 
+    **THE ECHO BELONGS TO THE OFFER, NOT TO THE TRANSPORT THAT WON (D6.3).**
+    This function used to answer ``(cookie_token, None)`` the moment a cookie was
+    present, without looking at what the client had offered. Both halves of that
+    were individually reasonable and together they broke every browser session:
+
+      * the SPA offers ``["stockassist.auth", <token>]`` whenever it still holds
+        the bootstrap credential — which is every session, from sign-in until the
+        first refresh drops it (D6.1);
+      * D6.1's cookie fix then made the ``access_token`` cookie present on that
+        same handshake, so the cookie branch won and no subprotocol was selected;
+      * a browser that offered subprotocols and got none back **fails the
+        connection**, so the socket died at 1006 immediately after the server had
+        accepted it — realtime never connected, and the client, seeing a close
+        with no open, correctly diagnosed a credential problem and re-tried into
+        the same wall.
+
+    The server was reporting success (``[accepted]`` in the access log) for a
+    handshake the browser was tearing down, which is why no hermetic test saw it:
+    Starlette's test transport does not enforce the browser's rule. Verified in a
+    real Chrome against a real server — offering the marker closed at 1006,
+    offering nothing on the identical cookie opened.
+
+    The marker is therefore resolved from the OFFER first and echoed on every
+    path, including the one where the cookie supplied the credential.
+    """
     offered = [p.strip() for p in
                (websocket.headers.get("sec-websocket-protocol") or "").split(",")
                if p.strip()]
-    if WS_AUTH_SUBPROTOCOL in offered:
+    marker = WS_AUTH_SUBPROTOCOL if WS_AUTH_SUBPROTOCOL in offered else None
+
+    cookie_token = websocket.cookies.get(ACCESS_TOKEN_COOKIE)
+    if cookie_token:
+        return cookie_token, marker
+
+    if marker is not None:
         # Any value that is not the marker is the credential. Positional
         # ("the second one") would break the moment a client offered a third
         # subprotocol for an unrelated reason.
         for value in offered:
             if value != WS_AUTH_SUBPROTOCOL:
-                return value, WS_AUTH_SUBPROTOCOL
+                return value, marker
     return None, None
 
 
