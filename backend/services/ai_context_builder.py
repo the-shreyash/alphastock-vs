@@ -334,12 +334,30 @@ def _render_news(articles: Optional[list], sentiment: Optional[dict]) -> Optiona
     return "\n".join(lines) if len(lines) > 1 else None
 
 
-def _render_broker(session: Optional[dict]) -> Optional[str]:
-    if not session:
+def _render_broker(accounts) -> Optional[str]:
+    """The user's brokerage accounts, one line each (D6.4).
+
+    Takes a list since D6.4. It used to take one document from an unordered
+    `find_one`, so a user with two accounts had one of them described to the
+    model and the other invisible — and which one was not deterministic.
+
+    Carries the broker and the *external* account id (the broker's own client
+    code, which the user recognises), never the internal `broker_account_id`:
+    the model has no use for an opaque routing handle and a prompt is not a place
+    to put internal identifiers.
+    """
+    if isinstance(accounts, dict):  # a single document, from an older caller
+        accounts = [accounts]
+    accounts = [a for a in (accounts or []) if a]
+    if not accounts:
         return "## Broker\n- No broker connected (analysis/paper mode)."
-    name = session.get("broker") or "broker"
-    connected = session.get("connected", False)
-    return f"## Broker\n- {name}: {'connected (live session)' if connected else 'disconnected'}"
+    lines = ["## Broker"]
+    for a in accounts:
+        name = a.get("broker") or "broker"
+        label = a.get("external_account_id")
+        state = "connected (live session)" if a.get("connected", False) else "disconnected"
+        lines.append(f"- {name}{f' [{label}]' if label else ''}: {state}")
+    return "\n".join(lines)
 
 
 def _render_activity(entries: Optional[list]) -> Optional[str]:
@@ -430,7 +448,15 @@ async def _assemble(db, user: dict, quotes_map_func: QuotesMapFunc) -> ChatConte
         _safe(news_service.get_market_sentiment(), "sentiment"),
         _safe(ai_memory.get_user_memory(db, user_id), "memory", default={}),
         _safe(quotes_map_func(extra_symbols), "extra_quotes", default={}) if extra_symbols else _noop({}),
-        _safe(db.broker_accounts.find_one({"user_id": user_id, "connected": {"$ne": False}}), "broker"),
+        # D6.4 — every connected ACCOUNT, owner-scoped, instead of `find_one`
+        # over "this user's connected brokers". `find_one` with no sort answered
+        # "whichever document Mongo returned first", which is exactly the
+        # any-connected selection this sprint removes — and for a user with two
+        # accounts it silently described one and hid the other from the model.
+        _safe(db.broker_accounts.find(
+            {"user_id": user_id, "connected": {"$ne": False}},
+            {"broker": 1, "broker_account_id": 1, "external_account_id": 1,
+             "connected": 1}).to_list(20), "broker", default=[]),
     )
 
     # ---- Derived analytics (pure, cheap, never raise on empty) ---- #

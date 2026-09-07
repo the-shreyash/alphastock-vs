@@ -75,8 +75,8 @@ BROKER-NEUTRALITY
 -----------------
 This module imports nothing from `services.` beyond `reliability`, names no
 broker, and receives no broker vocabulary. Its whole input is a
-`(user, broker, channel)` key, a :class:`RecoveryClass`, and two injected
-predicates. `broker` here is an opaque account-scoping token — the same role it
+`(broker_account_id, channel)` key, a :class:`RecoveryClass`, and two injected
+predicates. The account id here is an opaque scoping token — the same role it
 plays in `BrokerStreamManager`'s registry key — and is never compared to a
 literal. The Market Engine imports none of this, and does not learn that
 anything was re-probed.
@@ -230,12 +230,12 @@ class ReprobeOutcome(str, Enum):
     ATTEMPT_FAILED = "attempt_failed"
 
 
-RecoveryKey = Tuple[str, str, str]
+RecoveryKey = Tuple[str, str]
 
 
 @dataclass
 class RecoveryCandidate:
-    """One withdrawn (user, broker, channel) and what it is waiting for.
+    """One withdrawn (account, channel) and what it is waiting for.
 
     Per key, which is the same granularity `BrokerStreamManager` keys its
     registry on and the same granularity `ConnectionStability` is instantiated
@@ -243,10 +243,15 @@ class RecoveryCandidate:
     withdrawal actually happens to. Two users on one broker hold two candidates
     that no code path can confuse, and one user's refused market feed says
     nothing about the same user's order channel.
+
+    D6.4 narrowed the account half of the key from `(user_id, broker)` to
+    `broker_account_id`, at the same time and for the same reason the stream
+    registry did: a user's two accounts at one broker shared a key, so a
+    withdrawal recorded against one suppressed re-probe of the other and a
+    discharge on either one cleared both.
     """
 
-    user_id: str
-    broker: str
+    broker_account_id: str
     channel: str
     recovery_class: RecoveryClass
     #: Attempts made against this key since the ladder was last cleared by a
@@ -260,7 +265,7 @@ class RecoveryCandidate:
 
     @property
     def key(self) -> RecoveryKey:
-        return (self.user_id, self.broker, self.channel)
+        return (self.broker_account_id, self.channel)
 
     @property
     def is_reprobeable(self) -> bool:
@@ -269,13 +274,12 @@ class RecoveryCandidate:
     def describe(self, *, now: float) -> Dict[str, Any]:
         """Diagnostics only. Carries no session, no credential and no reason text.
 
-        The broker name is present for the same reason it is present on a
-        provider name: this reaches an operator's diagnostics surface and the
+        The account id is present for the same reason a broker name is present on
+        a provider name: this reaches an operator's diagnostics surface and the
         logs, never a consumer payload (Developer Rule 4).
         """
         return {
-            "user_id": self.user_id,
-            "broker": self.broker,
+            "broker_account_id": self.broker_account_id,
             "channel": self.channel,
             "recovery_class": self.recovery_class.value,
             "reprobeable": self.is_reprobeable,
@@ -329,8 +333,7 @@ class RecoveryRegister:
 
     def record_withdrawal(
         self,
-        user_id: Any,
-        broker: str,
+        broker_account_id: str,
         channel: str,
         recovery_class: RecoveryClass,
     ) -> Optional[RecoveryCandidate]:
@@ -352,11 +355,10 @@ class RecoveryRegister:
         """
         if recovery_class in SELF_RECOVERING_CLASSES:
             return None
-        key = (str(user_id), broker, channel)
+        key = (str(broker_account_id), channel)
         attempts = self._history.get(key, 0)
         candidate = RecoveryCandidate(
-            user_id=key[0],
-            broker=broker,
+            broker_account_id=key[0],
             channel=channel,
             recovery_class=recovery_class,
             attempts=attempts,
@@ -368,9 +370,9 @@ class RecoveryRegister:
         )
         self._candidates[key] = candidate
         logger.info(
-            "Recovery: %s %s feed for user %s withdrawn (%s), attempts=%d, "
+            "Recovery: %s feed for account %s withdrawn (%s), attempts=%d, "
             "next attempt %s",
-            broker, channel, key[0], recovery_class.value, attempts,
+            channel, key[0], recovery_class.value, attempts,
             "never — not re-probeable" if candidate.next_attempt_at is None
             else f"in {candidate.next_attempt_at - self._clock():.0f}s",
         )
@@ -378,8 +380,7 @@ class RecoveryRegister:
 
     def reclassify(
         self,
-        user_id: Any,
-        broker: str,
+        broker_account_id: str,
         recovery_class: RecoveryClass,
         channel: str = None,
     ) -> int:
@@ -393,14 +394,14 @@ class RecoveryRegister:
         carried across by the one piece of code that knows how.
         """
         changed = 0
-        for key in self._keys(user_id, broker, channel):
+        for key in self._keys(broker_account_id, channel):
             if self._candidates[key].recovery_class is recovery_class:
                 continue
-            self.record_withdrawal(key[0], key[1], key[2], recovery_class)
+            self.record_withdrawal(key[0], key[1], recovery_class)
             changed += 1
         return changed
 
-    def discharge(self, user_id: Any, broker: str, channel: str = None) -> int:
+    def discharge(self, broker_account_id: str, channel: str = None) -> int:
         """The feed produced evidence — drop the outstanding withdrawal.
 
         Keeps the attempt history, deliberately. See the class docstring: an
@@ -413,18 +414,18 @@ class RecoveryRegister:
         which socket carried it.
         """
         removed = 0
-        for key in self._keys(user_id, broker, channel):
+        for key in self._keys(broker_account_id, channel):
             if self._candidates.pop(key, None) is not None:
                 removed += 1
         if removed:
             logger.info(
-                "Recovery: %s feed for user %s recovered on evidence "
+                "Recovery: feed for account %s recovered on evidence "
                 "(%d outstanding withdrawal(s) discharged)",
-                broker, str(user_id), removed,
+                str(broker_account_id), removed,
             )
         return removed
 
-    def forget(self, user_id: Any, broker: str, channel: str = None) -> int:
+    def forget(self, broker_account_id: str, channel: str = None) -> int:
         """Clear the withdrawal **and the ladder** for this account.
 
         The only thing that resets pacing, and its callers are the two
@@ -433,7 +434,7 @@ class RecoveryRegister:
         disconnected it (there is nothing left to recover).
         """
         cleared = 0
-        for key in self._keys(user_id, broker, channel):
+        for key in self._keys(broker_account_id, channel):
             cleared += int(self._candidates.pop(key, None) is not None)
             self._history.pop(key, None)
         return cleared
@@ -454,8 +455,8 @@ class RecoveryRegister:
 
     # ── Reading ──────────────────────────────────────────
 
-    def get(self, user_id: Any, broker: str, channel: str) -> Optional[RecoveryCandidate]:
-        return self._candidates.get((str(user_id), broker, channel))
+    def get(self, broker_account_id: str, channel: str) -> Optional[RecoveryCandidate]:
+        return self._candidates.get((str(broker_account_id), channel))
 
     def is_due(self, candidate: RecoveryCandidate) -> bool:
         """Whether `candidate`'s ladder says the next attempt may happen now.
@@ -504,12 +505,12 @@ class RecoveryRegister:
 
     # ── Internals ────────────────────────────────────────
 
-    def _keys(self, user_id: Any, broker: str, channel: str = None) -> List[RecoveryKey]:
-        owner = str(user_id)
+    def _keys(self, broker_account_id: str, channel: str = None) -> List[RecoveryKey]:
+        owner = str(broker_account_id)
         return [
             key
             for key in list(self._candidates)
-            if key[0] == owner and key[1] == broker and (channel is None or key[2] == channel)
+            if key[0] == owner and (channel is None or key[1] == channel)
         ]
 
     def _pause(self, attempts: int) -> float:
@@ -536,13 +537,13 @@ class RecoveryService:
     a cycle back into `broker_engine` — and, more usefully, what makes every
     branch below assertable without a database, a socket or an adapter.
 
-    :param attach: ``await attach(user_id, broker, channel)`` — perform one
+    :param attach: ``await attach(broker_account_id, channel)`` — perform one
         ordinary attach of that channel. The engine passes its existing
         `start_stream`, scoped to the one channel; there is no probe-only path
         and there must not be one (see the module docstring).
-    :param has_session: ``has_session(user_id, broker) -> bool`` — whether a
+    :param has_session: ``has_session(broker_account_id) -> bool`` — whether a
         valid session exists to attach with.
-    :param is_attached: ``is_attached(user_id, broker, channel) -> bool`` —
+    :param is_attached: ``is_attached(broker_account_id, channel) -> bool`` —
         whether a stream is already running for that channel.
     """
 
@@ -578,7 +579,7 @@ class RecoveryService:
 
     # ── One probe ────────────────────────────────────────
 
-    async def reprobe(self, user_id: Any, broker: str, channel: str) -> ReprobeOutcome:
+    async def reprobe(self, broker_account_id: str, channel: str) -> ReprobeOutcome:
         """Attempt one re-probe of one channel. Never raises.
 
         The order of the guards is the policy, so it is worth reading as one
@@ -595,7 +596,7 @@ class RecoveryService:
         disconnected the broker, or another channel reported the token dead —
         which no classification made at withdrawal time can know about.
         """
-        candidate = self._register.get(user_id, broker, channel)
+        candidate = self._register.get(broker_account_id, channel)
         if candidate is None:
             return ReprobeOutcome.NOT_REGISTERED
         if not candidate.is_reprobeable:
@@ -606,23 +607,23 @@ class RecoveryService:
 
     async def _attempt(self, candidate: RecoveryCandidate) -> ReprobeOutcome:
         """Run the session/attachment guards and, if they pass, attach once."""
-        if not self._has_session(candidate.user_id, candidate.broker):
+        if not self._has_session(candidate.broker_account_id):
             # Not an attempt: nothing was asked of the broker, so nothing is
             # charged. A candidate with no session simply waits, and the
             # lifecycle event that restores the session clears it outright.
             return ReprobeOutcome.SESSION_UNAVAILABLE
-        if self._is_attached(candidate.user_id, candidate.broker, candidate.channel):
-            self._register.discharge(candidate.user_id, candidate.broker, candidate.channel)
+        if self._is_attached(candidate.broker_account_id, candidate.channel):
+            self._register.discharge(candidate.broker_account_id, candidate.channel)
             return ReprobeOutcome.ALREADY_ATTACHED
 
         self._register.note_attempt(candidate)
         logger.info(
-            "Recovery: re-probing the %s %s feed for user %s (attempt %d) — "
+            "Recovery: re-probing the %s feed for account %s (attempt %d) — "
             "one ordinary attach; readiness and probation are still to be earned",
-            candidate.broker, candidate.channel, candidate.user_id, candidate.attempts,
+            candidate.channel, candidate.broker_account_id, candidate.attempts,
         )
         try:
-            await self._attach(candidate.user_id, candidate.broker, candidate.channel)
+            await self._attach(candidate.broker_account_id, candidate.channel)
         except Exception as e:
             # Swallowed on purpose. A re-probe is speculative by definition and
             # runs on a background task: an adapter raising must not kill the
@@ -630,8 +631,8 @@ class RecoveryService:
             # ladder has already climbed, so a broker that reliably throws backs
             # off exactly as one that reliably refuses does.
             logger.warning(
-                "Recovery: re-probe of the %s %s feed for user %s failed: %s",
-                candidate.broker, candidate.channel, candidate.user_id, e,
+                "Recovery: re-probe of the %s feed for account %s failed: %s",
+                candidate.channel, candidate.broker_account_id, e,
             )
             return ReprobeOutcome.ATTEMPT_FAILED
         return ReprobeOutcome.ATTEMPTED

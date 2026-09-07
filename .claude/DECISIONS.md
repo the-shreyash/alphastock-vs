@@ -4418,3 +4418,286 @@ else in the session architecture was touched.
   evidence, feed-state, probation, latency or tick-codec change.
 * The `SessionStore.rotate()` TOCTOU (LIM-D6.2-6) is untouched, as instructed:
   D6.3 found no tenant-isolation failure that it causes.
+
+---
+
+# ADR-063 — A public fact about the market is not a public fact about who looked at it (D6.3 closure)
+
+**Status:** Accepted · 2026-09-06 · Extends ADR-062 (D6.3), which extends
+ADR-061 (D6.2), ADR-060 (D6.1) and ADR-059 (D6.0).
+
+## Context
+
+D6.3 shipped with two limitations that were honestly recorded rather than
+papered over, and both were of the same kind: **the instrument that could have
+found the defect was never built.**
+
+* **LIM-D6.3-1** — the browser leg drove one browser, one tab, no broker. Two
+  accounts signed in simultaneously were never driven.
+* **LIM-D6.3-2** — no real database race was reproduced, because `FakeDB` is
+  single-threaded with no await point inside an operation. `SessionStore`'s
+  read/decide/write TOCTOU (LIM-D6.2-6) was parked for the same reason.
+
+Closing them was not a documentation exercise. Building the two instruments
+found one new cross-tenant disclosure and three real races.
+
+## Decision
+
+### 1. An activity entry is owned by the caller it describes, not by the data it names
+
+`/stocks/{symbol}/patterns` wrote its scan line to the **shared** activity
+stream. D6.1 had classified it as platform scope with an explicit and correct
+premise — the route takes no identity, and the symbol it names is public
+reference data the same endpoint returns.
+
+The premise was true and the conclusion did not follow. The entry does not exist
+because the market did something; it exists because **a specific signed-in user
+opened that symbol's detail page**. Publishing it to the shared stream told every
+other signed-in user which symbols their neighbours were researching — on a
+trading platform, that is the users' research interest, disclosed in near real
+time and rendered on the dashboard.
+
+**The rule:** classify a private-vs-shared boundary by *what causes the record to
+exist*, not by whether the field values are individually public. A value composed
+entirely of public facts is still private when its existence is caused by one
+account's behaviour.
+
+The route now takes `get_optional_user_id` — the identity D6.1's own comment said
+it would need — and follows the shape D6.1 had already chosen for
+`run_backtest_route` when it hit this same problem: an identified caller's entry
+is theirs alone; a genuinely anonymous visitor, who is not a tenant, keeps the
+public behaviour unchanged. **One defect class, one remedy, one pattern.**
+
+Rejected: dropping the entry entirely for anonymous callers. It would have been
+marginally safer and would have introduced a second pattern for a problem that
+already had one, for no tenant-isolation gain — an anonymous page view discloses
+no account's business.
+
+### 2. A race is proven against a database that can exhibit races, or it is not proven
+
+`FakeDB` cannot interleave a read and a write inside one operation, so every
+concurrency result D6.3 could produce was a statement about application paths
+rather than about atomicity. `test_d63_real_db_races.py` drives the real
+production code against a real `mongod`, with the interleaving pinned by an
+`asyncio.Barrier` at the collection boundary — real documents, real filters, real
+update semantics; only the scheduling is forced.
+
+**The falsifying twins come first and are load-bearing.** A concurrency suite
+that cannot observe a race reports "no race crossed tenants" for a reason that
+has nothing to do with tenancy — precisely the unfalsifiable shape LIM-D6.3-2
+refused to write. So the file opens by proving, against the same database and the
+same barrier, that it *does* detect a lost update and *does* distinguish a
+compare-and-swap from a read/decide/write. If those go green by accident,
+everything after them is void.
+
+### 3. LIM-D6.2-6 is reproduced, contained, and still not fixed
+
+Two concurrent refreshes of one family both return `ROTATED` against real Mongo:
+the store issues two live refresh tokens for a family that can only have one, and
+counts one logical rotation twice. This is no longer an argument — it is a test.
+
+**It causes no tenant-isolation failure.** The bystander's session document is
+compared field-for-field across the race *and* across the family-revoking refresh
+that follows it, and is byte-identical, while the bystander's own refresh still
+succeeds (the owner-positive control without which "unchanged" proves nothing).
+The losing client fails closed at `REUSE_DETECTED`; that costs it its session and
+hands nobody anything.
+
+`rotate()` is therefore **untouched**, per the D6.2 freeze. What changed is the
+evidence: "not constructible" has become "constructed, and contained".
+
+### 4. Three real races found, none cross-tenant, none swept up
+
+`update_paper_balance` is read/modify/write with `$set` and loses concurrent
+credits; `close_paper_trade` decides on a status it does not restate in the
+write, so one position closes N times; `_record_order` can duplicate a row for
+one user because `db.orders` carries no unique index on
+`(user_id, broker, order_id)`.
+
+All three are single-owner integrity defects and all three are outside D6.3's
+tenant boundary, so they are **not fixed here**. They are also not left as prose:
+the first two are asserted in their *correct* form under `xfail(strict=True)`, so
+they are red-by-design today and turn the suite red again the moment someone
+fixes the write without removing the marker.
+
+**A fix-ordering hazard is recorded with them:** the double-close is currently
+*masked* by the lost update. Repairing `update_paper_balance` to `$inc` on its
+own would convert a hidden double-close into a real over-credit. The two must be
+cleared together.
+
+### 5. A guard must be checked against the tool doing work, not against its CLI
+
+`test_dockerignore_semantics.py` gated its differential tests on
+`docker buildx version` — a command the CLI plugin answers with the daemon
+stopped. Sixteen tests therefore *ran* and *failed* on any machine with Docker
+installed but not running, contradicting the module's own docstring ("they …
+skip when no daemon is reachable") and burying real regressions in noise. The
+guard now also requires `docker info`, which the daemon must answer. This is the
+same lesson ADR-055 recorded for the `.dockerignore` matcher: a guard that models
+another tool's availability has to be validated against that tool.
+
+## Consequences
+
+* The shared activity stream is now fed only by work that is genuinely
+  market-wide or by callers who own nothing. The file-level import sweep in
+  `test_d61_security.py` cannot see this distinction — it reads imports, not
+  causes — so enforcement is the targeted route test plus its anonymous twin.
+* `scripts/browser/d63_tenant_isolation.js` makes the two-tenant browser check
+  repeatable and release-gating. It is the only instrument on this project that
+  can see either of the two defect classes described above.
+* `requires_db` now has a real carrier. The suite skips itself when no `mongod`
+  answers, so it is safe in the default selection.
+* **The broker leg of LIM-D6.3-1 remains open.** Every broker-isolation result on
+  this project is still from hermetic tests; no live Zerodha/Upstox session has
+  ever been driven.
+
+---
+
+## ADR-058 — `broker_account_id` is the identity of a brokerage account; `(user_id, broker)` never was
+
+**Status:** Accepted (D6.4). **Supersedes** the invariant recorded by D6.1 / S3
+("every broker operation is addressed by an explicit `(user_id, broker)` pair"),
+which it strengthens rather than reverses.
+
+## Context
+
+D6.1 deleted `any_connected_session(broker)` — an accessor that returned "the
+most recently connected fresh account for this broker, of *any* user" to a caller
+that supplied no identity. The invariant that replaced it was that every broker
+operation names a `(user_id, broker)` pair.
+
+That closed a cross-*tenant* hole and left a cross-*account* one open, because
+`(user_id, broker)` is not an account. It is a user and a **brand**. It identifies
+an account only while a user has at most one account per broker — a condition
+enforced by a unique index on `db.broker_accounts`, not by anything true about
+brokerage. Every Indian retail broker in this integration permits a person to
+hold more than one account.
+
+The pair had been written into seven independent places (the unique index, the
+engine's session cache, its instrument-map cache, the stream registry, the
+recovery register, the market-feed provider name, the Source Manager's
+connected-broker registry) and into the signature of every public engine method
+and every persisted order, holding and portfolio row.
+
+The failure it produced was silent. A user's second Zerodha account did not fail
+to connect — it **upserted over** the first: same row, same cached session, same
+socket, same provider, same recovery candidate. `sync_portfolio`'s
+`delete_many({user_id, broker})` deleted the first account's holdings before
+writing the second's. Nothing raised.
+
+## Decision
+
+**1. The identity is `broker_account_id`** — opaque (`ba_` + 128 random bits),
+internal, immutable, minted exactly once per external brokerage account per user,
+and derived from nothing.
+
+**2. The id is random; the LOOKUP is deterministic.** The tempting alternative is
+`hash(user_id, broker, external_account_id)`, which makes migration trivially
+idempotent. It is wrong twice: the id becomes derivable by anyone who knows those
+three values, and it is welded to a field that must be allowed to change — a
+legacy row that later learns its external identity would need a *different* id,
+orphaning every order pointing at the old one. So determinism lives in
+`BrokerAccountDirectory.link`, which resolves `(user_id, broker,
+external_account_id)` to an existing row before minting. Reconnect is idempotent
+because the lookup finds the row, not because the id was recomputed from it.
+
+**3. Ownership is a database filter, not a comparison.** Every directory read
+leads with `user_id`, so another user's document is never in memory. A
+`find_one({"broker_account_id": …})` followed by `if doc["user_id"] != user_id`
+is a check somebody can forget, reorder or short-circuit; a filter is not.
+
+**4. The engine takes a `BrokerAccountRef`, not a pair of strings.** This is the
+substantive strengthening of D6.1's invariant. "Every call names a `user_id`" is
+a *convention*: a caller can pass any string and nothing verifies it owns the
+session that comes back. A `BrokerAccountRef` is obtainable from exactly one
+place — the owner-filtered directory — so the ownership check happens *before a
+reference exists* rather than inside each method. A caller cannot assert an owner
+by supplying the right-shaped argument; it has to have been given one.
+
+**5. The broker-addressed routes are kept and made to REFUSE.** They resolve only
+the unambiguous case and answer 409 otherwise. Deleting them breaks the shipped
+frontend and every integration for a population in which the answer is
+unambiguous; making them *choose* reintroduces "first connected", "last
+connected" and "any connected" under a new name. Refusing is the only remaining
+honest option.
+
+**6. The external identity is per broker, and was audited rather than assumed.**
+Kite and Upstox return `user_id`, SmartAPI `clientcode`, Fyers `fy_id`, Dhan
+`dhanClientId`. Three names across five brokers; what they share is the property
+the platform needs — stable across logins, unique within the broker, and printed
+on the user's own contract notes. Only the adapter is entitled to know which
+field it is.
+
+**7. Ambiguity in legacy data is refused, not resolved.** Two documents claiming
+one legacy identity are reported and skipped, and every row referencing that pair
+is left untouched. Merging joins two credential sets and two portfolio histories
+under one id; picking one silently orphans the other's orders. Neither is a
+migration.
+
+## What this ADR does NOT change
+
+The market feed's **owner** stays at user scope (`owner_user_id`). Entitlement is
+a property of the person, not of the account: a user with two Zerodha accounts
+has two feeds and both are theirs to consume. Only the provider *name* became
+account-scoped, and only because a feed is a property of the socket and the
+socket belongs to an account. D5's ranking, promotion, probation and latency
+semantics are untouched, and public market data is not account-scoped.
+
+## Consequences
+
+* **A user can hold several accounts at one broker.** The unique index that
+  forbade it is explicitly dropped — `create_index` does not redefine an existing
+  index with the same key pattern, so leaving it in place would have kept
+  uniqueness silently in force under a set of indexes that all say a second
+  account is legal, surfacing as a duplicate-key error on the user's second
+  connect after every code path had already agreed it was allowed.
+* **Order dedup moved to `(broker_account_id, order_id)`.** A broker order id is
+  a per-account sequence, so two accounts at one broker can legitimately issue
+  the same id; the old key merged them into one row. The corresponding *unique
+  index* is still missing (LIM-D6.4-2).
+* **A background task can no longer choose an account.** `_broker_exit` reads the
+  `broker_account_id` recorded on the trade and **refuses to exit** a trade that
+  carries none, rather than resolving the broker name. A live market order placed
+  into an account a scheduler picked is the failure this whole sprint exists to
+  make impossible.
+* **`get_status` can no longer answer with one boolean** for a user with two
+  accounts at one broker. It reports `ambiguous: true` and carries the accounts,
+  because inventing a boolean is `any_connected` again.
+* **`users.preferred_broker` is now under-expressive** (LIM-D6.4-4). It resolves
+  through the bridge and therefore refuses for such a user — correct, but the
+  field should become `preferred_broker_account_id`.
+
+## What D6.4 found that was not on its own list
+
+**A live critical vulnerability, D6.4 / V-1.** `GET /api/zerodha/callback` still
+read `uid` from the query string — the exact defect D6.1 / S1 removed from
+`/api/brokers/{broker}/callback`, surviving on the *older alias for the same
+flow*. `KITE_REDIRECT_URL` in this repository's own `.env` points at the legacy
+path, so **the D6.1 fix was inert for Zerodha in the shipped configuration**.
+
+The lesson is narrow and worth keeping: **a security fix applied to one route is
+not applied to a flow.** D6.1 audited the route it was rewriting and did not ask
+which URL the provider was actually configured to call. The remedy here is not a
+second implementation but a delegation — the legacy alias now calls the hardened
+handler, so there is one ownership proof and not two that must agree.
+
+## How this is enforced against returning
+
+* `test_d64_identity.py` — 109 tests, including a two-user/three-account matrix
+  driven over HTTP and a static sweep for `any_connected_session`,
+  `first_connected`, `last_connected`, `default_broker_account` and
+  `find_by_broker` in executable code only (so the explanations in this sprint's
+  comments, which necessarily name the patterns they removed, are not violations).
+* A sweep asserting no `broker_accounts` query outside the directory is keyed by
+  broker name — the specific query shape that made two accounts collide.
+* `BrokerStreamManager.start_stream` **requires** `broker_account_id` as a
+  keyword argument and raises without one. Enforcement by signature, which D6.1
+  found beats enforcement by sweep: a caller that cannot name the account cannot
+  open a connection at all.
+* `get_unscoped` — the one reader that bypasses the owner filter, for background
+  paths that act *as* the account — has its caller list pinned by a test.
+* **15 mutations, 15 killed.** Three survived the first pass and each exposed a
+  test that could not have failed: a fallback test with nothing to fall back to;
+  a two-account test using the same symbol in both, where Mongo's `update_one`
+  writes one document and the test agreed with the bug; and a disconnect test
+  that removed the account an unscoped update happens to hit anyway.

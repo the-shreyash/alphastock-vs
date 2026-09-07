@@ -36,6 +36,7 @@ from services.brokers.catalogue import EQUITY_SEGMENT
 
 from services.brokers.feed_universe import FeedInstrument
 from tests.test_broker_streaming import run
+from _accounts import account_ref  # noqa: E402
 
 BROKERS = ("zerodha", "upstox", "angelone", "fyers", "dhan")
 
@@ -102,7 +103,7 @@ def test_an_account_with_no_holdings_still_subscribes(broker, monkeypatch,
     _catalogue_for(broker, monkeypatch)
 
     tokens, symbols = run(engine_with_empty_account._plan_tick_subscription(
-        "u1", broker, {}, holdings=[], positions=[]))
+        account_ref("u1", broker), {}, holdings=[], positions=[]))
 
     assert tokens, (
         f"{broker}: an account with an empty portfolio planned an empty "
@@ -128,8 +129,8 @@ def test_a_tick_for_an_unheld_watchlist_instrument_can_be_named(broker, monkeypa
 
     _catalogue_for(broker, monkeypatch)
     run(engine_with_empty_account._plan_tick_subscription(
-        "u1", broker, {}, holdings=[], positions=[]))
-    instrument_map = run(engine_with_empty_account._instrument_map("u1", broker))
+        account_ref("u1", broker), {}, holdings=[], positions=[]))
+    instrument_map = run(engine_with_empty_account._instrument_map(account_ref("u1", broker)))
 
     ticks = canonical_ticks(
         [{"instrument_token": CATALOGUE_ANSWERS[broker]["SBIN"], "last_price": 812.5}],
@@ -152,7 +153,7 @@ def test_the_subscription_carries_no_instrument_the_account_did_not_ask_for(
     _catalogue_for(broker, monkeypatch)
 
     tokens, symbols = run(engine_with_empty_account._plan_tick_subscription(
-        "u1", broker, {}, holdings=[], positions=[]))
+        account_ref("u1", broker), {}, holdings=[], positions=[]))
 
     from services.brokers.feed_universe import dashboard_symbols
 
@@ -191,7 +192,7 @@ def test_an_account_with_nothing_at_all_subscribes_to_nothing(broker, monkeypatc
     _catalogue_for(broker, monkeypatch)
 
     tokens, symbols = run(engine._plan_tick_subscription(
-        "u1", broker, {}, holdings=[], positions=[]))
+        account_ref("u1", broker), {}, holdings=[], positions=[]))
 
     assert tokens == [] and symbols == ()
 
@@ -233,7 +234,7 @@ def test_an_unreachable_master_leaves_the_portfolio_subscription_intact(
     monkeypatch.setattr(type(adapter), "_instrument_catalogue", _unreachable)
 
     _tokens, symbols = run(engine_with_empty_account._plan_tick_subscription(
-        "u1", broker, {},
+        account_ref("u1", broker), {},
         holdings=[{"symbol": "RELIANCE", "exchange": "NSE",
                    "instrument_token": "738561"}],
         positions=[]))
@@ -263,7 +264,7 @@ def test_the_engine_asks_for_exchange_qualified_instruments(broker, monkeypatch,
     monkeypatch.setattr(type(adapter), "resolve_instruments", _record)
 
     run(engine_with_empty_account._plan_tick_subscription(
-        "u1", broker, {}, holdings=[], positions=[]))
+        account_ref("u1", broker), {}, holdings=[], positions=[]))
 
     assert seen, f"{broker}: the engine resolved no instruments at all"
     assert all(isinstance(i, FeedInstrument) for i in seen), (

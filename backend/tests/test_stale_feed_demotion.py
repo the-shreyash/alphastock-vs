@@ -53,6 +53,7 @@ import time
 from unittest.mock import patch
 
 import pytest
+from _accounts import account_ref  # noqa: E402
 
 from services.market_engine.providers import (
     DEFAULT_FEED_SHARD,
@@ -582,7 +583,7 @@ def test_stale_demotion_behaves_identically_for_every_broker_including_a_fiction
         name = run(_attach("u1", broker, ["RELIANCE"]))
         assert name, f"{broker} did not attach a market feed"
         feed = provider_registry.get(name)
-        run(set_market_feed_link("u1", broker, up=True))
+        run(set_market_feed_link(account_ref("u1", broker), up=True))
 
         # Drive this feed's own clock rather than sleeping: the seam builds the
         # provider, so the window is the published one and only the clock is
@@ -591,7 +592,7 @@ def test_stale_demotion_behaves_identically_for_every_broker_including_a_fiction
         feed._clock = clock
         feed.probation_seconds = 0.0
 
-        assert run(publish_market_ticks("u1", broker, [_tick()])) == 1
+        assert run(publish_market_ticks(account_ref("u1", broker), [_tick()])) == 1
         assert feed.is_stable, broker
         assert _quote_provider(manager) is feed, broker
 
@@ -602,7 +603,7 @@ def test_stale_demotion_behaves_identically_for_every_broker_including_a_fiction
         assert _quote_provider(manager) is baseline, broker
         assert manager.status(user_id="u1")["tier"] == "delayed", broker
 
-        assert run(publish_market_ticks("u1", broker, [_tick()])) == 1
+        assert run(publish_market_ticks(account_ref("u1", broker), [_tick()])) == 1
         assert _quote_provider(manager) is feed, broker
 
 

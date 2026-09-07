@@ -313,7 +313,8 @@ class TestBrokerErrorHandlers:
         assert resp.status_code == 409
         assert resp.json()["code"] == "BROKER_AUTH"
 
-    def test_a_broker_rate_limit_is_429(self, authenticated_client, fake_db, test_user):
+    def test_a_broker_rate_limit_is_429(self, authenticated_client, fake_db, test_user,
+                                        broker_account):
         from services.brokers.base import BrokerError
         error = BrokerError("slow down", user_message="Broker rate limit")
         error.code = "RATE_LIMIT"
@@ -322,7 +323,8 @@ class TestBrokerErrorHandlers:
             resp = authenticated_client.get("/api/brokers/zerodha/holdings")
         assert resp.status_code == 429
 
-    def test_a_generic_broker_failure_is_502(self, authenticated_client, fake_db, test_user):
+    def test_a_generic_broker_failure_is_502(self, authenticated_client, fake_db, test_user,
+                                             broker_account):
         """502 says "the upstream failed", which is true and actionable, rather
         than 500 which says "we failed" and points debugging at the wrong system."""
         from services.brokers.base import BrokerError

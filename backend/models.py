@@ -193,8 +193,17 @@ class TradeCreate(BaseModel):
     notes: Optional[str] = None
     setup_type: Optional[str] = None
     is_paper: bool = False
-    # Broker execution (Sprint 9): when `broker` is set the entry order is
-    # placed LIVE via the Broker Engine before the trade record is created.
+    # Broker execution (Sprint 9): when a broker account is named the entry
+    # order is placed LIVE via the Broker Engine before the trade record is
+    # created.
+    #
+    # D6.4 — `broker_account_id` is the precise form and takes precedence.
+    # `broker` remains accepted for the pre-D6.4 clients and resolves through the
+    # bridge, which refuses (409) rather than choosing when the user holds more
+    # than one account at that broker. Note that a client may not use `broker` to
+    # steer an order at an account it did not name: the account's own broker is
+    # what the order is placed through.
+    broker_account_id: Optional[str] = None
     broker: Optional[str] = None
     product: Optional[str] = None          # CNC/MIS/NRML — defaults per broker
     exchange: str = "NSE"
@@ -282,6 +291,10 @@ class TradeResponse(BaseDocument):
     targets_hit: Optional[List[dict]] = None
     events: Optional[List[dict]] = None
     broker: Optional[str] = None
+    #: The brokerage account this trade's live orders belong to (D6.4). Null for
+    #: a manual or paper trade, and for a legacy trade the migration could not
+    #: attribute. Opaque and credential-free, so it is safe on a response.
+    broker_account_id: Optional[str] = None
     broker_order_id: Optional[str] = None
     auto_exit: bool = False
     status: str = "OPEN"

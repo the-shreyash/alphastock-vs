@@ -20,6 +20,7 @@ hermetic (no real Mongo needed), and matches the rule that no real external
 service is required to pass.
 """
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -254,6 +255,30 @@ def _headers_for(user_doc):
 def test_user(fake_db):
     """A user document pre-seeded into the fake DB, for auth + ownership checks."""
     return _seed_user(fake_db, "test_user@example.com", "user", "Test User")
+
+
+@pytest.fixture
+def broker_account(fake_db, test_user):
+    """A connected Zerodha account owned by `test_user` (D6.4).
+
+    Since D6.4 a broker-addressed route resolves through the account directory
+    before it reaches the engine, so a test that patches an engine method but
+    seeds no account now gets "not connected" (409) instead of the behaviour it
+    meant to exercise. Requesting this fixture is how such a test says "this user
+    has a broker connected"; it is a `broker_accounts` document, which is exactly
+    what the state it describes looks like in a real database.
+
+    Returns the `BrokerAccountRef` so a test can name the account it seeded.
+    """
+    from _accounts import account_doc, account_ref
+
+    fake_db.broker_accounts.docs.append({
+        **account_doc(str(test_user["_id"]), "zerodha"),
+        "access_token": "seeded-token",
+        "expires_at": (datetime.now(timezone.utc) + timedelta(hours=6)).isoformat(),
+        "connected_at": datetime.now(timezone.utc).isoformat(),
+    })
+    return account_ref(str(test_user["_id"]), "zerodha")
 
 
 @pytest.fixture

@@ -3,6 +3,13 @@ import { useSearchParams } from "react-router-dom";
 import { motion } from "framer-motion";
 import api from "../services/api";
 import brokerService, { brokerErrorMessage } from "../services/brokerService";
+import {
+  accountLabel,
+  clearSelectedAccount,
+  readSelectedAccountId,
+  resolveSelection,
+  writeSelectedAccountId,
+} from "../lib/brokerAccounts";
 import { useAuth } from "../context/AuthContext";
 import { Save, User, Shield, ShieldAlert, Bell, Link2, ExternalLink, Database, Check, X, Wifi, MessageSquare, Mail, Workflow, Clock, RefreshCw, Unplug, Zap } from "lucide-react";
 
@@ -25,6 +32,11 @@ export default function SettingsPage() {
   const [stopping, setStopping] = useState(false);
   const [stopResult, setStopResult] = useState(null);
   const [brokerStatus, setBrokerStatus] = useState(null);
+  // D6.4 — one record per authorized brokerage ACCOUNT. `brokerStatus` stays
+  // because the "Connect" affordance is genuinely per broker: a login happens
+  // before any account exists.
+  const [brokerAccounts, setBrokerAccounts] = useState([]);
+  const [selectedAccountId, setSelectedAccountId] = useState(readSelectedAccountId());
   const [dataSources, setDataSources] = useState(null);
   const [brokerMessage, setBrokerMessage] = useState(null);
   const [brokerBusy, setBrokerBusy] = useState({});
@@ -74,6 +86,27 @@ export default function SettingsPage() {
 
   const refreshBrokerStatus = () => {
     brokerService.status().then(setBrokerStatus).catch(() => {});
+    brokerService
+      .accounts()
+      .then((accounts) => {
+        const list = accounts || [];
+        setBrokerAccounts(list);
+        // Re-resolve against what the server says the user actually has. A
+        // remembered id for an account that has since been disconnected or
+        // deleted is DISCARDED rather than repaired — never replaced with
+        // another account, which would be "pick one for them" (D6.4 / §12).
+        const { accountId } = resolveSelection(list, readSelectedAccountId());
+        setSelectedAccountId(accountId);
+        writeSelectedAccountId(accountId);
+      })
+      .catch(() => {});
+  };
+
+  // The account the user is acting on. Selected explicitly; never inferred from
+  // a broker name, an array position, or which account connected first or last.
+  const chooseAccount = (accountId) => {
+    setSelectedAccountId(accountId);
+    writeSelectedAccountId(accountId);
   };
 
   const handleSave = async () => {
@@ -122,24 +155,41 @@ export default function SettingsPage() {
     }
   };
 
-  const disconnectBroker = async (broker) => {
-    if (!window.confirm(`Disconnect ${broker}? Live sync and trading through this account will stop until you reconnect.`)) return;
-    setBrokerBusy((b) => ({ ...b, [broker]: true }));
+  // Both act on ONE account, addressed by `broker_account_id` (D6.4). Passing a
+  // broker name here would have been ambiguous the moment a user linked a second
+  // account at the same broker — and the server would refuse rather than choose,
+  // which is a 409 the user cannot act on from a per-account button.
+  const disconnectAccount = async (account) => {
+    if (!window.confirm(
+      `Disconnect ${accountLabel(account)}? Live sync and trading through this ` +
+      `account will stop until you reconnect. Your order and portfolio history ` +
+      `for it is kept.`
+    )) return;
+    const id = account.broker_account_id;
+    setBrokerBusy((b) => ({ ...b, [id]: true }));
     try {
-      await brokerService.disconnect(broker);
-      setBrokerMessage({ type: "success", text: `${broker.charAt(0).toUpperCase() + broker.slice(1)} disconnected.` });
+      await brokerService.account.disconnect(id);
+      setBrokerMessage({ type: "success", text: `${accountLabel(account)} disconnected.` });
+      // The disconnected account must stop being the selected one; the next
+      // refresh re-resolves, and clearing here avoids a render in between that
+      // still points at it.
+      if (selectedAccountId === id) {
+        setSelectedAccountId(null);
+        clearSelectedAccount();
+      }
       refreshBrokerStatus();
     } catch (err) {
-      setBrokerMessage({ type: "error", text: brokerErrorMessage(err, `Failed to disconnect ${broker}`) });
+      setBrokerMessage({ type: "error", text: brokerErrorMessage(err, "Failed to disconnect this account") });
     } finally {
-      setBrokerBusy((b) => ({ ...b, [broker]: false }));
+      setBrokerBusy((b) => ({ ...b, [id]: false }));
     }
   };
 
-  const syncBroker = async (broker) => {
-    setBrokerBusy((b) => ({ ...b, [broker]: true }));
+  const syncAccount = async (account) => {
+    const id = account.broker_account_id;
+    setBrokerBusy((b) => ({ ...b, [id]: true }));
     try {
-      const result = await brokerService.sync(broker);
+      const result = await brokerService.account.sync(id);
       const s = result?.summary;
       setBrokerMessage({
         type: "success",
@@ -147,9 +197,9 @@ export default function SettingsPage() {
       });
       refreshBrokerStatus();
     } catch (err) {
-      setBrokerMessage({ type: "error", text: brokerErrorMessage(err, `Failed to sync ${broker} portfolio`) });
+      setBrokerMessage({ type: "error", text: brokerErrorMessage(err, "Failed to sync this account") });
     } finally {
-      setBrokerBusy((b) => ({ ...b, [broker]: false }));
+      setBrokerBusy((b) => ({ ...b, [id]: false }));
     }
   };
 
@@ -196,59 +246,113 @@ export default function SettingsPage() {
           </div>
         )}
 
-        {brokerStatus && (
+        {/* D6.4 — one card per authorized ACCOUNT, then one "connect" row per
+            broker. The two lists answer different questions: an account is a
+            thing the user already has and can act on, and a broker is a place
+            they can go and get one. Before D6.4 there was a single list keyed
+            by broker, which could not render a second account at all. */}
+        {brokerAccounts.length > 0 && (
           <div className="space-y-5">
-            {Object.values(brokerStatus).map((b) => (
-              <div key={b.broker} data-testid={`broker-card-${b.broker}`} className="space-y-3 pb-4 border-b last:border-0 last:pb-0" style={{ borderColor: "var(--border)" }}>
+            {brokerAccounts.map((a) => {
+              const id = a.broker_account_id;
+              const selected = selectedAccountId === id;
+              return (
+              <div key={id} data-testid={`broker-account-card-${id}`}
+                className="space-y-3 pb-4 border-b last:border-0 last:pb-0"
+                style={{ borderColor: "var(--border)" }}>
                 <div className="flex items-center gap-3">
-                  <div className={`w-3 h-3 rounded-full ${b.connected ? "animate-pulse" : ""}`}
-                    style={{ background: b.connected ? "var(--gain)" : b.session_expired ? "var(--loss)" : b.configured ? "#F59E0B" : "var(--text-muted)" }} />
+                  <div className={`w-3 h-3 rounded-full ${a.connected ? "animate-pulse" : ""}`}
+                    style={{ background: a.connected ? "var(--gain)" : a.session_expired ? "var(--loss)" : "var(--text-muted)" }} />
                   <div className="min-w-0">
-                    <span className="text-sm font-semibold block" style={{ color: "var(--text-primary)" }}>{b.display_name}</span>
-                    <span className="caption">{b.message}</span>
+                    <span className="text-sm font-semibold block" style={{ color: "var(--text-primary)" }}>
+                      {a.display_name || a.broker}
+                    </span>
+                    {/* The BROKER's own account number — what a trader
+                        recognises and what tells two accounts at one broker
+                        apart. The internal id is a routing handle and is never
+                        rendered. */}
+                    <span className="caption">
+                      {a.external_account_id ? `${a.external_account_id} · ` : ""}{a.message}
+                    </span>
                   </div>
                   <div className="flex items-center gap-2 ml-auto shrink-0">
-                    {b.streaming && (
+                    {a.streaming && (
                       <span className="text-[10px] font-mono px-2 py-0.5 rounded-lg flex items-center gap-1"
                         style={{ background: "rgba(16,185,129,0.08)", color: "var(--gain)" }}>
                         <Wifi size={10} /> STREAM
                       </span>
                     )}
                     <span className="text-[10px] font-mono px-2 py-0.5 rounded-lg"
-                      style={{ background: b.connected ? "rgba(16,185,129,0.08)" : "var(--bg-surface)", color: b.connected ? "var(--gain)" : "var(--text-muted)" }}>
-                      {b.mode?.toUpperCase()}
+                      style={{ background: a.connected ? "rgba(16,185,129,0.08)" : "var(--bg-surface)", color: a.connected ? "var(--gain)" : "var(--text-muted)" }}>
+                      {a.mode?.toUpperCase()}
                     </span>
                   </div>
                 </div>
 
-                {b.connected ? (
+                {a.connected ? (
                   <div className="flex flex-col sm:flex-row gap-2">
-                    <div className="p-3 rounded-xl flex items-center gap-2 flex-1" style={{ background: "rgba(16,185,129,0.05)" }}>
+                    <button
+                      type="button"
+                      data-testid={`broker-account-select-${id}`}
+                      onClick={() => chooseAccount(id)}
+                      aria-pressed={selected}
+                      className="p-3 rounded-xl flex items-center gap-2 flex-1 text-left"
+                      style={{
+                        background: selected ? "rgba(16,185,129,0.08)" : "var(--bg-surface)",
+                        border: `1px solid ${selected ? "var(--gain)" : "var(--border)"}`,
+                      }}>
                       <Wifi size={14} style={{ color: "var(--gain)" }} />
-                      <span className="text-sm" style={{ color: "var(--gain)" }}>
-                        Live trading active{b.last_sync ? ` · synced ${new Date(b.last_sync).toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" })}` : ""}
+                      <span className="text-sm" style={{ color: selected ? "var(--gain)" : "var(--text-primary)" }}>
+                        {selected ? "Active account" : "Use this account"}
+                        {a.last_sync ? ` · synced ${new Date(a.last_sync).toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" })}` : ""}
                       </span>
-                    </div>
-                    <button data-testid={`broker-sync-btn-${b.broker}`} onClick={() => syncBroker(b.broker)} disabled={brokerBusy[b.broker]}
-                      className="btn-secondary shrink-0">
-                      <RefreshCw size={14} className={brokerBusy[b.broker] ? "animate-spin" : ""} /> Sync Now
                     </button>
-                    <button data-testid={`broker-disconnect-btn-${b.broker}`} onClick={() => disconnectBroker(b.broker)} disabled={brokerBusy[b.broker]}
+                    <button data-testid={`broker-account-sync-btn-${id}`} onClick={() => syncAccount(a)} disabled={brokerBusy[id]}
+                      className="btn-secondary shrink-0">
+                      <RefreshCw size={14} className={brokerBusy[id] ? "animate-spin" : ""} /> Sync Now
+                    </button>
+                    <button data-testid={`broker-account-disconnect-btn-${id}`} onClick={() => disconnectAccount(a)} disabled={brokerBusy[id]}
                       className="btn-secondary shrink-0" style={{ color: "var(--loss)" }}>
                       <Unplug size={14} /> Disconnect
                     </button>
                   </div>
                 ) : (
-                  <button data-testid={`broker-login-btn-${b.broker}`} onClick={() => connectBroker(b.broker)}
-                    disabled={!b.configured} className="btn-primary btn-block" style={!b.configured ? { opacity: 0.5, cursor: "not-allowed" } : {}}>
-                    <ExternalLink size={16} /> {b.session_expired ? `Reconnect ${b.display_name}` : `Connect ${b.display_name} Account`}
+                  <button data-testid={`broker-account-reconnect-btn-${id}`} onClick={() => connectBroker(a.broker)}
+                    className="btn-primary btn-block">
+                    <ExternalLink size={16} /> Reconnect {accountLabel(a)}
                   </button>
                 )}
               </div>
+              );
+            })}
+          </div>
+        )}
+
+        {brokerStatus && (
+          <div className="space-y-3 pt-4">
+            <h4 className="eyebrow">Connect an account</h4>
+            {Object.values(brokerStatus).map((b) => (
+              <div key={b.broker} data-testid={`broker-card-${b.broker}`}
+                className="flex items-center gap-3">
+                <div className="min-w-0">
+                  <span className="text-sm font-semibold block" style={{ color: "var(--text-primary)" }}>{b.display_name}</span>
+                  <span className="caption">
+                    {b.configured
+                      ? "Add another account at this broker, or reconnect an expired one."
+                      : b.message}
+                  </span>
+                </div>
+                <button data-testid={`broker-login-btn-${b.broker}`} onClick={() => connectBroker(b.broker)}
+                  disabled={!b.configured} className="btn-secondary shrink-0 ml-auto"
+                  style={!b.configured ? { opacity: 0.5, cursor: "not-allowed" } : {}}>
+                  <ExternalLink size={16} /> Connect
+                </button>
+              </div>
             ))}
             <p className="caption leading-relaxed">
-              Connecting redirects you to your broker's secure login page — credentials never touch StockAssist. Broker
-              sessions expire daily per exchange rules (Zerodha ~6:00 AM, Upstox ~3:30 AM IST) and will ask to reconnect.
+              Connecting redirects you to your broker's secure login page — credentials never touch StockAssist. You can
+              link more than one account at the same broker; each is tracked separately. Broker sessions expire daily per
+              exchange rules (Zerodha ~6:00 AM, Upstox ~3:30 AM IST) and will ask to reconnect.
             </p>
           </div>
         )}

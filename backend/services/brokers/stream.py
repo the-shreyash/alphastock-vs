@@ -261,13 +261,14 @@ logger = logging.getLogger(__name__)
 
 
 class BrokerStream:
-    """One live WebSocket connection for one (user, broker) account."""
+    """One live WebSocket connection for one brokerage account."""
 
     def __init__(
         self,
         user_id: str,
         broker: str,
         session: dict,
+        broker_account_id: str = None,
         credentials: dict = None,
         instrument_tokens: list = None,
         on_order_update=None,
@@ -280,6 +281,16 @@ class BrokerStream:
     ):
         self.user_id = user_id
         self.broker = broker
+        #: Which brokerage account this connection belongs to (D6.4).
+        #:
+        #: The transport never interprets it: it does not appear on a callback,
+        #: on the wire, or in any decision this class makes. It is carried so the
+        #: *registry* can key on it and so a log line names the account rather
+        #: than a user and a brand — the same treatment `shard` gets, and for the
+        #: same reason (see below). Optional here and required by
+        #: `BrokerStreamManager.start_stream`, which is the boundary that must
+        #: never key two accounts onto one entry.
+        self.broker_account_id = broker_account_id
         #: Which slice of this channel's logical subscription this connection
         #: carries (D5.10). `"0"` — the default — is the whole of it, which is
         #: what every stream opened before D5.10 was and what an unsharded
@@ -357,7 +368,9 @@ class BrokerStream:
     # -- lifecycle -----------------------------------------------------------
     def start(self):
         self._task = asyncio.create_task(
-            self._run(), name=f"broker-stream-{self.broker}-{self.channel}-{self.shard}-{self.user_id}"
+            self._run(),
+            name=f"broker-stream-{self.broker}-{self.channel}-{self.shard}-"
+                 f"{self.broker_account_id or self.user_id}",
         )
         return self._task
 
@@ -838,7 +851,7 @@ def _terminal_refusal(classification) -> Optional[Exception]:
 
 
 class BrokerStreamManager:
-    """Owns every live broker stream: start/stop/replace per (user, broker, channel, shard).
+    """Owns every live broker stream: start/stop/replace per (account, channel, shard).
 
     Keyed on the channel as well as the account since D4.7. The key used to be
     `(user, broker)`, which was not a simplification but an assumption — that a
@@ -854,16 +867,30 @@ class BrokerStreamManager:
     nothing raised. Every channel-level caller passes `shard=None` and means
     "every shard of this channel", which is what an unsharded channel's one
     shard has always been.
+
+    D6.4 REPLACED THE FIRST TWO ELEMENTS WITH ONE, FOR THE THIRD TIME
+    -----------------------------------------------------------------
+    `(user_id, broker)` was the same class of assumption one level up: that a
+    user has one account per broker. A user's second Zerodha account had the same
+    pair as their first, so its `start_stream` silently replaced the first's
+    socket — one account streaming, one account dark, nothing raised, and the
+    surviving socket carrying whichever credentials arrived last. The key is now
+    `(broker_account_id, channel, shard)`, and `broker_account_id` is required
+    rather than defaulted: a caller that cannot name the account cannot open a
+    connection, which is the only version of this fix that a future caller cannot
+    quietly opt out of.
     """
 
     def __init__(self):
-        self._streams: dict = {}  # (user_id, broker, channel, shard) -> BrokerStream
+        self._streams: dict = {}  # (broker_account_id, channel, shard) -> BrokerStream
 
     async def start_stream(
         self,
         user_id: str,
         broker: str,
         session: dict,
+        *,
+        broker_account_id: str,
         credentials: dict = None,
         instrument_tokens: list = None,
         on_order_update=None,
@@ -876,15 +903,21 @@ class BrokerStreamManager:
     ):
         channel = (channel or DEFAULT_STREAM_CHANNEL).strip() or DEFAULT_STREAM_CHANNEL
         shard = str(shard or DEFAULT_SHARD_ID).strip() or DEFAULT_SHARD_ID
+        if not broker_account_id:
+            # Fails at the boundary rather than keying on a falsy value that two
+            # accounts would share. There is no legitimate caller without one:
+            # the engine resolves an account before it plans a subscription.
+            raise ValueError("broker_account_id is required to open a broker stream")
         # Scoped to THIS shard (D5.10). Replacing the whole channel here would
         # tear down every sibling shard on every shard start, so a plan of three
         # connections would open and destroy each other in turn and the account
         # would end with one.
-        await self.stop_stream(user_id, broker, channel, shard)
+        await self.stop_stream(broker_account_id, channel, shard)
         stream = BrokerStream(
             user_id,
             broker,
             session,
+            broker_account_id=broker_account_id,
             credentials=credentials,
             instrument_tokens=instrument_tokens,
             on_order_update=on_order_update,
@@ -895,11 +928,11 @@ class BrokerStreamManager:
             channel=channel,
             shard=shard,
         )
-        self._streams[(user_id, broker, channel, shard)] = stream
+        self._streams[(broker_account_id, channel, shard)] = stream
         stream.start()
         return stream
 
-    def get(self, user_id: str, broker: str, channel: str, shard: str = DEFAULT_SHARD_ID):
+    def get(self, broker_account_id: str, channel: str, shard: str = DEFAULT_SHARD_ID):
         """The live stream for one exact connection, or None (D5.10).
 
         Exists so a caller rebuilding a shard plan can ask whether a shard it is
@@ -909,9 +942,9 @@ class BrokerStreamManager:
         """
         channel = (channel or DEFAULT_STREAM_CHANNEL).strip() or DEFAULT_STREAM_CHANNEL
         shard = str(shard or DEFAULT_SHARD_ID).strip() or DEFAULT_SHARD_ID
-        return self._streams.get((user_id, broker, channel, shard))
+        return self._streams.get((broker_account_id, channel, shard))
 
-    def _keys(self, user_id: str, broker: str, channel: str = None, shard: str = None) -> list:
+    def _keys(self, broker_account_id: str, channel: str = None, shard: str = None) -> list:
         """Every registry key for an account, or just the one channel's, or one shard's.
 
         `channel=None` means "every channel of this account", which is what the
@@ -929,23 +962,23 @@ class BrokerStreamManager:
         return [
             key
             for key in list(self._streams)
-            if key[0] == user_id and key[1] == broker
-            and (channel is None or key[2] == channel)
-            and (shard is None or key[3] == shard)
+            if key[0] == broker_account_id
+            and (channel is None or key[1] == channel)
+            and (shard is None or key[2] == shard)
         ]
 
-    async def stop_stream(self, user_id: str, broker: str, channel: str = None, shard: str = None):
+    async def stop_stream(self, broker_account_id: str, channel: str = None, shard: str = None):
         """Stop one connection, one channel, or every channel of an account.
 
         `channel=None` stops every channel; `shard=None` — the default — stops
         every shard of whichever channels were selected.
         """
-        for key in self._keys(user_id, broker, channel, shard):
+        for key in self._keys(broker_account_id, channel, shard):
             stream = self._streams.pop(key, None)
             if stream:
                 await stream.stop()
 
-    def discard(self, user_id: str, broker: str, channel: str = None, shard: str = None) -> bool:
+    def discard(self, broker_account_id: str, channel: str = None, shard: str = None) -> bool:
         """Forget a stream that has already ended on its own (PH3.6).
 
         Deliberately NOT `stop_stream`. The one caller is the broker's
@@ -968,7 +1001,7 @@ class BrokerStreamManager:
         pass one still means the whole channel, as it always did.
         """
         discarded = False
-        for key in self._keys(user_id, broker, channel, shard):
+        for key in self._keys(broker_account_id, channel, shard):
             discarded = self._streams.pop(key, None) is not None or discarded
         return discarded
 
@@ -979,8 +1012,9 @@ class BrokerStreamManager:
     def status(self) -> list:
         return [
             {
-                "user_id": user_id,
-                "broker": broker,
+                "user_id": stream.user_id,
+                "broker": stream.broker,
+                "broker_account_id": account_id,
                 "channel": channel,
                 # Internal diagnostics only. This list is read by
                 # `BrokerEngine.get_status` for a single boolean ("is anything
@@ -991,7 +1025,7 @@ class BrokerStreamManager:
                 "running": stream.running,
                 "subscribed_instruments": len(stream.instrument_tokens),
             }
-            for (user_id, broker, channel, shard), stream in self._streams.items()
+            for (account_id, channel, shard), stream in self._streams.items()
         ]
 
 

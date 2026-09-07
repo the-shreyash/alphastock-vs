@@ -51,6 +51,7 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from _accounts import account_doc, account_ref, fixture_account_id  # noqa: E402
 
 from services.broker_engine import BrokerEngine
 from services.brokers.base import BrokerAdapter
@@ -59,6 +60,7 @@ from services.brokers.contracts import BrokerOrder
 from services.brokers.credentials import BrokerCredentialSpec
 from services.brokers.errors import BrokerContractError
 from services.brokers.instruments import InstrumentMap, canonical_ticks
+from services.brokers.market_feed import feed_provider_name  # noqa: E402
 from services.brokers.registry import BrokerAdapterInvalid, BrokerRegistry, broker_registry
 from services.brokers.stream import (
     RECONNECT_BASE_DELAY,
@@ -353,9 +355,10 @@ def _db_with_saved_session(*, user_id: str, broker: str, expires_at: str = None)
     return FakeDB(
         broker_accounts=[
             {
-                "user_id": user_id,
-                "broker": broker,
-                "connected": True,
+                # The `broker_account_id` a migrated deployment carries (D6.4).
+                # Restore is keyed on it, so a fixture without one describes a
+                # database the startup backfill has not run against.
+                **account_doc(user_id, broker),
                 "access_token": "restored-token",
                 "refresh_token": "",
                 "public_token": "",
@@ -1138,19 +1141,16 @@ def test_no_broker_instrument_identifier_reaches_a_core_service():
     broker's handle in any form.
     """
     engine, _db, pushes = _engine_with(
-        holdings=[{**row, "user_id": "u1", "broker": "zerodha"} for row in _kite_holdings()]
+        holdings=[{**row, "user_id": "u1", "broker": "zerodha",
+                   "broker_account_id": fixture_account_id("u1", "zerodha")}
+                  for row in _kite_holdings()]
     )
 
     with _core_consumers_spied() as seen:
-        run(
-            engine._on_stream_tick(
-                "u1",
-                "zerodha",
-                [
-                    {"instrument_token": 738561, "last_price": 2650.0, "volume": 120},
-                ],
-            )
-        )
+        run(engine._on_stream_tick(
+            account_ref("u1", "zerodha"),
+            [{"instrument_token": 738561, "last_price": 2650.0, "volume": 120}],
+        ))
 
     delivered = [msg for _, msg in pushes] + seen["portfolio"] + seen["trade"]
     assert delivered, "nothing was delivered at all"
@@ -1172,11 +1172,13 @@ def test_a_batch_that_resolves_to_nothing_wakes_nothing():
     to do, on every frame, for as long as the map is stale.
     """
     engine, _db, pushes = _engine_with(
-        holdings=[{**row, "user_id": "u1", "broker": "zerodha"} for row in _kite_holdings()]
+        holdings=[{**row, "user_id": "u1", "broker": "zerodha",
+                   "broker_account_id": fixture_account_id("u1", "zerodha")}
+                  for row in _kite_holdings()]
     )
 
     with _core_consumers_spied() as seen:
-        run(engine._on_stream_tick("u1", "zerodha", [{"instrument_token": 999999, "last_price": 10.0}]))
+        run(engine._on_stream_tick(account_ref("u1", "zerodha"), [{"instrument_token": 999999, "last_price": 10.0}]))
 
     assert pushes == []
     assert seen["portfolio"] == [] and seen["trade"] == []
@@ -1199,7 +1201,7 @@ def test_a_fictional_second_broker_reaches_core_services_unchanged():
             instruments=["NOVACO"],
         )
         for _user, broker, batch in ticks:
-            run(engine._on_stream_tick("u1", broker, batch))
+            run(engine._on_stream_tick(account_ref("u1", broker), batch))
 
     assert seen["portfolio"], "a symbol-identified broker delivered nothing to the portfolio"
     assert seen["portfolio"][0][0]["symbol"] == "NOVACO"
@@ -1224,7 +1226,7 @@ def test_the_instrument_map_is_rebuilt_when_the_portfolio_is_synced():
 
     # A tick for an instrument the account has not synced yet: unmappable.
     with _core_consumers_spied() as before:
-        run(engine._on_stream_tick("u1", "zerodha", [{"instrument_token": 738561, "last_price": 2650.0}]))
+        run(engine._on_stream_tick(account_ref("u1", "zerodha"), [{"instrument_token": 738561, "last_price": 2650.0}]))
     assert before["portfolio"] == []
 
     from services import portfolio_stream
@@ -1241,10 +1243,10 @@ def test_the_instrument_map_is_rebuilt_when_the_portfolio_is_synced():
         patch.object(BrokerEngine, "start_stream", AsyncMock()),
         patch.object(portfolio_stream, "publish_snapshot", AsyncMock(return_value=None)),
     ):
-        run(engine.sync_portfolio("u1", "zerodha"))
+        run(engine.sync_portfolio(account_ref("u1", "zerodha")))
 
     with _core_consumers_spied() as after:
-        run(engine._on_stream_tick("u1", "zerodha", [{"instrument_token": 738561, "last_price": 2650.0}]))
+        run(engine._on_stream_tick(account_ref("u1", "zerodha"), [{"instrument_token": 738561, "last_price": 2650.0}]))
 
     assert after["portfolio"], "the instrument map survived a portfolio sync — new instruments stay unmappable"
     assert after["portfolio"][0][0]["symbol"] == "RELIANCE"
@@ -1316,10 +1318,10 @@ def test_starting_a_stream_makes_intraday_positions_mappable():
         patch.object(engine, "get_session", AsyncMock(return_value={"access_token": "t"})),
         patch.object(stream_manager, "start_stream", AsyncMock()),
     ):
-        run(engine.start_stream("u1", "zerodha", holdings=_kite_holdings(), positions=[position]))
+        run(engine.start_stream(account_ref("u1", "zerodha"), holdings=_kite_holdings(), positions=[position]))
 
     with _core_consumers_spied() as seen:
-        run(engine._on_stream_tick("u1", "zerodha", [{"instrument_token": 408065, "last_price": 1490.0}]))
+        run(engine._on_stream_tick(account_ref("u1", "zerodha"), [{"instrument_token": 408065, "last_price": 1490.0}]))
 
     assert seen["portfolio"], "an intraday position's ticks are unmappable"
     assert seen["portfolio"][0][0]["symbol"] == "INFY"
@@ -1335,12 +1337,14 @@ def test_disconnecting_leaves_no_per_account_state_behind():
     different instrument.
     """
     engine, db, _pushes = _engine_with(
-        holdings=[{**row, "user_id": "u1", "broker": "zerodha"} for row in _kite_holdings()]
+        holdings=[{**row, "user_id": "u1", "broker": "zerodha",
+                   "broker_account_id": fixture_account_id("u1", "zerodha")}
+                  for row in _kite_holdings()]
     )
     db.broker_accounts.docs = _db_with_saved_session(user_id="u1", broker="zerodha").broker_accounts.docs
 
     with _core_consumers_spied():
-        run(engine._on_stream_tick("u1", "zerodha", [{"instrument_token": 738561, "last_price": 2650.0}]))
+        run(engine._on_stream_tick(account_ref("u1", "zerodha"), [{"instrument_token": 738561, "last_price": 2650.0}]))
     assert engine._instrument_maps, "the map was never cached — this test would prove nothing"
 
     from services.brokers.gateway import broker_gateway
@@ -1350,7 +1354,7 @@ def test_disconnecting_leaves_no_per_account_state_behind():
         patch.object(stream_manager, "stop_stream", AsyncMock()),
         patch.object(broker_gateway, "invalidate_session", AsyncMock(return_value=None)),
     ):
-        run(engine.disconnect("zerodha", "u1"))
+        run(engine.disconnect(account_ref("u1", "zerodha")))
 
     assert engine._instrument_maps == {}
     assert engine._sessions == {}
@@ -1485,7 +1489,7 @@ def test_a_broker_without_the_streaming_capability_is_not_registered():
 
     with _clean_provider_registry() as registry, nova_registered(QuietNova()):
         assert run(_attach("u1", "quietnova")) is None
-        assert feed_provider_name("u1", "quietnova") not in registry
+        assert feed_provider_name(account_ref("u1", "quietnova")) not in registry
 
 
 def test_a_provider_declaring_a_pushed_capability_it_cannot_push_is_rejected():
@@ -1792,8 +1796,8 @@ def test_a_second_fictional_broker_uses_the_same_seam_with_no_new_code():
             first = run(_attach("u1", "nova", ["RELIANCE"]))
             second = run(_attach("u2", "orion", ["RELIANCE"]))
 
-        assert first == feed_provider_name("u1", "nova")
-        assert second == feed_provider_name("u2", "orion")
+        assert first == feed_provider_name(account_ref("u1", "nova"))
+        assert second == feed_provider_name(account_ref("u2", "orion"))
         assert first in registry and second in registry
         assert first != second
 
@@ -1830,8 +1834,8 @@ def test_an_unready_feed_is_not_resolved_and_ending_the_entitlement_unregisters_
         run(provider.connect())
         assert manager.resolve_feed(Capability.TICKS, ctx).available
 
-        assert run(detach_market_feed("u1", "nova")) is True
-        assert feed_provider_name("u1", "nova") not in registry
+        assert run(detach_market_feed(account_ref("u1", "nova"))) is True
+        assert feed_provider_name(account_ref("u1", "nova")) not in registry
         assert provider.has_sink is False, "an unregistered feed can still deliver into the gateway"
 
 
@@ -1847,7 +1851,7 @@ def test_the_engine_publishes_canonical_ticks_into_the_registered_feed():
 
     engine = BrokerEngine()
     engine.configure(FakeDB())
-    engine._remember_instrument_map("u1", "nova", holdings=[
+    engine._remember_instrument_map(account_ref("u1", "nova"), holdings=[
         {"symbol": "RELIANCE", "exchange": "NSE", "instrument_token": 738561},
     ])
 
@@ -1856,7 +1860,7 @@ def test_the_engine_publishes_canonical_ticks_into_the_registered_feed():
             name = run(_attach("u1", "nova"))
         provider = provider_registry.get(name)
         with patch.object(BrokerEngine, "_push", new=AsyncMock()):
-            run(engine._on_stream_tick("u1", "nova", [{"symbol": "RELIANCE", "last_price": 2650.0}]))
+            run(engine._on_stream_tick(account_ref("u1", "nova"), [{"symbol": "RELIANCE", "last_price": 2650.0}]))
         assert provider.describe()["accepted_records"] == 1, "the engine never pushed into the registered feed"
 
 
@@ -1865,7 +1869,7 @@ def _attach(user_id, broker, symbols=None):
     the engine imports it rather than through a name bound at module load."""
     from services.brokers.market_feed import attach_market_feed
 
-    return attach_market_feed(user_id, broker, symbols)
+    return attach_market_feed(account_ref(user_id, broker), symbols)
 
 
 # ==================================================================
@@ -2443,10 +2447,10 @@ def test_a_broker_feed_is_promoted_and_demoted_through_the_real_seam(no_probatio
             assert run(provider.on_raw([_tick()])) == 1
             assert manager.resolve(Capability.QUOTES, context=ctx) is provider
 
-            assert run(set_market_feed_link("u1", "nova", up=False, reason="socket closed")) is True
+            assert run(set_market_feed_link(account_ref("u1", "nova"), up=False, reason="socket closed")) is True
             assert manager.resolve(Capability.QUOTES, context=ctx) is baseline
 
-            assert run(set_market_feed_link("u1", "nova", up=True)) is True
+            assert run(set_market_feed_link(account_ref("u1", "nova"), up=True)) is True
             assert manager.resolve(Capability.QUOTES, context=ctx) is baseline, \
                 "a reconnect promoted the feed without fresh evidence"
             run(provider.on_raw([_tick()]))
@@ -2558,9 +2562,9 @@ def test_the_engine_subscribes_the_feed_to_the_accounts_instruments():
         with nova_registered():
             with patch("services.brokers.stream.stream_manager.start_stream", new=AsyncMock()), \
                     patch.object(BrokerEngine, "get_session", new=AsyncMock(return_value={"access_token": "t"})):
-                run(engine.start_stream("u1", "nova", holdings=holdings, positions=[]))
+                run(engine.start_stream(account_ref("u1", "nova"), holdings=holdings, positions=[]))
 
-            provider = provider_registry.get(feed_provider_name("u1", "nova"))
+            provider = provider_registry.get(feed_provider_name(account_ref("u1", "nova")))
             assert provider is not None, "the engine never registered the feed"
             assert provider.subscribed_symbols == ("RELIANCE", "TCS"), (
                 "the engine registered a feed it never told what to expect — it can never become ready"
@@ -3061,7 +3065,7 @@ def _kite_feed(user_id="u1", symbols=("RELIANCE",)):
     from services.market_engine.providers import provider_registry
 
     run(_attach(user_id, "zerodha", list(symbols)))
-    return provider_registry.get(feed_provider_name(user_id, "zerodha"))
+    return provider_registry.get(feed_provider_name(account_ref(user_id, "zerodha")))
 
 
 def _kite_map():
@@ -3092,7 +3096,7 @@ def test_a_connected_kite_stream_is_not_ready_until_a_real_packet_arrives(no_pro
         ctx = ResolutionContext(user_id="u1", symbol="RELIANCE")
 
         feed = _kite_feed()
-        run(set_market_feed_link("u1", "zerodha", up=True))
+        run(set_market_feed_link(account_ref("u1", "zerodha"), up=True))
         assert feed.is_link_up and not feed.is_ready
         assert manager.resolve(Capability.QUOTES, context=ctx) is baseline
 
@@ -3134,7 +3138,7 @@ def test_a_kite_feed_is_promoted_over_the_baseline_and_falls_back_on_link_loss(n
         ctx = ResolutionContext(user_id="u1", symbol="RELIANCE")
 
         feed = _kite_feed()
-        run(set_market_feed_link("u1", "zerodha", up=True))
+        run(set_market_feed_link(account_ref("u1", "zerodha"), up=True))
         assert manager.resolve(Capability.QUOTES, context=ctx) is baseline
 
         run(feed.on_raw(canonical_ticks(_kite_ticks(_kite_frame((738561, 265050))), _kite_map(), broker="zerodha")))
@@ -3146,11 +3150,11 @@ def test_a_kite_feed_is_promoted_over_the_baseline_and_falls_back_on_link_loss(n
         assert manager.resolve(Capability.QUOTES, context=ResolutionContext(user_id="u1", symbol="SPX")) is baseline
 
         # The socket dies: the very next resolution is the baseline again.
-        run(set_market_feed_link("u1", "zerodha", up=False, reason="socket closed"))
+        run(set_market_feed_link(account_ref("u1", "zerodha"), up=False, reason="socket closed"))
         assert manager.resolve(Capability.QUOTES, context=ctx) is baseline
 
         # It comes back, and has to re-earn readiness on the new link.
-        run(set_market_feed_link("u1", "zerodha", up=True))
+        run(set_market_feed_link(account_ref("u1", "zerodha"), up=True))
         assert manager.resolve(Capability.QUOTES, context=ctx) is baseline
         run(feed.on_raw(canonical_ticks(_kite_ticks(_kite_frame((738561, 266000))), _kite_map(), broker="zerodha")))
         assert manager.resolve(Capability.QUOTES, context=ctx) is feed
@@ -3169,11 +3173,11 @@ def test_a_kite_feed_that_never_ticks_leaves_the_baseline_primary_for_everyone(n
         manager = SourceManager(registry)
 
         feed_a, feed_b = _kite_feed("u1"), _kite_feed("u2")
-        run(set_market_feed_link("u1", "zerodha", up=True))
-        run(set_market_feed_link("u2", "zerodha", up=True))
+        run(set_market_feed_link(account_ref("u1", "zerodha"), up=True))
+        run(set_market_feed_link(account_ref("u2", "zerodha"), up=True))
         run(feed_b.on_raw(canonical_ticks(_kite_ticks(_kite_frame((738561, 265050))), _kite_map(), broker="zerodha")))
 
-        run(set_market_feed_link("u1", "zerodha", up=False, reason="connection refused"))
+        run(set_market_feed_link(account_ref("u1", "zerodha"), up=False, reason="connection refused"))
 
         assert manager.resolve(Capability.QUOTES, context=ResolutionContext(user_id="u1", symbol="RELIANCE")) is baseline
         assert manager.resolve(Capability.QUOTES, context=ResolutionContext(user_id="u2", symbol="RELIANCE")) is feed_b, \
@@ -3206,16 +3210,16 @@ def test_the_engine_carries_kite_bytes_all_the_way_into_the_registered_feed(no_p
                 patch.object(BrokerEngine, "get_session", new=AsyncMock(return_value={"access_token": "t"})), \
                 patch("services.brokers.gateway.broker_gateway.get_holdings", new=AsyncMock(return_value=holdings)), \
                 patch("services.brokers.gateway.broker_gateway.get_positions", new=AsyncMock(return_value=[])):
-            run(engine.start_stream("u1", "zerodha"))
+            run(engine.start_stream(account_ref("u1", "zerodha")))
 
-        feed = registry.get("brokerfeed:zerodha:u1")
+        feed = registry.get(feed_provider_name(account_ref("u1", "zerodha")))
         assert feed is not None, "the engine never registered the Kite feed"
         assert feed.subscribed_symbols == ("RELIANCE",)
         run(feed.mark_link_up())
         assert manager.resolve(Capability.QUOTES, context=ctx) is baseline
 
         with patch.object(BrokerEngine, "_push", new=AsyncMock()):
-            run(engine._on_stream_tick("u1", "zerodha", _kite_ticks(_kite_frame((738561, 265050)))))
+            run(engine._on_stream_tick(account_ref("u1", "zerodha"), _kite_ticks(_kite_frame((738561, 265050)))))
 
         assert feed.describe()["accepted_records"] == 1
         assert manager.resolve(Capability.QUOTES, context=ctx) is feed
@@ -3290,10 +3294,10 @@ def test_an_expired_kite_session_detaches_the_market_feed():
     with _clean_provider_registry():
         feed = _kite_feed("u1")
         run(feed.on_raw(canonical_ticks(_kite_ticks(_kite_frame((738561, 265050))), _kite_map(), broker="zerodha")))
-        assert provider_registry.get("brokerfeed:zerodha:u1") is not None
+        assert provider_registry.get(feed_provider_name(account_ref("u1", "zerodha"))) is not None
 
-        run(engine._on_stream_expired("u1", "zerodha"))
-        assert provider_registry.get("brokerfeed:zerodha:u1") is None
+        run(engine._on_stream_expired(account_ref("u1", "zerodha")))
+        assert provider_registry.get(feed_provider_name(account_ref("u1", "zerodha"))) is None
 
 
 # -- the multi-broker acceptance criterion ----------------------------------
@@ -3930,7 +3934,7 @@ def _upstox_feed(user_id="u1", symbols=("RELIANCE",)):
     from services.market_engine.providers import provider_registry
 
     run(_attach(user_id, "upstox", list(symbols)))
-    return provider_registry.get(feed_provider_name(user_id, "upstox"))
+    return provider_registry.get(feed_provider_name(account_ref(user_id, "upstox")))
 
 
 def _upstox_canonical(price=2650.75, key="NSE_EQ|INE002A01018"):
@@ -3955,7 +3959,7 @@ def test_a_connected_upstox_stream_is_not_ready_until_a_real_frame_arrives(no_pr
         ctx = ResolutionContext(user_id="u1", symbol="RELIANCE")
 
         feed = _upstox_feed()
-        run(set_market_feed_link("u1", "upstox", up=True))
+        run(set_market_feed_link(account_ref("u1", "upstox"), up=True))
         assert feed.is_link_up and not feed.is_ready
         assert manager.resolve(Capability.QUOTES, context=ctx) is baseline
 
@@ -3995,17 +3999,17 @@ def test_an_upstox_feed_is_promoted_over_the_baseline_and_falls_back_on_link_los
         ctx = ResolutionContext(user_id="u1", symbol="RELIANCE")
 
         feed = _upstox_feed()
-        run(set_market_feed_link("u1", "upstox", up=True))
+        run(set_market_feed_link(account_ref("u1", "upstox"), up=True))
         run(feed.on_raw(_upstox_canonical()))
         assert manager.resolve(Capability.QUOTES, context=ctx) is feed
 
-        run(set_market_feed_link("u1", "upstox", up=False, reason="socket closed"))
+        run(set_market_feed_link(account_ref("u1", "upstox"), up=False, reason="socket closed"))
         assert manager.resolve(Capability.QUOTES, context=ctx) is baseline
         assert registry.get(baseline.name) is baseline, "Yahoo was released instead of kept as standby"
         assert baseline._connected or True  # the baseline was never disconnected
 
         # Re-earned on the new link, not inherited from the old one.
-        run(set_market_feed_link("u1", "upstox", up=True))
+        run(set_market_feed_link(account_ref("u1", "upstox"), up=True))
         assert not feed.is_ready
         assert manager.resolve(Capability.QUOTES, context=ctx) is baseline
         run(feed.on_raw(_upstox_canonical()))
@@ -4036,22 +4040,22 @@ def test_an_upstox_order_channel_link_loss_does_not_demote_the_market_feed(no_pr
         engine.db = FakeDB()
 
         feed = _upstox_feed()
-        run(engine._on_stream_link_state("u1", "upstox", True, "", "market"))
+        run(engine._on_stream_link_state(account_ref("u1", "upstox"), True, "", "market"))
         run(feed.on_raw(_upstox_canonical()))
         assert manager.resolve(Capability.QUOTES, context=ctx) is feed
 
         # The ORDER channel dies. The market feed is untouched.
-        run(engine._on_stream_link_state("u1", "upstox", False, "socket closed", "orders"))
+        run(engine._on_stream_link_state(account_ref("u1", "upstox"), False, "socket closed", "orders"))
         assert feed.is_ready, "an order-socket failure demoted the market feed"
         assert manager.resolve(Capability.QUOTES, context=ctx) is feed
 
         # The MARKET channel dies. Now it demotes.
-        run(engine._on_stream_link_state("u1", "upstox", False, "socket closed", "market"))
+        run(engine._on_stream_link_state(account_ref("u1", "upstox"), False, "socket closed", "market"))
         assert not feed.is_ready
         assert manager.resolve(Capability.QUOTES, context=ctx) is baseline
 
         # And an order-channel reconnect does not re-arm a tick feed that is down.
-        run(engine._on_stream_link_state("u1", "upstox", True, "", "orders"))
+        run(engine._on_stream_link_state(account_ref("u1", "upstox"), True, "", "orders"))
         assert manager.resolve(Capability.QUOTES, context=ctx) is baseline
 
 
@@ -4084,14 +4088,14 @@ def test_a_reconnected_upstox_feed_cannot_answer_from_the_dead_links_prices(no_p
         manager = SourceManager(registry)
 
         feed = _upstox_feed("u1", symbols=("RELIANCE", "TCS"))
-        run(set_market_feed_link("u1", "upstox", up=True))
+        run(set_market_feed_link(account_ref("u1", "upstox"), up=True))
         run(feed.on_raw(_upstox_canonical(2650.75, "NSE_EQ|INE002A01018")))   # RELIANCE
         run(feed.on_raw(_upstox_canonical(3990.10, "NSE_EQ|INE467B01029")))   # TCS
         assert feed.covers("RELIANCE") and feed.covers("TCS")
 
         # The socket dies and a new one replaces it.
-        run(set_market_feed_link("u1", "upstox", up=False, reason="dropped"))
-        run(set_market_feed_link("u1", "upstox", up=True))
+        run(set_market_feed_link(account_ref("u1", "upstox"), up=False, reason="dropped"))
+        run(set_market_feed_link(account_ref("u1", "upstox"), up=True))
 
         # Only RELIANCE ticks on the new link. TCS's price belongs to a dead one.
         run(feed.on_raw(_upstox_canonical(2660.00, "NSE_EQ|INE002A01018")))
@@ -4117,7 +4121,7 @@ def test_an_upstox_feed_that_never_ticks_leaves_the_baseline_primary():
         manager = SourceManager(registry)
 
         _upstox_feed()
-        run(set_market_feed_link("u1", "upstox", up=True))
+        run(set_market_feed_link(account_ref("u1", "upstox"), up=True))
         for user in ("u1", "u2", None):
             ctx = ResolutionContext(user_id=user, symbol="RELIANCE")
             assert manager.resolve(Capability.QUOTES, context=ctx) is baseline
@@ -4133,7 +4137,7 @@ def test_upstox_registers_through_the_existing_provider_framework():
 
     with _clean_provider_registry() as registry:
         name = run(_attach("u1", "upstox", ["RELIANCE"]))
-        assert name == feed_provider_name("u1", "upstox")
+        assert name == feed_provider_name(account_ref("u1", "upstox"))
         provider = registry.get(name)
         assert isinstance(provider, StreamingTickProvider), "Upstox got a provider class of its own"
         assert provider.tier is SourceTier.STREAMING
@@ -4159,7 +4163,7 @@ def test_one_users_upstox_feed_failure_moves_only_that_users_feed(no_probation_w
         feed_a = _upstox_feed("userA")
         feed_b = _upstox_feed("userB")
         for user, feed in (("userA", feed_a), ("userB", feed_b)):
-            run(set_market_feed_link(user, "upstox", up=True))
+            run(set_market_feed_link(account_ref(user, "upstox"), up=True))
             run(feed.on_raw(_upstox_canonical()))
 
         ctx_a = ResolutionContext(user_id="userA", symbol="RELIANCE")
@@ -4167,7 +4171,7 @@ def test_one_users_upstox_feed_failure_moves_only_that_users_feed(no_probation_w
         assert manager.resolve(Capability.QUOTES, context=ctx_a) is feed_a
         assert manager.resolve(Capability.QUOTES, context=ctx_b) is feed_b
 
-        run(set_market_feed_link("userA", "upstox", up=False, reason="dropped"))
+        run(set_market_feed_link(account_ref("userA", "upstox"), up=False, reason="dropped"))
         assert manager.resolve(Capability.QUOTES, context=ctx_a) is baseline
         assert manager.resolve(Capability.QUOTES, context=ctx_b) is feed_b, "A's failure demoted B"
 
@@ -4185,7 +4189,7 @@ def test_an_upstox_quote_carries_no_broker_identity_and_no_other_users_data():
         registry.clear()
         registry.register(YahooPollingAdapter())
         feed = _upstox_feed("u1")
-        run(set_market_feed_link("u1", "upstox", up=True))
+        run(set_market_feed_link(account_ref("u1", "upstox"), up=True))
         run(feed.on_raw(_upstox_canonical()))
 
         quote = run(feed.fetch_quote("RELIANCE"))
@@ -4213,18 +4217,19 @@ def test_an_expired_upstox_token_stops_every_channel_and_detaches_the_feed():
     with _clean_provider_registry():
         feed = _upstox_feed("u1")
         run(feed.on_raw(_upstox_canonical()))
-        assert provider_registry.get("brokerfeed:upstox:u1") is not None
+        assert provider_registry.get(feed_provider_name(account_ref("u1", "upstox"))) is not None
 
         stopped = []
 
-        async def record_stop(user_id, broker, channel=None):
-            stopped.append((user_id, broker, channel))
+        async def record_stop(broker_account_id, channel=None, shard=None):
+            stopped.append((broker_account_id, channel))
 
         with patch.object(stream_manager, "stop_stream", new=record_stop):
-            run(engine._on_stream_expired("u1", "upstox", "market"))
+            run(engine._on_stream_expired(account_ref("u1", "upstox"), "market"))
 
-        assert provider_registry.get("brokerfeed:upstox:u1") is None, "the feed stayed registered"
-        assert stopped == [("u1", "upstox", None)], "the account's other channels were left running"
+        assert provider_registry.get(feed_provider_name(account_ref("u1", "upstox"))) is None, "the feed stayed registered"
+        assert stopped == [(fixture_account_id("u1", "upstox"), None)], \
+            "the account's other channels were left running"
 
 
 # -- security -----------------------------------------------------------------
@@ -4392,11 +4397,11 @@ def test_both_brokers_reach_the_market_gateway_through_the_identical_seam(no_pro
             ctx = ResolutionContext(user_id="u1", symbol="RELIANCE")
 
             feed = feed_factory("u1")
-            run(set_market_feed_link("u1", broker, up=True))
+            run(set_market_feed_link(account_ref("u1", broker), up=True))
             assert manager.resolve(Capability.QUOTES, context=ctx) is baseline, broker
             run(feed.on_raw(batch()))
             assert manager.resolve(Capability.QUOTES, context=ctx) is feed, broker
-            run(set_market_feed_link("u1", broker, up=False, reason="dropped"))
+            run(set_market_feed_link(account_ref("u1", broker), up=False, reason="dropped"))
             assert manager.resolve(Capability.QUOTES, context=ctx) is baseline, broker
 
 
@@ -4422,7 +4427,7 @@ def test_a_broker_with_two_feeds_opens_one_stream_per_channel():
             patch.object(stream_manager, "start_stream", new=record), \
             patch.object(engine, "get_session", AsyncMock(return_value={"access_token": "t"})), \
             patch("services.broker_engine.attach_market_feed", new=AsyncMock()):
-        run(engine.start_stream("u1", "upstox", holdings=holdings, positions=[]))
+        run(engine.start_stream(account_ref("u1", "upstox"), holdings=holdings, positions=[]))
 
     assert [c for _, c, _ in started] == ["orders", "market"]
     # Both channels are handed the same instrument list; each decides what to do
@@ -4449,7 +4454,7 @@ def test_a_single_channel_broker_is_unchanged_by_the_channel_concept():
             patch.object(stream_manager, "start_stream", new=record), \
             patch.object(engine, "get_session", AsyncMock(return_value={"access_token": "t"})), \
             patch("services.broker_engine.attach_market_feed", new=AsyncMock()):
-        run(engine.start_stream("u1", "zerodha",
+        run(engine.start_stream(account_ref("u1", "zerodha"),
                                 holdings=[{"symbol": "RELIANCE", "instrument_token": 738561}], positions=[]))
 
     assert started == [DEFAULT]
@@ -4557,15 +4562,19 @@ def test_the_stream_registry_keys_on_the_channel_so_one_feed_cannot_replace_anot
 
     async def scenario():
         with patch.object(BrokerStream, "start", lambda self: None):
-            await manager.start_stream("u1", "upstox", {"access_token": "t"}, channel="orders")
-            await manager.start_stream("u1", "upstox", {"access_token": "t"}, channel="market")
+            await manager.start_stream("u1", "upstox", {"access_token": "t"},
+                                       broker_account_id=fixture_account_id("u1", "upstox"),
+                                       channel="orders")
+            await manager.start_stream("u1", "upstox", {"access_token": "t"},
+                                       broker_account_id=fixture_account_id("u1", "upstox"),
+                                       channel="market")
             assert sorted(s["channel"] for s in manager.status()) == ["market", "orders"]
 
             # Stopping one channel leaves the other alone...
-            await manager.stop_stream("u1", "upstox", "orders")
+            await manager.stop_stream(fixture_account_id("u1", "upstox"), "orders")
             assert [s["channel"] for s in manager.status()] == ["market"]
             # ...and stopping the account stops what remains.
-            await manager.stop_stream("u1", "upstox")
+            await manager.stop_stream(fixture_account_id("u1", "upstox"))
             assert manager.status() == []
 
     run(scenario())
@@ -4676,7 +4685,7 @@ def _angel_feed(user_id="u1", symbols=("RELIANCE",)):
     from services.market_engine.providers import provider_registry
 
     run(_attach(user_id, "angelone", list(symbols)))
-    return provider_registry.get(feed_provider_name(user_id, "angelone"))
+    return provider_registry.get(feed_provider_name(account_ref(user_id, "angelone")))
 
 
 def _angel_session():
@@ -5438,7 +5447,7 @@ def test_a_connected_angelone_stream_is_not_ready_until_a_real_packet_arrives(no
         ctx = ResolutionContext(user_id="u1", symbol="RELIANCE")
 
         feed = _angel_feed("u1", symbols=("RELIANCE",))
-        run(set_market_feed_link("u1", "angelone", up=True))
+        run(set_market_feed_link(account_ref("u1", "angelone"), up=True))
         assert manager.resolve(Capability.QUOTES, context=ctx) is baseline
 
         for noise in ("pong", json.dumps({"errorCode": "E1001"}), b"\xff\xff", _angel_packet(size=20)):
@@ -5469,11 +5478,11 @@ def test_an_angelone_feed_is_promoted_over_the_baseline_and_falls_back_on_link_l
         ctx = ResolutionContext(user_id="u1", symbol="RELIANCE")
 
         feed = _angel_feed("u1", symbols=("RELIANCE",))
-        run(set_market_feed_link("u1", "angelone", up=True))
+        run(set_market_feed_link(account_ref("u1", "angelone"), up=True))
         run(feed.on_raw(_angel_canonical()))
         assert manager.resolve(Capability.QUOTES, context=ctx) is feed
 
-        run(set_market_feed_link("u1", "angelone", up=False, reason="socket closed"))
+        run(set_market_feed_link(account_ref("u1", "angelone"), up=False, reason="socket closed"))
         assert manager.resolve(Capability.QUOTES, context=ctx) is baseline
         assert registry.get(feed.name) is feed, "a dropped socket unregistered the feed"
 
@@ -5495,13 +5504,13 @@ def test_a_reconnected_angelone_feed_cannot_answer_from_the_dead_links_prices():
         manager = SourceManager(registry)
 
         feed = _angel_feed("u1", symbols=("RELIANCE", "TCS"))
-        run(set_market_feed_link("u1", "angelone", up=True))
+        run(set_market_feed_link(account_ref("u1", "angelone"), up=True))
         run(feed.on_raw(_angel_canonical(price=265075, token="2885")))    # RELIANCE
         run(feed.on_raw(_angel_canonical(price=399010, token="11536")))   # TCS
         assert feed.covers("RELIANCE") and feed.covers("TCS")
 
-        run(set_market_feed_link("u1", "angelone", up=False, reason="dropped"))
-        run(set_market_feed_link("u1", "angelone", up=True))
+        run(set_market_feed_link(account_ref("u1", "angelone"), up=False, reason="dropped"))
+        run(set_market_feed_link(account_ref("u1", "angelone"), up=True))
         assert not feed.is_ready, "readiness survived the link that earned it"
 
         run(feed.on_raw(_angel_canonical(price=266000, token="2885")))
@@ -5523,7 +5532,7 @@ def test_an_angelone_feed_that_never_ticks_leaves_the_baseline_primary():
         manager = SourceManager(registry)
 
         _angel_feed("u1", symbols=("RELIANCE",))
-        run(set_market_feed_link("u1", "angelone", up=True))
+        run(set_market_feed_link(account_ref("u1", "angelone"), up=True))
         assert manager.resolve(
             Capability.QUOTES, context=ResolutionContext(user_id="u1", symbol="RELIANCE")) is baseline
 
@@ -5536,7 +5545,7 @@ def test_angelone_registers_through_the_existing_provider_framework():
     with _clean_provider_registry() as registry:
         registry.clear()
         name = run(_attach("u1", "angelone", ["RELIANCE"]))
-        assert name == feed_provider_name("u1", "angelone") == "brokerfeed:angelone:u1"
+        assert name == feed_provider_name(account_ref("u1", "angelone")) == feed_provider_name(account_ref("u1", "angelone"))
         provider = registry.get(name)
         assert type(provider) is StreamingTickProvider, "a broker-specific provider class appeared"
         assert provider.owner_user_id == "u1"
@@ -5555,7 +5564,7 @@ def test_removing_the_angelone_tick_capability_removes_its_market_feed():
         registry.clear()
         with patch.object(type(adapter), "capabilities", narrowed):
             assert run(_attach("u1", "angelone", ["RELIANCE"])) is None
-        assert registry.get("brokerfeed:angelone:u1") is None
+        assert registry.get(feed_provider_name(account_ref("u1", "angelone"))) is None
 
 
 # -- isolation ------------------------------------------------------------------
@@ -5583,7 +5592,7 @@ def test_four_users_on_four_providers_stay_on_their_own(no_probation_window, cap
             "userC": _upstox_feed("userC", symbols=("RELIANCE",)),
         }
         for user, broker in (("userA", "angelone"), ("userB", "zerodha"), ("userC", "upstox")):
-            run(set_market_feed_link(user, broker, up=True))
+            run(set_market_feed_link(account_ref(user, broker), up=True))
         run(feeds["userA"].on_raw(_angel_canonical()))
         run(feeds["userB"].on_raw(canonical_ticks(
             _kite_ticks(_kite_frame((738561, 265075))), _kite_map(), broker="zerodha")))
@@ -5598,7 +5607,7 @@ def test_four_users_on_four_providers_stay_on_their_own(no_probation_window, cap
         assert resolved("userD") is baseline, "a user with no broker was served another user's feed"
 
         # Angel One drops. Only user A moves.
-        run(set_market_feed_link("userA", "angelone", up=False, reason="socket closed"))
+        run(set_market_feed_link(account_ref("userA", "angelone"), up=False, reason="socket closed"))
         assert resolved("userA") is baseline
         assert resolved("userB") is feeds["userB"]
         assert resolved("userC") is feeds["userC"]
@@ -5610,7 +5619,7 @@ def _attach_and_get(user_id, broker, symbols=("RELIANCE",)):
     from services.market_engine.providers import provider_registry
 
     run(_attach(user_id, broker, list(symbols)))
-    return provider_registry.get(feed_provider_name(user_id, broker))
+    return provider_registry.get(feed_provider_name(account_ref(user_id, broker)))
 
 
 def test_an_angelone_quote_carries_no_broker_identity_and_no_other_users_data():
@@ -5622,7 +5631,7 @@ def test_an_angelone_quote_carries_no_broker_identity_and_no_other_users_data():
         registry.clear()
         registry.register(YahooPollingAdapter())
         feed = _angel_feed("u1", symbols=("RELIANCE",))
-        run(set_market_feed_link("u1", "angelone", up=True))
+        run(set_market_feed_link(account_ref("u1", "angelone"), up=True))
         run(feed.on_raw(_angel_canonical()))
         quote = run(feed.fetch_quote("RELIANCE"))
 
@@ -5653,20 +5662,20 @@ def test_the_engine_carries_angelone_bytes_all_the_way_into_the_registered_feed(
                 patch.object(BrokerEngine, "get_session", new=AsyncMock(return_value=_angel_session())), \
                 patch("services.brokers.gateway.broker_gateway.get_holdings", new=AsyncMock(return_value=holdings)), \
                 patch("services.brokers.gateway.broker_gateway.get_positions", new=AsyncMock(return_value=[])):
-            run(engine.start_stream("u1", "angelone"))
+            run(engine.start_stream(account_ref("u1", "angelone")))
 
         # One channel, and the engine passed it this account's SmartAPI ids.
         assert started.await_count == 1
         assert started.await_args.kwargs["instrument_tokens"] == ["1|2885"]
         assert started.await_args.kwargs["channel"] == DEFAULT_STREAM_CHANNEL
 
-        feed = registry.get("brokerfeed:angelone:u1")
+        feed = registry.get(feed_provider_name(account_ref("u1", "angelone")))
         assert feed is not None and feed.subscribed_symbols == ("RELIANCE",)
         run(feed.mark_link_up())
         assert manager.resolve(Capability.QUOTES, context=ctx) is baseline
 
         with patch.object(BrokerEngine, "_push", new=AsyncMock()):
-            run(engine._on_stream_tick("u1", "angelone", _angel_ticks(_angel_packet(price=265050))))
+            run(engine._on_stream_tick(account_ref("u1", "angelone"), _angel_ticks(_angel_packet(price=265050))))
 
         assert feed.describe()["accepted_records"] == 1
         assert manager.resolve(Capability.QUOTES, context=ctx) is feed
@@ -5681,11 +5690,11 @@ def test_an_expired_angelone_session_detaches_the_market_feed():
     with _clean_provider_registry() as registry:
         registry.clear()
         _angel_feed("u1", symbols=("RELIANCE",))
-        assert registry.get("brokerfeed:angelone:u1") is not None
+        assert registry.get(feed_provider_name(account_ref("u1", "angelone"))) is not None
         with patch.object(BrokerEngine, "_push", new=AsyncMock()), \
                 patch("services.brokers.stream.stream_manager.stop_stream", new=AsyncMock()):
-            run(engine._on_stream_expired("u1", "angelone", DEFAULT_STREAM_CHANNEL))
-        assert registry.get("brokerfeed:angelone:u1") is None
+            run(engine._on_stream_expired(account_ref("u1", "angelone"), DEFAULT_STREAM_CHANNEL))
+        assert registry.get(feed_provider_name(account_ref("u1", "angelone"))) is None
 
 
 # -- security --------------------------------------------------------------------
@@ -5725,12 +5734,12 @@ def test_the_angelone_feed_token_is_encrypted_at_rest_like_every_other_session_s
     engine = BrokerEngine()
     engine.configure(FakeDB())
     session = {"access_token": "jwt", "feed_token": "SECRET-FEED-TOKEN", "account_id": "A1"}
-    run(engine._save_account("u1", "angelone", session))
+    run(engine._save_session(account_ref("u1", "angelone"), session))
 
     stored = run(engine.db.broker_accounts.find_one({"user_id": "u1", "broker": "angelone"}))
     assert stored["feed_token"] != "SECRET-FEED-TOKEN"
     assert is_encrypted(stored["feed_token"])
-    assert run(engine._load_account("u1", "angelone"))["feed_token"] == "SECRET-FEED-TOKEN"
+    assert run(engine._load_session(account_ref("u1", "angelone")))["feed_token"] == "SECRET-FEED-TOKEN"
 
 
 def test_disconnecting_an_angelone_account_clears_every_session_secret():
@@ -5739,7 +5748,7 @@ def test_disconnecting_an_angelone_account_clears_every_session_secret():
 
     engine = BrokerEngine()
     engine.configure(FakeDB())
-    run(engine._save_account("u1", "angelone", {
+    run(engine._save_session(account_ref("u1", "angelone"), {
         "access_token": "jwt", "feed_token": "SECRET-FEED-TOKEN",
         "refresh_token": "r", "account_id": "A1"}))
 
@@ -5747,7 +5756,7 @@ def test_disconnecting_an_angelone_account_clears_every_session_secret():
             patch("services.brokers.stream.stream_manager.stop_stream", new=AsyncMock()), \
             patch.object(BrokerEngine, "_push", new=AsyncMock()), \
             patch.object(BrokerEngine, "_publish_connection", new=AsyncMock()):
-        run(engine.disconnect("angelone", "u1"))
+        run(engine.disconnect(account_ref("u1", "angelone")))
 
     stored = run(engine.db.broker_accounts.find_one({"user_id": "u1", "broker": "angelone"}))
     assert stored["connected"] is False
@@ -6003,7 +6012,7 @@ def _fy_feed(user_id="u1", symbols=("RELIANCE",)):
     from services.market_engine.providers import provider_registry
 
     run(_attach(user_id, "fyers", list(symbols)))
-    return provider_registry.get(feed_provider_name(user_id, "fyers"))
+    return provider_registry.get(feed_provider_name(account_ref(user_id, "fyers")))
 
 
 # -- authentication and session ------------------------------------------------
@@ -6903,7 +6912,7 @@ def test_a_connected_fyers_stream_is_not_ready_until_a_real_packet_arrives(no_pr
         ctx = ResolutionContext(user_id="u1", symbol="RELIANCE")
 
         feed = _fy_feed("u1", symbols=("RELIANCE",))
-        run(set_market_feed_link("u1", "fyers", up=True))
+        run(set_market_feed_link(account_ref("u1", "fyers"), up=True))
         assert manager.resolve(Capability.QUOTES, context=ctx) is baseline
 
         connection = _fy_conn()
@@ -6934,11 +6943,11 @@ def test_a_fyers_feed_is_promoted_over_the_baseline_and_falls_back_on_link_loss(
         ctx = ResolutionContext(user_id="u1", symbol="RELIANCE")
 
         feed = _fy_feed("u1", symbols=("RELIANCE",))
-        run(set_market_feed_link("u1", "fyers", up=True))
+        run(set_market_feed_link(account_ref("u1", "fyers"), up=True))
         run(feed.on_raw(_fy_canonical()))
         assert manager.resolve(Capability.QUOTES, context=ctx) is feed
 
-        run(set_market_feed_link("u1", "fyers", up=False, reason="socket closed"))
+        run(set_market_feed_link(account_ref("u1", "fyers"), up=False, reason="socket closed"))
         assert manager.resolve(Capability.QUOTES, context=ctx) is baseline
         assert registry.get(feed.name) is feed, "a dropped socket unregistered the feed"
 
@@ -6955,13 +6964,13 @@ def test_a_reconnected_fyers_feed_cannot_answer_from_the_dead_links_prices():
         manager = SourceManager(registry)
 
         feed = _fy_feed("u1", symbols=("RELIANCE", "TCS"))
-        run(set_market_feed_link("u1", "fyers", up=True))
+        run(set_market_feed_link(account_ref("u1", "fyers"), up=True))
         run(feed.on_raw(_fy_canonical(price=265075, topic="sf|nse_cm|2885")))
         run(feed.on_raw(_fy_canonical(price=399010, topic="sf|nse_cm|11536")))
         assert feed.covers("RELIANCE") and feed.covers("TCS")
 
-        run(set_market_feed_link("u1", "fyers", up=False, reason="dropped"))
-        run(set_market_feed_link("u1", "fyers", up=True))
+        run(set_market_feed_link(account_ref("u1", "fyers"), up=False, reason="dropped"))
+        run(set_market_feed_link(account_ref("u1", "fyers"), up=True))
         assert not feed.is_ready, "readiness survived the link that earned it"
 
         run(feed.on_raw(_fy_canonical(price=266000, topic="sf|nse_cm|2885")))
@@ -6982,7 +6991,7 @@ def test_a_fyers_feed_that_never_ticks_leaves_the_baseline_primary():
         manager = SourceManager(registry)
 
         _fy_feed("u1", symbols=("RELIANCE",))
-        run(set_market_feed_link("u1", "fyers", up=True))
+        run(set_market_feed_link(account_ref("u1", "fyers"), up=True))
         assert manager.resolve(
             Capability.QUOTES, context=ResolutionContext(user_id="u1", symbol="RELIANCE")) is baseline
 
@@ -6995,7 +7004,7 @@ def test_fyers_registers_through_the_existing_provider_framework():
     with _clean_provider_registry() as registry:
         registry.clear()
         name = run(_attach("u1", "fyers", ["RELIANCE"]))
-        assert name == feed_provider_name("u1", "fyers") == "brokerfeed:fyers:u1"
+        assert name == feed_provider_name(account_ref("u1", "fyers")) == feed_provider_name(account_ref("u1", "fyers"))
         provider = registry.get(name)
         assert type(provider) is StreamingTickProvider, "a broker-specific provider class appeared"
         assert provider.owner_user_id == "u1"
@@ -7008,7 +7017,7 @@ def test_removing_the_fyers_tick_capability_removes_its_market_feed():
         registry.clear()
         with patch.object(type(adapter), "capabilities", narrowed):
             assert run(_attach("u1", "fyers", ["RELIANCE"])) is None
-        assert registry.get("brokerfeed:fyers:u1") is None
+        assert registry.get(feed_provider_name(account_ref("u1", "fyers"))) is None
 
 
 # -- isolation ------------------------------------------------------------------
@@ -7038,7 +7047,7 @@ def test_five_users_on_five_providers_stay_on_their_own(no_probation_window):
         }
         for user, broker in (("userA", "angelone"), ("userB", "zerodha"),
                              ("userC", "upstox"), ("userD", "fyers")):
-            run(set_market_feed_link(user, broker, up=True))
+            run(set_market_feed_link(account_ref(user, broker), up=True))
         run(feeds["userA"].on_raw(_angel_canonical()))
         run(feeds["userB"].on_raw(canonical_ticks(
             _kite_ticks(_kite_frame((738561, 265075))), _kite_map(), broker="zerodha")))
@@ -7053,7 +7062,7 @@ def test_five_users_on_five_providers_stay_on_their_own(no_probation_window):
         assert resolved("userE") is baseline, "a user with no broker was served another user's feed"
 
         # Fyers drops. Only user D moves.
-        run(set_market_feed_link("userD", "fyers", up=False, reason="socket closed"))
+        run(set_market_feed_link(account_ref("userD", "fyers"), up=False, reason="socket closed"))
         assert resolved("userD") is baseline
         for user in ("userA", "userB", "userC"):
             assert resolved(user) is feeds[user]
@@ -7068,7 +7077,7 @@ def test_a_fyers_quote_carries_no_broker_identity_and_no_other_users_data():
         registry.clear()
         registry.register(YahooPollingAdapter())
         feed = _fy_feed("u1", symbols=("RELIANCE",))
-        run(set_market_feed_link("u1", "fyers", up=True))
+        run(set_market_feed_link(account_ref("u1", "fyers"), up=True))
         run(feed.on_raw(_fy_canonical()))
         quote = run(feed.fetch_quote("RELIANCE"))
 
@@ -7099,19 +7108,19 @@ def test_the_engine_carries_fyers_bytes_all_the_way_into_the_registered_feed(no_
                 patch.object(BrokerEngine, "get_session", new=AsyncMock(return_value=_fy_session())), \
                 patch("services.brokers.gateway.broker_gateway.get_holdings", new=AsyncMock(return_value=holdings)), \
                 patch("services.brokers.gateway.broker_gateway.get_positions", new=AsyncMock(return_value=[])):
-            run(engine.start_stream("u1", "fyers"))
+            run(engine.start_stream(account_ref("u1", "fyers")))
 
         assert started.await_count == 1
         assert started.await_args.kwargs["instrument_tokens"] == ["sf|nse_cm|2885"]
         assert started.await_args.kwargs["channel"] == "market"
 
-        feed = registry.get("brokerfeed:fyers:u1")
+        feed = registry.get(feed_provider_name(account_ref("u1", "fyers")))
         assert feed is not None and feed.subscribed_symbols == ("RELIANCE",)
         run(feed.mark_link_up())
         assert manager.resolve(Capability.QUOTES, context=ctx) is baseline
 
         with patch.object(BrokerEngine, "_push", new=AsyncMock()):
-            run(engine._on_stream_tick("u1", "fyers", _fy_ticks(_fy_snapshot(values=(265050,)))))
+            run(engine._on_stream_tick(account_ref("u1", "fyers"), _fy_ticks(_fy_snapshot(values=(265050,)))))
 
         assert feed.describe()["accepted_records"] == 1
         assert manager.resolve(Capability.QUOTES, context=ctx) is feed
@@ -7125,11 +7134,11 @@ def test_an_expired_fyers_session_detaches_the_market_feed():
     with _clean_provider_registry() as registry:
         registry.clear()
         _fy_feed("u1", symbols=("RELIANCE",))
-        assert registry.get("brokerfeed:fyers:u1") is not None
+        assert registry.get(feed_provider_name(account_ref("u1", "fyers"))) is not None
         with patch.object(BrokerEngine, "_push", new=AsyncMock()), \
                 patch("services.brokers.stream.stream_manager.stop_stream", new=AsyncMock()):
-            run(engine._on_stream_expired("u1", "fyers", "market"))
-        assert registry.get("brokerfeed:fyers:u1") is None
+            run(engine._on_stream_expired(account_ref("u1", "fyers"), "market"))
+        assert registry.get(feed_provider_name(account_ref("u1", "fyers"))) is None
 
 
 # -- security --------------------------------------------------------------------
@@ -7170,12 +7179,12 @@ def test_the_fyers_session_token_is_encrypted_at_rest_like_every_other_secret():
     engine = BrokerEngine()
     engine.configure(FakeDB())
     token = _fy_token("SECRET-HSM-KEY")
-    run(engine._save_account("u1", "fyers", {"access_token": token, "account_id": "XY01234"}))
+    run(engine._save_session(account_ref("u1", "fyers"), {"access_token": token, "account_id": "XY01234"}))
 
     stored = run(engine.db.broker_accounts.find_one({"user_id": "u1", "broker": "fyers"}))
     assert stored["access_token"] != token and is_encrypted(stored["access_token"])
     assert "SECRET-HSM-KEY" not in json.dumps(stored, default=str)
-    assert run(engine._load_account("u1", "fyers"))["access_token"] == token
+    assert run(engine._load_session(account_ref("u1", "fyers")))["access_token"] == token
     assert "access_token" in TOKEN_FIELDS
 
 
@@ -7184,14 +7193,14 @@ def test_disconnecting_a_fyers_account_clears_every_session_secret():
 
     engine = BrokerEngine()
     engine.configure(FakeDB())
-    run(engine._save_account("u1", "fyers", {
+    run(engine._save_session(account_ref("u1", "fyers"), {
         "access_token": _fy_token("SECRET-HSM-KEY"), "refresh_token": "R1", "account_id": "XY01234"}))
 
     with patch("services.brokers.gateway.broker_gateway.invalidate_session", new=AsyncMock()), \
             patch("services.brokers.stream.stream_manager.stop_stream", new=AsyncMock()), \
             patch.object(BrokerEngine, "_push", new=AsyncMock()), \
             patch.object(BrokerEngine, "_publish_connection", new=AsyncMock()):
-        run(engine.disconnect("fyers", "u1"))
+        run(engine.disconnect(account_ref("u1", "fyers")))
 
     stored = run(engine.db.broker_accounts.find_one({"user_id": "u1", "broker": "fyers"}))
     assert stored["connected"] is False
@@ -8086,19 +8095,19 @@ def test_a_dhan_feed_is_promoted_only_by_a_canonical_tick_on_the_current_link(no
         assert feed is not None
         assert manager.resolve(Capability.QUOTES, context=ctx) is baseline, "registering promoted the feed"
 
-        run(set_market_feed_link("u1", "dhan", up=True))
+        run(set_market_feed_link(account_ref("u1", "dhan"), up=True))
         assert manager.resolve(Capability.QUOTES, context=ctx) is baseline, "connecting promoted the feed"
 
         run(feed.on_raw(_dhan_canonical()))
         assert manager.resolve(Capability.QUOTES, context=ctx) is feed
 
         # The link drops: the baseline serves immediately, and it never left.
-        run(set_market_feed_link("u1", "dhan", up=False, reason="socket closed"))
+        run(set_market_feed_link(account_ref("u1", "dhan"), up=False, reason="socket closed"))
         assert manager.resolve(Capability.QUOTES, context=ctx) is baseline
         assert baseline.name in registry, "the baseline was released before the feed was ready"
 
         # A reconnect re-earns readiness rather than inheriting it.
-        run(set_market_feed_link("u1", "dhan", up=True))
+        run(set_market_feed_link(account_ref("u1", "dhan"), up=True))
         assert manager.resolve(Capability.QUOTES, context=ctx) is baseline, \
             "a reconnect promoted the feed on the previous connection's evidence"
         run(feed.on_raw(_dhan_canonical()))
@@ -8112,7 +8121,7 @@ def test_a_dhan_feed_is_promoted_only_by_a_canonical_tick_on_the_current_link(no
         # socket serving prices that arrived on a socket that is gone. Found by
         # mutation: removing the discard in `mark_link_up` alone left every
         # other assertion in this test green.
-        run(set_market_feed_link("u1", "dhan", up=True))
+        run(set_market_feed_link(account_ref("u1", "dhan"), up=True))
         assert manager.resolve(Capability.QUOTES, context=ctx) is baseline, \
             "a new link inherited the previous link's evidence"
         run(feed.on_raw(_dhan_canonical()))
@@ -8127,7 +8136,7 @@ def test_dhan_registers_through_the_existing_provider_framework():
     with _clean_provider_registry() as registry:
         registry.clear()
         name = run(_attach("u1", "dhan", ["RELIANCE"]))
-        assert name == feed_provider_name("u1", "dhan") == "brokerfeed:dhan:u1"
+        assert name == feed_provider_name(account_ref("u1", "dhan")) == feed_provider_name(account_ref("u1", "dhan"))
         provider = registry.get(name)
         assert type(provider) is StreamingTickProvider, "a broker-specific provider class appeared"
         assert provider.owner_user_id == "u1"
@@ -8140,7 +8149,7 @@ def test_removing_the_dhan_tick_capability_removes_its_market_feed():
         registry.clear()
         with patch.object(type(adapter), "capabilities", narrowed):
             assert run(_attach("u1", "dhan", ["RELIANCE"])) is None
-        assert registry.get("brokerfeed:dhan:u1") is None
+        assert registry.get(feed_provider_name(account_ref("u1", "dhan"))) is None
 
 
 # -- multi-broker isolation ----------------------------------------------------
@@ -8214,7 +8223,7 @@ def test_six_users_on_six_providers_stay_on_their_own(no_probation_window):
 
         for user, broker in (("userA", "angelone"), ("userB", "zerodha"), ("userC", "upstox"),
                              ("userD", "fyers"), ("userE", "dhan")):
-            run(set_market_feed_link(user, broker, up=True))
+            run(set_market_feed_link(account_ref(user, broker), up=True))
         run(feeds["userA"].on_raw(_angel_canonical()))
         run(feeds["userB"].on_raw(canonical_ticks(
             _kite_ticks(_kite_frame((738561, 265075))), _kite_map(), broker="zerodha")))
@@ -8230,14 +8239,14 @@ def test_six_users_on_six_providers_stay_on_their_own(no_probation_window):
         assert resolved("guest") is baseline, "a user with no broker was served another user's feed"
 
         # Dhan drops. Only user E moves, and the other four brokers are untouched.
-        run(set_market_feed_link("userE", "dhan", up=False, reason="socket closed"))
+        run(set_market_feed_link(account_ref("userE", "dhan"), up=False, reason="socket closed"))
         assert resolved("userE") is baseline
         for user in ("userA", "userB", "userC", "userD"):
             assert resolved(user) is feeds[user]
         assert resolved("guest") is baseline
 
         # And Dhan's reconnect does not disturb anybody else's subscription.
-        run(set_market_feed_link("userE", "dhan", up=True))
+        run(set_market_feed_link(account_ref("userE", "dhan"), up=True))
         run(feeds["userE"].on_raw(_dhan_canonical()))
         assert resolved("userE") is feeds["userE"]
         for user in ("userA", "userB", "userC", "userD"):
@@ -8271,7 +8280,7 @@ def test_two_dhan_users_of_the_SAME_broker_never_share_a_feed(no_probation_windo
         provider_registry,
     )
 
-    assert feed_provider_name("userX", "dhan") != feed_provider_name("userY", "dhan"), \
+    assert feed_provider_name(account_ref("userX", "dhan")) != feed_provider_name(account_ref("userY", "dhan")), \
         "two accounts at one broker share a provider name"
 
     with _clean_provider_registry() as registry:
@@ -8290,8 +8299,8 @@ def test_two_dhan_users_of_the_SAME_broker_never_share_a_feed(no_probation_windo
         # Both are still resolvable AT THE SAME TIME — the property the object
         # comparison above cannot see, because registering the second must not
         # have evicted the first.
-        assert registry.get(feed_provider_name("userX", "dhan")) is first
-        assert registry.get(feed_provider_name("userY", "dhan")) is second
+        assert registry.get(feed_provider_name(account_ref("userX", "dhan"))) is first
+        assert registry.get(feed_provider_name(account_ref("userY", "dhan"))) is second
 
         run(first.mark_link_up())
         run(second.mark_link_up())
@@ -8333,7 +8342,7 @@ def test_a_dhan_quote_carries_no_broker_identity_and_no_other_users_data():
         registry.clear()
         registry.register(YahooPollingAdapter())
         feed = _dhan_feed("u1", symbols=("RELIANCE",))
-        run(set_market_feed_link("u1", "dhan", up=True))
+        run(set_market_feed_link(account_ref("u1", "dhan"), up=True))
         run(feed.on_raw(_dhan_canonical()))
         quote = run(feed.fetch_quote("RELIANCE"))
 
@@ -8364,19 +8373,19 @@ def test_the_engine_carries_dhan_bytes_all_the_way_into_the_registered_feed(no_p
                 patch.object(BrokerEngine, "get_session", new=AsyncMock(return_value=_dhan_session())), \
                 patch("services.brokers.gateway.broker_gateway.get_holdings", new=AsyncMock(return_value=holdings)), \
                 patch("services.brokers.gateway.broker_gateway.get_positions", new=AsyncMock(return_value=[])):
-            run(engine.start_stream("u1", "dhan"))
+            run(engine.start_stream(account_ref("u1", "dhan")))
 
         assert started.await_count == 1
         assert started.await_args.kwargs["instrument_tokens"] == ["NSE_EQ|1333"]
         assert started.await_args.kwargs["channel"] == DEFAULT_STREAM_CHANNEL
 
-        feed = registry.get("brokerfeed:dhan:u1")
+        feed = registry.get(feed_provider_name(account_ref("u1", "dhan")))
         assert feed is not None and feed.subscribed_symbols == ("RELIANCE",)
         run(feed.mark_link_up())
         assert manager.resolve(Capability.QUOTES, context=ctx) is baseline
 
         with patch.object(BrokerEngine, "_push", new=AsyncMock()):
-            run(engine._on_stream_tick("u1", "dhan", _dhan_ticks(_dhan_quote(price=2650.5))))
+            run(engine._on_stream_tick(account_ref("u1", "dhan"), _dhan_ticks(_dhan_quote(price=2650.5))))
 
         assert feed.describe()["accepted_records"] == 1
         assert manager.resolve(Capability.QUOTES, context=ctx) is feed

@@ -38,6 +38,7 @@ from services.brokers import (
     broker_gateway,
     broker_registry,
 )
+from services.brokers.accounts import broker_accounts  # noqa: E402
 from services.brokers.base import BrokerAdapter
 from services.brokers.capabilities import CAPABILITY_METHODS
 from services.brokers.contracts import (
@@ -988,8 +989,14 @@ def test_connecting_a_broker_publishes_the_lifecycle_event_the_source_manager_ne
         assert manager.connected_brokers("u9") == ["zerodha"]
         assert manager.streaming_brokers("u9") == ["zerodha"]
 
+        # D6.4 — disconnect the account `complete_auth` actually minted. Its id
+        # is random by design, so the test reads it back rather than deriving
+        # one: an event keyed on a *different* account would leave the registry
+        # entry behind, and this assertion is what catches that.
+        account = run(broker_accounts.sole_for_broker("u9", "zerodha"))
+        assert account is not None
         with patch.object(ZerodhaAdapter, "invalidate_session", new=AsyncMock()):
-            run(engine.disconnect("zerodha", "u9"))
+            run(engine.disconnect(account))
         assert manager.connected_brokers("u9") == []
     finally:
         _unsubscribe(manager)

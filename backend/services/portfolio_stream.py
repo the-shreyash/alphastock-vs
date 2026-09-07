@@ -229,7 +229,8 @@ async def publish_snapshot(db, user_id: str,
 
 
 async def apply_broker_ticks(db, user_id: str, broker: str, ticks: list,
-                             quotes_map_func: Optional[Callable[[list], Awaitable[dict]]] = None) -> Optional[dict]:
+                             quotes_map_func: Optional[Callable[[list], Awaitable[dict]]] = None,
+                             *, broker_account_id: Optional[str] = None) -> Optional[dict]:
     """Fold live broker ticks into the user's portfolio and stream the result.
 
     Ticks are canonical ``MarketTick`` dicts (`services/market_engine/ticks.py`):
@@ -261,7 +262,18 @@ async def apply_broker_ticks(db, user_id: str, broker: str, ticks: list,
 
     # The holdings read stays: it is a *portfolio* join (which rows to re-mark),
     # not an identity join, and both sides of it are canonical symbols.
-    docs = await db.holdings.find({"user_id": user_id, "broker": broker}).to_list(500)
+    #
+    # D6.4 — narrowed to the ACCOUNT whose socket delivered the tick when the
+    # caller names one. A tick arrives on one account's connection and prices
+    # that account's rows; re-marking `(user_id, broker)` would have written one
+    # account's live price onto the other account's holdings of the same symbol,
+    # at a different average cost and a different quantity.
+    scope = {"user_id": user_id}
+    if broker_account_id:
+        scope["broker_account_id"] = broker_account_id
+    else:
+        scope["broker"] = broker
+    docs = await db.holdings.find(dict(scope)).to_list(500)
     override = {}
     for d in docs:
         sym = (d.get("symbol") or "").upper()
@@ -271,7 +283,7 @@ async def apply_broker_ticks(db, user_id: str, broker: str, ticks: list,
         override[sym] = float(price)
         qty = float(d.get("quantity") or 0)
         await db.holdings.update_one(
-            {"user_id": user_id, "broker": broker, "symbol": d.get("symbol")},
+            {**scope, "symbol": d.get("symbol")},
             {"$set": {
                 "last_price": float(price),
                 "market_value": round(float(price) * qty, 2),

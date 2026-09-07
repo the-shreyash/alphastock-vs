@@ -330,12 +330,46 @@ async def _publish(event_type: str, data: dict) -> None:
 
 
 async def _broker_exit(broker_engine, trade: dict, quantity: int, reason: str):
-    """Place the live market exit order for an auto_exit trade. Returns the
-    broker order result or None on failure (failure never blocks bookkeeping —
-    the user is alerted either way)."""
+    """Place the live market exit order for an auto_exit trade.
+
+    Returns the broker order result or None on failure (failure never blocks
+    bookkeeping — the user is alerted either way).
+
+    D6.4 — THE ACCOUNT COMES FROM THE TRADE, NOT FROM THE BROKER NAME.
+    ------------------------------------------------------------------
+    This runs on a background scheduler with no request and no authenticated
+    user, so it cannot resolve an account by asking "this user's zerodha". It
+    reads the `broker_account_id` the entry order was recorded against and
+    exits there. A trade that carries no account id is **not exited** — it is
+    logged and skipped, because the alternative is a live market order in an
+    account this function chose, which is precisely the failure D6.4 exists to
+    make impossible. The bookkeeping still runs and the user is still alerted.
+
+    `get_unscoped` is correct here and is one of its two sanctioned callers: the
+    task is acting as the account, and the ownership check it would otherwise
+    perform is already discharged — the id came off a trade row that was itself
+    filtered by `user_id` when it was written.
+    """
+    account_id = trade.get("broker_account_id")
+    if not account_id:
+        logger.error(
+            "Auto-exit for %s skipped: the trade names broker %r but no "
+            "broker_account_id, and this path may not choose an account.",
+            trade.get("symbol"), trade.get("broker"))
+        return None
+    from services.brokers.accounts import broker_accounts
+
+    account = await broker_accounts.get_unscoped(account_id)
+    if account is None or not account.owned_by(trade.get("user_id")):
+        # The second half is not redundant with the first: an account that was
+        # deleted and an account whose row no longer belongs to this trade's
+        # owner are different facts, and neither may be exited into.
+        logger.error("Auto-exit for %s skipped: account %s is not resolvable for "
+                     "its owner.", trade.get("symbol"), account_id)
+        return None
     side = "BUY" if _is_short(trade) else "SELL"
     try:
-        return await broker_engine.place_order(trade["user_id"], trade["broker"], {
+        return await broker_engine.place_order(account, {
             "symbol": trade["symbol"], "exchange": trade.get("exchange", "NSE"),
             "transaction_type": side, "quantity": quantity,
             "order_type": "MARKET", "product": trade.get("product") or "CNC",
@@ -389,7 +423,9 @@ async def run_cycle(db, quotes: dict, broker_engine=None, ws_push=None) -> dict:
             trade = {**trade, **trail}
 
         # 2. Target / SL lifecycle.
-        auto = bool(trade.get("auto_exit")) and bool(trade.get("broker"))
+        # D6.4 — gated on the ACCOUNT, so a trade whose account cannot be named
+        # never reaches `_broker_exit` at all.
+        auto = bool(trade.get("auto_exit")) and bool(trade.get("broker_account_id"))
         for action in evaluate_trade(trade, price):
             if action["action"] == "TARGET_HIT":
                 level, qty = action["level"], action["quantity"]

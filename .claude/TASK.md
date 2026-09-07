@@ -7190,12 +7190,22 @@ unfiltered; the notification and conversation writes losing their owner.
   connected**: every broker-isolation result in §3 is from hermetic tests, not
   from a live Zerodha/Upstox session. Two *browsers* on one account, and two
   accounts in two browsers simultaneously, were not driven.
+  **PARTIALLY CLOSED 2026-09-06 (ADR-063).** Two accounts in two simultaneous
+  browser contexts, two tabs on one account, and the WebSocket lifetime are now
+  driven in real Chrome by `scripts/browser/d63_tenant_isolation.js` (27/27) —
+  which found a cross-tenant private-activity disclosure no single-tab check
+  could see. **The broker leg remains open**: no live broker session has ever
+  been driven. See "D6.3 CLOSURE" below.
 * **LIM-D6.3-2 — a real database race was not reproduced.** `FakeDB` is
   single-threaded with no await point inside an operation, so concurrent-write
   interleavings cannot be constructed against it. The §15 tests exercise
   concurrent *application* paths over shared state, which is real, and say
   nothing about Mongo-level atomicity. Rather than write a test that cannot fail,
   this is recorded. (Same constraint that put LIM-D6.2-6 out of reach.)
+  **CLOSED 2026-09-06 (ADR-063)** by `backend/tests/test_d63_real_db_races.py`,
+  which drives the real code against a real `mongod`. Three real races were
+  reproduced and **none crosses a tenant boundary**; LIM-D6.2-6 is now
+  reproduced and proven contained rather than argued. See "D6.3 CLOSURE" below.
 * **LIM-D6.3-3 — the fan-out sweep cannot see an injected callable.** Stated in
   the test itself, with the one instance named and read by hand.
 * **LIM-D6.3-4 — `price.updated` scoping uses a tier comparison.** A broker feed
@@ -7274,5 +7284,586 @@ items pointing at it (§8). **Not started** — the brief forbids it.
 ---
 
 **D6.3 STATUS: COMPLETE.**
+
+---
+
+# D6.3 CLOSURE — LIM-D6.3-1 AND LIM-D6.3-2 (2026-09-06) — COMPLETE
+
+Decision record: **ADR-063** (extends ADR-062/D6.3). Scope: close the two D6.3
+limitations that were "not proven" rather than "proven safe". **D6.2 remains
+frozen**; `SessionStore.rotate()` was reproduced and left untouched. No D5 file
+was touched. D6.4 was not started.
+
+## Headline
+
+Both limitations were of one kind: **the instrument that could have found the
+defect had never been built.** Building the two instruments found **one new
+cross-tenant disclosure** and **three real single-owner races**.
+
+The disclosure needed two accounts signed in at the same instant to exist at
+all, which is exactly what LIM-D6.3-1 said had never been driven.
+
+---
+
+## 1. LIM-D6.3-1 — the browser leg, widened
+
+`scripts/browser/d63_tenant_isolation.js` (new, with a README). Real Chrome via
+Playwright's `channel: "chrome"`, real API, real Mongo, **three isolated browser
+contexts** = three cookie jars. **27/27 checks pass.** No order placed, no broker
+connected.
+
+| | Scenario | Result |
+|---|---|---|
+| T1 | Two accounts, two contexts, signed in **simultaneously** | 7/7 — separate cookies, B's watchlist empty while A's holds two symbols, nothing of A's in B's DOM or `localStorage` |
+| T2 | Two **tabs**, one account, one cookie jar | 5/5 — access cookie dropped, both tabs refresh concurrently, **both accepted**, neither signed out |
+| T3 | `A -> B` transition in one tab, via the **real UI logout** | 5/5 — sign-out purges A's browser state, B's session is genuinely B |
+| T4 | WebSocket lifetime + private frames across two live contexts | 5/5 — 4/4 sockets stayed open, no frame carried the other tenant's id |
+| T5 | Private activity across tenants | 5/5 **after the fix below** |
+
+**T2 is the first browser-level proof that `JWT_REFRESH_GRACE_SECONDS` works.**
+D6.2 introduced the grace window for the two-tab race and could only assert it at
+the transport boundary. Two real tabs sharing one cookie jar, both refreshing
+concurrently, both got 200 and neither was signed out.
+
+**T3 had to drive the sidebar's logout control, not `POST /api/auth/logout`.**
+Calling the API directly bypasses `clearTenantLocalState()` — the client code the
+test exists to verify — and would have passed while proving nothing.
+
+### D63C-1 — a user's stock-page visit was announced to every other user (MEDIUM)
+
+**Before.** `/api/stocks/{symbol}/patterns` logged `Scanning chart patterns for
+X` to the **shared** activity stream. D6.1 had classified it platform-scope on a
+premise that was true — the route took no identity, and the symbol is public
+reference data the same endpoint returns — but the conclusion did not follow: the
+entry exists only because *a specific signed-in user opened that page*.
+
+**Reproduced, deterministically, in two simultaneous Chrome profiles:**
+
+| Step | Observation |
+|---|---|
+| before | B's feed does not mention `VOLTAS` |
+| A opens `/stock/VOLTAS` | — |
+| after | **B's feed names it, and it renders on B's dashboard** |
+| control | `BERGEPAINT`, which nobody opened, stays absent throughout |
+| owner control | A *does* see their own scan |
+
+**After.** The route takes `get_optional_user_id` — the identity D6.1's own
+comment said it would need — and follows the shape D6.1 already chose for
+`run_backtest_route` on this same problem: identified caller → private entry;
+anonymous visitor (not a tenant) → public behaviour unchanged. One defect class,
+one remedy, one pattern.
+
+**Enforcement.** The file-level import sweep in `test_d61_security.py` reads
+imports, not causes, and cannot see this distinction; `server.py` stays on its
+allowlist. Enforcement is
+`test_d63_isolation.py::TestTeardown::test_a_signed_in_users_pattern_scan_is_not_announced_to_everyone`
+plus an anonymous **falsifying twin**, without which deleting the log line
+outright would make the isolation test pass.
+
+---
+
+## 2. LIM-D6.3-2 — real database races
+
+`backend/tests/test_d63_real_db_races.py` (new, 10 tests: **8 pass, 2 xfail by
+design**). Drives real production code against real `mongod`; interleaving pinned
+by `asyncio.Barrier` at the collection boundary, every barrier bounded by
+`asyncio.wait_for` so a regression is red rather than hung. Skips itself when no
+`mongod` answers, and carries the `requires_db` marker (whose description in
+`pyproject.toml` said "no hermetic test carries this" and has been corrected).
+
+**The falsifying twins come first and are load-bearing** (§1 of the file): the
+suite proves it *can* see a lost update and *can* distinguish a compare-and-swap
+from a read/decide/write. Without that, "no race crossed tenants" is the answer a
+harness that observes nothing also gives.
+
+### LIM-D6.2-6 — reproduced, contained, NOT fixed
+
+Two concurrent refreshes of one family **both return `ROTATED`** against real
+Mongo: two live refresh tokens for a family that can only have one,
+`refresh_count` incremented twice for one logical rotation. No longer an
+argument — a test.
+
+**No tenant-isolation failure.** The bystander's session document is compared
+field-for-field across the race *and* the family-revoking refresh that follows,
+and is byte-identical; the bystander's own refresh still succeeds (the
+owner-positive control without which "unchanged" proves nothing). The loser fails
+closed at `REUSE_DETECTED`. `rotate()` is **untouched**, per the freeze.
+
+### Three real races found — none cross-tenant, none swept up
+
+| Race | Shape | Cross-tenant? |
+|---|---|---|
+| `update_paper_balance` | read/modify/write with `$set` — 4 concurrent +100 credits apply as +100 | No — one owner |
+| `close_paper_trade` | decides on a status it does not restate in the write — one position closes N times | No — one owner |
+| `_record_order` | concurrent upsert duplicates a row; `db.orders` has no unique index on `(user_id, broker, order_id)` | No — one owner |
+
+The first two are asserted **in their correct form** under `xfail(strict=True)`:
+red-by-design today, and red again the moment someone fixes the write without
+removing the marker.
+
+**Fix-ordering hazard.** The double-close is currently *masked* by the lost
+update. Repairing `update_paper_balance` to `$inc` alone would turn a hidden
+double-close into a real over-credit. **Clear them together.**
+
+---
+
+## 3. Mutation / adversarial verification — 8/8 killed
+
+Harness restores from `EXIT`, `INT` **and** `TERM` (D6.3's first campaign was
+killed mid-mutant and left a production file mutated).
+
+| # | Mutation | Result |
+|---|---|---|
+| M1 | `_record_order` upsert filter loses `user_id` | KILLED |
+| M2 | `close_paper_trade` read loses `user_id` | KILLED |
+| M3 | `rotate()` made atomic (the LIM-D6.2-6 fix shape) | KILLED |
+| M4 | `update_paper_balance` made atomic (`$inc`) | KILLED — harness check *and* the xfail react |
+| M5 | the CAS twin's own filter degraded to a blind write | KILLED |
+| N1 | the D63C-1 fix reverted | KILLED |
+| N2 | the logging deleted entirely (the lazy "fix") | KILLED by the anonymous twin |
+| N3 | the route stops taking the caller identity | KILLED |
+
+**N1 was re-verified by hand after a bad applied-check.** The first run's grep
+tested the whole 7,000-line file for `if user_id:`, which appears throughout, so
+"mutation did not apply" was printed next to a RED result — a combination that
+should be impossible. Re-run with a function-scoped check: baseline green,
+mutation confirmed applied, exactly the isolation test red. **A mutation reported
+as killed without a check that the mutation applied is not evidence.**
+
+**T5 was mutation-tested in the browser too**: the fix was reverted, the API
+restarted, and T5 failed while its owner-positive and noise controls stayed
+green — so the failure is attributable to the leak, not to feed noise.
+
+---
+
+## 4. Full test results
+
+| Gate | Result |
+|---|---|
+| D6.3 isolation suite | **79 passed** (77 + 2 new) |
+| D6.3 real-DB races | **8 passed, 2 xfailed** (by design) |
+| D6.1 + D6.2 suites | **138 passed** |
+| Full backend | **4682 passed, 15 failed, 66 skipped, 6 xfailed** |
+| Full frontend | **681 passed, 4 failed** |
+| flake8 | new test file clean; `server.py` **249 issues before, 249 after — identical** |
+| black + isort (CI gate for new files) | clean |
+| Production build | **succeeds** |
+
+### Failure classification
+
+* **15 backend — PRE-EXISTING / ENVIRONMENTAL.** All in
+  `test_entrypoint_log_level.py`, failing with `python: command not found`: the
+  entrypoint script expects a `python` binary that exists in the Docker image and
+  not on this host. Exactly the baseline recorded since D3.
+* **4 frontend — PRE-EXISTING.** All in `Landing.test.jsx`; the same four D6.1,
+  D6.2 and D6.3 each recorded. No frontend source file was touched this pass.
+* **0 NEW REGRESSIONS.**
+
+### 16 failures that turned out to be a broken guard (fixed)
+
+`test_dockerignore_semantics.py` gated its differential tests on
+`docker buildx version` — answered by the **CLI plugin** with the daemon stopped.
+So on any machine with Docker installed but not running, 16 tests ran and failed,
+contradicting the module's own docstring ("they … skip when no daemon is
+reachable"). The guard now also requires `docker info`. Those 16 are honest
+**skips**. Out of D6.3's scope, found by the mandated gate, and small enough to
+correct in place rather than leave as noise that hides a real regression.
+
+---
+
+## 5. Remaining limitations
+
+* **LIM-D6.3-1 (PARTIALLY closed) — the broker leg is still open.** Two browsers,
+  two simultaneous accounts, two tabs and the WebSocket lifetime are now driven
+  in real Chrome. **No broker has ever been connected**, so every broker-isolation
+  result on this project remains hermetic. Closing it needs live Zerodha/Upstox
+  credentials and an interactive login — not available in this environment, and
+  not something to fake.
+* **LIM-D6.3-2 (closed).** Superseded by `test_d63_real_db_races.py`.
+* **LIM-D6.2-6 (inherited, untouched).** Now *reproduced* rather than argued.
+  Proven tenant-contained. Not fixed, per the freeze.
+* **LIM-D6.3-3 / LIM-D6.3-4 / LIM-D6.1-3** — unchanged.
+* **The browser suite is one machine, one Chrome version, headless.** It has not
+  been run on Firefox or Safari, and the WebSocket subprotocol rule that produced
+  D63-5 is a browser-wide rule but was only ever verified against Chrome.
+
+---
+
+## 6. Found and deferred to D6.4
+
+Everything in D6.3 §8 still stands, plus:
+
+* **`update_paper_balance` lost update** and **`close_paper_trade` double close**
+  — both reproduced, both `xfail(strict=True)`, **and they must be fixed
+  together** (see the ordering hazard above).
+* **`db.orders` has no unique index on `(user_id, broker, order_id)`** — the only
+  index is the non-unique `(user_id, placed_at)`. Concurrent upserts of one
+  order can produce duplicate rows. Adding the index is a migration, not a
+  one-liner: existing duplicates would have to be reconciled first, and
+  `_record_order` would need to handle `DuplicateKeyError`.
+
+---
+
+## 7. Files changed
+
+**New (3)** — `backend/tests/test_d63_real_db_races.py`,
+`scripts/browser/d63_tenant_isolation.js`, `scripts/browser/README.md`.
+
+**Backend (4)** — `server.py` (`stock_patterns` takes the caller identity and
+logs privately), `tests/test_d63_isolation.py` (+2 tests: the regression and its
+anonymous twin), `tests/test_d61_security.py` (allowlist comment), `pyproject.toml`
+(`requires_db` marker description), `tests/test_dockerignore_semantics.py`
+(daemon-aware guard).
+
+**Frontend — none.** **D5 — untouched.**
+
+---
+
+**D6.3 CLOSURE STATUS: COMPLETE.** D6.4 not started.
+
+---
+
+# D6.4 — IDENTITY & BROKER ACCOUNT MODEL
+
+**STATUS: COMPLETE — ARCHITECTURALLY VERIFIED, LIVE BROKER ACCOUNT VERIFICATION
+PENDING.** Not committed. D6.5 not started.
+
+---
+
+## 1. The current-state map (audited before anything was changed)
+
+The identity of a brokerage account was the pair `(user_id, broker)`. It was
+not one convention in one module — it was the same assumption written into
+seven places independently:
+
+| Where | Shape before D6.4 |
+|---|---|
+| `db.broker_accounts` | `{user_id, broker}` **UNIQUE index** (`server.py`) |
+| `BrokerEngine._sessions` | `(user_id, broker) -> decrypted session` |
+| `BrokerEngine._instrument_maps` | `(user_id, broker) -> InstrumentMap` |
+| `BrokerStreamManager._streams` | `(user_id, broker, channel, shard) -> stream` |
+| `RecoveryRegister` | `(user_id, broker, channel) -> candidate` |
+| market feed provider name | `brokerfeed:<broker>:<user_id>` |
+| `SourceManager._connected_brokers` | `user -> {broker: capabilities}` |
+| every public `BrokerEngine` method | `(user_id, broker, …)` |
+| `db.orders` / `holdings` / `portfolios` / `trades` | `{user_id, broker, …}` |
+
+**What that pair actually is:** a user and a *brand*. It is an account identity
+only while a user has at most one account per broker — a condition enforced by
+a unique index, not by anything true about brokerage.
+
+**What followed from it.** A second Zerodha account did not fail to connect. It
+*upserted over* the first: same row, same cached session, same stream registry
+entry, same provider, same recovery candidate — and `sync_portfolio`'s
+`delete_many({user_id, broker})` deleted the first account's holdings before
+writing the second's.
+
+**External identity, per broker (audited, not assumed).** Every adapter already
+returned one and `_save_account` already stored it as `session["account_id"]`,
+which is what made the migration possible without inventing anything:
+
+| Broker | Field | Source | Reliability |
+|---|---|---|---|
+| Zerodha | `user_id` | `/session/token` response | Present on every exchange |
+| Upstox | `user_id` | `/login/authorization/token` | Present on every exchange |
+| Angel One | `clientcode` | `/user/v1/getProfile` | **Hard-fails** if absent |
+| Fyers | `fy_id` | `/profile` | May be null; not hard-failed |
+| Dhan | `dhanClientId` | consent response | **Hard-fails** if absent |
+
+The brief warned against assuming `client_id` is the external identity. It is
+not one field: three different names across five brokers. What they share is the
+property the platform needs — stable across logins, unique within the broker,
+and the number printed on the user's own contract notes.
+
+---
+
+## 2. The target model
+
+```
+user_id                       the platform identity
+  └── broker_account_id       an authorized external brokerage account
+        ├── broker            which brand it is at
+        ├── external_account_id   what the broker calls it
+        ├── auth session      credentials, expiry, refresh
+        └── connections       websockets, channels, shards
+```
+
+`broker_account_id` is opaque (`ba_` + 128 random bits), internal, immutable,
+and minted exactly once per external brokerage account per user. It is **not**
+derived from the broker name, the OAuth state, the access token, a websocket, or
+any client-supplied value.
+
+### Why the id is random and the *lookup* is deterministic
+
+A deterministic id — `hash(user, broker, client_code)` — makes migration
+trivially idempotent, and is wrong twice: it is derivable by anyone who knows
+those three values, and it welds the identity to a field that must be allowed to
+change (a legacy row that later learns its external id would need a *different*
+id, orphaning every order pointing at the old one).
+
+So the id is random and **determinism lives in the lookup**:
+`BrokerAccountDirectory.link` resolves `(user_id, broker, external_account_id)`
+to an existing row before minting. Reconnect is idempotent because the lookup
+finds the row, not because the id was recomputed.
+
+---
+
+## 3. Uniqueness
+
+| Level | Key |
+|---|---|
+| platform identity | `user_id` |
+| broker account | `broker_account_id` (UNIQUE) |
+| external broker identity | `(user_id, broker, external_account_id)` (UNIQUE, **partial**) |
+| owner-scoped listing / the bridge | `(user_id, broker)` (**non-unique**) |
+
+The external-identity index is **partial on `external_account_id` existing**:
+Mongo treats missing and null as one value in a unique index, so without the
+filter two legacy accounts the broker never named would collide — and that is
+exactly the population the migration cannot name.
+
+The pre-D6.4 `{user_id, broker}` UNIQUE index is **explicitly dropped**.
+`create_index` does not redefine an existing index with the same key pattern, so
+leaving it would have kept uniqueness silently in force under a set of indexes
+that all say a second account is legal — surfacing as a duplicate-key error on a
+user's second connect, after every code path had already agreed it was allowed.
+
+---
+
+## 4. Migration
+
+`services/brokers/account_migration.py`, run from `startup` **before**
+`broker_engine.load_sessions()` — a session restored against an unmigrated
+document would be cached under an id that does not exist yet.
+
+*Deterministic* — the pre-D6.4 UNIQUE index guarantees every legacy account maps
+to exactly one document, so "which account does this order belong to" has one
+answer. *Idempotent* — every step filters on the field being absent. *Non-
+destructive* — it only adds fields; `broker` and `connected` stay, so a rollback
+is a deploy and not a data restore. *Auditable* — returns a report and writes a
+`schema_migrations` row.
+
+**Ambiguity is refused, not resolved.** Two documents claiming one legacy
+identity are reported and skipped, and **every row referencing that pair is left
+untouched** — merging joins two credential sets and two histories; picking one
+orphans the other's orders. Neither is a migration.
+
+Rows stamped: `orders`, `holdings`, `portfolios`, `trades`. Deliberately **not**
+stamped: `positions` (never persisted), `paper_trades` (no brokerage account by
+definition), `activity` / `audit_logs` (append-only history — back-dating an
+identity onto a historical row rewrites the record rather than migrating it).
+
+---
+
+## 5. OAuth / account linking
+
+```
+user → start linking (authenticated) → opaque state, bound server-side + cookie
+     → broker authorization → callback → validate state + cookie
+     → resolve the initiating user FROM THE RECORD
+     → exchange the token
+     → resolve/create the account FROM THE BROKER'S OWN RESPONSE
+     → store credentials against broker_account_id → activate
+```
+
+The ordering is the rule: the token exchange comes **first**, and the account is
+resolved from what the *broker* said in its authenticated response — never from
+a `broker_account_id` the client supplied, never from the OAuth state, never
+from "this user's zerodha". That is what makes reconnect idempotent and a second
+account possible in the same method, without `complete_auth` choosing anything.
+
+---
+
+## 6. NEW VULNERABILITY FOUND AND FIXED — D6.4 / V-1 (CRITICAL)
+
+**`GET /api/zerodha/callback` still read `uid` from the query string.**
+
+D6.1 / S1 removed exactly this from `/api/brokers/{broker}/callback` and replaced
+it with a server-side single-use, cookie-bound state record. It did not touch the
+*older alias for the same flow* — and `KITE_REDIRECT_URL` in this repository's
+own `.env` and `.env.example` points at `/api/zerodha/callback`. **The D6.1 fix
+was inert for Zerodha in the shipped configuration.**
+
+What it bought, in both directions and with no credential of the other party:
+
+* an attacker completing a Kite login with `redirect_params=uid=<victim>`
+  attached **their** brokerage account to the victim's platform account — the
+  victim's subsequent orders would be placed in the attacker's account;
+* an attacker luring a victim through a Kite login carrying `uid=<attacker>`
+  attached the **victim's** brokerage account to the attacker's platform
+  account — holdings, positions, funds and live order placement.
+
+**Fix:** the legacy route now delegates to `broker_oauth_callback`, so there is
+one ownership proof and not two that must agree. `uid` is not read at all.
+
+**Also fixed:** `GET /api/zerodha/login-url` passed `str(user["_id"])` into the
+adapter's `state` parameter, putting the app's user id on the wire as
+`redirect_params=state=<user id>` — the D6.1 defect with the parameter renamed.
+
+Pinned by `test_the_legacy_zerodha_callback_no_longer_trusts_uid` and
+`test_the_legacy_zerodha_login_url_puts_no_user_id_on_the_wire`, and by mutation
+M10, which restores the old handler and turns the first of those red.
+
+---
+
+## 7. Routing, and why the broker-addressed routes were kept
+
+Two addressing modes:
+
+* **Account-addressed** (`/api/brokers/accounts/{broker_account_id}/…`) — the
+  correct form. Resolves through `_account`, which filters by the authenticated
+  user, so an id belonging to somebody else does not resolve.
+* **Broker-addressed** (`/api/brokers/{broker}/…`) — the compatibility bridge.
+  Resolves **only the unambiguous case** and answers **409** when the user holds
+  more than one account at that broker. It never picks.
+
+Keeping the bridge is a judgement call and is stated as one. Deleting it would
+break the shipped frontend and every existing integration for a user population
+in which the answer is unambiguous. Making it *choose* would reintroduce "first
+connected"/"last connected"/"any connected" under a new name. Refusing is the
+only remaining honest option, and 409 (not 404) because the app's existing
+`BrokerAuthError` handler already maps to it and the frontend branches on it.
+
+`get_status` (the per-broker view) reports `ambiguous: true`, a null
+`broker_account_id` and an `accounts` array when a user holds several at one
+broker, rather than inventing a boolean.
+
+---
+
+## 8. Test results
+
+| Gate | Result |
+|---|---|
+| D6.4 targeted (`test_d64_identity.py`, new) | **109 passed** |
+| D6.1 security | 76 passed |
+| D6.2 lifecycle | 47 passed |
+| D6.3 isolation (+ real-Mongo races) | 98 passed, 2 xfail (deferred, known) |
+| Full backend suite | **5108 passed**, 66 skipped, 6 xfailed, **15 failed** |
+| Full frontend suite | **711 passed**, **4 failed** |
+| Frontend D6.4 (`brokerAccountsD64.test.jsx`, new) | 30 passed |
+| flake8 blocking gate (`E9,F63,F7,F82,F811,F632`) | **clean** |
+| flake8 advisory, repo-wide | **470 — exactly baseline** |
+| flake8, new files, full standard | **clean** |
+| black `--check` | 245 would reformat — **exactly baseline** (repo is not black-formatted) |
+| isort `--check-only` | **100 files — one BELOW baseline (101)** |
+| Production frontend build (`craco build`) | **succeeds** |
+
+### Failure classification
+
+* **15 backend — ENVIRONMENTAL, PRE-EXISTING.**
+  `tests/test_entrypoint_log_level.py`, all `python: command not found` from
+  `docker/entrypoint.sh`: the host has `python3`, the container has `python`.
+  Verified by stashing the entire D6.4 diff and re-running — **15 failed, 5
+  passed**, identical.
+* **4 frontend — PRE-EXISTING.** `pages/__tests__/Landing.test.jsx`.
+  `Landing.jsx` is untouched by D6.4 (`git status` confirms).
+* **NEW REGRESSIONS: 0.**
+
+### Mutation testing — 15/15 killed
+
+Every claim above was checked by breaking the production code and requiring the
+suite to go red. Three mutations **survived the first pass**, and each exposed a
+real test defect, not a false alarm:
+
+* **M6** (auto-exit falls back to the broker name) survived because the fixture
+  had *no account to fall back to* — the test could not have failed. Rewritten
+  to seed a perfectly good account belonging to the trade's owner, so refusing
+  has to be a decision rather than an accident of there being nothing to find.
+* **M7** (tick re-mark scoped by broker) survived because both accounts held the
+  *same symbol*, and Mongo's `update_one` writes one document — so the second
+  account's row kept its old price and the test agreed with the bug. Rewritten
+  with different symbols in each account.
+* **M12** (disconnect clears every account of the broker) survived because the
+  test disconnected the *first* account, which an unscoped `update_one` happens
+  to hit anyway. Parametrized over both; the second case is the one that fails.
+
+---
+
+## 9. Live-broker verification
+
+**ARCHITECTURALLY VERIFIED. LIVE BROKER ACCOUNT VERIFICATION PENDING.**
+
+No independently authorized live brokerage account was available, and no *second*
+account at one broker existed to test against. Two distinct external accounts are
+represented in tests by two adapter responses carrying different `account_id`s —
+which is the exact input a real second account produces — but that is a hermetic
+substitute and is not evidence.
+
+**No real order was submitted anywhere.** The order path is exercised only to the
+gateway boundary, which is stubbed in every test.
+
+Not claimed: live multi-account isolation; that two real Zerodha accounts open
+two real sockets; that a real broker's client code is stable across a re-KYC.
+
+---
+
+## 10. Files changed
+
+**New (5)** — `backend/services/brokers/accounts.py`,
+`backend/services/brokers/account_migration.py`,
+`backend/tests/test_d64_identity.py`, `backend/tests/_accounts.py`,
+`frontend/src/lib/brokerAccounts.js`,
+`frontend/src/__tests__/brokerAccountsD64.test.jsx`.
+
+**Backend (10)** — `server.py`, `models.py`, `services/broker_engine.py`,
+`services/brokers/stream.py`, `services/brokers/market_feed.py`,
+`services/brokers/recovery.py`, `services/trading_engine.py`,
+`services/portfolio_stream.py`, `services/ai_context_builder.py`,
+`services/market_engine/source_manager.py`.
+
+**Frontend (2)** — `src/services/brokerService.js`, `src/pages/Settings.jsx`.
+
+**Tests updated (17)** — mechanically migrated to the account-addressed API;
+`conftest.py` gained a `broker_account` fixture.
+
+**D5 market-data semantics — unchanged.** The only D5 file touched is
+`source_manager.py`, and only its per-user *connected-broker registry* key.
+
+---
+
+## 11. Deferred, unchanged
+
+* **LIM-D6.2-6** (SessionStore.rotate TOCTOU), **`update_paper_balance`** lost
+  update, **`close_paper_trade`** double close, **process-local activity**,
+  **multi-worker scheduler**, **user fan-out caps**, **broker socket scaling**,
+  **in-memory decrypted-token lifetime** — all untouched, per the brief.
+* **`_record_order` duplicate-row/index issue** — *interacts* with D6.4 and is
+  recorded rather than fixed: the dedup key moved from
+  `(user_id, broker, order_id)` to `(broker_account_id, order_id)`, which is the
+  correct key (a broker order id is a per-account sequence). The missing **unique
+  index** on it is still absent, so the concurrent-upsert race D6.3 reproduced
+  remains open — narrower now, but open. See §12.
+
+---
+
+## 12. New limitations recorded
+
+* **LIM-D6.4-1 — no live second account.** See §9.
+* **LIM-D6.4-2 — `db.orders` still has no unique index on
+  `(broker_account_id, order_id)`.** The key is now correct; the constraint is
+  not there. Adding it is a migration (existing duplicates must be reconciled and
+  `_record_order` must handle `DuplicateKeyError`), which is the same reasoning
+  D6.3 recorded, one key narrower.
+* **LIM-D6.4-3 — Fyers may return no external account id.** Its `exchange_token`
+  takes `profile.get("account_id")` without hard-failing, unlike Angel One and
+  Dhan. Such an account links as `external_identity_verified: false` and adopts
+  the one unnamed account per broker. A user with *two* unnamed Fyers accounts
+  would be indistinguishable to the platform. Not fixed here because the fix is a
+  hard-fail in the Fyers adapter, which is a broker-behaviour change and belongs
+  with a live Fyers session to verify against.
+* **LIM-D6.4-4 — `users.preferred_broker` is still a broker name.** The
+  quick-trade path therefore resolves through the bridge and 409s for a user with
+  two accounts at their preferred broker. Correct (it refuses rather than
+  choosing) but not yet expressive: the field should become
+  `preferred_broker_account_id`. Deliberately out of scope — it is a settings-model
+  and UI change, not an identity-boundary one.
+* **LIM-D6.4-5 — the account lifecycle vocabulary is four states, not six.**
+  `BLOCKED` and `DELETED` from the brief are absent because nothing in this
+  codebase can enter or act on them today, and a state vocabulary with
+  unreachable members is one nobody can trust.
+
+---
+
+**D6.4 STATUS: COMPLETE.** Nothing committed. D6.5 not started.
 
 ---

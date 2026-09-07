@@ -29,6 +29,7 @@ from services.brokers.zerodha import parse_kite_binary
 from services.brokers.upstox import UpstoxAdapter
 from services.brokers.zerodha import ZerodhaAdapter
 from services.broker_engine import BrokerEngine
+from _accounts import account_doc, account_ref  # noqa: E402
 
 
 # ---------------------------------------------------------------- crypto
@@ -316,13 +317,13 @@ def test_engine_stores_tokens_encrypted(monkeypatch):
     uid = str(ObjectId())
     session = _fresh_session(engine.adapter("zerodha"))
 
-    asyncio.run(engine._save_account(uid, "zerodha", session))
+    asyncio.run(engine._save_session(account_ref(uid, "zerodha"), session))
 
     stored = engine.db.broker_accounts.docs[0]
     assert stored["access_token"] != "live-token"
     assert is_encrypted(stored["access_token"])
     # And the engine can read it back decrypted.
-    loaded = asyncio.run(engine._load_account(uid, "zerodha"))
+    loaded = asyncio.run(engine._load_session(account_ref(uid, "zerodha")))
     assert loaded["access_token"] == "live-token"
 
 
@@ -331,15 +332,19 @@ def test_engine_migrates_legacy_plaintext_tokens(monkeypatch):
     monkeypatch.setenv("KITE_API_SECRET", "s")
     engine = _engine_with_fakedb()
     uid = str(ObjectId())
-    # A pre-Sprint-7 record: plaintext token, no expires_at.
+    # A pre-Sprint-7 record: plaintext token, no expires_at. Carries the
+    # `broker_account_id` the D6.4 startup backfill assigns, because that
+    # migration runs before any session is loaded — see
+    # `services/brokers/account_migration.py` and
+    # `tests/test_d64_identity.py::test_the_backfill_assigns_one_id_per_legacy_account`.
     engine.db.broker_accounts.docs.append({
-        "user_id": uid, "broker": "zerodha",
+        **account_doc(uid, "zerodha"),
         "access_token": "legacy-plain", "public_token": "",
         "connected_at": datetime.now(timezone.utc).isoformat(),
         "profile": {"user_id": "AB1234"},
     })
 
-    loaded = asyncio.run(engine._load_account(uid, "zerodha"))
+    loaded = asyncio.run(engine._load_session(account_ref(uid, "zerodha")))
 
     assert loaded["access_token"] == "legacy-plain"
     stored = engine.db.broker_accounts.docs[0]
@@ -354,17 +359,21 @@ def test_engine_get_session_raises_when_expired(monkeypatch):
     uid = str(ObjectId())
     expired = _fresh_session(engine.adapter("zerodha"))
     expired["expires_at"] = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
-    asyncio.run(engine._save_account(uid, "zerodha", expired))
+    asyncio.run(engine._save_session(account_ref(uid, "zerodha"), expired))
     engine._sessions.clear()  # force a DB load
 
     with pytest.raises(BrokerAuthError):
-        asyncio.run(engine.get_session(uid, "zerodha"))
+        asyncio.run(engine.get_session(account_ref(uid, "zerodha")))
 
 
 def test_engine_get_session_raises_when_never_connected():
     engine = _engine_with_fakedb()
+    # A real, resolved account with no stored session: the account exists (the
+    # user linked it once) and holds no credential. That is what "never
+    # connected" now looks like — an account is a durable record, and having one
+    # is not the same as having a live session.
     with pytest.raises(BrokerAuthError):
-        asyncio.run(engine.get_session(str(ObjectId()), "upstox"))
+        asyncio.run(engine.get_session(account_ref(str(ObjectId()), "upstox")))
 
 
 def test_engine_place_order_writes_audit_log(monkeypatch):
@@ -372,11 +381,11 @@ def test_engine_place_order_writes_audit_log(monkeypatch):
     monkeypatch.setenv("KITE_API_SECRET", "s")
     engine = _engine_with_fakedb()
     uid = str(ObjectId())
-    asyncio.run(engine._save_account(uid, "zerodha", _fresh_session(engine.adapter("zerodha"))))
+    asyncio.run(engine._save_session(account_ref(uid, "zerodha"), _fresh_session(engine.adapter("zerodha"))))
 
     ok_payload = {"status": "success", "data": {"order_id": "Z9001"}}
     with patch.object(ZerodhaAdapter, "_request", new_callable=AsyncMock, return_value=ok_payload):
-        result = asyncio.run(engine.place_order(uid, "zerodha", {
+        result = asyncio.run(engine.place_order(account_ref(uid, "zerodha"), {
             "symbol": "INFY", "transaction_type": "BUY", "quantity": 1,
             "order_type": "MARKET", "product": "CNC",
         }))
@@ -398,7 +407,7 @@ def test_engine_status_reports_all_brokers(monkeypatch):
     monkeypatch.setenv("UPSTOX_REDIRECT_URL", "")
     engine = _engine_with_fakedb()
     uid = str(ObjectId())
-    asyncio.run(engine._save_account(uid, "zerodha", _fresh_session(engine.adapter("zerodha"))))
+    asyncio.run(engine._save_session(account_ref(uid, "zerodha"), _fresh_session(engine.adapter("zerodha"))))
 
     status = asyncio.run(engine.get_status(uid))
 
@@ -419,11 +428,11 @@ def test_engine_disconnect_clears_tokens(monkeypatch):
     monkeypatch.setenv("KITE_API_SECRET", "s")
     engine = _engine_with_fakedb()
     uid = str(ObjectId())
-    asyncio.run(engine._save_account(uid, "zerodha", _fresh_session(engine.adapter("zerodha"))))
+    asyncio.run(engine._save_session(account_ref(uid, "zerodha"), _fresh_session(engine.adapter("zerodha"))))
 
     with patch.object(ZerodhaAdapter, "_request", new_callable=AsyncMock,
                       return_value={"status": "success", "data": {}}):
-        result = asyncio.run(engine.disconnect("zerodha", uid))
+        result = asyncio.run(engine.disconnect(account_ref(uid, "zerodha")))
 
     assert result["success"] is True
     stored = engine.db.broker_accounts.docs[0]

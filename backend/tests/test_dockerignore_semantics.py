@@ -251,13 +251,29 @@ _SCRATCH_DOCKERFILE = "FROM scratch\nCOPY . /\n"
 
 
 def _docker_available() -> bool:
+    """True only when a Docker **daemon** is actually reachable with buildx.
+
+    `docker buildx version` is answered by the CLI plugin alone and succeeds
+    with the daemon stopped, so it was passing this guard on any machine where
+    Docker was installed but not running — the differential tests then ran and
+    failed at `docker buildx build` with a connection error. Sixteen tests
+    reported as failures what was really an absent dependency, contradicting
+    this module's own docstring ("they ... skip when no daemon is reachable")
+    and burying real regressions in noise on every developer laptop.
+
+    `docker info` is the cheapest command that requires the daemon to answer,
+    so both halves are now checked: the plugin exists AND something is
+    listening. A guard that models another tool's availability has to be
+    checked against that tool actually doing work, not against its CLI parsing
+    a subcommand.
+    """
     if shutil.which("docker") is None:
         return False
     try:
-        return subprocess.run(
-            ["docker", "buildx", "version"],
-            capture_output=True, timeout=60,
-        ).returncode == 0
+        for probe in (["docker", "buildx", "version"], ["docker", "info"]):
+            if subprocess.run(probe, capture_output=True, timeout=60).returncode != 0:
+                return False
+        return True
     except (OSError, subprocess.SubprocessError):
         return False
 

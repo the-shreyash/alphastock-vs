@@ -47,11 +47,16 @@ import asyncio
 import pathlib
 
 import pytest
+from _accounts import account_doc, account_ref, fixture_account_id  # noqa: E402
 from bson import ObjectId
 
 import server
 from server import create_access_token, ws_manager
 from services.broker_engine import broker_engine
+from services.brokers.accounts import (  # noqa: E402
+    broker_accounts,
+    is_broker_account_id,
+)
 from services.realtime import event_bridge as bridge
 
 BACKEND = pathlib.Path(__file__).resolve().parent.parent
@@ -486,18 +491,38 @@ class TestInMemoryStateIsOwnerKeyed:
             assert module._tick_allowed("user-b", now=1000.0) is True
             assert module._tick_allowed("user-a", now=1000.0) is False
 
-    def test_every_broker_engine_cache_is_keyed_by_owner_and_broker(self):
+    def test_every_broker_engine_cache_is_keyed_by_the_account(self):
         """§4 — `_sessions` and `_instrument_maps` hold decrypted broker sessions
-        and an account's instrument table. Keyed by `broker` alone, either one is
-        a cross-tenant read."""
-        broker_engine._sessions[("user-a", "zerodha")] = {"access_token": "A"}
-        broker_engine._instrument_maps[("user-a", "zerodha")] = object()
+        and an account's instrument table.
+
+        D6.3 required these to be keyed by `(user_id, broker)` rather than by
+        `broker` alone, which stopped a cross-*tenant* read. D6.4 narrows the key
+        again to `broker_account_id`, which stops a cross-*account* read the pair
+        could not: a user's two Zerodha accounts shared one entry, so the second
+        connect overwrote the first's decrypted session and the first account's
+        ticks were then named from the second account's instrument table.
+
+        The D6.3 property still holds and is stronger, not weaker: an account id
+        implies exactly one owner, so a key that is an account id cannot be
+        reached by another tenant either.
+        """
+        a_id = fixture_account_id("user-a", "zerodha")
+        b_id = fixture_account_id("user-b", "zerodha")
+        a_second_id = fixture_account_id("user-a", "zerodha", suffix="second")
+        broker_engine._sessions[a_id] = {"access_token": "A"}
+        broker_engine._instrument_maps[a_id] = object()
 
         for cache in (broker_engine._sessions, broker_engine._instrument_maps):
             for key in cache:
-                assert isinstance(key, tuple) and len(key) == 2, (
-                    f"{key!r} is not an (user_id, broker) pair")
-            assert cache.get(("user-b", "zerodha")) is None
+                assert is_broker_account_id(key), (
+                    f"{key!r} is not a broker_account_id — a broker name or a "
+                    f"(user, broker) pair here is an account that can be "
+                    f"overwritten by another")
+            # Another tenant's account: not reachable.
+            assert cache.get(b_id) is None
+            # The SAME tenant's SECOND account at the SAME broker: also not
+            # reachable, which is the half `(user_id, broker)` could not express.
+            assert cache.get(a_second_id) is None
 
 
 # =========================================================================== #
@@ -509,7 +534,8 @@ class TestBrokerIsolation:
     @staticmethod
     def _connect(fake_db, user, broker, token):
         fake_db.broker_accounts.docs.append({
-            "_id": ObjectId(), "user_id": str(user["_id"]), "broker": broker,
+            "_id": ObjectId(),
+            **account_doc(str(user["_id"]), broker),
             "access_token": token, "connected": True,
             "connected_at": "2026-09-04T04:00:00+00:00",
             "expires_at": "2099-01-01T00:00:00+00:00"})
@@ -537,9 +563,9 @@ class TestBrokerIsolation:
         """The D6-S3 shape: a caller with no session of their own reaching the
         one that happens to exist in the process."""
         self._connect(fake_db, test_user, "zerodha", "A-TOKEN")
-        _run(broker_engine.get_session(str(test_user["_id"]), "zerodha"))
+        _run(broker_engine.get_session(account_ref(str(test_user["_id"]), "zerodha")))
         assert ("A-TOKEN" ==
-                broker_engine._sessions[(str(test_user["_id"]), "zerodha")]["access_token"])
+                broker_engine._sessions[fixture_account_id(str(test_user["_id"]), "zerodha")]["access_token"])
 
         resp = client.get(path, headers=_headers(other_user))
         # 409 is the engine's "this account is not connected" answer. What must
@@ -559,14 +585,14 @@ class TestBrokerIsolation:
         uid = str(test_user["_id"])
 
         # Control: Zerodha resolves, and resolves to the Zerodha token.
-        session = _run(broker_engine.get_session(uid, "zerodha"))
+        session = _run(broker_engine.get_session(account_ref(uid, "zerodha")))
         assert session["access_token"] == "ZERODHA-TOKEN"
 
         # Upstox is not connected for this same user, and must say so rather than
         # falling through to the session that does exist.
         from services.brokers import BrokerAuthError
         with pytest.raises(BrokerAuthError):
-            _run(broker_engine.get_session(uid, "upstox"))
+            _run(broker_engine.get_session(account_ref(uid, "upstox")))
 
         status = client.get("/api/brokers/status", headers=_headers(test_user)).json()
         assert status["zerodha"]["connected"] is True
@@ -574,15 +600,48 @@ class TestBrokerIsolation:
 
     def test_the_engine_exposes_no_way_to_ask_without_an_owner(self):
         """D6.1 deleted `any_connected_session`. Asked for by name, because a
-        comment saying it is gone is not evidence."""
+        comment saying it is gone is not evidence.
+
+        D6.4 REPLACED `user_id` WITH SOMETHING STRICTER, NOT WEAKER.
+        ------------------------------------------------------------
+        Until D6.4 the invariant asserted here was "every broker call takes a
+        `user_id`". That is a *convention*: a caller could pass any string, and
+        nothing checked that the string owned the broker session that came back.
+
+        Every one of these methods now takes a `BrokerAccountRef`, and a ref is
+        obtainable from exactly one place — `BrokerAccountDirectory`, whose every
+        lookup filters by the owning `user_id`. The ownership check therefore
+        happens *before* a reference exists rather than inside each method, and
+        a caller cannot construct a reference to somebody else's account by
+        supplying the right-shaped argument. That is why this test now asserts
+        the parameter is `account` and separately asserts the ref carries an
+        owner: the two together are the property, and the first alone is not.
+        """
+        import inspect
+
         assert not hasattr(broker_engine, "any_connected_session")
         for name in ("get_holdings", "get_positions", "get_funds", "get_orders",
                      "get_trades", "get_profile", "get_margins", "place_order",
                      "modify_order", "cancel_order", "sync_orders",
-                     "sync_portfolio", "start_stream", "disconnect"):
-            import inspect
+                     "sync_portfolio", "start_stream", "disconnect",
+                     "get_session"):
             params = list(inspect.signature(getattr(broker_engine, name)).parameters)
-            assert "user_id" in params, f"{name} takes no user_id: {params}"
+            assert params and params[0] == "account", (
+                f"broker_engine.{name} is not account-addressed: {params}")
+
+        # The ref carries its owner, and the ownership predicate is on the type
+        # rather than re-derived at each call site.
+        ref = account_ref("user-a", "zerodha")
+        assert ref.user_id == "user-a"
+        assert ref.owned_by("user-a") and not ref.owned_by("user-b")
+
+        # And the ONLY constructor that reaches a database filters by owner. A
+        # directory method that took an account id alone would be the D6.4
+        # equivalent of `any_connected_session`.
+        for name in ("resolve", "list_for_user", "sole_for_broker"):
+            params = list(inspect.signature(getattr(broker_accounts, name)).parameters)
+            assert params[0] == "user_id", (
+                f"broker_accounts.{name} does not lead with the owner: {params}")
 
     def test_the_order_record_upsert_cannot_overwrite_another_users_row(
             self, fake_db, test_user, other_user):
@@ -591,8 +650,8 @@ class TestBrokerIsolation:
         up with two rows, not one that the second write stole."""
         broker_engine.db = fake_db
         order = {"order_id": "SAME-ID", "symbol": "RELIANCE", "status": "COMPLETE"}
-        _run(broker_engine._record_order(str(test_user["_id"]), "zerodha", dict(order)))
-        _run(broker_engine._record_order(str(other_user["_id"]), "zerodha",
+        _run(broker_engine._record_order(account_ref(str(test_user["_id"]), "zerodha"), dict(order)))
+        _run(broker_engine._record_order(account_ref(str(other_user["_id"]), "zerodha"),
                                          {**order, "symbol": "TCS"}))
 
         rows = fake_db.orders.docs
@@ -1083,14 +1142,22 @@ class TestOrderPathIsolation:
             self, client, fake_db, test_user, other_user, monkeypatch):
         """The submission is stubbed. Nothing here reaches a broker.
 
-        The property under test is that the `(user_id, broker)` pair the engine is
-        asked for comes from the token and from nothing in the request — not the
-        body, not a query parameter, not a header.
+        The property under test is that the ACCOUNT the engine is asked to place
+        into comes from the token and from nothing in the request — not the body,
+        not a query parameter, not a header. Since D6.4 the engine is handed a
+        resolved `BrokerAccountRef` rather than a `(user_id, broker)` pair, and
+        the ref carries the owner the directory resolved it for; a caller-supplied
+        id would show up here as a different `account.user_id`.
         """
+        # D6.4 — the caller must actually own a Zerodha account for the route to
+        # reach the engine at all. Seeded for `test_user` only: the victim has
+        # none, so a route that read the owner from the request would fail to
+        # resolve rather than silently succeed against the wrong account.
+        TestBrokerIsolation._connect(fake_db, test_user, "zerodha", "A-TOKEN")
         calls = []
 
-        async def _stub_place(user_id, broker, order):
-            calls.append((user_id, broker, dict(order)))
+        async def _stub_place(account, order):
+            calls.append((account.user_id, account.broker, dict(order)))
             return {"order_id": "STUB-1", "status": "PLACED"}
 
         monkeypatch.setattr(broker_engine, "place_order", _stub_place)
@@ -1149,11 +1216,13 @@ class TestOrderPathIsolation:
         which cannot touch A's order."""
         seen = []
 
-        async def _stub_cancel(user_id, broker, order_id):
-            seen.append((user_id, broker, order_id))
+        async def _stub_cancel(account, order_id):
+            seen.append((account.user_id, account.broker, order_id))
             return {"order_id": order_id, "status": "CANCELLED"}
 
         monkeypatch.setattr(broker_engine, "cancel_order", _stub_cancel)
+        # B owns a Zerodha account of their own; A's order id is passed to it.
+        TestBrokerIsolation._connect(fake_db, other_user, "zerodha", "B-TOKEN")
         client.delete("/api/brokers/zerodha/orders/A-ORDER-1", headers=_headers(other_user))
         assert seen == [(str(other_user["_id"]), "zerodha", "A-ORDER-1")]
         assert seen[0][0] != str(test_user["_id"])
@@ -1168,19 +1237,20 @@ class TestTeardown:
     def test_disconnecting_a_broker_forgets_the_session_and_the_instrument_map(
             self, fake_db, test_user, monkeypatch):
         uid = str(test_user["_id"])
+        account_id = fixture_account_id(uid, "zerodha")
         fake_db.broker_accounts.docs.append({
-            "_id": ObjectId(), "user_id": uid, "broker": "zerodha",
+            "_id": ObjectId(), **account_doc(uid, "zerodha"),
             "access_token": "A-TOKEN", "connected": True,
             "expires_at": "2099-01-01T00:00:00+00:00"})
         broker_engine.db = fake_db
-        _run(broker_engine.get_session(uid, "zerodha"))
-        broker_engine._instrument_maps[(uid, "zerodha")] = object()
-        assert (uid, "zerodha") in broker_engine._sessions      # positive control
+        _run(broker_engine.get_session(account_ref(uid, "zerodha")))
+        broker_engine._instrument_maps[account_id] = object()
+        assert account_id in broker_engine._sessions           # positive control
 
-        _run(broker_engine.disconnect("zerodha", uid))
+        _run(broker_engine.disconnect(account_ref(uid, "zerodha")))
 
-        assert (uid, "zerodha") not in broker_engine._sessions
-        assert (uid, "zerodha") not in broker_engine._instrument_maps
+        assert account_id not in broker_engine._sessions
+        assert account_id not in broker_engine._instrument_maps
         row = fake_db.broker_accounts.docs[0]
         assert not row.get("access_token"), "the decrypted token survived a disconnect"
 
@@ -1188,12 +1258,12 @@ class TestTeardown:
             self, super_admin_client, fake_db, other_user, monkeypatch):
         uid = str(other_user["_id"])
         fake_db.broker_accounts.docs.append({
-            "_id": ObjectId(), "user_id": uid, "broker": "zerodha",
+            "_id": ObjectId(), **account_doc(uid, "zerodha"),
             "access_token": "VICTIM-TOKEN", "connected": True})
         order = []
 
-        async def _stub_disconnect(broker, user_id):
-            order.append(("disconnect", user_id, broker))
+        async def _stub_disconnect(account):
+            order.append(("disconnect", account.user_id, account.broker))
             return {"ok": True}
 
         monkeypatch.setattr(broker_engine, "disconnect", _stub_disconnect)
@@ -1215,6 +1285,79 @@ class TestTeardown:
                                activity_logger.get_recent_activity("user-b")]
         assert private not in [e["action"] for e in
                                activity_logger.get_recent_activity(None)]
+
+    def test_a_signed_in_users_pattern_scan_is_not_announced_to_everyone(
+            self, client, fake_db, test_user, other_user):
+        """§13 / D6.3 CLOSURE — the entry describes a caller, not the market.
+
+        Found by the widened browser leg (LIM-D6.3-1), not by any hermetic test,
+        because it needs two accounts signed in at once to be visible at all: A
+        opened `/stock/PIDILITIND` in one Chrome profile and the line rendered on
+        B's dashboard in another, seconds later. `/stocks/{symbol}/patterns` was
+        writing to the broadcast stream, so the shared feed disclosed which
+        symbols every user was researching.
+
+        The symbol is public reference data — that was D6.1's reasoning and it is
+        still true. What is private is that *this account just looked at it*.
+
+        The assertion is on the SCOPE the entry lands in, not on the route's
+        status code, because the route answered 200 the whole time it was
+        leaking. `get_recent_activity(None)` is the platform stream as an
+        anonymous reader sees it: the one surface every tenant shares.
+        """
+        from services import activity_logger
+
+        activity_logger.reset_for_tests()
+        symbol = "PIDILITIND"
+        resp = client.get(f"/api/stocks/{symbol}/patterns", headers=_headers(test_user))
+        assert resp.status_code == 200, resp.text
+
+        def _actions(user_id):
+            return [e["action"] for e in activity_logger.get_recent_activity(user_id)]
+
+        owner = [a for a in _actions(str(test_user["_id"])) if symbol in a]
+        assert owner, (
+            "owner-positive control: the caller must still see their own scan. "
+            "Without this the test passes when the entry is dropped entirely, "
+            "which is not the fix.")
+        assert not [a for a in _actions(str(other_user["_id"])) if symbol in a], (
+            f"another signed-in user can see that this account scanned {symbol}")
+        assert not [a for a in _actions(None) if symbol in a], (
+            f"the shared platform stream announced that someone scanned {symbol}")
+
+    def test_an_anonymous_pattern_scan_still_reaches_the_platform_stream(self):
+        """Falsifying twin for the test above.
+
+        The fix is "log it to the caller", not "stop logging". An anonymous
+        visitor owns nothing and is not a tenant, so their scan keeps the
+        public behaviour D6.1 deliberately preserved for the backtest route.
+
+        Without this twin, deleting the logging call outright would make the
+        isolation test above pass — the exact shape of a negative test that
+        cannot fail.
+        """
+        from services import activity_logger
+
+        activity_logger.reset_for_tests()
+        symbol = "BERGEPAINT"
+        resp = client_module_anonymous().get(f"/api/stocks/{symbol}/patterns")
+        assert resp.status_code == 200, resp.text
+        assert [a for a in
+                (e["action"] for e in activity_logger.get_recent_activity(None))
+                if symbol in a], (
+            "an anonymous scan must still reach the shared stream; if this is "
+            "empty the logging call was removed rather than scoped")
+
+
+def client_module_anonymous():
+    """A TestClient with no credential attached.
+
+    A plain module-level helper rather than a fixture because the twin above
+    needs a client that has never been given a header, and the shared `client`
+    fixture is also used by tests that authenticate through it.
+    """
+    from fastapi.testclient import TestClient
+    return TestClient(server.app)
 
 
 # =========================================================================== #
@@ -1287,13 +1430,13 @@ class TestConcurrency:
         users = [str(ObjectId()) for _ in range(6)]
         for i, uid in enumerate(users):
             fake_db.broker_accounts.docs.append({
-                "_id": ObjectId(), "user_id": uid, "broker": "zerodha",
+                "_id": ObjectId(), **account_doc(uid, "zerodha"),
                 "access_token": f"TOKEN-{i}", "connected": True,
                 "expires_at": "2099-01-01T00:00:00+00:00"})
 
         async def _all():
             return await asyncio.gather(
-                *(broker_engine.get_session(uid, "zerodha") for uid in users))
+                *(broker_engine.get_session(account_ref(uid, "zerodha")) for uid in users))
 
         sessions = _run(_all())
         assert [s["access_token"] for s in sessions] == [f"TOKEN-{i}" for i in range(6)]

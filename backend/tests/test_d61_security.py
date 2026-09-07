@@ -38,6 +38,8 @@ from security.cookies import BROKER_OAUTH_STATE_COOKIE
 from server import create_access_token, ws_manager
 from services.broker_engine import broker_engine
 from services.realtime import event_bridge as bridge
+from _accounts import account_doc, account_ref, fixture_account_id  # noqa: E402
+from services.brokers.accounts import is_broker_account_id  # noqa: E402
 
 BACKEND = pathlib.Path(__file__).resolve().parent.parent
 POLICY_VIOLATION = 1008
@@ -373,7 +375,11 @@ class TestS2DataSources:
         wrong store finds nothing and passes for no reason.
         """
         fake_db.broker_accounts.docs.append({
-            "_id": ObjectId(), "user_id": str(user_id), "broker": "zerodha",
+            "_id": ObjectId(),
+            # D6.4 — a connected account carries its `broker_account_id`; the
+            # status read resolves through the directory, so a row without one
+            # is a row the platform cannot address.
+            **account_doc(str(user_id), "zerodha"),
             "connected": True, "access_token": token,
             "connected_at": "2026-01-01T00:00:00+00:00",
             "expires_at": "2099-01-01T00:00:00+00:00",
@@ -429,26 +435,43 @@ class TestS3NoImplicitBrokerSession:
         assert not hasattr(broker_engine, "any_connected_session")
 
     def test_every_public_data_and_order_method_demands_an_owner(self):
-        """The invariant that replaces the deleted method: `user_id` is the
-        FIRST positional parameter of every broker data and order call, so there
-        is no supported way to reach a broker without saying whose."""
+        """The invariant that replaces the deleted method.
+
+        D6.1 required `user_id` to be the FIRST positional parameter of every
+        broker data and order call, so there was no supported way to reach a
+        broker without saying whose. D6.4 replaced that with a stricter one: the
+        first parameter is a `BrokerAccountRef`, which carries its owner and can
+        only be obtained from the owner-filtered account directory. A caller can
+        no longer *assert* an owner by passing a string; it has to have been
+        given one.
+
+        Asserted here, in the D6.1 file, because this is the same invariant one
+        turn tighter and it must not be possible to loosen it back to a string
+        without a test in the security suite going red.
+        """
         import inspect
+
+        from services.brokers.accounts import BrokerAccountRef
 
         for name in ("get_profile", "get_holdings", "get_positions", "get_funds",
                      "get_margins", "get_orders", "get_trades", "place_order",
                      "modify_order", "cancel_order", "sync_orders", "sync_portfolio",
                      "get_session"):
-            params = list(inspect.signature(getattr(broker_engine, name)).parameters)
-            assert params[0] == "user_id", \
-                f"broker_engine.{name} does not take user_id first: {params}"
+            signature = inspect.signature(getattr(broker_engine, name))
+            params = list(signature.parameters)
+            assert params[0] == "account", \
+                f"broker_engine.{name} is not account-addressed: {params}"
+            annotation = signature.parameters["account"].annotation
+            assert annotation in (BrokerAccountRef, "BrokerAccountRef"), \
+                f"broker_engine.{name} does not take a BrokerAccountRef: {annotation}"
 
     def test_the_session_cache_is_keyed_by_owner_and_broker(self, fake_db):
         """A cache keyed on `broker` alone is the same defect in another shape."""
-        broker_engine._sessions[("user-a", "zerodha")] = {"access_token": "A"}
-        broker_engine._sessions[("user-b", "zerodha")] = {"access_token": "B"}
+        broker_engine._sessions[fixture_account_id("user-a", "zerodha")] = {"access_token": "A"}
+        broker_engine._sessions[fixture_account_id("user-b", "zerodha")] = {"access_token": "B"}
         try:
-            assert broker_engine._sessions[("user-a", "zerodha")]["access_token"] == "A"
-            assert broker_engine._sessions[("user-b", "zerodha")]["access_token"] == "B"
+            assert broker_engine._sessions[fixture_account_id("user-a", "zerodha")]["access_token"] == "A"
+            assert broker_engine._sessions[fixture_account_id("user-b", "zerodha")]["access_token"] == "B"
         finally:
             broker_engine._sessions.pop(("user-a", "zerodha"), None)
             broker_engine._sessions.pop(("user-b", "zerodha"), None)
@@ -456,14 +479,14 @@ class TestS3NoImplicitBrokerSession:
     def test_user_a_cannot_reach_user_bs_broker_session(self, fake_db):
         """A's connected Zerodha session exists; B asks the engine for one and is
         told they are not connected, rather than being handed A's."""
-        broker_engine._sessions[("user-a", "zerodha")] = {
+        broker_engine._sessions[fixture_account_id("user-a", "zerodha")] = {
             "access_token": "A-TOKEN", "expires_at": "2099-01-01T00:00:00+00:00"}
         try:
             from services.brokers.base import BrokerAuthError
 
-            assert _run(broker_engine.get_session("user-a", "zerodha"))["access_token"] == "A-TOKEN"
+            assert _run(broker_engine.get_session(account_ref("user-a", "zerodha")))["access_token"] == "A-TOKEN"
             with pytest.raises(BrokerAuthError):
-                _run(broker_engine.get_session("user-b", "zerodha"))
+                _run(broker_engine.get_session(account_ref("user-b", "zerodha")))
         finally:
             broker_engine._sessions.pop(("user-a", "zerodha"), None)
 
@@ -575,8 +598,10 @@ class TestS4ActivityFeed:
             "services/heartbeat_engine.py",
             "services/real_market.py",
             "services/scheduler.py",
-            # Reached only from endpoints that take no identity at all; each call
-            # site carries a comment saying so and what to do if that changes.
+            # Reached only from endpoints that take no identity at all, or from
+            # an `if caller_id: ... else:` fallback where the anonymous branch
+            # genuinely owns nothing; each call site carries a comment saying so
+            # and what to do if that changes.
             "services/ai_debate_engine.py",
             "server.py",
             # The module that defines it.
@@ -892,15 +917,15 @@ class TestS7DeletionRevokesBrokerCredentials:
         broker session and market feed on every restart, forever."""
         uid = str(other_user["_id"])
         fake_db.broker_accounts.docs.append(
-            {"_id": ObjectId(), "user_id": uid, "broker": "zerodha",
+            {"_id": ObjectId(), **account_doc(uid, "zerodha"),
              "connected": True, "access_token": "still-valid"})
 
         disconnected = []
 
-        async def _fake_disconnect(broker, user_id):
-            disconnected.append((broker, user_id))
+        async def _fake_disconnect(account):
+            disconnected.append((account.broker, account.user_id))
             for doc in fake_db.broker_accounts.docs:
-                if doc["user_id"] == user_id and doc["broker"] == broker:
+                if doc.get("broker_account_id") == account.broker_account_id:
                     doc.update({"connected": False, "access_token": ""})
             return {"success": True}
 
@@ -919,9 +944,9 @@ class TestS7DeletionRevokesBrokerCredentials:
         account undeletable — nor silently claim it succeeded."""
         uid = str(other_user["_id"])
         fake_db.broker_accounts.docs.append(
-            {"_id": ObjectId(), "user_id": uid, "broker": "zerodha", "connected": True})
+            {"_id": ObjectId(), **account_doc(uid, "zerodha"), "connected": True})
 
-        async def _boom(broker, user_id):
+        async def _boom(account):
             raise RuntimeError("broker unreachable")
 
         monkeypatch.setattr(broker_engine, "disconnect", _boom)
@@ -930,7 +955,11 @@ class TestS7DeletionRevokesBrokerCredentials:
 
         assert resp.status_code == 200
         assert not any(u["_id"] == other_user["_id"] for u in fake_db.users.docs)
-        assert "zerodha" in resp.json()["broker_errors"]
+        # D6.4 — reported per ACCOUNT, naming the broker. Keyed by broker alone
+        # it could not have described two accounts at one broker.
+        errors = resp.json()["broker_errors"]
+        assert [e["broker"] for e in errors.values()] == ["zerodha"]
+        assert all(is_broker_account_id(k) for k in errors)
 
     def test_deletion_revokes_every_session(
             self, super_admin_client, fake_db, other_user):

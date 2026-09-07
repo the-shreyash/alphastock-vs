@@ -78,6 +78,12 @@ from services.alpha_vantage import get_global_quote as av_get_quote, get_intrada
 # Legacy single-session Zerodha shim (data-sources status + startup log only).
 # All broker routes go through services.broker_engine (Sprint 7).
 from services.broker_engine import broker_engine
+from services.brokers.accounts import (
+    AmbiguousBrokerAccount,
+    UnknownBrokerAccount,
+    broker_accounts,
+    is_broker_account_id,
+)
 from services.brokers.base import BrokerAuthError, BrokerError
 from services.brokers.stream import stream_manager
 from services.scheduler import setup_scheduler
@@ -2087,15 +2093,38 @@ async def stock_chart(symbol: str, period: str = "1D"):
 
 
 @stocks_router.get("/{symbol}/patterns")
-async def stock_patterns(symbol: str):
-    """Detect classic chart patterns for a given symbol using 3 months of OHLCV data."""
+async def stock_patterns(symbol: str, user_id: Optional[str] = Depends(get_optional_user_id)):
+    """Detect classic chart patterns for a given symbol using 3 months of OHLCV data.
+
+    D6.3 (closure) — THE ENTRY DESCRIBES A CALLER, NOT THE MARKET.
+    -------------------------------------------------------------
+    D6.1 classified this scan line as platform scope on the grounds that the
+    route took no identity and the symbol it names is public reference data.
+    The first half was true and the conclusion did not follow: the entry exists
+    only because *somebody opened this symbol's detail page*, so publishing it
+    to the shared stream told every other signed-in user which symbols their
+    neighbours were researching.
+
+    Reproduced in two simultaneous real-Chrome profiles (LIM-D6.3-1 closure):
+    B's feed did not mention `PIDILITIND`; A opened `/stock/PIDILITIND`; B's
+    feed and B's rendered dashboard both named it seconds later, while a control
+    symbol nobody opened stayed absent throughout. The symbol is public; the
+    fact that this account just looked at it is not.
+
+    The route now takes the optional caller identity D6.1's own comment said it
+    would need, and follows the shape D6.1 already chose for the backtest route
+    (`run_backtest_route`) when it hit this same problem: an identified caller's
+    entry is theirs alone, while a genuinely anonymous visitor — who is not a
+    tenant and whose page view discloses no account's business — keeps the
+    public behaviour unchanged. Same defect, same remedy, one pattern.
+    """
+    from services.activity_logger import log_activity, log_platform_activity
     from services.real_market import detect_chart_patterns
-    # PLATFORM scope (D6.1 / S4): this route takes no identity at all and the
-    # symbol it names is public reference data the same endpoint returns. There
-    # is no user to own the entry. If this endpoint ever gains a caller
-    # identity, this must become the private logger and take their id.
-    from services.activity_logger import log_platform_activity
-    log_platform_activity(f"Scanning chart patterns for {symbol.upper()}", "scan", "done")
+    message = f"Scanning chart patterns for {symbol.upper()}"
+    if user_id:
+        log_activity(message, "scan", "done", user_id=user_id)
+    else:
+        log_platform_activity(message, "scan", "done")
     result = await detect_chart_patterns(symbol)
     return result
 
@@ -2358,10 +2387,18 @@ async def create_trade(data: TradeCreate, user: dict = Depends(get_current_user)
     # 2. Optional LIVE entry order via the Broker Engine (no simulation — a
     #    failed broker order never creates an OPEN trade).
     broker_order_id = None
-    if data.broker:
-        broker = _require_broker(data.broker)
+    broker_account = None
+    if data.broker_account_id:
+        # D6.4 — the client named an account. Resolved owner-scoped; the broker
+        # comes FROM the account rather than from a second client-supplied field,
+        # so a request cannot name one account and one brand and have them
+        # disagree.
+        broker_account = await _account(user, data.broker_account_id)
+    elif data.broker:
+        broker_account = await _sole_account(user, data.broker)
+    if broker_account is not None:
         try:
-            placed = await broker_engine.place_order(user["_id"], broker, {
+            placed = await broker_engine.place_order(broker_account, {
                 "symbol": data.symbol.upper(), "exchange": data.exchange,
                 "transaction_type": data.type, "quantity": data.quantity,
                 "order_type": data.order_type,
@@ -2406,12 +2443,21 @@ async def create_trade(data: TradeCreate, user: dict = Depends(get_current_user)
         "notes": data.notes,
         "setup_type": data.setup_type,
         "is_paper": data.is_paper,
-        "broker": data.broker,
+        # OWNER vs ACCOUNT OWNER (D6.4 / §14). `user_id` is who may read and act
+        # on this trade; `broker_account_id` is the brokerage account the entry
+        # order actually went to and the account a later auto-exit must return
+        # to. `broker` is now derived metadata — kept because history, reports
+        # and the UI read it, but it no longer identifies anything.
+        "broker": broker_account.broker if broker_account else data.broker,
+        "broker_account_id": (broker_account.broker_account_id
+                              if broker_account else None),
         "broker_order_id": broker_order_id,
         "product": data.product,
         "exchange": data.exchange,
-        # Live auto-exit needs explicit per-trade consent AND a broker link.
-        "auto_exit": bool(data.auto_exit and data.broker),
+        # Live auto-exit needs explicit per-trade consent AND a resolved broker
+        # ACCOUNT. Gated on the account rather than on the broker name: an exit
+        # that cannot say which account to sell in must not run.
+        "auto_exit": bool(data.auto_exit and broker_account is not None),
         "risk_check": {"warnings": check["warnings"], "metrics": check["metrics"],
                        "acknowledged": data.override_warnings},
     }
@@ -2754,12 +2800,18 @@ async def exit_trade(trade_id: str, data: TradeExitRequest, background_tasks: Ba
 
     broker_order_id = None
     if data.at_market:
-        if not trade.get("broker"):
+        # D6.4 — the exit returns to the ACCOUNT the entry was placed in, read
+        # off the trade itself. Routing by `trade["broker"]` would have sold the
+        # position in whichever account the bridge happened to resolve, which
+        # for a user with two accounts at one broker is a market order in the
+        # wrong brokerage account.
+        exit_account = await _trade_broker_account(user, trade)
+        if exit_account is None:
             raise HTTPException(status_code=400,
                                 detail="This trade is not linked to a broker — enter an exit price instead.")
         side = "BUY" if trade.get("type") == "SELL" else "SELL"
         try:
-            placed = await broker_engine.place_order(user["_id"], trade["broker"], {
+            placed = await broker_engine.place_order(exit_account, {
                 "symbol": trade["symbol"], "exchange": trade.get("exchange", "NSE"),
                 "transaction_type": side, "quantity": quantity,
                 "order_type": "MARKET", "product": trade.get("product") or "CNC",
@@ -4504,6 +4556,88 @@ def _require_broker(broker: str) -> str:
     return broker
 
 
+# ---------------------------------------------------------------------------
+# Account resolution (D6.4)
+# ---------------------------------------------------------------------------
+# Two helpers, and the difference between them is the whole of this sprint's
+# routing rule.
+#
+# `_account(user, broker_account_id)` is the ACCOUNT-ADDRESSED path. The client
+# named an account; the directory resolves it filtered by the authenticated
+# user, so an id belonging to somebody else does not resolve. The 404 is
+# identical for "no such account" and "not yours" on purpose — an ownership
+# failure is not a debugging surface (the same rule D6.1 applied to the broker
+# OAuth callback).
+#
+# `_sole_account(user, broker)` is the BROKER-ADDRESSED bridge that keeps the
+# pre-D6.4 routes and the existing frontend working. It resolves the
+# unambiguous case and **409s when the user holds more than one account at that
+# broker**. It never picks. "First connected", "last connected" and "any
+# connected" are the semantics D6.4 exists to remove, and a bridge that quietly
+# chose would reintroduce all three under a different name.
+
+#: Told to a client whose broker-addressed request can no longer be answered by
+#: a broker name alone. Names the account ids so the caller can retry correctly.
+BROKER_ACCOUNT_AMBIGUOUS = (
+    "You have more than one {broker} account connected. "
+    "Address this request to a specific broker_account_id."
+)
+
+
+async def _account(user: dict, broker_account_id: str):
+    """The authenticated user's account with this id, or 404."""
+    if not is_broker_account_id(broker_account_id):
+        raise HTTPException(status_code=404, detail="Broker account not found")
+    try:
+        return await broker_engine.resolve_account(str(user["_id"]), broker_account_id)
+    except UnknownBrokerAccount:
+        raise HTTPException(status_code=404, detail="Broker account not found")
+
+
+async def _sole_account(user: dict, broker: str):
+    """The user's single account at `broker`. 404 if none, 409 if several."""
+    broker = _require_broker(broker)
+    try:
+        account = await broker_engine.account_for_broker(str(user["_id"]), broker)
+    except AmbiguousBrokerAccount:
+        raise HTTPException(
+            status_code=409,
+            detail=BROKER_ACCOUNT_AMBIGUOUS.format(broker=broker))
+    if account is None:
+        # BrokerAuthError, not a bare 404. "You have no account at this broker"
+        # and "your account's token died" are the same thing to a caller — both
+        # mean *connect your broker* — and the app's handler already maps this
+        # exception to 409 with a reconnect message. A 404 here would have been a
+        # new status code on an existing contract, and the frontend interceptor
+        # branches on 409 (see the handler above `app = FastAPI(...)`).
+        from services.brokers import broker_registry
+
+        adapter = broker_registry.get(broker)
+        raise BrokerAuthError(
+            f"{adapter.display_name if adapter else broker} is not connected. "
+            "Connect your account in Settings.")
+    return account
+
+
+async def _trade_broker_account(user: dict, trade: dict):
+    """The brokerage account a stored trade's live orders belong to.
+
+    Prefers the `broker_account_id` recorded on the trade. Falls back to the
+    broker-name bridge only for a legacy row the D6.4 migration could not stamp
+    — and the bridge refuses when it is ambiguous, so the fallback can produce
+    the right account or an error, never a guess.
+
+    Returns None when the trade has no broker link at all, which is the manual
+    and paper case and is not an error.
+    """
+    account_id = trade.get("broker_account_id")
+    if account_id:
+        return await _account(user, account_id)
+    if trade.get("broker"):
+        return await _sole_account(user, trade["broker"])
+    return None
+
+
 def _frontend_base() -> str:
     base = os.environ.get("FRONTEND_URL")
     if not base:
@@ -4513,15 +4647,162 @@ def _frontend_base() -> str:
 
 @brokers_router.get("")
 async def brokers_list(user: dict = Depends(get_current_user)):
-    """Supported brokers + this user's connection status for each."""
+    """Supported brokers + this user's accounts and per-broker status.
+
+    `status` is the pre-D6.4 per-broker view, kept because the frontend and the
+    legacy clients read it. `accounts` is the D6.4 view and is the one that can
+    represent reality: one record per authorized brokerage account, each naming
+    its `broker_account_id`. When a user holds several accounts at one broker the
+    per-broker record reports `ambiguous: true` and a null `broker_account_id`
+    rather than inventing a single answer.
+    """
     return {
         "brokers": broker_engine.list_brokers(),
         "status": await broker_engine.get_status(str(user["_id"])),
+        "accounts": await broker_engine.account_statuses(str(user["_id"])),
     }
 
 @brokers_router.get("/status")
 async def brokers_status(user: dict = Depends(get_current_user)):
     return await broker_engine.get_status(str(user["_id"]))
+
+
+# ---------------------------------------------------------------------------
+# Account-addressed broker routes (D6.4)
+# ---------------------------------------------------------------------------
+# Every one resolves `{broker_account_id}` through `_account`, which filters by
+# the authenticated user. There is no route that takes an account id alone.
+#
+# These are registered BEFORE `/{broker}/...` so `accounts` is never captured as
+# a broker name — `_require_broker` would 404 it, but relying on that would make
+# the routing order load-bearing in the wrong direction.
+
+@brokers_router.get("/accounts")
+async def broker_accounts_list(user: dict = Depends(get_current_user)):
+    """Every brokerage account this user has authorized."""
+    return {"accounts": await broker_engine.account_statuses(str(user["_id"]))}
+
+
+@brokers_router.get("/accounts/{broker_account_id}")
+async def broker_account_detail(broker_account_id: str,
+                                user: dict = Depends(get_current_user)):
+    account = await _account(user, broker_account_id)
+    for entry in await broker_engine.account_statuses(str(user["_id"])):
+        if entry["broker_account_id"] == account.broker_account_id:
+            return entry
+    return account.public_dict()
+
+
+@brokers_router.post("/accounts/{broker_account_id}/disconnect")
+async def broker_account_disconnect(broker_account_id: str,
+                                    user: dict = Depends(get_current_user)):
+    account = await _account(user, broker_account_id)
+    result = await broker_engine.disconnect(account)
+    await _sync_legacy_broker_flag(str(user["_id"]), account.broker)
+    return result
+
+
+@brokers_router.post("/accounts/{broker_account_id}/sync")
+async def broker_account_sync(broker_account_id: str,
+                              user: dict = Depends(get_current_user)):
+    return await broker_engine.sync_portfolio(await _account(user, broker_account_id))
+
+
+@brokers_router.get("/accounts/{broker_account_id}/profile")
+async def broker_account_profile(broker_account_id: str,
+                                 user: dict = Depends(get_current_user)):
+    return await broker_engine.get_profile(await _account(user, broker_account_id))
+
+
+@brokers_router.get("/accounts/{broker_account_id}/holdings")
+async def broker_account_holdings(broker_account_id: str,
+                                  user: dict = Depends(get_current_user)):
+    account = await _account(user, broker_account_id)
+    return {"broker": account.broker, "broker_account_id": account.broker_account_id,
+            "holdings": await broker_engine.get_holdings(account)}
+
+
+@brokers_router.get("/accounts/{broker_account_id}/positions")
+async def broker_account_positions(broker_account_id: str,
+                                   user: dict = Depends(get_current_user)):
+    account = await _account(user, broker_account_id)
+    return {"broker": account.broker, "broker_account_id": account.broker_account_id,
+            "positions": await broker_engine.get_positions(account)}
+
+
+@brokers_router.get("/accounts/{broker_account_id}/funds")
+async def broker_account_funds(broker_account_id: str,
+                               user: dict = Depends(get_current_user)):
+    account = await _account(user, broker_account_id)
+    return {"broker": account.broker, "broker_account_id": account.broker_account_id,
+            "funds": await broker_engine.get_funds(account)}
+
+
+@brokers_router.get("/accounts/{broker_account_id}/margins")
+async def broker_account_margins(broker_account_id: str,
+                                 user: dict = Depends(get_current_user)):
+    account = await _account(user, broker_account_id)
+    return {"broker": account.broker, "broker_account_id": account.broker_account_id,
+            "margins": await broker_engine.get_margins(account)}
+
+
+@brokers_router.get("/accounts/{broker_account_id}/orders")
+async def broker_account_orders(broker_account_id: str,
+                                user: dict = Depends(get_current_user)):
+    account = await _account(user, broker_account_id)
+    return {"broker": account.broker, "broker_account_id": account.broker_account_id,
+            "orders": await broker_engine.get_orders(account)}
+
+
+@brokers_router.get("/accounts/{broker_account_id}/trades")
+async def broker_account_trades(broker_account_id: str,
+                                user: dict = Depends(get_current_user)):
+    account = await _account(user, broker_account_id)
+    return {"broker": account.broker, "broker_account_id": account.broker_account_id,
+            "trades": await broker_engine.get_trades(account)}
+
+
+@brokers_router.post("/accounts/{broker_account_id}/orders")
+async def broker_account_place_order(broker_account_id: str, order: BrokerOrderCreate,
+                                     user: dict = Depends(get_current_user)):
+    """Place a LIVE order in ONE named brokerage account (no simulation)."""
+    account = await _account(user, broker_account_id)
+    return await broker_engine.place_order(account, order.model_dump(exclude_none=True))
+
+
+@brokers_router.patch("/accounts/{broker_account_id}/orders/{order_id}")
+async def broker_account_modify_order(broker_account_id: str, order_id: str,
+                                      changes: BrokerOrderModify,
+                                      user: dict = Depends(get_current_user)):
+    account = await _account(user, broker_account_id)
+    return await broker_engine.modify_order(account, order_id,
+                                            changes.model_dump(exclude_none=True))
+
+
+@brokers_router.delete("/accounts/{broker_account_id}/orders/{order_id}")
+async def broker_account_cancel_order(broker_account_id: str, order_id: str,
+                                      user: dict = Depends(get_current_user)):
+    return await broker_engine.cancel_order(
+        await _account(user, broker_account_id), order_id)
+
+
+async def _sync_legacy_broker_flag(user_id: str, broker: str) -> None:
+    """Keep `users.{broker}_connected` true while ANY account there is live.
+
+    The flag predates D6.4 and is read by older surfaces. It was written as a
+    plain boolean on connect and disconnect, which with two accounts at one
+    broker meant disconnecting either one told the rest of the platform the
+    broker was gone. Recomputed from the directory instead of assigned.
+    """
+    try:
+        accounts = await broker_engine.account_statuses(user_id)
+    except Exception as e:  # pragma: no cover - best effort bookkeeping
+        logger.warning("Could not refresh the %s connected flag for %s: %s",
+                       broker, user_id, e)
+        return
+    connected = any(a["broker"] == broker and a.get("connected") for a in accounts)
+    await db.users.update_one({"_id": ObjectId(user_id)},
+                              {"$set": {f"{broker}_connected": connected}})
 
 # ---------------------------------------------------------------------------
 # Broker OAuth ownership (D6.1 / S1 — was CRITICAL)
@@ -4598,8 +4879,14 @@ async def broker_session(broker: str, request: Request, user: dict = Depends(get
     result = await broker_engine.complete_auth(broker, str(user["_id"]), body)
     await db.users.update_one({"_id": ObjectId(user["_id"])},
                               {"$set": {f"{broker}_connected": True}})
-    # Never return tokens to the browser — profile + sync summary only.
-    return {"success": True, "broker": broker, "profile": result.get("profile", {}),
+    # Never return tokens to the browser — profile + sync summary only. The
+    # `broker_account_id` IS returned: it is an opaque internal handle the client
+    # needs in order to address the account it just linked, and it carries no
+    # credential (D6.4).
+    return {"success": True, "broker": broker,
+            "broker_account_id": result.get("broker_account_id"),
+            "account": result.get("account"),
+            "profile": result.get("profile", {}),
             "sync": (result.get("sync") or {}).get("summary")}
 
 #: The one outcome every S1 rejection reports. Deliberately identical for a
@@ -4695,70 +4982,84 @@ async def broker_oauth_callback(broker: str, request: Request):
         logger.error(f"{broker} OAuth callback failed: {e}")
         return _finish(f"status=failed&error={message}")
 
+# ---------------------------------------------------------------------------
+# Broker-addressed routes — the D6.4 compatibility bridge
+# ---------------------------------------------------------------------------
+# Every one resolves through `_sole_account`, which answers only when the user
+# has exactly one account at that broker and 409s otherwise. They are kept, not
+# deprecated-and-broken, because they are what the shipped frontend and every
+# existing integration call — and because for a user with one account per broker
+# (which is every user today) the answer is unambiguous and identical to what it
+# has always been.
+
 @brokers_router.post("/{broker}/disconnect")
 async def broker_disconnect(broker: str, user: dict = Depends(get_current_user)):
-    broker = _require_broker(broker)
-    result = await broker_engine.disconnect(broker, str(user["_id"]))
-    await db.users.update_one({"_id": ObjectId(user["_id"])},
-                              {"$set": {f"{broker}_connected": False}})
+    account = await _sole_account(user, broker)
+    result = await broker_engine.disconnect(account)
+    await _sync_legacy_broker_flag(str(user["_id"]), account.broker)
     return result
 
 @brokers_router.post("/{broker}/sync")
 async def broker_sync(broker: str, user: dict = Depends(get_current_user)):
     """Full portfolio sync: holdings + positions + funds persisted to Mongo."""
-    return await broker_engine.sync_portfolio(str(user["_id"]), _require_broker(broker))
+    return await broker_engine.sync_portfolio(await _sole_account(user, broker))
 
 @brokers_router.get("/{broker}/profile")
 async def broker_profile(broker: str, user: dict = Depends(get_current_user)):
-    return await broker_engine.get_profile(str(user["_id"]), _require_broker(broker))
+    return await broker_engine.get_profile(await _sole_account(user, broker))
 
 @brokers_router.get("/{broker}/holdings")
 async def broker_holdings(broker: str, user: dict = Depends(get_current_user)):
-    return {"broker": broker, "holdings": await broker_engine.get_holdings(str(user["_id"]), _require_broker(broker))}
+    return {"broker": broker, "holdings": await broker_engine.get_holdings(await _sole_account(user, broker))}
 
 @brokers_router.get("/{broker}/positions")
 async def broker_positions(broker: str, user: dict = Depends(get_current_user)):
-    return {"broker": broker, "positions": await broker_engine.get_positions(str(user["_id"]), _require_broker(broker))}
+    return {"broker": broker, "positions": await broker_engine.get_positions(await _sole_account(user, broker))}
 
 @brokers_router.get("/{broker}/funds")
 async def broker_funds(broker: str, user: dict = Depends(get_current_user)):
-    return {"broker": broker, "funds": await broker_engine.get_funds(str(user["_id"]), _require_broker(broker))}
+    return {"broker": broker, "funds": await broker_engine.get_funds(await _sole_account(user, broker))}
 
 @brokers_router.get("/{broker}/margins")
 async def broker_margins(broker: str, user: dict = Depends(get_current_user)):
-    return {"broker": broker, "margins": await broker_engine.get_margins(str(user["_id"]), _require_broker(broker))}
+    return {"broker": broker, "margins": await broker_engine.get_margins(await _sole_account(user, broker))}
 
 @brokers_router.get("/{broker}/orders")
 async def broker_orders(broker: str, user: dict = Depends(get_current_user)):
-    return {"broker": broker, "orders": await broker_engine.get_orders(str(user["_id"]), _require_broker(broker))}
+    return {"broker": broker, "orders": await broker_engine.get_orders(await _sole_account(user, broker))}
 
 @brokers_router.get("/{broker}/trades")
 async def broker_trades(broker: str, user: dict = Depends(get_current_user)):
     """Executed trade history for the day (official broker trade book)."""
-    return {"broker": broker, "trades": await broker_engine.get_trades(str(user["_id"]), _require_broker(broker))}
+    return {"broker": broker, "trades": await broker_engine.get_trades(await _sole_account(user, broker))}
 
 @brokers_router.post("/{broker}/orders")
 async def broker_place_order(broker: str, order: BrokerOrderCreate, user: dict = Depends(get_current_user)):
-    """Place a LIVE order via the official broker API (no simulation)."""
-    broker = _require_broker(broker)
+    """Place a LIVE order via the official broker API (no simulation).
+
+    Refuses with 409 when the user holds more than one account at this broker
+    rather than choosing one. An order is the request where "we picked for you"
+    is least acceptable, and it is the reason the bridge fails closed everywhere
+    instead of only here.
+    """
+    account = await _sole_account(user, broker)
     payload = order.model_dump(exclude_none=True)
     # The product default comes from the adapter (`BrokerGateway.place_order`),
     # not from a broker name in this route. The expression here used to be
     # `"CNC" if broker == "zerodha" else "D"`, which named a broker in a core
     # route AND silently handed Upstox's product code to every broker added
     # after it.
-    return await broker_engine.place_order(str(user["_id"]), broker, payload)
+    return await broker_engine.place_order(account, payload)
 
 @brokers_router.patch("/{broker}/orders/{order_id}")
 async def broker_modify_order(broker: str, order_id: str, changes: BrokerOrderModify,
                               user: dict = Depends(get_current_user)):
-    broker = _require_broker(broker)
-    return await broker_engine.modify_order(str(user["_id"]), broker, order_id,
+    return await broker_engine.modify_order(await _sole_account(user, broker), order_id,
                                             changes.model_dump(exclude_none=True))
 
 @brokers_router.delete("/{broker}/orders/{order_id}")
 async def broker_cancel_order(broker: str, order_id: str, user: dict = Depends(get_current_user)):
-    return await broker_engine.cancel_order(str(user["_id"]), _require_broker(broker), order_id)
+    return await broker_engine.cancel_order(await _sole_account(user, broker), order_id)
 
 
 # ============ UNIFIED ORDER HISTORY (Sprint 9) ============
@@ -4770,26 +5071,44 @@ orders_router = APIRouter(prefix="/api/orders", tags=["Orders"])
 
 @orders_router.get("")
 async def unified_orders(user: dict = Depends(get_current_user),
-                         broker: Optional[str] = None, refresh: bool = False):
-    """Unified order history. `refresh=true` re-syncs the live order book from
-    every connected broker first (best-effort — a broker outage never hides
-    the locally recorded history)."""
+                         broker: Optional[str] = None,
+                         broker_account_id: Optional[str] = None,
+                         refresh: bool = False):
+    """Unified order history across every account this user owns.
+
+    Always filtered by `user_id` — that is the ownership boundary and it has not
+    moved. `broker_account_id` narrows it to one brokerage account (D6.4);
+    `broker` narrows it to one brand, which may now span several accounts.
+
+    `refresh=true` re-syncs the live order book from every connected *account*
+    first (best-effort — a broker outage never hides the locally recorded
+    history).
+    """
     user_id = str(user["_id"])
     sync_errors = {}
     if refresh:
-        statuses = await broker_engine.get_status(user_id)
-        for name, status in statuses.items():
-            if broker and name != broker:
+        # D6.4 — iterate ACCOUNTS, not brokers. The per-broker loop synced one
+        # order book per brand, so a user with two accounts at one broker had one
+        # of them silently never refreshed.
+        for entry in await broker_engine.account_statuses(user_id):
+            if broker and entry["broker"] != broker:
                 continue
-            if not status.get("connected"):
+            if broker_account_id and entry["broker_account_id"] != broker_account_id:
+                continue
+            if not entry.get("connected"):
                 continue
             try:
-                await broker_engine.sync_orders(user_id, name)
-            except BrokerError as e:
-                sync_errors[name] = e.user_message
+                account = await broker_engine.resolve_account(
+                    user_id, entry["broker_account_id"])
+                await broker_engine.sync_orders(account)
+            except (BrokerError, UnknownBrokerAccount) as e:
+                sync_errors[entry["broker_account_id"]] = getattr(
+                    e, "user_message", "sync failed")
     query = {"user_id": user_id}
     if broker:
         query["broker"] = broker
+    if broker_account_id:
+        query["broker_account_id"] = broker_account_id
     docs = await db.orders.find(query).sort("placed_at", -1).to_list(200)
     for d in docs:
         d["_id"] = str(d["_id"])
@@ -4805,8 +5124,16 @@ async def zerodha_status(user: dict = Depends(get_current_user)):
     return (await broker_engine.get_status(str(user["_id"])))["zerodha"]
 
 @zerodha_router.get("/login-url")
-async def zerodha_login(user: dict = Depends(get_current_user)):
-    return broker_engine.get_login_url("zerodha", str(user["_id"]))
+async def zerodha_login(response: Response, user: dict = Depends(get_current_user)):
+    """Legacy alias. Mints the same bound state the D6.1 route does.
+
+    It used to call `get_login_url("zerodha", str(user["_id"]))` — passing the
+    app's user id into the adapter's `state` parameter, which put it on the wire
+    as `redirect_params=state=<user id>`. That is the very shape D6.1 removed;
+    the parameter had merely been renamed. It now issues a real opaque state and
+    plants the cookie, by delegating to the hardened route.
+    """
+    return await broker_login_url("zerodha", response, user)
 
 @zerodha_router.post("/session")
 async def zerodha_session(request: Request, user: dict = Depends(get_current_user)):
@@ -4825,14 +5152,14 @@ async def zerodha_session(request: Request, user: dict = Depends(get_current_use
 @zerodha_router.get("/holdings")
 async def zerodha_holdings(user: dict = Depends(get_current_user)):
     try:
-        return {"source": "zerodha", "holdings": await broker_engine.get_holdings(str(user["_id"]), "zerodha")}
+        return {"source": "zerodha", "holdings": await broker_engine.get_holdings(await _sole_account(user, "zerodha"))}
     except BrokerAuthError as e:
         return {"source": "zerodha", "holdings": [], "error": e.user_message}
 
 @zerodha_router.get("/positions")
 async def zerodha_positions(user: dict = Depends(get_current_user)):
     try:
-        positions = await broker_engine.get_positions(str(user["_id"]), "zerodha")
+        positions = await broker_engine.get_positions(await _sole_account(user, "zerodha"))
         return {"source": "zerodha", "net": positions, "day": []}
     except BrokerAuthError as e:
         return {"source": "zerodha", "net": [], "day": [], "error": e.user_message}
@@ -4841,7 +5168,7 @@ async def zerodha_positions(user: dict = Depends(get_current_user)):
 async def zerodha_order(request: Request, user: dict = Depends(get_current_user)):
     body = await request.json()
     try:
-        result = await broker_engine.place_order(str(user["_id"]), "zerodha", {
+        result = await broker_engine.place_order(await _sole_account(user, "zerodha"), {
             "symbol": body["symbol"],
             "transaction_type": body.get("transaction_type", "BUY"),
             "quantity": body["quantity"],
@@ -4857,7 +5184,7 @@ async def zerodha_order(request: Request, user: dict = Depends(get_current_user)
 @zerodha_router.delete("/order/{order_id}")
 async def zerodha_cancel(order_id: str, user: dict = Depends(get_current_user)):
     try:
-        result = await broker_engine.cancel_order(str(user["_id"]), "zerodha", order_id)
+        result = await broker_engine.cancel_order(await _sole_account(user, "zerodha"), order_id)
         return {"source": "zerodha", "status": "success", "order_id": result.get("order_id")}
     except BrokerError as e:
         return {"source": "zerodha", "status": "ERROR", "message": e.user_message}
@@ -4865,7 +5192,7 @@ async def zerodha_cancel(order_id: str, user: dict = Depends(get_current_user)):
 @zerodha_router.get("/funds")
 async def zerodha_funds(user: dict = Depends(get_current_user)):
     try:
-        funds = await broker_engine.get_funds(str(user["_id"]), "zerodha")
+        funds = await broker_engine.get_funds(await _sole_account(user, "zerodha"))
         # Legacy aliases used by the Portfolio page.
         return {"source": "zerodha", **funds,
                 "available": funds.get("available_margin"),
@@ -4878,7 +5205,7 @@ async def zerodha_funds(user: dict = Depends(get_current_user)):
 @zerodha_router.get("/profile")
 async def zerodha_profile(user: dict = Depends(get_current_user)):
     try:
-        profile = await broker_engine.get_profile(str(user["_id"]), "zerodha")
+        profile = await broker_engine.get_profile(await _sole_account(user, "zerodha"))
         return {"source": "zerodha", **profile, "user_id": profile.get("account_id", "")}
     except BrokerAuthError as e:
         return {"source": "zerodha", "user_name": "Not Connected", "user_id": "", "error": e.user_message}
@@ -4886,7 +5213,7 @@ async def zerodha_profile(user: dict = Depends(get_current_user)):
 @zerodha_router.get("/orders")
 async def zerodha_orders(user: dict = Depends(get_current_user)):
     try:
-        return {"source": "zerodha", "orders": await broker_engine.get_orders(str(user["_id"]), "zerodha")}
+        return {"source": "zerodha", "orders": await broker_engine.get_orders(await _sole_account(user, "zerodha"))}
     except BrokerAuthError as e:
         return {"source": "zerodha", "orders": [], "error": e.user_message}
 
@@ -4900,10 +5227,11 @@ async def zerodha_account(user: dict = Depends(get_current_user)):
                 "holdings": {"holdings": []}, "positions": {"net": [], "day": []},
                 "status": status}
     try:
-        profile = await broker_engine.get_profile(user_id, "zerodha")
-        funds = await broker_engine.get_funds(user_id, "zerodha")
-        holdings = await broker_engine.get_holdings(user_id, "zerodha")
-        positions = await broker_engine.get_positions(user_id, "zerodha")
+        account = await _sole_account(user, "zerodha")
+        profile = await broker_engine.get_profile(account)
+        funds = await broker_engine.get_funds(account)
+        holdings = await broker_engine.get_holdings(account)
+        positions = await broker_engine.get_positions(account)
     except BrokerError as e:
         return {"profile": {"error": e.user_message}, "funds": None,
                 "holdings": {"holdings": []}, "positions": {"net": [], "day": []},
@@ -4934,7 +5262,7 @@ async def zerodha_quick_trade(request: Request, user: dict = Depends(get_current
 
     # Place LIVE order on Zerodha via the Broker Engine (no simulation)
     try:
-        placed = await broker_engine.place_order(str(user["_id"]), "zerodha", {
+        placed = await broker_engine.place_order(await _sole_account(user, "zerodha"), {
             "symbol": symbol, "transaction_type": "BUY", "quantity": qty,
             "price": entry, "order_type": "LIMIT", "product": "MIS", "exchange": "NSE",
         })
@@ -4996,16 +5324,19 @@ async def zerodha_emergency_stop(user: dict = Depends(get_current_user)):
         from services.email_service import send_notification as send_email_notif, is_configured as email_configured
         from services.telegram_service import send_notification as send_tg_notif, is_configured as tg_configured
 
-        user_id = str(user["_id"])
         now_str = datetime.now(timezone.utc).isoformat()
 
-        # 1. Cancel all open orders (per-user, via the Broker Engine)
+        # 1. Cancel all open orders (per-ACCOUNT, via the Broker Engine).
+        #    Resolved once and reused, so every cancel and every liquidation
+        #    below targets the same account. Re-resolving per iteration would be
+        #    a second chance to land somewhere else.
+        zerodha_account = await _sole_account(user, "zerodha")
         cancelled_count = 0
         try:
-            for o in await broker_engine.get_orders(user_id, "zerodha"):
+            for o in await broker_engine.get_orders(zerodha_account):
                 if o.get("status") in ("OPEN", "PENDING", "PARTIALLY_FILLED"):
                     try:
-                        await broker_engine.cancel_order(user_id, "zerodha", o["order_id"])
+                        await broker_engine.cancel_order(zerodha_account, o["order_id"])
                         cancelled_count += 1
                     except BrokerError as e:
                         logger.error(f"Emergency stop: cancel {o['order_id']} failed: {e}")
@@ -5015,11 +5346,11 @@ async def zerodha_emergency_stop(user: dict = Depends(get_current_user)):
         # 2. Liquidate active open positions at market
         liquidated_count = 0
         try:
-            for pos in await broker_engine.get_positions(user_id, "zerodha"):
+            for pos in await broker_engine.get_positions(zerodha_account):
                 qty = pos.get("quantity", 0)
                 if qty != 0:
                     try:
-                        await broker_engine.place_order(user_id, "zerodha", {
+                        await broker_engine.place_order(zerodha_account, {
                             "symbol": pos["symbol"],
                             "exchange": pos.get("exchange", "NSE"),
                             "transaction_type": "SELL" if qty > 0 else "BUY",
@@ -5306,39 +5637,42 @@ async def configure_email(request: Request, user: dict = Depends(get_current_use
     return {"message": "Email preferences updated", "email_alerts": email_enabled}
 
 
-# ============ ZERODHA CALLBACK ============
+# ============ ZERODHA CALLBACK (legacy path) ============
+#
+# D6.4 / V-1 — THIS ROUTE STILL TRUSTED `uid`.
+# ---------------------------------------------
+# D6.1 / S1 removed `uid = params.get("uid")` from `/api/brokers/{broker}/
+# callback` and replaced it with a server-side, single-use, cookie-bound OAuth
+# state record. It did not touch this route, which is the *older* alias for the
+# same flow — and `KITE_REDIRECT_URL` in this repository's own `.env` and
+# `.env.example` points at THIS path, so the hardened callback was not the one
+# Kite actually redirected to. The D6.1 fix was inert for Zerodha in the shipped
+# configuration.
+#
+# What the vulnerability bought, in both directions:
+#   * an attacker who completed a Kite login themselves, with
+#     `redirect_params=uid=<victim>`, attached THEIR brokerage account to the
+#     victim's platform account — the victim's orders would then be placed in the
+#     attacker's account;
+#   * an attacker who lured a victim through a Kite login carrying
+#     `uid=<attacker>` attached the VICTIM's brokerage account to the attacker's
+#     platform account, handing over the victim's holdings, positions, funds and
+#     live order placement.
+#
+# Neither required any credential of the other party. The fix is not a new
+# mechanism: this route now runs the identical ownership proof the D6.1 route
+# does — the state record plus the `b_oauth_state` cookie — by delegating to it,
+# so there is one implementation and not two that must agree.
 
 @zerodha_router.get("/callback")
 async def zerodha_callback(request: Request):
-    """Handle the Kite Connect browser redirect after login/OTP.
+    """Legacy Kite redirect target. Ownership is proved exactly as D6.1 requires.
 
-    Kite appends ?request_token=...&status=... plus any redirect_params we
-    attached to the login URL (uid identifies the app user, since no JWT is
-    available on a cross-site redirect). Always redirects back to the
-    frontend with an absolute URL — a relative redirect would land on the
-    backend origin and 404.
+    `uid` is not read. A callback that arrives without a valid, cookie-matched,
+    single-use state record is refused with the same constant message every other
+    rejection uses — a caller probing this endpoint learns only that it failed.
     """
-    request_token = request.query_params.get("request_token")
-    status_param = request.query_params.get("status")
-    uid = request.query_params.get("uid")
-    from starlette.responses import RedirectResponse
-
-    frontend_base = _frontend_base()
-
-    if status_param == "success" and request_token:
-        try:
-            await broker_engine.complete_auth("zerodha", uid, {"request_token": request_token})
-            if uid:
-                try:
-                    await db.users.update_one({"_id": ObjectId(uid)}, {"$set": {"zerodha_connected": True}})
-                except Exception:
-                    pass
-            return RedirectResponse(url=f"{frontend_base}/settings?zerodha=connected")
-        except (BrokerError, Exception) as e:
-            message = getattr(e, "user_message", str(e))
-            logger.error(f"Zerodha session exchange failed: {message}")
-            return RedirectResponse(url=f"{frontend_base}/settings?zerodha=failed&error={message}")
-    return RedirectResponse(url=f"{frontend_base}/settings?zerodha=cancelled")
+    return await broker_oauth_callback("zerodha", request)
 
 @zerodha_router.post("/postback")
 async def zerodha_postback(request: Request):
@@ -6208,21 +6542,26 @@ async def admin_delete_user(user_id: str, user: dict = Depends(require_admin)):
 
     revoked_brokers, broker_errors = [], {}
     try:
-        accounts = await db.broker_accounts.find(
-            {"user_id": user_id, "connected": {"$ne": False}}).to_list(50)
+        # D6.4 — every ACCOUNT, through the directory. The old query listed
+        # documents and disconnected by broker name, which with two accounts at
+        # one broker would have revoked one of them twice and the other never.
+        accounts = await broker_accounts.list_for_user(user_id)
     except Exception as e:
         accounts = []
         logger.error(f"Could not list broker accounts for deleted user {user_id}: {e}")
     for account in accounts:
-        broker = account.get("broker")
-        if not broker:
-            continue
         try:
-            await broker_engine.disconnect(broker, user_id)
-            revoked_brokers.append(broker)
+            await broker_engine.disconnect(account)
+            revoked_brokers.append(account.broker)
         except Exception as e:
-            broker_errors[broker] = str(e)
-            logger.error(f"Broker teardown failed for deleted user {user_id} / {broker}: {e}")
+            # Keyed by the account, valued with the broker: a user may hold two
+            # accounts at one broker, so a broker name is no longer a unique key
+            # for "which teardown failed", and dropping the name would leave an
+            # operator with an opaque id and no idea which brokerage to chase.
+            broker_errors[account.broker_account_id] = {
+                "broker": account.broker, "error": str(e)}
+            logger.error(f"Broker teardown failed for deleted user {user_id} / "
+                         f"{account.broker_account_id}: {e}")
 
     try:
         sessions_revoked = await SessionStore(db).revoke_all_for_user(user_id, reason="user_deleted")
@@ -7467,7 +7806,65 @@ async def ensure_indexes():
     # busiest collection in the product on every admin page load.
     await db.chat_messages.create_index("created_at")
 
-    await db.broker_accounts.create_index([("user_id", 1), ("broker", 1)], unique=True)
+    # ----------------------------------------------------------------------- #
+    # Broker account identity (D6.4)
+    # ----------------------------------------------------------------------- #
+    # The old index was `{user_id, broker}` UNIQUE. That single line was the
+    # thing that made a second account at one broker impossible: a user's second
+    # Zerodha connect did not fail, it *upserted over* the first.
+    #
+    # What replaces it, and what each one is for:
+    #
+    #   `{broker_account_id}` UNIQUE
+    #       The account's identity. Every owner-scoped lookup, every stream key
+    #       and every stamped row resolves through it.
+    #
+    #   `{user_id, broker, external_account_id}` UNIQUE
+    #       The *external* identity, and the constraint that makes reconnect
+    #       idempotent: relinking the same brokerage account can only ever land
+    #       on the row that is already there. A different client code at the same
+    #       broker is a different tuple and therefore a different account, which
+    #       is what makes two Zerodha accounts possible at all.
+    #
+    #       PARTIAL, on `external_account_id` existing. Mongo treats missing and
+    #       null as one value in a unique index, so without the filter a user
+    #       with two accounts whose brokers never named them would collide — and
+    #       the legacy rows this migration cannot name are exactly that case.
+    #
+    #   `{user_id, broker}` NON-unique
+    #       Kept for the owner-scoped listing and for the compatibility bridge,
+    #       which asks "how many accounts does this user have at this broker" on
+    #       every broker-addressed request. Non-unique is the whole point.
+    #
+    # The old unique index is dropped explicitly. `create_index` does not
+    # redefine an existing index with the same key pattern, so leaving it would
+    # have kept the uniqueness constraint silently in force under a new set of
+    # indexes that all say a second account is allowed — the failure would have
+    # been a duplicate-key error on a user's second connect, after every code
+    # path had already agreed it was legal.
+    try:
+        await db.broker_accounts.drop_index("user_id_1_broker_1")
+        logger.info("Dropped the pre-D6.4 unique broker_accounts index")
+    except Exception:
+        # Already dropped, never existed (fresh database), or the deployment
+        # named it differently. None is an error; the migration below and the
+        # indexes above are what the platform actually depends on.
+        pass
+    await db.broker_accounts.create_index("broker_account_id", unique=True,
+                                          partialFilterExpression={
+                                              "broker_account_id": {"$exists": True}})
+    await db.broker_accounts.create_index(
+        [("user_id", 1), ("broker", 1), ("external_account_id", 1)], unique=True,
+        partialFilterExpression={"external_account_id": {"$exists": True, "$type": "string"}})
+    await db.broker_accounts.create_index([("user_id", 1), ("broker", 1)])
+
+    # Owner-scoped, account-scoped reads of the rows that now name an account.
+    # `{user_id, broker_account_id}` leads with the owner so it also answers the
+    # plain per-user reads as a prefix; `orders` additionally needs the
+    # deduplication key `_record_order` upserts on.
+    await db.orders.create_index([("broker_account_id", 1), ("order_id", 1)])
+    await db.holdings.create_index([("user_id", 1), ("broker_account_id", 1)])
+    await db.portfolios.create_index([("user_id", 1), ("broker_account_id", 1)])
 
     # Admin Portal collections (Sprint 11)
     await db.admin_audit_logs.create_index("timestamp")
@@ -7517,6 +7914,28 @@ async def ensure_indexes():
 
 
 # Startup
+async def _run_broker_account_migration() -> None:
+    """Assign `broker_account_id` to pre-D6.4 accounts, before any session load.
+
+    Never raises: a migration failure must not stop the process starting, and a
+    session restored against an unmigrated document is skipped by
+    `load_sessions` rather than restored under an invented identity. An
+    ambiguous legacy pair is logged at ERROR because it needs a person — those
+    accounts stay unusable until it is resolved by hand (D6.4 / §4).
+    """
+    try:
+        from services.brokers.account_migration import migrate_broker_accounts
+
+        report = await migrate_broker_accounts(db)
+        if report.ambiguous:
+            logger.error(
+                "D6.4 broker account migration found %d ambiguous legacy "
+                "identities; those accounts are UNUSABLE until resolved: %s",
+                len(report.ambiguous), report.ambiguous)
+    except Exception as e:
+        logger.error("D6.4 broker account migration failed: %s", e)
+
+
 @app.on_event("startup")
 async def startup():
     # Indexes first, before anything else in boot and before the readiness gate
@@ -7588,6 +8007,11 @@ async def startup():
 
     # Restore same-day broker sessions (Zerodha/Upstox) + realtime streams so
     # a backend restart doesn't force re-login. Encrypts legacy plaintext tokens.
+    # D6.4 — the identity backfill runs BEFORE any session is restored. A
+    # session restored against an unmigrated document would be cached under an
+    # id that does not exist yet, and every stream, provider and order it wrote
+    # would carry it.
+    await _run_broker_account_migration()
     await broker_engine.load_sessions()
 
     # Admin accounts are never seeded by the API server (PH1.1). For local

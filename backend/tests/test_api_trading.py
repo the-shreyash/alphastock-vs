@@ -163,7 +163,7 @@ class TestBrokerOrderFailures:
     """A live entry that the broker rejects must leave no OPEN trade behind."""
 
     def test_broker_rejection_is_502_and_records_nothing(
-            self, authenticated_client, fake_db, test_user):
+            self, authenticated_client, fake_db, test_user, broker_account):
         with patch.object(server.broker_engine, "place_order", new_callable=AsyncMock,
                           side_effect=BrokerError("insufficient funds",
                                                   user_message="Insufficient funds")):
@@ -175,7 +175,7 @@ class TestBrokerOrderFailures:
             "a trade was recorded for an order the broker rejected"
 
     def test_successful_broker_order_id_is_stored(
-            self, authenticated_client, fake_db, test_user):
+            self, authenticated_client, fake_db, test_user, broker_account):
         with patch.object(server.broker_engine, "place_order", new_callable=AsyncMock,
                           return_value={"order_id": "TEST-ORDER-1"}):
             resp = authenticated_client.post(
@@ -362,11 +362,17 @@ class TestExitTrade:
         assert fake_db.trades.docs[0]["status"] == "OPEN"
 
     def test_broker_rejected_exit_leaves_the_position_open(
-            self, authenticated_client, fake_db, test_user, open_trade):
+            self, authenticated_client, fake_db, test_user, open_trade,
+            broker_account):
         """The most dangerous failure in the file: recording an exit for an
         order the broker refused would leave the user flat on paper and long in
         reality, with no stop attached."""
+        # D6.4 — the exit returns to the account the entry was placed in, which
+        # is the id recorded on the trade, not a broker name resolved at exit
+        # time. Both fields are set here because that is what a real trade row
+        # carries.
         fake_db.trades.docs[0]["broker"] = "zerodha"
+        fake_db.trades.docs[0]["broker_account_id"] = broker_account.broker_account_id
         with patch.object(server.broker_engine, "place_order", new_callable=AsyncMock,
                           side_effect=BrokerError("rejected", user_message="Order rejected")):
             resp = authenticated_client.post(f"/api/trades/{open_trade['_id']}/exit",

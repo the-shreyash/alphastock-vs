@@ -46,12 +46,39 @@ they are already covered, far more completely, by the mechanical 401 sweep in
 `test_api_authz.py` — which checks all 126 authenticated routes rather than the
 handful these files happened to name.
 """
+import asyncio
 from unittest.mock import AsyncMock, patch
 
 import pytest
 from bson import ObjectId
 
 import server
+
+
+def _run_coro(coro):
+    """Drive one coroutine to completion from a synchronous test.
+
+    The loop is closed afterwards; leaving it open leaks a file descriptor per
+    call and raises a `ResourceWarning` that reads like an application defect.
+    """
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
+
+
+def _seed_callback_user(fake_db):
+    """A real, active user for the OAuth state record to resolve to.
+
+    The callback re-reads the owner from the database after consuming the state
+    (a state can outlive the user that minted it), so a record pointing at
+    nobody is rejected before it can report an outcome.
+    """
+    uid = ObjectId()
+    fake_db.users.docs.append({"_id": uid, "email": "cb@example.com",
+                               "name": "Callback User", "role": "user"})
+    return uid
 
 
 # --------------------------------------------------------------------------- #
@@ -80,11 +107,48 @@ class TestZerodhaConfigurationEndpoints:
     def test_cancelled_callback_redirects_rather_than_erroring(self, client, fake_db):
         """The user pressed "cancel" in Kite. That is a normal outcome, and they
         must land back in Settings — an error page here looks like a broken
-        integration for what was a deliberate choice."""
+        integration for what was a deliberate choice.
+
+        D6.4 / V-1 — THE OUTCOME IS NOW REPORTED ONLY AFTER OWNERSHIP IS PROVED.
+        This legacy path used to read `uid` straight out of the query string; it
+        now runs the same state-record + cookie proof `/api/brokers/{broker}/
+        callback` does, and a callback that proves nothing is refused *before*
+        its self-declared `status` is read. That ordering is deliberate:
+        `status=cancelled` is attacker-supplied text, and letting it short-circuit
+        the ownership proof would give an unauthenticated caller a branch that
+        skips every check.
+
+        What the user still gets is what this test is about: a redirect back into
+        Settings, never a 4xx page and never a stack trace. A *real* cancel from
+        Kite carries the state we put in `redirect_params`, and is covered by
+        `test_a_cancelled_callback_with_a_valid_state_reports_cancelled`.
+        """
         resp = client.get("/api/zerodha/callback", params={"status": "cancelled"},
                           follow_redirects=False)
         assert resp.status_code in (302, 307)
-        assert "zerodha=cancelled" in resp.headers["location"]
+        location = resp.headers["location"]
+        assert location.startswith("http://localhost:3000/settings?")
+        assert "broker=zerodha" in location
+
+    def test_a_cancelled_callback_with_a_valid_state_reports_cancelled(
+            self, client, fake_db):
+        """The real cancel: Kite echoes the state we planted, so ownership is
+        proved and the honest outcome — `cancelled`, not `failed` — is reported."""
+        from security import oauth_state as oauth_state_store
+        from security.cookies import BROKER_OAUTH_STATE_COOKIE
+
+        state = _run_coro(oauth_state_store.issue(
+            oauth_state_store.FLOW_BROKER,
+            {"user_id": str(_seed_callback_user(fake_db)), "broker": "zerodha"}))
+        client.cookies.set(BROKER_OAUTH_STATE_COOKIE, state)
+        try:
+            resp = client.get("/api/zerodha/callback",
+                              params={"status": "cancelled", "state": state},
+                              follow_redirects=False)
+        finally:
+            client.cookies.delete(BROKER_OAUTH_STATE_COOKIE)
+        assert resp.status_code in (302, 307)
+        assert "status=cancelled" in resp.headers["location"]
 
     def test_callback_without_a_request_token_does_not_error(self, client, fake_db):
         resp = client.get("/api/zerodha/callback", follow_redirects=False)

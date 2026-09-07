@@ -89,6 +89,7 @@ from tests.test_provider_health_recovery import (
     wired,
 )
 from tests.test_provider_probation import _tick
+from _accounts import account_ref  # noqa: E402
 
 
 STATUS_KEYS = {"state", "tier", "reason", "capabilities"}
@@ -334,7 +335,7 @@ def _entitlement_fixture(users=("u1",)):
 
     manager, baseline, feeds = _market_fixture(users=users)
     for user in users:
-        run(publish_market_ticks(user, "nova", [_tick()]))
+        run(publish_market_ticks(account_ref(user, "nova"), [_tick()]))
     return manager, baseline, feeds
 
 
@@ -355,7 +356,7 @@ def test_an_entitlement_refusal_explains_the_tier_it_moved():
         assert manager.status(user_id="u1")["tier"] == "streaming", "the fixture never promoted"
         spy.events.clear()
 
-        run(_engine()._on_stream_not_entitled("u1", "nova", DEFAULT_STREAM_CHANNEL))
+        run(_engine()._on_stream_not_entitled(account_ref("u1", "nova"), DEFAULT_STREAM_CHANNEL))
 
         scoped = spy.for_user("u1")
         assert scoped, "the owner was never told their tier moved"
@@ -388,7 +389,7 @@ def test_the_explained_event_is_not_beaten_to_the_bus_by_the_teardown():
         registry.clear()
         _entitlement_fixture()
         spy.events.clear()
-        run(_engine()._on_stream_not_entitled("u1", "nova", DEFAULT_STREAM_CHANNEL))
+        run(_engine()._on_stream_not_entitled(account_ref("u1", "nova"), DEFAULT_STREAM_CHANNEL))
         scoped = spy.for_user("u1")
 
     assert len(scoped) == 1, \
@@ -414,7 +415,7 @@ def test_the_explanation_rides_the_event_and_never_the_steady_state():
     with entitlement_nova(), _clean_provider_registry() as registry:
         registry.clear()
         manager, _baseline, _feeds = _entitlement_fixture()
-        run(_engine()._on_stream_not_entitled("u1", "nova", DEFAULT_STREAM_CHANNEL))
+        run(_engine()._on_stream_not_entitled(account_ref("u1", "nova"), DEFAULT_STREAM_CHANNEL))
 
         after = manager.status(user_id="u1")
 
@@ -439,7 +440,7 @@ def test_the_refusal_reason_is_broker_neutral():
         registry.clear()
         _entitlement_fixture()
         spy.events.clear()
-        run(_engine()._on_stream_not_entitled("u1", "nova", DEFAULT_STREAM_CHANNEL))
+        run(_engine()._on_stream_not_entitled(account_ref("u1", "nova"), DEFAULT_STREAM_CHANNEL))
         scoped = spy.for_user("u1")
 
     assert scoped
@@ -464,7 +465,7 @@ def test_a_refusal_is_explained_to_its_owner_and_to_nobody_else():
         registry.clear()
         _entitlement_fixture(users=("u1", "u2"))
         spy.events.clear()
-        run(_engine()._on_stream_not_entitled("u1", "nova", DEFAULT_STREAM_CHANNEL))
+        run(_engine()._on_stream_not_entitled(account_ref("u1", "nova"), DEFAULT_STREAM_CHANNEL))
         explained = {e["user_id"] for e in spy.events
                      if e.get("change_reason") and e.get("user_id")}
         others = [e for e in spy.events if e.get("user_id") == "u2"]
@@ -488,7 +489,7 @@ def test_a_platform_wide_status_never_carries_a_users_transition_reason():
         registry.clear()
         _entitlement_fixture()
         spy.events.clear()
-        run(_engine()._on_stream_not_entitled("u1", "nova", DEFAULT_STREAM_CHANNEL))
+        run(_engine()._on_stream_not_entitled(account_ref("u1", "nova"), DEFAULT_STREAM_CHANNEL))
         platform = [e for e in spy.events if not e.get("user_id")]
 
     assert all(e.get("change_reason") is None for e in platform), \
@@ -513,7 +514,7 @@ def test_an_expired_session_and_a_disconnect_carry_their_own_reasons():
         registry.clear()
         _entitlement_fixture()
         spy.events.clear()
-        run(_engine()._on_stream_expired("u1", "nova"))
+        run(_engine()._on_stream_expired(account_ref("u1", "nova")))
         scoped = spy.for_user("u1")
 
     assert scoped, "an expired session told the owner nothing"

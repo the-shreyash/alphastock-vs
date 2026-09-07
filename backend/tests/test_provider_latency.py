@@ -77,6 +77,7 @@ from tests.test_broker_streaming import (
     run,
 )
 from tests.test_provider_probation import FakeClock, _tick
+from _accounts import account_ref  # noqa: E402
 
 BACKEND = pathlib.Path(__file__).resolve().parent.parent
 
@@ -709,7 +710,7 @@ def test_latency_state_does_not_cross_users():
     """Brief case 16, and Rule 11.
 
     Structural rather than enforced: the deque is an instance attribute and
-    `feed_provider_name(user, broker)` gives one instance per pair, so sharing
+    `feed_provider_name(account_ref(user, broker))` gives one instance per pair, so sharing
     would require a module-level accumulator and none exists. Asserted anyway,
     because "there is nothing to leak through" is exactly the claim a later
     refactor would break silently.
@@ -856,24 +857,24 @@ def test_latency_behaves_identically_for_every_broker_including_a_fictional_one(
         name = run(_attach("u1", broker, ["RELIANCE"]))
         assert name, f"{broker} did not attach a market feed"
         feed = provider_registry.get(name)
-        run(set_market_feed_link("u1", broker, up=True))
+        run(set_market_feed_link(account_ref("u1", broker), up=True))
 
         clock = FakeClock(now=feed._clock())
         feed._clock = clock
         feed.probation_seconds = 0.0
 
-        assert run(publish_market_ticks("u1", broker, [_tick()])) == 1
+        assert run(publish_market_ticks(account_ref("u1", broker), [_tick()])) == 1
         assert feed.delivery_latency is None, broker
 
         for _ in range(LATENCY_WINDOW_SAMPLES):
             clock.advance(FAST)
-            assert run(publish_market_ticks("u1", broker, [_tick()])) == 1
+            assert run(publish_market_ticks(account_ref("u1", broker), [_tick()])) == 1
 
         assert feed.delivery_latency == pytest.approx(FAST), broker
         assert _quote_provider(manager) is feed, broker
 
         # And it resets on this broker's reconnect exactly as on every other's.
-        run(set_market_feed_link("u1", broker, up=False, reason="drop"))
+        run(set_market_feed_link(account_ref("u1", broker), up=False, reason="drop"))
         assert feed.delivery_latency is None, broker
         assert _quote_provider(manager) is baseline, broker
 
