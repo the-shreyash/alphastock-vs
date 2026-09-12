@@ -316,12 +316,14 @@ export default function StockDetail() {
               </span>
             )}
           </div>
+          {/* "Watching" is a confirmed state, not a primary action, so it takes
+              the confirm token rather than the brand accent. */}
           <button
             onClick={toggleWatchlist}
             disabled={watchlistLoading}
-            className={`btn-secondary btn-sm hidden sm:inline-flex transition-all ${inWatchlist ? "!bg-[var(--accent)]/15 !border-[var(--accent)]" : ""}`}
+            className={`btn-secondary btn-sm hidden sm:inline-flex transition-all ${inWatchlist ? "!bg-[var(--confirm-soft)] !border-[var(--confirm)]" : ""}`}
             title={inWatchlist ? "Remove from Watchlist" : "Add to Watchlist"}
-            style={inWatchlist ? { color: "var(--accent)" } : undefined}
+            style={inWatchlist ? { color: "var(--confirm)" } : undefined}
           >
             <Star size={13} fill={inWatchlist ? "currentColor" : "none"} />
             {watchlistLoading ? "..." : inWatchlist ? "Watching" : "Watchlist"}

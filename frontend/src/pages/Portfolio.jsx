@@ -6,6 +6,7 @@ import { PieChart as RechartsPie, Pie, Cell, ResponsiveContainer, Tooltip, AreaC
 import { motion } from "framer-motion";
 import AnimatedNumber from "../components/ui/AnimatedNumber";
 import { usePriceFlash } from "../hooks/usePriceFlash";
+import { PageHeader } from "../components/ds";
 import {
   useRealtimeStore,
   selectConnected,
@@ -121,7 +122,7 @@ function SourceBadge({ source }) {
   const isBroker = source === "broker";
   return (
     <span className="badge-status ml-2" style={{
-      background: isBroker ? "var(--ai-accent-bg, var(--hover))" : "var(--hover)",
+      background: isBroker ? "var(--ai-accent-soft)" : "var(--hover)",
       color: isBroker ? "var(--ai-accent)" : "var(--text-muted)",
       fontSize: 9,
     }}>{isBroker ? "BROKER" : "MANUAL"}</span>
@@ -336,23 +337,21 @@ export default function Portfolio() {
     <div data-testid="portfolio-page" className="space-y-5">
       {/* Header */}
       <Reveal>
-        <div className="flex items-center justify-between">
-          <div>
-            <h1 className="page-title">Portfolio</h1>
-            <p className="page-subtitle mt-1">
-              Your holdings and performance overview
-              {sources.length > 0 && <span className="caption ml-2">· {sources.map(s => s === "broker" ? "Broker" : "Manual").join(" + ")}</span>}
-            </p>
-          </div>
-          <div className="flex items-center gap-2">
-            <button onClick={fetchPortfolio} className="btn-ghost btn-sm" style={{ padding: "10px" }} title="Refresh">
+        <PageHeader
+          title="Your Portfolio"
+          subtitle={<>
+            Track, analyse and grow your investments
+            {sources.length > 0 && <span className="caption ml-2">· {sources.map(s => s === "broker" ? "Broker" : "Manual").join(" + ")}</span>}
+          </>}
+          actions={<>
+            <button onClick={fetchPortfolio} className="btn-ghost btn-sm" style={{ padding: "10px" }} title="Refresh" aria-label="Refresh portfolio">
               <RefreshCw size={15} />
             </button>
-            <button onClick={handleExport} disabled={exporting || holdings.length === 0} className="btn-ghost btn-sm" style={{ padding: "10px" }} title="Export CSV">
+            <button onClick={handleExport} disabled={exporting || holdings.length === 0} className="btn-ghost btn-sm" style={{ padding: "10px" }} title="Export CSV" aria-label="Export portfolio as CSV">
               {exporting ? <Loader2 size={15} className="animate-spin" /> : <Download size={15} />}
             </button>
-          </div>
-        </div>
+          </>}
+        />
       </Reveal>
 
       {/* Tab Bar */}

@@ -12,6 +12,7 @@ import {
 } from "../store/realtimeStore";
 import { Eye, Search, Plus, Trash2, ArrowUpRight, ArrowDownRight, Activity } from "lucide-react";
 import { motion } from "framer-motion";
+import { PageHeader, Card, EmptyState } from "../components/ds";
 
 // Beyond this many rows the list windows itself (Sprint R9 virtualization);
 // smaller lists keep the staggered entrance animation.
@@ -264,27 +265,23 @@ export default function Watchlist() {
     <div data-testid="watchlist-page" className="space-y-5">
       {/* Header */}
       <Reveal>
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-          <div>
-            <h1 className="page-title">Watchlist</h1>
-            <p className="page-subtitle mt-1">
-              Stocks you're tracking — prices, RSI and signals stream in live
-            </p>
-          </div>
-          <AddStockSearch onAdd={handleAdd} existing={items.map(i => i.symbol)} />
-        </div>
+        <PageHeader
+          title="Watchlist"
+          subtitle="Stocks you're tracking — prices, RSI and signals stream in live"
+          actions={<AddStockSearch onAdd={handleAdd} existing={items.map(i => i.symbol)} />}
+        />
       </Reveal>
 
       {/* List */}
       {items.length === 0 ? (
         <Reveal>
-          <div className="glass-card p-12 text-center">
-            <Eye size={32} className="mx-auto mb-3" style={{ color: "var(--text-muted)" }} />
-            <h3 className="card-title mb-1">Your watchlist is empty</h3>
-            <p className="body-text max-w-sm mx-auto">
-              Search for a stock above to start tracking it. The AI keeps an eye on price, momentum, and volume for every stock you add.
-            </p>
-          </div>
+          <Card padding="none">
+            <EmptyState
+              icon={Eye}
+              title="Your watchlist is empty"
+              description="Search for a stock above to start tracking it. The AI keeps an eye on price, momentum and volume for every stock you add."
+            />
+          </Card>
         </Reveal>
       ) : (
         <Reveal>

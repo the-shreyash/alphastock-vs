@@ -355,3 +355,37 @@ describe("bounded live state (PH3.6)", () => {
     expect(store().aiRunOrder.length).toBeLessThanOrEqual(6);
   });
 });
+
+describe("morning report ready-signal (D6.9)", () => {
+  it("carries the generation outcome, not just the fact that the run ended", () => {
+    // The event used to say only `available`, and consumers read the bump as
+    // "a report was produced". "The 8:30 pipeline finished" and "a report was
+    // produced" are different events; a run that failed also bumps this.
+    store().applyEvent(event("morningreport.generated", {
+      date: "2026-01-15", picks: 3, available: true,
+      status: "completed", completed_at: "2026-01-15T03:00:00Z", is_ai_generated: true,
+    }));
+
+    expect(store().morningReportReadyAt).toBe("2026-01-15T09:30:00.000Z");
+    expect(store().morningReportStatus).toBe("completed");
+  });
+
+  it("reports a failed morning run as failed rather than as a new report", () => {
+    store().applyEvent(event("morningreport.generated", {
+      date: "2026-01-15", picks: 0, available: false,
+      status: "failed", completed_at: null, is_ai_generated: false,
+    }));
+
+    // The signal still bumps — consumers must refetch to learn the details —
+    // but nothing here implies a report was produced.
+    expect(store().morningReportReadyAt).toBeTruthy();
+    expect(store().morningReportStatus).toBe("failed");
+  });
+
+  it("leaves the status null when an older backend sends no outcome", () => {
+    store().applyEvent(event("morningreport.generated", { date: "2026-01-15", available: true }));
+
+    expect(store().morningReportReadyAt).toBeTruthy();
+    expect(store().morningReportStatus).toBeNull();
+  });
+});

@@ -3,6 +3,7 @@ import { Outlet, useLocation } from "react-router-dom";
 import { motion, AnimatePresence } from "framer-motion";
 import Sidebar, { SIDEBAR_COLLAPSED_W, SIDEBAR_EXPANDED_W, SIDEBAR_MOBILE_W } from "./Sidebar";
 import Navbar from "./Navbar";
+import MobileTabBar, { MOBILE_TAB_BAR_H } from "./MobileTabBar";
 import NotificationPanel from "../notifications/NotificationPanel";
 import NotificationToast from "../notifications/NotificationToast";
 import AIQuickAction from "../AIQuickAction";
@@ -74,7 +75,12 @@ export default function Layout() {
           onNotificationClick={() => setShowNotifs(!showNotifs)}
           onMenuClick={() => setMobileOpen(true)}
         />
-        <main className="page-container min-h-[calc(100vh-64px)]">
+        {/* The bottom tab bar is fixed, so the page reserves room for it or
+            the last card on every mobile screen sits underneath it. */}
+        <main
+          className="page-container min-h-[calc(100vh-64px)]"
+          style={{ paddingBottom: isDesktop ? undefined : `calc(${MOBILE_TAB_BAR_H}px + env(safe-area-inset-bottom, 0px) + 1rem)` }}
+        >
           <AnimatePresence mode="wait">
             <motion.div
               key={location.pathname}
@@ -108,6 +114,10 @@ export default function Layout() {
           </AnimatePresence>
         </main>
       </div>
+      {/* Bottom navigation — small screens only; hidden from `lg` up, where the
+          persistent sidebar takes over. */}
+      {!isDesktop && <MobileTabBar />}
+
       {showNotifs && <NotificationPanel onClose={() => setShowNotifs(false)} />}
 
       {/* Live toast host (Sprint R8): notification.created + news.breaking

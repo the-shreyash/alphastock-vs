@@ -43,6 +43,85 @@ scheduler = AsyncIOScheduler(timezone="Asia/Kolkata")
 _job_started_at: dict = {}
 
 
+# --------------------------------------------------------------------------- #
+# Single-leader ownership (D6.7 / A2)                                           #
+# --------------------------------------------------------------------------- #
+#: The lease this process holds, or None when the scheduler was started without
+#: one. Set by `setup_scheduler`; read by `leader_only` on every job tick.
+_lease = None
+
+#: Jobs that must run on EXACTLY ONE process, platform-wide.
+#:
+#: WHAT MAKES A JOB BELONG HERE
+#: ----------------------------
+#: Every job in this module reads the whole platform's data and writes per-user
+#: output, so running N copies produces N times the work. For five of the six
+#: that is merely wasteful and, at worst, user-visible as a duplicate
+#: notification. For `trade_monitor` it is a **second live market order in a
+#: real brokerage account**, because that job reaches
+#: `trading_engine.run_cycle` → `_broker_exit` → `broker_engine.place_order`.
+#:
+#: They are all listed anyway rather than only the dangerous one. A duplicate
+#: EOD report tells a user their P&L twice; a duplicate portfolio snapshot
+#: writes two marks for one session date and distorts the equity curve the
+#: Performance page is built from. "Harmless duplication" is not a property any
+#: of these actually has, and the one that has teeth is not distinguishable from
+#: the others at the call site — so the rule is uniform and there is no judgment
+#: call to get wrong when a seventh job is added.
+LEADER_ONLY_JOBS = frozenset({
+    "morning_analysis", "market_scanner", "trade_monitor",
+    "exit_reminder", "eod_report", "portfolio_snapshot",
+})
+
+
+def set_lease(lease) -> None:
+    """Install the leader lease this scheduler's jobs are gated on.
+
+    Separate from `setup_scheduler` so the application can elect before it
+    schedules, and so a test can drive the gate without standing up a scheduler.
+    """
+    global _lease
+    _lease = lease
+
+
+def is_leader() -> bool:
+    """Whether this process may run leader-only work right now.
+
+    NO LEASE MEANS YES, AND THAT IS DELIBERATE. A deployment that never
+    configured an election is the pre-D6.7 single-process deployment, and it
+    must keep working exactly as it did — a scheduler that silently stops
+    running because nobody wired a lock would be a far worse regression than the
+    duplication the lock prevents. The safety for that configuration is the
+    per-trade exit claim in `trading_engine.claim_exit`, which is unconditional
+    and does not depend on this gate at all.
+    """
+    return _lease is None or bool(_lease.is_leader)
+
+
+def leader_only(job_id: str, fn):
+    """Wrap a job so it runs only on the process holding the lease.
+
+    Wrapping at registration rather than checking inside each job body keeps the
+    rule in one place and, more importantly, keeps it **impossible to forget**:
+    a new job added to `LEADER_ONLY_JOBS` is gated by the loop in
+    `setup_scheduler`, not by a line its author has to remember to write.
+    """
+    async def _gated(*args, **kwargs):
+        if job_id in LEADER_ONLY_JOBS and not is_leader():
+            # DEBUG, not INFO: on a four-worker deployment three processes skip
+            # every job on every tick, and at INFO the trade monitor alone would
+            # emit ~1,000 lines a market day saying nothing happened.
+            logger.debug("Skipping %s: this process does not hold the "
+                         "scheduler lease.", job_id)
+            instruments.record_scheduler_run(job_id, "not_leader")
+            return None
+        return await fn(*args, **kwargs)
+
+    _gated.__name__ = getattr(fn, "__name__", job_id)
+    _gated.__doc__ = getattr(fn, "__doc__", None)
+    return _gated
+
+
 def _on_job_event(event) -> None:
     """Translate an APScheduler event into metrics. Never raises.
 
@@ -172,8 +251,13 @@ async def trade_monitor_job(db, ws_broadcast):
                 if not isinstance(res, Exception) and res:
                     quote_cache[sym] = res
 
-        # Pre-fetch all quotes for open trades
-        open_trades = await db.trades.find({"status": "OPEN"}).to_list(100)
+        # Pre-fetch all quotes for open trades.
+        # D6.7 — was `.to_list(100)`, a platform-wide sweep with no sort: past
+        # 100 open trades across ALL users, the rest were silently unpriced and
+        # therefore never checked against their stop losses.
+        from services import fanout
+        open_trades = await fanout.collect(
+            db.trades.find({"status": "OPEN"}), label="trade_monitor.open_trades")
         symbols_needed = list({t["symbol"] for t in open_trades})
         if symbols_needed:
             await prefetch_quotes(symbols_needed)
@@ -231,7 +315,9 @@ async def exit_reminder_job(db):
     """3:10 PM weekdays: Remind users who have open trades to close positions."""
     logger.info("Sending exit reminders...")
     try:
-        active_trades = await db.trades.find({"status": "OPEN"}).to_list(100)
+        from services import fanout
+        active_trades = await fanout.collect(
+            db.trades.find({"status": "OPEN"}), label="exit_reminder.open_trades")
         user_trades = {}
         for t in active_trades:
             uid = t["user_id"]
@@ -390,12 +476,28 @@ async def portfolio_snapshot_job(db):
         logger.error(f"Portfolio snapshot error: {e}")
 
 
-def setup_scheduler(db, ai_summary_func, ws_broadcast=None):
-    """Set up all cron jobs."""
+def setup_scheduler(db, ai_summary_func, ws_broadcast=None, lease=None):
+    """Set up all cron jobs, gated on this process holding the scheduler lease.
+
+    D6.7 — WHY THE JOBS ARE REGISTERED ON EVERY PROCESS AND GATED AT RUN TIME,
+    RATHER THAN REGISTERED ONLY ON THE LEADER.
+    ---------------------------------------------------------------------------
+    Registering only on the winner of a startup election is simpler and wrong.
+    Leadership is not a property of boot — it changes when the holder dies — and
+    a process that lost the election at startup would have no jobs to run if it
+    later won the lease. The platform would then have *no* scheduler at all
+    until somebody redeployed, which is a worse failure than the duplication the
+    election exists to prevent.
+
+    Gating at run time costs one in-memory boolean per job tick (the lease's
+    renewal loop maintains it; nothing queries the database here) and means a
+    process that acquires the lease mid-life simply starts doing the work.
+    """
+    set_lease(lease)
 
     # Morning Analysis — 8:30 AM IST weekdays
     scheduler.add_job(
-        morning_analysis_job,
+        leader_only("morning_analysis", morning_analysis_job),
         CronTrigger(hour=8, minute=30, day_of_week="mon-fri"),
         args=[db, ai_summary_func],
         id="morning_analysis",
@@ -404,7 +506,7 @@ def setup_scheduler(db, ai_summary_func, ws_broadcast=None):
 
     # Market Scanner — Every 5 min, 9:15 AM - 3:30 PM IST weekdays
     scheduler.add_job(
-        market_scanner_job,
+        leader_only("market_scanner", market_scanner_job),
         CronTrigger(minute="*/5", hour="9-15", day_of_week="mon-fri"),
         args=[db, ws_broadcast],
         id="market_scanner",
@@ -413,7 +515,7 @@ def setup_scheduler(db, ai_summary_func, ws_broadcast=None):
 
     # Trade Monitor — Every 60 sec during market hours
     scheduler.add_job(
-        trade_monitor_job,
+        leader_only("trade_monitor", trade_monitor_job),
         CronTrigger(minute="*", hour="9-15", day_of_week="mon-fri"),
         args=[db, ws_broadcast],
         id="trade_monitor",
@@ -422,7 +524,7 @@ def setup_scheduler(db, ai_summary_func, ws_broadcast=None):
 
     # Exit Reminder — 3:10 PM IST weekdays
     scheduler.add_job(
-        exit_reminder_job,
+        leader_only("exit_reminder", exit_reminder_job),
         CronTrigger(hour=15, minute=10, day_of_week="mon-fri"),
         args=[db],
         id="exit_reminder",
@@ -431,7 +533,7 @@ def setup_scheduler(db, ai_summary_func, ws_broadcast=None):
 
     # EOD Report — 4:00 PM IST weekdays
     scheduler.add_job(
-        eod_report_job,
+        leader_only("eod_report", eod_report_job),
         CronTrigger(hour=16, minute=0, day_of_week="mon-fri"),
         args=[db],
         id="eod_report",
@@ -440,7 +542,7 @@ def setup_scheduler(db, ai_summary_func, ws_broadcast=None):
 
     # Portfolio Snapshot — 4:05 PM IST weekdays (after EOD marks settle)
     scheduler.add_job(
-        portfolio_snapshot_job,
+        leader_only("portfolio_snapshot", portfolio_snapshot_job),
         CronTrigger(hour=16, minute=5, day_of_week="mon-fri"),
         args=[db],
         id="portfolio_snapshot",
@@ -456,5 +558,9 @@ def setup_scheduler(db, ai_summary_func, ws_broadcast=None):
     )
 
     scheduler.start()
-    logger.info("Scheduler started with 6 cron jobs (IST timezone)")
+    logger.info(
+        "Scheduler started with 6 cron jobs (IST timezone); leader-only gating "
+        "is %s, this process %s the lease.",
+        "OFF (no lease configured)" if lease is None else "ON",
+        "holds" if is_leader() else "does NOT hold")
     return scheduler

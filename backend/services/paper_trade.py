@@ -31,16 +31,54 @@ async def get_paper_balance(user_id: str, db) -> dict:
 
 
 async def update_paper_balance(user_id: str, amount: float, db):
-    """Add (positive) or subtract (negative) from paper_capital."""
-    user = await db.users.find_one({"_id": ObjectId(user_id)})
-    current = user.get("paper_capital", DEFAULT_CAPITAL) if user else DEFAULT_CAPITAL
-    new_balance = round(current + amount, 2)
-    await db.users.update_one(
-        {"_id": ObjectId(user_id)},
-        {"$set": {"paper_capital": new_balance}},
-        upsert=True,
-    )
-    return new_balance
+    """Add (positive) or subtract (negative) from paper_capital, atomically.
+
+    D6.7 — WHY THIS IS `$inc` AND NOT `$set`
+    ----------------------------------------
+    This used to read the balance, add to it in Python, and `$set` the result.
+    That is a lost update, and it is not theoretical: `tests/test_d63_real_db_
+    races.py::test_concurrent_credits_should_all_be_applied` reproduced it
+    against a real `mongod` — four concurrent ₹100 credits against ₹1,00,000
+    left ₹1,00,100, not ₹1,00,400, because all four read the same starting
+    value. It was recorded by D6.3 as an open defect under `xfail(strict=True)`
+    rather than swept up, and this is the fix that clears the marker.
+
+    `$inc` is evaluated by the server against the document's current value under
+    the document lock, so N concurrent callers apply N increments. No lock, no
+    retry, no transaction — the whole race lives in one field of one document,
+    and the smallest correct mechanism is the operator that was designed for it.
+
+    THE SEEDING BRANCH, AND WHY IT IS NOT A SECOND RACE
+    --------------------------------------------------
+    `$inc` on a field that does not exist starts from zero, not from
+    `DEFAULT_CAPITAL` — so a user row that predates paper trading would have its
+    balance silently reset to the increment. The pre-D6.7 code got this right by
+    accident (its Python-side default did the work), and losing it would be a
+    financial regression dressed as a concurrency fix.
+
+    So the increment runs first and unconditionally: if it matched a row, that
+    row had a balance and the arithmetic is done. Only when it matches nothing
+    does the seeding branch run, and that branch is itself conditional on the
+    balance still being absent — so of N concurrent callers that all find the
+    row missing, the `_id` unique index admits exactly one creator and the rest
+    fall back to the increment they should have taken.
+    """
+    oid = ObjectId(user_id)
+    delta = round(amount, 2)
+    result = await db.users.update_one({"_id": oid}, {"$inc": {"paper_capital": delta}})
+    if not getattr(result, "matched_count", 0):
+        try:
+            await db.users.update_one(
+                {"_id": oid, "paper_capital": {"$exists": False}},
+                {"$set": {"paper_capital": round(DEFAULT_CAPITAL + delta, 2)}},
+                upsert=True,
+            )
+        except Exception:
+            # A concurrent creator won the `_id` index. The row exists now, so
+            # the increment this call owes it is the one that was skipped above.
+            await db.users.update_one({"_id": oid}, {"$inc": {"paper_capital": delta}})
+    row = await db.users.find_one({"_id": oid}, {"paper_capital": 1})
+    return round((row or {}).get("paper_capital", DEFAULT_CAPITAL + delta), 2)
 
 
 async def get_paper_trades(user_id: str, db) -> list:
@@ -195,13 +233,42 @@ async def execute_paper_trade(
     total_cost = round(entry_price * quantity, 2)
 
     if trade_type == "BUY":
-        balance_info = await get_paper_balance(user_id, db)
-        if balance_info["balance"] < total_cost:
-            raise ValueError(
-                f"Insufficient paper capital. Need ₹{total_cost:,.2f}, have ₹{balance_info['balance']:,.2f}"
-            )
-        # Deduct capital
-        await update_paper_balance(user_id, -total_cost, db)
+        # D6.7 — CHECK AND DEBIT ARE ONE WRITE, NOT TWO STEPS.
+        #
+        # This used to read the balance, compare it in Python, and debit. Two
+        # concurrent BUYs for ₹60,000 against a ₹1,00,000 account both read
+        # ₹1,00,000, both passed the check, and both debited — leaving the
+        # account at ₹-20,000 with two positions it could never have afforded.
+        # Found by D6.7's stress matrix; not one of the two races D6.3 recorded.
+        #
+        # The sufficiency test now lives in the filter, so the server evaluates
+        # it against the current balance under the document lock. A caller whose
+        # filter does not match did not have the money at the instant it tried
+        # to spend it, which is the only instant that matters.
+        debited = await db.users.update_one(
+            {"_id": ObjectId(user_id), "paper_capital": {"$gte": total_cost}},
+            {"$inc": {"paper_capital": -total_cost}},
+        )
+        if not getattr(debited, "modified_count", 0):
+            # Either genuinely insufficient, or a row with no balance yet. Read
+            # it back to tell the user which, and to keep the starting-capital
+            # default in one place (`get_paper_balance`).
+            balance_info = await get_paper_balance(user_id, db)
+            if balance_info["balance"] >= total_cost:
+                # The row exists but carries no `paper_capital` field — seed it
+                # and take the debit in one conditional write, which is the same
+                # compare-and-swap applied to the seeded value.
+                seeded = await db.users.update_one(
+                    {"_id": ObjectId(user_id), "paper_capital": {"$exists": False}},
+                    {"$set": {"paper_capital": round(DEFAULT_CAPITAL - total_cost, 2)}},
+                )
+                if getattr(seeded, "modified_count", 0):
+                    debited = seeded
+            if not getattr(debited, "modified_count", 0):
+                raise ValueError(
+                    f"Insufficient paper capital. Need ₹{total_cost:,.2f}, "
+                    f"have ₹{balance_info['balance']:,.2f}"
+                )
 
     trade_doc = {
         "user_id": user_id,
@@ -258,8 +325,26 @@ async def close_paper_trade(trade_id: str, user_id: str, db) -> dict:
     # D6.3 — the owner is part of the write, not merely of the read above. The
     # read that found this trade already filtered on `user_id`; stating the rule
     # again here is what makes it survive an edit to either statement alone.
-    await db.trades.update_one(
-        {"_id": ObjectId(trade_id), "user_id": user_id, "is_paper": True},
+    #
+    # D6.7 — AND SO IS THE STATUS. This is the fix for the second of D6.3's two
+    # recorded open races (`test_a_paper_trade_should_only_close_once`).
+    #
+    # The `status != "OPEN"` check above is a decision made against a value read
+    # moments earlier. Restating `status: "OPEN"` in the filter is what turns
+    # that decision into a compare-and-swap: of N concurrent closers, all N pass
+    # the Python check, and exactly one write finds the trade still OPEN. The
+    # other N-1 match nothing.
+    #
+    # The credit below is then conditional on having WON, which is the half that
+    # actually protects the money. Without it, every caller credited the
+    # proceeds — a position closed three times paid out three times. That
+    # over-credit was previously *masked* by `update_paper_balance`'s lost
+    # update (all three credits collapsed into one), which is why the two fixes
+    # had to land together: repairing the balance alone would have converted a
+    # hidden double-close into a real, visible over-credit.
+    closed = await db.trades.update_one(
+        {"_id": ObjectId(trade_id), "user_id": user_id, "is_paper": True,
+         "status": "OPEN"},
         {"$set": {
             "status": "CLOSED",
             "exit_price": exit_price,
@@ -268,6 +353,12 @@ async def close_paper_trade(trade_id: str, user_id: str, db) -> dict:
             "pnl_percent": pnl_pct,
         }},
     )
+    if not getattr(closed, "modified_count", 0):
+        # Somebody else closed it between the read and this write. Raising the
+        # same error the pre-check raises keeps the two indistinguishable to the
+        # caller — the trade is closed and this request did not close it, which
+        # is exactly what "Trade already closed" means.
+        raise ValueError("Trade already closed")
 
     # Credit back proceeds on BUY close
     if trade["type"] == "BUY":

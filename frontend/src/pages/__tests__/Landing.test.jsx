@@ -44,6 +44,14 @@ const liveOverview = {
   bank_nifty: { value: 52800.15, change_pct: 1.05 },
 };
 
+/**
+ * The NIFTY figure the hero falls back to when there is nothing live to show.
+ * Kept as a constant so the two tests below assert the *same* number from
+ * opposite directions: present under a SAMPLE label, absent under a LIVE one.
+ * If the design changes its sample figures, this is the one line to update.
+ */
+const SAMPLE_NIFTY = "25,428";
+
 /** What the gateway actually returns when it cannot serve indices. */
 const unavailableOverview = {
   available: false,
@@ -79,7 +87,9 @@ describe("landing page", () => {
     // The figure on screen is the one the gateway sent, not the sample.
     const card = screen.getByTestId("mi-index-card");
     expect(within(card).getByText("24,567.8")).toBeInTheDocument();
-    expect(within(card).getByText(/\+0\.91% today/)).toBeInTheDocument();
+    expect(within(card).getByText("+0.91%")).toBeInTheDocument();
+    // ...and the sample figure is nowhere on the card.
+    expect(within(card).queryByText(SAMPLE_NIFTY)).not.toBeInTheDocument();
   });
 
   it("labels the index card SAMPLE when the gateway reports data unavailable", async () => {
@@ -93,7 +103,7 @@ describe("landing page", () => {
     // `available: false` carries no index payload, so the card falls back to
     // its sample figure — which is exactly why it must not claim to be live.
     const card = screen.getByTestId("mi-index-card");
-    expect(within(card).getByText("24,320")).toBeInTheDocument();
+    expect(within(card).getByText(SAMPLE_NIFTY)).toBeInTheDocument();
   });
 
   it("still renders, labelled SAMPLE, when the market request fails", async () => {

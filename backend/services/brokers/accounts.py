@@ -409,9 +409,15 @@ class BrokerAccountDirectory:
         """Every account in a live state, for startup restore. Owner-agnostic."""
         if self.db is None:
             return []
-        docs = await self.db.broker_accounts.find(
-            {"status": {"$in": sorted(BrokerAccountStatus.LIVE)}},
-            _REF_PROJECTION).to_list(1000)
+        # D6.7 — streamed. This feeds startup session restore, so a cap meant
+        # accounts past the 1,000th were never restored and their owners found a
+        # disconnected broker after a deploy, with nothing logged.
+        from services import fanout
+        docs = await fanout.collect(
+            self.db.broker_accounts.find(
+                {"status": {"$in": sorted(BrokerAccountStatus.LIVE)}},
+                _REF_PROJECTION),
+            label="broker_accounts.live_accounts")
         return [ref for ref in (ref_from_doc(d) for d in docs) if ref is not None]
 
     # -- writes ----------------------------------------------------------------

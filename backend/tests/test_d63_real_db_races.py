@@ -79,7 +79,9 @@ from bson import ObjectId
 pymongo = pytest.importorskip("pymongo", reason="pymongo is required for the real-DB race suite")
 motor_asyncio = pytest.importorskip("motor.motor_asyncio", reason="motor is required for the real-DB race suite")
 
-from security.sessions import REUSE_DETECTED, ROTATED, SessionStore  # noqa: E402
+from security.sessions import (  # noqa: E402
+    GRACE_REPLAY, REUSE_DETECTED, ROTATED, SessionStore,
+)
 from _accounts import account_ref  # noqa: E402
 
 MONGO_URL = os.environ.get("MONGO_URL", "mongodb://localhost:27017")
@@ -217,18 +219,28 @@ class TestTheHarnessCanSeeARace:
     """
 
     def test_a_read_modify_write_really_does_lose_an_update(self, mongo_db):
-        """The instrument detects a lost update — on real production code.
+        """The instrument detects a lost update.
 
-        `update_paper_balance` reads `paper_capital`, adds in Python, and writes
-        the absolute result with `$set`. Two writers that both read the old value
-        both write `old + amount`, and one credit disappears. `FakeDB` cannot
-        express this: it has no await point between the read and the write.
+        REWRITTEN IN D6.7, AND WHY IT NO LONGER DRIVES PRODUCTION CODE
+        -------------------------------------------------------------
+        This check used to run `update_paper_balance` — which really did read
+        `paper_capital`, add in Python and `$set` the absolute result — and
+        assert that four concurrent ₹100 credits collapsed into one. Its own
+        failure message named the day this would stop working: *"If this is
+        100400.0 the write is now atomic and this harness check ... needs
+        updating."* D6.7 made it atomic (`$inc`), so that day is today.
 
-        This is simultaneously the harness check and the reproduction of a real
-        defect — see `TestSingleOwnerIntegrityRaces` for the same finding stated
-        as the assertion it should eventually pass.
+        The twin is still needed and is now written the same way the CAS twin
+        beside it always was: as **a property of the database and the gate**,
+        exercised through a read/modify/write defined right here. That is
+        strictly better than what it replaced. Pinning the harness's credibility
+        to a defect in production code means the instrument stops being
+        falsifiable the moment the defect is fixed — and worse, it creates an
+        incentive to leave the defect in place so the suite stays green.
+
+        `FakeDB` cannot express any of this: it is single-threaded with no await
+        point inside an operation, which is the whole reason this file exists.
         """
-        import services.paper_trade as paper_trade
 
         async def body(db):
             user_id = ObjectId()
@@ -236,7 +248,17 @@ class TestTheHarnessCanSeeARace:
 
             barrier = asyncio.Barrier(4)
             gated = _GatedDb(db, {"users": barrier})
-            await _gather(*[paper_trade.update_paper_balance(str(user_id), 100.0, gated) for _ in range(4)])
+
+            async def lossy_credit(amount):
+                """The pre-D6.7 shape of `update_paper_balance`, verbatim."""
+                row = await gated.users.find_one({"_id": user_id})
+                current = row.get("paper_capital", 100000.0)
+                await gated.users.update_one(
+                    {"_id": user_id},
+                    {"$set": {"paper_capital": round(current + amount, 2)}},
+                )
+
+            await _gather(*[lossy_credit(100.0) for _ in range(4)])
 
             row = await db.users.find_one({"_id": user_id})
             return row["paper_capital"]
@@ -244,10 +266,36 @@ class TestTheHarnessCanSeeARace:
         balance = _run(mongo_db, body)
         assert balance == 100100.0, (
             f"expected the lost-update race to collapse four +100 credits into one "
-            f"(100100.0), got {balance}. If this is 100400.0 the write is now atomic "
-            f"and this harness check — plus the xfail in TestSingleOwnerIntegrityRaces "
-            f"— needs updating."
+            f"(100100.0), got {balance}. If this is 100400.0 the barrier is not "
+            f"overlapping the readers and every race result in this file is "
+            f"meaningless."
         )
+
+    def test_the_production_credit_path_no_longer_loses_an_update(self, mongo_db):
+        """The same gate, the same four callers, against real production code.
+
+        Paired deliberately with the twin above: identical barrier, identical
+        database, identical four-caller shape — the only difference is that this
+        one calls `update_paper_balance`. One goes red when the *instrument*
+        breaks; this one goes red when the *fix* is reverted. Neither can stand
+        in for the other, and reading them together is what makes "the race is
+        closed" a measured claim rather than an absent failure.
+        """
+        import services.paper_trade as paper_trade
+
+        async def body(db):
+            user_id = ObjectId()
+            await db.users.insert_one({"_id": user_id, "paper_capital": 100000.0})
+            barrier = asyncio.Barrier(4)
+            gated = _GatedDb(db, {"users": barrier})
+            await _gather(*[
+                paper_trade.update_paper_balance(str(user_id), 100.0, gated)
+                for _ in range(4)
+            ])
+            row = await db.users.find_one({"_id": user_id})
+            return row["paper_capital"]
+
+        assert _run(mongo_db, body) == 100400.0
 
     def test_a_compare_and_swap_admits_exactly_one_writer(self, mongo_db):
         """The instrument distinguishes a CAS from a read/decide/write.
@@ -294,14 +342,26 @@ class TestTheHarnessCanSeeARace:
 
 
 # =========================================================================== #
-# §2 — LIM-D6.2-6 reproduced, and confined                                     #
+# §2 — LIM-D6.2-6: reproduced by D6.3, CLOSED by D6.7                          #
 # =========================================================================== #
 class TestSessionRotationRaceIsTenantContained:
     """The `rotate()` TOCTOU, against a database that can actually exhibit it.
 
     D6.2 reasoned that the race fails closed and D6.3 reasoned that it leaks
-    nothing across tenants. Neither could demonstrate it. These three tests do,
-    and they change nothing in `security/sessions.py` — the brief freezes it.
+    nothing across tenants. Neither could demonstrate it; these tests did — and
+    what they demonstrated was worse than "untidy". Both racing refreshes were
+    accepted, so the family held two live tokens, and the client that lost held
+    one that was neither current nor the single retired generation. Its next
+    refresh was therefore indistinguishable from replay and **revoked the whole
+    family**: a user signed out of every device because two tabs refreshed in
+    the same instant.
+
+    D6.7 made the write a compare-and-swap (`security/sessions.py`), so the
+    tests below now assert the closed behaviour. The class name is kept: tenant
+    containment was and remains the property D6.3 owned here, and it is still
+    asserted — a race that is gone cannot cross a boundary, but the bystander
+    control is what proves the *fix* did not start touching other families
+    either.
     """
 
     @staticmethod
@@ -310,14 +370,20 @@ class TestSessionRotationRaceIsTenantContained:
         gated = SessionStore(_GatedDb(db, {"sessions": barrier}))
         return await _gather(*[gated.rotate(session_id, presented, f"{presented}-next-{suffix}") for suffix in parties])
 
-    def test_two_concurrent_rotations_of_one_family_both_succeed(self, mongo_db):
-        """LIM-D6.2-6, reproduced. Both callers are told `ROTATED`; one jti is real.
+    def test_exactly_one_of_two_concurrent_rotations_is_accepted(self, mongo_db):
+        """LIM-D6.2-6, closed. One `ROTATED`, one `GRACE_REPLAY`, one live token.
 
-        `rotate()` reads the family, decides against the read, then writes
-        filtered on `session_id` alone. Two refreshes presenting the same current
-        jti both pass the decision and both write — so the store issues two live
-        refresh tokens for a family that can only have one, and the counter is
-        incremented twice for a single logical rotation.
+        The write now restates `current_jti`, so Mongo admits exactly one of the
+        two racing rotations under the document lock. The loser is not invented a
+        new answer for: the winner has just set `previous_jti` to the very token
+        the loser presented, so it lands in D6.2's existing two-tab grace path
+        and is handed the winner's live token. That vocabulary was built for this
+        shape; the race was simply reaching it by a route that revoked instead.
+
+        `refresh_count == 1` is the load-bearing half of the assertion. It is the
+        one field that counts *logical* rotations, so a fix that merely made both
+        writers agree on a final `current_jti` — without making one of them lose
+        — would still show 2 here.
         """
 
         async def body(db):
@@ -325,25 +391,44 @@ class TestSessionRotationRaceIsTenantContained:
             session_id = await store.create("user-A", "jti-1")
             results = await self._race(db, session_id, "jti-1")
             doc = await db.sessions.find_one({"session_id": session_id})
-            return [r.outcome for r in results], doc
+            return [r.outcome for r in results], doc, [r.issued_jti for r in results]
 
-        outcomes, doc = _run(mongo_db, body)
-        assert outcomes == [ROTATED, ROTATED], (
-            f"expected the documented TOCTOU: both racing refreshes accepted. Got {outcomes}. "
-            f"If one of these is now REUSE_DETECTED, rotate() has become atomic and "
-            f"LIM-D6.2-6 is closed — update this test and the limitation together."
+        outcomes, doc, issued = _run(mongo_db, body)
+        assert sorted(outcomes) == [GRACE_REPLAY, ROTATED], (
+            f"a compare-and-swap must admit exactly one of two racing rotations; got "
+            f"{outcomes}. Two ROTATED is LIM-D6.2-6 reopened."
         )
-        assert doc["refresh_count"] == 2, "one logical rotation, counted twice"
+        assert doc["refresh_count"] == 1, (
+            f"one logical rotation must be counted once, got {doc['refresh_count']}"
+        )
         assert doc["current_jti"] in ("jti-1-next-X", "jti-1-next-Y")
         assert doc["revoked"] is False, "the race itself must not revoke the family"
+        assert set(issued) == {doc["current_jti"]}, (
+            f"both clients must be handed the ONE live token; got {issued} against a "
+            f"stored current_jti of {doc['current_jti']}. A client sent away with a "
+            f"token the family does not hold is the old defect wearing a new outcome."
+        )
 
-    def test_the_client_that_lost_the_race_fails_closed(self, mongo_db):
-        """The loser is denied and the family dies — it is not silently promoted.
+    def test_a_token_the_family_never_issued_still_fails_closed_after_a_race(self, mongo_db):
+        """Reuse detection is not softened by the fix. Renamed in D6.7.
 
-        This is the "fails closed" half of the D6.2 verdict. The token the losing
-        client was handed is neither current nor the single retired generation, so
-        its next refresh is indistinguishable from replay and revokes the family.
-        Costly for that user; it hands nobody anything.
+        WHAT THIS TEST USED TO BE, AND WHY THE NAME HAD TO CHANGE
+        --------------------------------------------------------
+        It was `test_the_client_that_lost_the_race_fails_closed`, and it was the
+        "fails closed" half of the D6.2 verdict: under the TOCTOU, the losing
+        client really was handed a live-looking token the family did not hold, so
+        its next refresh revoked the family. That was the defect's cost, stated
+        honestly.
+
+        After D6.7 there is no such client — the loser gets `GRACE_REPLAY` and
+        the winner's real token — so the jti this test constructs is now simply
+        one the family never issued. The assertion still holds and is still worth
+        holding, but it is a different claim, and leaving the old name on it
+        would have left the suite reporting a scenario that can no longer occur.
+
+        What it proves now: making `rotate()` atomic did **not** buy the fix by
+        widening the grace window. A genuinely unknown token presented against a
+        live family is still theft, and still kills the family.
         """
 
         async def body(db):
@@ -352,8 +437,12 @@ class TestSessionRotationRaceIsTenantContained:
             await self._race(db, session_id, "jti-1")
 
             doc = await db.sessions.find_one({"session_id": session_id})
-            loser = "jti-1-next-Y" if doc["current_jti"] == "jti-1-next-X" else "jti-1-next-X"
-            result = await store.rotate(session_id, loser, "jti-3")
+            # The jti the losing rotation *would* have installed pre-D6.7. The
+            # family never issued it, which is exactly what makes it the right
+            # probe for reuse detection.
+            unissued = ("jti-1-next-Y" if doc["current_jti"] == "jti-1-next-X"
+                        else "jti-1-next-X")
+            result = await store.rotate(session_id, unissued, "jti-3")
             after = await db.sessions.find_one({"session_id": session_id})
             return result.outcome, after
 
@@ -382,8 +471,9 @@ class TestSessionRotationRaceIsTenantContained:
             await self._race(db, a_session, "jti-1")
 
             doc = await db.sessions.find_one({"session_id": a_session})
-            loser = "jti-1-next-Y" if doc["current_jti"] == "jti-1-next-X" else "jti-1-next-X"
-            await store.rotate(a_session, loser, "jti-3")
+            unissued = ("jti-1-next-Y" if doc["current_jti"] == "jti-1-next-X"
+                        else "jti-1-next-X")
+            await store.rotate(a_session, unissued, "jti-3")
 
             after = await db.sessions.find_one({"session_id": b_session})
             b_still_works = await store.rotate(b_session, "b-jti-1", "b-jti-2")
@@ -522,24 +612,25 @@ class TestConcurrentWritesDoNotCrossTenants:
 # §4 — single-owner integrity races found on the way                           #
 # =========================================================================== #
 class TestSingleOwnerIntegrityRaces:
-    """Reproduced, NOT cross-tenant, NOT fixed here — and not swept up either.
+    """CLOSED IN D6.7. Kept as the regression, with the history intact.
 
-    Both tests below assert the behaviour the code *should* have, under
-    `xfail(strict=True)`. Today they fail, which is the record of an open defect.
-    When someone fixes the underlying write, `strict` turns the unexpected pass
-    into a failure, so the fix cannot land without deleting the marker and the
-    limitation together.
+    D6.3 recorded two reproducible single-owner races here under
+    `xfail(strict=True)` — red-by-design, so that `strict` would turn the
+    unexpected pass into a failure and the fix could not land without deleting
+    the marker and the limitation together. That is exactly what happened: D6.7
+    made `update_paper_balance` a `$inc` and `close_paper_trade` a status-
+    conditional compare-and-swap, both tests began to pass, `strict` caught it,
+    and the markers are gone.
 
-    They are out of D6.3's scope on purpose: D6.3 owns the tenant boundary, and
-    neither of these crosses it. Both belong to the owner's own account.
+    The tests themselves are unchanged and stay — a race that was reproduced
+    once will be reintroduced by the next well-meaning refactor of either write,
+    and this is the only instrument in the repository that can see it.
+
+    Neither ever crossed the tenant boundary, which is why D6.3 was right to
+    scope them out and record them rather than fix them mid-sprint. Both belong
+    to the owner's own account.
     """
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="OPEN (D6.4): update_paper_balance is read/modify/write with $set — "
-        "concurrent credits are lost. Fix is $inc. Reproduced by "
-        "TestTheHarnessCanSeeARace::test_a_read_modify_write_really_does_lose_an_update.",
-    )
     def test_concurrent_credits_should_all_be_applied(self, mongo_db):
         import services.paper_trade as paper_trade
 
@@ -554,19 +645,14 @@ class TestSingleOwnerIntegrityRaces:
 
         assert _run(mongo_db, body) == 100400.0
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="OPEN (D6.4): close_paper_trade reads status, decides, then writes without "
-        "restating status in the filter — concurrent closes all pass the check and "
-        "the position is credited once per caller. Fix is a status-conditional update.",
-    )
     def test_a_paper_trade_should_only_close_once(self, mongo_db):
         """The write must be conditional on the status the decision was made against.
 
-        Note the interaction, which is why the two xfails in this class must be
-        cleared together: the double credit is currently *masked* by the lost
-        update above. Fixing `update_paper_balance` to `$inc` on its own would
-        turn a hidden double-close into a real over-credit.
+        Note the interaction, which is why the two markers had to clear
+        together: the double credit was *masked* by the lost update above.
+        Fixing `update_paper_balance` to `$inc` on its own would have turned a
+        hidden double-close into a real, visible over-credit — the balance would
+        have been repaired into paying out three times for one position.
         """
         import services.paper_trade as paper_trade
         import services.real_market as real_market

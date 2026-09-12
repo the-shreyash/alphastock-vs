@@ -1117,3 +1117,56 @@ Every interface should feel like it belongs to the same ecosystem.
 ---
 
 # End of Design System
+---
+
+# Implementation Status (D7.1 — Product-Wide Design System)
+
+Everything above is the *intent*. This section records what is actually built,
+so a future reader can tell the two apart.
+
+## Where it lives
+
+| Concern | Location |
+| --- | --- |
+| Design tokens (both themes) | `frontend/src/index.css` |
+| Global component classes | `frontend/src/App.css` |
+| Shared component layer | `frontend/src/components/ds/` (see its README) |
+| Generic primitives | `frontend/src/components/ui/` (shadcn/Radix) |
+| Token integrity guard | `frontend/src/__tests__/designTokens.test.js` |
+| Component contracts | `frontend/src/components/__tests__/designSystem.test.jsx` |
+| Navigation structure | `frontend/src/components/__tests__/SidebarNavigation.test.jsx` |
+
+## Decisions taken in D7.1
+
+**Primary action colour is a neutral, not a hue.** `--brand-accent` is
+near-black on light and near-white on dark, matching the landing page's
+"Get Started" button. "Primary" therefore always reads as the highest-contrast
+element on the surface rather than as one particular colour. The previous
+indigo `--ai-accent` is retained as the *AI identity* colour only.
+
+**`--confirm` is a distinct execution green.** Reserved for actions that commit
+something (place order, connect broker). It is deliberately not `--gain`: a
+green meaning "the price went up" and a green meaning "this will execute a
+trade" must not be the same green.
+
+**Navigation active state is a subtle tint plus an accent marker**, never a
+saturated filled pill — see `--nav-active-*`.
+
+**Nine top-level nav sections**, with each section's other views nested and
+revealed when that section is active. No route was removed; `NAV_PATHS` (exported
+from `Sidebar.jsx`) is asserted against the previous flat rail's full path list.
+
+**Both themes remain equal citizens.** Every themeable token is defined in both
+blocks, and that is enforced by test rather than by review.
+
+## Known gaps (not yet done)
+
+- The `ds/` layer is adopted for page headers (10 pages), the Markets tab row,
+  the dashboard index strip and AI summary, and the Watchlist empty state.
+  Remaining pages still hand-build their inner cards and tables; migrating them
+  is mechanical but was not completed in D7.1.
+- `DataTable` is specified in the component list above but not yet built —
+  holdings, rankings and movers tables are still per-page markup.
+- The codebase is JavaScript (`.jsx`), not TypeScript as CLAUDE.md specifies.
+  The `ds/` layer follows the existing convention rather than introducing a
+  second language; converting the frontend to TypeScript is its own project.

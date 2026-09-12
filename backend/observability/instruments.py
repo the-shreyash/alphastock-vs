@@ -309,7 +309,14 @@ def record_task_end(task: str, outcome: str, duration_seconds: Optional[float] =
 # --------------------------------------------------------------------------- #
 # Scheduler (APScheduler cron jobs)                                             #
 # --------------------------------------------------------------------------- #
-SCHEDULER_OUTCOMES = frozenset({"executed", "error", "missed"})
+# `not_leader` (D6.7) is deliberately its OWN outcome rather than folded into
+# `missed`. A missed run is an incident — the loop was blocked or the previous
+# run overran — and `record_scheduler_run` counts it as an error for exactly
+# that reason. A run skipped because this process does not hold the scheduler
+# lease is the system working: on a four-worker deployment three processes skip
+# every job on every tick, and counting those as errors would bury a real missed
+# run under thousands of healthy ones.
+SCHEDULER_OUTCOMES = frozenset({"executed", "error", "missed", "not_leader"})
 
 
 def record_scheduler_run(job: str, outcome: str,

@@ -9,6 +9,10 @@ import GlobalMarketsCard from "../components/morning/GlobalMarketsCard";
 import NewsHeadlines from "../components/morning/NewsHeadlines";
 import EconomicCalendarCard from "../components/morning/EconomicCalendarCard";
 import PortfolioAlertsCard from "../components/morning/PortfolioAlertsCard";
+import ReportProvenance, {
+  ReportUnavailable, BriefingAttribution,
+} from "../components/morning/ReportProvenance";
+import { deriveReportStatus, formatInstant } from "../lib/reportProvenance";
 import {
   Sun, RefreshCw, TrendingUp, TrendingDown, Minus,
   AlertTriangle, BarChart3, ArrowUpRight, ArrowDownRight,
@@ -91,9 +95,15 @@ function PickCard({ pick }) {
           <p className="text-[15px] font-semibold font-display" style={{ color: "var(--text-primary)" }}>{pick.name}</p>
           <p className="text-[11px] font-mono" style={{ color: "var(--text-muted)" }}>{pick.symbol}</p>
         </div>
+        {/* D6.9 — `confidence` is the technical scan's own score (RSI, volume,
+            MACD, patterns), not a model's judgement. It kept the AI accent
+            colour and the bare label "conf", which on a page headed "AI" read
+            as an AI confidence. Neutral colour, and the tooltip names what it
+            actually measures. */}
         <span className="text-xs font-bold px-2 py-0.5 rounded-full"
-          style={{ background: "var(--ai-accent-soft)", color: "var(--ai-accent)" }}>
-          {pick.confidence}% conf
+          title="Technical score from RSI, volume, MACD and detected patterns"
+          style={{ background: "var(--bg-elevated, rgba(120,120,140,0.12))", color: "var(--text-secondary)" }}>
+          {pick.confidence}% signal
         </span>
       </div>
       <p className="text-[13px] leading-relaxed" style={{ color: "var(--text-secondary)" }}>{pick.reason}</p>
@@ -113,6 +123,15 @@ export default function MorningReport() {
   const [report, setReport] = useState(null);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
+  // D6.9 — CURRENT AI service health, fetched independently of the report.
+  // It is a second axis and never evidence about the report's history: an
+  // offline provider does not make the 08:30 briefing fake, and an online one
+  // does not prove today's briefing was generated.
+  const [aiStatus, setAiStatus] = useState(null);
+  // Ticks once a minute so the rendered age advances between refetches. It
+  // re-derives freshness from the report already in hand; it fetches nothing,
+  // so this is not polling and does not touch the event-driven refresh below.
+  const [now, setNow] = useState(() => Date.now());
   // Correlation id for the request in flight — matches the live AI pipeline
   // events (ai.run.* / ai.step over WebSocket) to this fetch (Sprint R7).
   const [activeRunId, setActiveRunId] = useState(null);
@@ -141,6 +160,21 @@ export default function MorningReport() {
   }, []);
 
   useEffect(() => { load(); }, [load]);
+
+  useEffect(() => {
+    let cancelled = false;
+    api.get("/ai/status")
+      .then((r) => !cancelled && setAiStatus(r.data))
+      // A failed status request is not proof of an outage — it is the absence
+      // of an answer. `online: null` renders no claim either way.
+      .catch(() => !cancelled && setAiStatus(null));
+    return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 60000);
+    return () => clearInterval(id);
+  }, []);
 
   // Sprint R8: the 8:30 pipeline broadcasts morningreport.generated when the
   // fresh report lands — refetch in place (refresh spinner, not a skeleton
@@ -171,18 +205,20 @@ export default function MorningReport() {
     />
   );
 
-  if (!report || report.available === false) return (
-    <div className="text-center py-20" style={{ color: "var(--text-muted)" }}>
-      <Sun size={40} className="mx-auto mb-3 opacity-40" />
-      <p className="body-text mb-5">
-        {report?.note || "Unable to load morning report. Please try refreshing."}
-      </p>
-      <button onClick={() => load(true)} className="btn-primary">Retry</button>
-    </div>
+  // D6.9 — ONE derivation, shared by every surface below. The page no longer
+  // infers "an AI wrote this" from the presence of report data.
+  const status = deriveReportStatus(report, { generating: refreshing, aiStatus, now });
+
+  if (!status.hasReport) return (
+    <ReportUnavailable status={status} note={report?.note} onRetry={() => load(true)} />
   );
 
   const mood = MOOD_CONFIG[report.market_mood] || MOOD_CONFIG.Neutral;
   const MoodIcon = mood.icon;
+  // Ties the picks to the generation that produced them, so a stale report's
+  // picks are visibly as old as the report rather than reading as live.
+  const generatedInstant = formatInstant(status.completedAt);
+  const pickTimingNote = generatedInstant ? ` · selected ${generatedInstant}` : "";
 
   return (
     <div className="space-y-6 max-w-4xl" data-testid="morning-report-page">
@@ -196,17 +232,27 @@ export default function MorningReport() {
               Morning Briefing
             </h1>
           </div>
-          <p className="caption font-mono">
-            {new Date(report.generated_at || Date.now()).toLocaleString("en-IN", {
-              weekday: "long", day: "numeric", month: "long", year: "numeric", hour: "2-digit", minute: "2-digit",
-            })}
-          </p>
+          {/* The report's own date — the trading day it covers. It is NOT a
+              generation time and is no longer presented as one.
+
+              D6.9 — this read `new Date(report.generated_at || Date.now())`.
+              On a legacy document with no `generated_at`, the `|| Date.now()`
+              rendered the page-load time as the generation time: a report of
+              unknown age presented as generated seconds ago. The real
+              generation instant, or the honest absence of it, is in
+              <ReportProvenance /> below. */}
+          <p className="caption font-mono" data-testid="report-date">{report.date}</p>
         </div>
         <button onClick={() => load(true)} disabled={refreshing} className="btn-secondary btn-sm">
           <RefreshCw size={13} className={refreshing ? "animate-spin" : ""} />
           {refreshing ? "Refreshing..." : "Refresh Report"}
         </button>
       </motion.div>
+
+      {/* When it was generated, how old it is now, whether a model wrote it,
+          and whether AI is up right now — four separate facts, stated as four
+          separate facts. */}
+      <ReportProvenance status={status} />
 
       {/* Market Mood Banner */}
       <motion.div className="rounded-2xl p-5 flex items-center justify-between"
@@ -243,32 +289,62 @@ export default function MorningReport() {
         <IndexCard label="Sensex" value={report.sensex?.value} change_pct={report.sensex?.change_pct} />
       </div>
 
-      {/* AI Briefing */}
+      {/* Market Briefing.
+
+          D6.9 — the heading was unconditionally "AI Market Briefing". It is the
+          truth only when a model actually answered; the same block otherwise
+          holds the grounded restatement of the collected numbers, and on a
+          deployment whose key had no credit it held the provider's own
+          "AI services are currently offline" text. The heading and the accent
+          now follow `status.isAIGenerated`, which comes from the backend's
+          record of what ran — never from the presence of a string here. */}
       <motion.div className="glass-card p-5"
         initial={{ opacity: 0, y: 16 }} whileInView={{ opacity: 1, y: 0 }}
-        viewport={{ once: true, margin: "-60px" }} transition={{ duration: 0.4 }}>
-        <h3 className="eyebrow mb-3 flex items-center gap-2" style={{ color: "var(--ai-accent)" }}>
-          <BarChart3 size={13} /> AI Market Briefing
+        viewport={{ once: true, margin: "-60px" }} transition={{ duration: 0.4 }}
+        data-testid="market-briefing">
+        <h3 className="eyebrow mb-1 flex items-center gap-2"
+          style={{ color: status.isAIGenerated ? "var(--ai-accent)" : "var(--text-secondary)" }}
+          data-testid="briefing-heading">
+          <BarChart3 size={13} /> {status.isAIGenerated ? "AI Market Briefing" : "Market Briefing"}
         </h3>
+        <div className="mb-3"><BriefingAttribution status={status} /></div>
         <blockquote className="body-text border-l-2 pl-4"
-          style={{ borderColor: "var(--ai-accent)" }}>
+          style={{ borderColor: status.isAIGenerated ? "var(--ai-accent)" : "var(--border)" }}>
           {report.ai_briefing}
         </blockquote>
       </motion.div>
 
-      {/* Top Picks */}
+      {/* Top Picks.
+
+          D6.9 — these are a deterministic RSI / volume / MACD / pattern scan
+          and have never involved a model, but they sat under an AI-framed page
+          beside an AI-accented "% conf" badge and above a "View full AI stock
+          picks" link. They are labelled for what they are, and tied to the
+          generation that produced them — a pick's age is this report's
+          `completed_at`, not now. */}
       <motion.div initial={{ opacity: 0, y: 16 }} whileInView={{ opacity: 1, y: 0 }}
         viewport={{ once: true, margin: "-60px" }} transition={{ duration: 0.4 }}>
-        <h3 className="eyebrow mb-3 flex items-center gap-2">
+        <h3 className="eyebrow mb-1 flex items-center gap-2">
           <TrendingUp size={13} /> Today's Top Picks
         </h3>
+        <p className="text-[11px] font-mono mb-3" style={{ color: "var(--text-muted)" }}
+          data-testid="picks-attribution">
+          {status.picksAreDeterministic
+            ? "Deterministic technical scan — not AI-generated"
+            : "Source not recorded"}
+          {pickTimingNote}
+        </p>
         {report.top_picks?.length > 0 ? (
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
             {report.top_picks.map((p, i) => <PickCard key={i} pick={p} />)}
           </div>
         ) : (
-          <div className="glass-card p-5 text-center text-sm" style={{ color: "var(--text-muted)" }}>
-            Picks generating — check back in a moment.
+          // "Picks generating — check back in a moment" was false: generation
+          // had finished, and the scan had returned nothing. A completed run
+          // with an empty result is stated as one.
+          <div className="glass-card p-5 text-center text-sm" style={{ color: "var(--text-muted)" }}
+            data-testid="picks-empty">
+            No setups met the scan's criteria for this report.
           </div>
         )}
       </motion.div>
@@ -310,7 +386,7 @@ export default function MorningReport() {
       {/* Footer link */}
       <div className="text-center pt-2">
         <Link to="/picks" className="text-sm font-medium hover:underline" style={{ color: "var(--ai-accent)" }}>
-          View full AI stock picks →
+          View full stock picks →
         </Link>
       </div>
     </div>

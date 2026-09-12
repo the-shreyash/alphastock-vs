@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { motion } from "framer-motion";
 import api from "../services/api";
+import { PageHeader } from "../components/ds";
 import {
   BarChart3, Play, TrendingUp, TrendingDown, Minus, Award,
   AlertTriangle, RefreshCw, Info, ChevronDown,
@@ -111,12 +112,10 @@ Is this strategy viable for live trading? What are the key risks? What improveme
     <div className="space-y-5" data-testid="backtesting-page">
       {/* Header */}
       <div>
-        <h1 className="page-title">
-          Backtesting
-        </h1>
-        <p className="page-subtitle mt-0.5">
-          Test trading strategies on historical NSE data
-        </p>
+        <PageHeader
+          title="Research"
+          subtitle="Test trading strategies on historical NSE data"
+        />
       </div>
 
       {/* Config Panel */}

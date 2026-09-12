@@ -379,7 +379,9 @@ async def task_monitor_trades():
     from services.activity_logger import log_platform_activity as log_activity
     log_activity("Monitoring Open Trades", "monitor", "running")
     try:
-        open_trades = await _db.trades.find({"status": "OPEN"}).to_list(200)
+        from services import fanout
+        open_trades = await fanout.collect(
+            _db.trades.find({"status": "OPEN"}), label="heartbeat.monitor_trades")
         if not open_trades:
             log_activity("No open trades to monitor", "monitor", "done")
             return
@@ -437,8 +439,14 @@ async def task_monitor_portfolio():
     from services.activity_logger import log_platform_activity as log_activity
     log_activity("Monitoring Portfolio", "monitor", "running")
     try:
-        open_trades = await _db.trades.find({"status": "OPEN"}).to_list(200)
-        broker_holdings = await _db.holdings.find({}).to_list(500)
+        # D6.7 — both streamed. The user set below is DERIVED from these two
+        # lists, so a truncated read did not merely shorten the work: a user
+        # whose holdings fell past row 500 received no portfolio update at all.
+        from services import fanout
+        open_trades = await fanout.collect(
+            _db.trades.find({"status": "OPEN"}), label="heartbeat.portfolio.trades")
+        broker_holdings = await fanout.collect(
+            _db.holdings.find({}), label="heartbeat.portfolio.holdings")
         manual = [t for t in open_trades if not t.get("is_paper")]
         user_ids = {t["user_id"] for t in manual} | {h["user_id"] for h in broker_holdings}
         if not user_ids:

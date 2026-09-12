@@ -217,8 +217,33 @@ class SessionStore:
             return RotationResult(REUSE_DETECTED, session)
 
         now = _now()
-        await self._col.update_one(
-            {"session_id": session_id},
+        # D6.7 — THE WRITE RESTATES WHAT THE DECISION WAS MADE AGAINST.
+        #
+        # This closes LIM-D6.2-6. The filter used to be `{"session_id": ...}`
+        # alone, so the four checks above were a decision taken against a value
+        # read a round trip earlier and then written unconditionally. Two
+        # refreshes presenting the same current jti both passed every check and
+        # both wrote: the store issued two live refresh tokens for a family that
+        # can only have one, and `refresh_count` counted one logical rotation
+        # twice. Reproduced against a real `mongod` by
+        # `tests/test_d63_real_db_races.py::TestSessionRotationRaceIsTenant
+        # Contained`, which D6.2 and D6.3 could each only reason about.
+        #
+        # The consequence was not merely untidy. Whichever client lost held a
+        # token that was neither current nor the one retired generation, so its
+        # next refresh was indistinguishable from replay and **revoked the whole
+        # family** — a user signed out of every device because two tabs
+        # refreshed in the same instant.
+        #
+        # `current_jti` and `revoked` in the filter make this a compare-and-swap:
+        # Mongo evaluates it under the document lock, so of N racing rotations
+        # exactly one matches. `revoked` is there for a second reason of its own
+        # — a logout that lands between the read and this write must not have
+        # its revocation overwritten by a rotation that slid `expires_at`
+        # forward on a family the user just killed.
+        result = await self._col.update_one(
+            {"session_id": session_id, "current_jti": presented_jti,
+             "revoked": False},
             {"$set": {
                 "current_jti": new_jti,
                 # Remember exactly one retired generation, and the instant it
@@ -231,6 +256,25 @@ class SessionStore:
                 "expires_at": now + timedelta(seconds=refresh_ttl_seconds()),
             }, "$inc": {"refresh_count": 1}},
         )
+        if not getattr(result, "modified_count", 0):
+            # We lost the swap. Re-read and answer from what is actually there
+            # rather than guessing: the winner of a concurrent rotation has just
+            # set `previous_jti` to the very token we presented, so this lands in
+            # D6.2's existing two-tab grace path and the caller is handed the
+            # winner's live token — which is precisely the outcome that vocabulary
+            # was built for. Any other reason for the miss (revoked mid-flight, or
+            # a jti that moved on past the grace) falls through to the same
+            # fail-closed answers the sequential path gives.
+            current = await self._col.find_one({"session_id": session_id})
+            if current is None:
+                return RotationResult(NOT_FOUND)
+            if current.get("revoked"):
+                return RotationResult(REVOKED, current)
+            if self._within_rotation_grace(current, presented_jti):
+                return RotationResult(GRACE_REPLAY, current,
+                                      issued_jti=current.get("current_jti"))
+            await self._revoke_doc(session_id, REASON_REUSE)
+            return RotationResult(REUSE_DETECTED, current)
         return RotationResult(ROTATED, session, issued_jti=new_jti)
 
     async def revoke(self, session_id: str, *, reason: str = REASON_LOGOUT) -> bool:

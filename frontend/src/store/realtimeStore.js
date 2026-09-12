@@ -108,6 +108,10 @@ const initialState = {
   watchlistEvent: null, // { action: "added"|"removed", symbol, updatedAt }
   // Morning report ready-signal (Sprint R8) — pages refetch when this bumps.
   morningReportReadyAt: null,
+  // The outcome that signal reported (D6.9): "completed" | "failed" |
+  // "unavailable" | null when not yet known. A bump with a non-completed status
+  // means the morning run happened and produced nothing.
+  morningReportStatus: null,
 };
 
 // Index symbol aliases used when folding index events into the price store.
@@ -469,7 +473,18 @@ export const useRealtimeStore = create((set, get) => ({
       case "morningreport":
         // morningreport.generated — the 8:30 pipeline finished; consumers
         // refetch the report when this timestamp bumps.
-        set({ morningReportReadyAt: envelope.timestamp || Date.now() });
+        //
+        // D6.9 — the event now carries the generation's OUTCOME, because
+        // "the pipeline finished" and "a report was produced" are not the same
+        // event and this bump used to be read as both. A listener that
+        // refetches on a failed run needs to land in the failed state, not in
+        // a state that assumes the arrival of the signal implies a report.
+        // Metadata only — the body still comes from the API, where per-user
+        // layering and authorization live.
+        set({
+          morningReportReadyAt: envelope.timestamp || Date.now(),
+          morningReportStatus: data?.status || null,
+        });
         break;
       case "notification": {
         // notification.created — per-user push. Increment the unread badge and

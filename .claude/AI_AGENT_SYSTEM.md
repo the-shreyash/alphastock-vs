@@ -74,6 +74,136 @@ Agents explain uncertainty.
 
 ---
 
+# AI Artifact Provenance (D6.9)
+
+This section is authoritative for every AI-generated artifact on the platform.
+The code counterpart is `backend/services/ai_provenance.py`.
+
+## The rule
+
+An artifact may be presented as AI-generated only when a model actually
+produced it, and that fact must be recorded at generation time — never inferred
+at read time.
+
+## Four facts that must never be collapsed
+
+    GENERATION TIME  ≠  MARKET DATA TIME  ≠  CURRENT AI HEALTH  ≠  FRESHNESS
+
+Collapsing them is what produced the defect this model exists to prevent: on a
+deployment whose API key had no billing credit, the workspace header read
+**AI ready**, the Morning Report read **AI Market Briefing**, and the text
+underneath was the provider's own "AI services are currently offline" message —
+persisted and served to every user for the rest of the day.
+
+Specifically:
+
+* An AI provider being online now is **not** evidence that today's artifact was
+  generated.
+* An AI provider being offline now is **not** evidence that an existing
+  artifact is fake. A report generated at 08:30 stays a real 08:30 report when
+  the provider dies at 14:00.
+* A scheduler having run is **not** evidence that generation succeeded.
+* An API key being configured is **not** evidence that a model answered.
+
+## Generation status
+
+    generating    a run is in flight; any body present is partial
+    completed     the run finished and produced a usable artifact
+    failed        the run was attempted and did not produce one
+    unavailable   the run could not be attempted (inputs unreachable)
+
+Only `completed` licenses treating the result as an artifact. Only
+`completed` **and** `ai.outcome == "succeeded"` licenses calling it
+AI-generated — each rules out a case the other misses.
+
+## Provenance fields
+
+    provenance_version   shape version of this record
+    artifact_type        e.g. "morning_report"
+    artifact_id          e.g. "morning:2026-09-11"
+    status               the four states above
+    generated_at         when the attempt BEGAN
+    completed_at         when it SUCCEEDED — the only freshness clock
+    analysis_version     version of the artifact's composition logic
+    ai.outcome           succeeded | not_configured | provider_error | not_applicable
+    ai.provider          written ONLY on success; never the provider attempted
+    ai.model             written ONLY on success
+    ai.prompt_key        the Prompt Library key used
+    ai.prompt_version    that prompt's version
+    market_data.source_tier   the freshness TIER, never a provider name
+    market_data.observed_at   when the numbers were observed
+    error                { code, message } — user-facing text only
+
+`ai.provider` and `ai.model` have exactly one writer, `ai_provenance.ai_succeeded`,
+so an attribution cannot appear without a model call.
+
+## Freshness
+
+Derived at read time from `completed_at` and from nothing else — never from
+`updated_at`, the request clock, the page-load time, or current AI health.
+Storing a freshness value is forbidden: it is a function of *now* and would be
+wrong the instant after it was written.
+
+    FRESH        ≤ 3h    the pre-open read is still the operative one
+    STALE        ≤ 12h   same trading day; the market has moved — warn
+    VERY_STALE   > 12h   predates today's pre-open window
+    UNKNOWN              completed, but the instant was never recorded
+    UNAVAILABLE          no successful generation to measure
+
+The 3h and 12h thresholds are derived from the NSE session, not chosen for
+roundness: generation is 08:30 IST, so 08:30+3h = 11:30 (two hours into
+trading) and 08:30+12h = 20:30 (after the 15:30 close). They live in
+`ai_provenance.FRESHNESS_POLICY` and are shipped to clients so the browser can
+let the age advance without inventing a second definition of "stale".
+
+**Freshness changes the label, never the availability.** A stale artifact stays
+visible with a warning; it is never replaced by an error screen.
+
+## Failure behaviour — the no-fake-AI rule
+
+When AI is unavailable the platform must NOT invent a report, picks, confidence
+scores, AI activity or AI reasoning, and must not mark AI active. Two things
+are permitted and must be labelled:
+
+* A **deterministic fallback** that restates data actually collected. The
+  Morning Report's grounded briefing is one; it is stamped
+  `briefing_source: "deterministic"` and never carries an AI heading.
+* A **previously generated** artifact, shown with its real provenance and
+  freshness warning.
+
+Provider error strings never leave the process: they carry request ids, account
+identifiers and echoed prompts. Failures are recorded as a classified label
+from the closed `observability.errors` vocabulary plus a message written for a
+user.
+
+## Legacy records
+
+Artifacts stored before provenance existed carry no record and are described as
+`status: "unknown"`, `known: false`. No timestamp, provider or model is ever
+backfilled for them. In particular `generated_at` is **not** promoted into
+`completed_at`: it was written at the top of a path that could still fail, so
+promoting it would manufacture a success that may never have happened.
+
+"Unknown provenance" and "failed generation" are different answers and must
+stay distinguishable — an absent record cannot testify that generation failed.
+
+## Current AI health
+
+`services/ai_health.py` records the observed outcome of every real model call,
+and `/api/ai/status` reports `online` only when a configured provider is not in
+an observed-failure state. A configured provider that has never been called is
+reported as not-yet-verified, not as broken: knowing nothing is not evidence of
+an outage.
+
+## Adding a new AI artifact
+
+Declare the type in `ai_provenance.ARTIFACT_TYPES`, then call `begin()` →
+`ai_succeeded()` / `ai_did_not_run()` → `market_data()` → `completed()` /
+`failed()`. Serve `describe()`. Do not extend the module per artifact, and do
+not re-implement freshness anywhere.
+
+---
+
 # Market Data Access
 
 AI agents never communicate with market data providers.
@@ -583,6 +713,39 @@ by every user and generated once per day; the personal layer (portfolio
 alerts) is computed per request and never persisted into the shared document
 — it is keyed by date alone, so a per-user field stored there would reach the
 wrong user. Implementation: services/morning_report.py.
+
+## Lifecycle and provenance (D6.9)
+
+    scheduler 08:30 (or an on-demand request)
+      → ai_provenance.begin()            status: generating
+      → market layer built via the Market Gateway
+      → briefing: a model, or the grounded deterministic fallback
+      → ai_succeeded() | ai_did_not_run()
+      → market_data(source_tier, observed_at)
+      → completed() | failed()
+      → persisted to db.reports (EVERY outcome, including failures)
+      → morningreport.generated published, carrying status + completed_at
+      → read: describe() derives freshness from completed_at
+
+Every exit persists a record, failures included. "Today's report did not
+generate" and "nobody has asked for today's report yet" used to be the same
+observation — an absent document — and they are different facts.
+
+A persisted failure is evidence about the last attempt, not a report: the next
+read retries rather than serving it, so a transient 08:30 outage is never
+pinned for the day.
+
+Two things on this report are NOT AI and are labelled accordingly:
+
+* `ai_briefing` is a model's narration only when `briefing_source == "ai"`.
+  Otherwise it is the grounded restatement of the numbers the report collected,
+  and it is rendered under "Market Briefing", not "AI Market Briefing".
+* `top_picks` are a deterministic RSI / volume / MACD / pattern scan
+  (`top_picks_source: "deterministic_technical_scan"`) and have never involved
+  a model. They carry this report's generation timestamp, so a stale report's
+  picks read as stale rather than as live.
+
+See "AI Artifact Provenance" above for the full model.
 
 ---
 

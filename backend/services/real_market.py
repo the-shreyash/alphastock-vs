@@ -1330,12 +1330,28 @@ async def fetch_real_top_picks(count=3):
             ],
             "sector_change": sector_change_map.get(s.get("sector")),
             "risk_level": "LOW" if confidence > 82 else ("MEDIUM" if confidence > 72 else "HIGH"),
-            "reasons": reasons if len(reasons) >= 2 else reasons + [f"Price action is above key support level", f"Consolidating near recent highs"],
-            "risk_factors": [
-                "Overall market indices approaching key psychological resistance",
-                "Earnings or major corporate announcements pending this week"
-            ],
-            "historical_success": f"{65 + int(confidence / 3)}%"
+            # D6.9 — THREE FABRICATED FIELDS WERE REMOVED HERE.
+            #
+            # `historical_success` was `f"{65 + int(confidence / 3)}%"` and was
+            # rendered on the AI Picks page as **"Win: 87%"**. No backtest
+            # produced it; no trade outcome was consulted. It was the
+            # confidence score put through arithmetic and relabelled as a
+            # realised win rate — the single most dangerous number in the
+            # product, because a user sizes a position on it.
+            #
+            # `risk_factors` was a two-item constant, identical for every pick
+            # on every day, asserting pending earnings and index resistance that
+            # nothing had checked.
+            #
+            # `reasons` was padded to a minimum of two entries with "Price
+            # action is above key support level" and "Consolidating near recent
+            # highs" — claims about price action that this function never
+            # evaluated, appended precisely when it had the least to say.
+            #
+            # Nothing replaces them: inventing a substitute is the defect, and
+            # the honest scan already states its real evidence below. The
+            # surfaces that rendered them are updated in the same change.
+            "reasons": reasons,
         })
         
     # Sort by confidence/score

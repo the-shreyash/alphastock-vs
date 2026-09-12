@@ -467,6 +467,47 @@ portfolio — { available, alerts[], holdings_count, risk, pnl, note }
 
 fii_dii, ai_briefing, generated_at
 
+briefing_source — "ai" | "deterministic" (D6.9). `ai_briefing` is a model's
+narration only for "ai"; otherwise it is the grounded restatement of the
+numbers this report collected. Clients label from this field and never from
+the presence of the text.
+
+top_picks_source — "deterministic_technical_scan" (D6.9). The picks are an
+RSI / volume / MACD / pattern scan and are never AI output. They carry this
+report's generation timestamp.
+
+provenance — the AI artifact provenance record (D6.9). See
+AI_AGENT_SYSTEM.md → "AI Artifact Provenance" for the full model.
+
+    status              generating | completed | failed | unavailable | unknown
+    known               false for documents stored before provenance existed
+    generated_at        when the attempt BEGAN
+    completed_at        when it SUCCEEDED — null unless status is completed
+    ai.outcome          succeeded | not_configured | provider_error | not_applicable
+    ai.provider         present ONLY when a model answered; null otherwise
+    ai.model            present ONLY when a model answered; null otherwise
+    ai.prompt_key       Prompt Library key (never the template)
+    ai.prompt_version
+    market_data.source_tier   freshness tier, never a provider name
+    market_data.observed_at   when the numbers were observed
+    analysis_version
+    freshness           fresh | stale | very_stale | unknown | unavailable
+    age_seconds         seconds since completed_at; null when not knowable
+    is_ai_generated     the ONLY licence to label the briefing AI-generated
+    freshness_policy    { fresh_max_seconds, stale_max_seconds }
+    error               { code, message } — user-facing text only
+
+`freshness` and `age_seconds` are derived per request, so two reads of one
+cached report differ in `age_seconds` and in nothing else. Never persisted.
+
+A report is returned at every age — a stale one carries a warning, it is not
+withheld. A failed or unavailable generation returns available: false with the
+provenance record explaining which.
+
+Never exposed: API keys, prompt templates, provider error strings, stack
+traces. A failure's `error.message` is written for a user; the provider's own
+text is logged and discarded.
+
 Any section that cannot be sourced returns available: false with a note
 explaining why. Values are never substituted or estimated.
 
@@ -512,6 +553,37 @@ Status
 Latency
 
 Usage
+
+---
+
+GET
+
+/ai/status
+
+Public (no auth), so the workspace can render an honest offline state
+pre-login. Model Router + provider health and the task→model routing table.
+
+    providers.{claude,gemini}.configured   a key is present
+    providers.{claude,gemini}.model        the model actually called
+    debate_ready / full_debate             CAPABILITY — key presence only
+    online                                 at least one configured provider is
+                                           not in an observed-failure state
+    health.{claude,gemini}                 observed outcomes (D6.9):
+        configured, verified, degraded, calls_attempted,
+        last_success_at, last_success_model, last_failure_at, last_error_class
+    routing, policy
+
+D6.9 — `online` USED TO MEAN "a key is present", and the workspace header
+rendered that as **AI ready**. A revoked key, an unbilled key and a healthy key
+were identical under that test. It now additionally requires that no configured
+provider is failing. A configured provider that has never been called is
+reported `verified: false, degraded: false` — knowing nothing is not evidence
+of an outage, and a cold process must behave as it always did.
+
+`last_error_class` is a label from the closed `observability.errors`
+vocabulary, never the provider's error string — those carry request ids,
+account identifiers and echoed prompts. The coercion is enforced in
+`services/ai_health.record_failure`, not left to callers.
 
 ---
 
@@ -1047,7 +1119,12 @@ news.published
 
 ai.analysis.completed
 
-morningreport.ready
+morningreport.generated — { date, picks, available, status, completed_at,
+is_ai_generated }. Metadata only; the body still comes from the API, where
+per-user layering and authorization live. `status` was added in D6.9 because
+"the 08:30 pipeline finished" and "a report was produced" are not the same
+event, and a listener refetching on this signal must land in the right state
+rather than assuming the signal implies a report.
 
 ---
 

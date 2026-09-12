@@ -892,9 +892,12 @@ class TestBackgroundTasksCarryTheirAccount:
                     placed.append(account)
                     return {"order_id": "X"}
 
-            trade = {"user_id": "u1", "symbol": "RELIANCE", "broker": "zerodha",
-                     "quantity": 1, "type": "BUY"}
-            assert _run(trading_engine._broker_exit(_Engine(), trade, 1, "SL")) is None
+            trade_id = ObjectId()
+            trade = {"_id": trade_id, "user_id": "u1", "symbol": "RELIANCE",
+                     "broker": "zerodha", "quantity": 1, "type": "BUY"}
+            trades_db = FakeDB(trades=[dict(trade)])
+            assert _run(trading_engine._broker_exit(
+                _Engine(), trade, 1, "SL", db=trades_db)) is None
             assert placed == [], (
                 "a trade with no broker_account_id was exited into an account "
                 "this path chose for itself")
@@ -902,6 +905,15 @@ class TestBackgroundTasksCarryTheirAccount:
             broker_accounts.configure(None)
 
     def test_the_auto_exit_path_uses_the_account_recorded_on_the_trade(self):
+        """D6.7 note: `db` is now passed, as `run_cycle` has always passed it.
+
+        `_broker_exit` takes a per-trade exit claim before it places anything
+        (`trading_engine.claim_exit`), and a claim it cannot record is a claim it
+        cannot prove exclusive — so with no database it declines to order. The
+        account-routing property this test owns is unchanged; the fixture simply
+        supplies the handle the production caller supplies, instead of asserting
+        routing through a path that fails closed before it routes.
+        """
         from services import trading_engine
 
         directory_db = FakeDB(broker_accounts=[account_doc("u1", "upstox")])
@@ -914,10 +926,13 @@ class TestBackgroundTasksCarryTheirAccount:
                     seen.append(account.broker_account_id)
                     return {"order_id": "X"}
 
-            trade = {"user_id": "u1", "symbol": "RELIANCE", "broker": "upstox",
+            trade_id = ObjectId()
+            trade = {"_id": trade_id, "user_id": "u1", "symbol": "RELIANCE",
+                     "broker": "upstox",
                      "broker_account_id": fixture_account_id("u1", "upstox"),
                      "quantity": 1, "type": "BUY"}
-            _run(trading_engine._broker_exit(_Engine(), trade, 1, "SL"))
+            trades_db = FakeDB(trades=[dict(trade)])
+            _run(trading_engine._broker_exit(_Engine(), trade, 1, "SL", db=trades_db))
             assert seen == [fixture_account_id("u1", "upstox")]
         finally:
             broker_accounts.configure(None)
@@ -939,11 +954,22 @@ class TestBackgroundTasksCarryTheirAccount:
                     placed.append(account)
                     return {"order_id": "X"}
 
-            trade = {"user_id": "u1", "symbol": "RELIANCE", "broker": "upstox",
+            # D6.7 — `db` is supplied, as `run_cycle` supplies it. Without it
+            # `_broker_exit` declines at the exit claim (it cannot prove the
+            # claim exclusive), so the ownership refusal this test owns would
+            # never be reached and the test would pass with `owned_by` DELETED.
+            # Caught by D6.7's M2 mutation, which survived against the old form.
+            trade_id = ObjectId()
+            trade = {"_id": trade_id, "user_id": "u1", "symbol": "RELIANCE",
+                     "broker": "upstox",
                      "broker_account_id": fixture_account_id("someone-else", "upstox"),
                      "quantity": 1, "type": "BUY"}
-            assert _run(trading_engine._broker_exit(_Engine(), trade, 1, "SL")) is None
-            assert placed == []
+            trades_db = FakeDB(trades=[dict(trade)])
+            assert _run(trading_engine._broker_exit(
+                _Engine(), trade, 1, "SL", db=trades_db)) is None
+            assert placed == [], (
+                "an auto-exit was placed into an account that does not belong "
+                "to the trade's owner")
         finally:
             broker_accounts.configure(None)
 

@@ -2268,6 +2268,12 @@ async def morning_report():
     session_open = overview.get("market_status") == "OPEN"
 
     report = ""
+    # D6.9 — provenance for the compact briefing. `briefing_source` is "ai" only
+    # when a model actually answered; `ai_provider` / `ai_model` are written
+    # only on that branch and are never filled from what was *attempted*.
+    briefing_source = "deterministic"
+    ai_provider_name: Optional[str] = None
+    ai_model_name: Optional[str] = None
     if claude_configured() or gemini_configured():
         try:
             engine = get_debate_engine()
@@ -2292,10 +2298,27 @@ Nifty: {overview['nifty']['value']} | Bank Nifty: {overview['bank_nifty']['value
 Sentiment: {f"{sentiment}/100" if sentiment is not None else "unavailable"} | VIX: {vix if vix is not None else "unavailable"}
 Top Sectors: {', '.join([f"{s['sector']} ({s['change_pct']}%)" for s in sectors[:3]]) or "unavailable"}
 Top Picks: {', '.join([f"{p['name']} (Confidence: {p['confidence']}%)" for p in picks]) or "unavailable"}"""
-            report = await engine.simple_chat(system_msg, prompt, prefer="claude", max_tokens=400)
+            # `simple_chat_result`, not `simple_chat`: the string form cannot
+            # distinguish a model's answer from the SimulatedProvider's outage
+            # text, and this endpoint published whichever it received.
+            resp = await engine.simple_chat_result(system_msg, prompt, prefer="claude", max_tokens=400)
+            if resp.success and (resp.content or "").strip():
+                report = resp.content.strip()
+                briefing_source = "ai"
+                ai_provider_name, ai_model_name = resp.provider, resp.model
+            else:
+                logging.warning("morning-report: no model produced a briefing (provider=%s)", resp.provider)
         except Exception as e:
-            report = f"Morning report generation failed: {str(e)}"
-    else:
+            # D6.9 — this used to assign `f"Morning report generation failed:
+            # {str(e)}"` to `report` and return it with `available: True`. Two
+            # defects in one line: a failure was published as a successful
+            # report, and the raw exception text — which can carry a request id,
+            # an account identifier or an echoed prompt — was served to the
+            # client. The exception is logged; the client gets the grounded
+            # briefing below, correctly labelled as not AI-generated.
+            logging.error(f"morning-report briefing failed: {e}")
+
+    if not report:
         top_pick_line = (f"Top pick: {picks[0]['name']} ({picks[0]['confidence']}% confidence)."
                          if picks else "Live pick data is unavailable right now.")
         report = (f"Good morning! NSE is open — Nifty trading at {overview['nifty']['value']}. "
@@ -2307,6 +2330,14 @@ Top Picks: {', '.join([f"{p['name']} (Confidence: {p['confidence']}%)" for p in 
     return {
         "available": True,
         "report": report,
+        # Whether `report` above is a model's narration or the grounded
+        # restatement of the numbers beside it. Consumers label from this
+        # rather than assuming, and `picks` are a deterministic technical scan
+        # in both cases — see services/morning_report.PICKS_SOURCE_DETERMINISTIC.
+        "briefing_source": briefing_source,
+        "ai_provider": ai_provider_name,
+        "ai_model": ai_model_name,
+        "picks_source": "deterministic_technical_scan",
         "picks": picks,
         "overview": overview,
         "market_open": session_open,
@@ -2431,9 +2462,15 @@ async def create_trade(data: TradeCreate, user: dict = Depends(get_current_user)
         "trailing_stop": trailing,
         "best_price": data.entry_price,
         "targets_hit": [],
+        # The narration names the broker of the RESOLVED account, not the
+        # `broker` the client sent. An account-addressed request (the only kind
+        # the trade form now makes) carries no `broker` field at all, and the
+        # entry event would otherwise lose the brand it was actually placed
+        # through. Same rule as `broker` below: derived from the account.
         "events": [trading_engine.make_event(
             "ENTRY", f"{side_word} {data.quantity} @ ₹{data.entry_price}"
-                     + (f" via {data.broker} (order {broker_order_id})" if data.broker else ""),
+                     + (f" via {broker_account.broker} (order {broker_order_id})"
+                        if broker_account else ""),
             data.entry_price)],
         "status": "OPEN",
         "pnl": None,
@@ -4129,7 +4166,12 @@ async def ai_monitoring_loop():
                     # 5 min per user). create_notification also publishes
                     # notification.created so the bridge pushes it live.
                     from services.notification_service import create_notification
-                    users = await db.users.find({}, {"_id": 1}).to_list(100)
+                    from services import fanout
+                    # D6.7 — was `.to_list(100)`. A market alert is sent to every
+                    # user, so the cap meant user 101 onward never received one.
+                    users = await fanout.collect(
+                        db.users.find({}, {"_id": 1}),
+                        label="market_alert_loop.users")
                     for u in users:
                         await create_notification(
                             db, str(u["_id"]),
@@ -5831,7 +5873,11 @@ async def webhook_weekly_review(_: bool = Depends(verify_webhook_key)):
     """Generate an AI weekly performance review for every user and notify them."""
     from services.trade_journal import generate_weekly_review
     try:
-        users = await db.users.find({}, {"_id": 1, "capital": 1, "risk_level": 1}).to_list(1000)
+        from services import fanout
+        # D6.7 — was `.to_list(1000)`: user 1,001 onward never got a review.
+        users = await fanout.collect(
+            db.users.find({}, {"_id": 1, "capital": 1, "risk_level": 1}),
+            label="weekly_review.users")
         reviewed = 0
         for u in users:
             uid = str(u["_id"])
@@ -7862,9 +7908,31 @@ async def ensure_indexes():
     # `{user_id, broker_account_id}` leads with the owner so it also answers the
     # plain per-user reads as a prefix; `orders` additionally needs the
     # deduplication key `_record_order` upserts on.
-    await db.orders.create_index([("broker_account_id", 1), ("order_id", 1)])
+    # D6.7 — UNIQUE, not merely indexed. `_record_order` upserts on exactly this
+    # pair from three concurrent writers (a broker-book sync, the realtime order
+    # stream, and an order acknowledgement), and `update_one(upsert=True)` is not
+    # atomic against a concurrent insert of the same key WITHOUT a unique index:
+    # both callers find nothing and both insert, leaving two authoritative rows
+    # for one real broker order. The build is defensive and never destructive —
+    # see `services/brokers/order_identity.py` for why a collection that already
+    # violates the constraint is reported rather than repaired.
+    from services.brokers.order_identity import (
+        ensure_holding_identity_index, ensure_order_identity_index,
+    )
+    await ensure_order_identity_index(db)
     await db.holdings.create_index([("user_id", 1), ("broker_account_id", 1)])
+    # D6.7 — the per-symbol upsert in `BrokerEngine._replace_holdings` needs this
+    # constraint to be atomic against a concurrent sync of the same account.
+    await ensure_holding_identity_index(db)
     await db.portfolios.create_index([("user_id", 1), ("broker_account_id", 1)])
+
+    # Leader election (D6.7 / A2). One document per named lease, keyed by `_id`,
+    # so the unique constraint that makes the election safe is the one Mongo
+    # already enforces on every collection — there is nothing to declare here.
+    # `expires_at` is deliberately NOT a TTL index: Mongo's TTL reaper runs on a
+    # ~60s cycle, so a document it was responsible for removing can outlive its
+    # expiry by longer than the lease itself. The election compares `expires_at`
+    # in its own filter instead, which is exact.
 
     # Admin Portal collections (Sprint 11)
     await db.admin_audit_logs.create_index("timestamp")
@@ -8026,12 +8094,44 @@ async def startup():
     except Exception as e:
         logger.error(f"Market Engine init error: {e}")
 
-    # Setup scheduler (cron jobs)
+    # Setup scheduler (cron jobs), behind a single-leader lease (D6.7 / A2).
+    #
+    # Every uvicorn worker is a separate process and runs this handler, so before
+    # D6.7 every worker registered its own copy of the six cron jobs — including
+    # `trade_monitor`, which places real broker exit orders on stop-loss and
+    # target hits. Two schedulers meant two live market orders for one position.
+    # The only thing standing against that was a warning in the Docker
+    # entrypoint, which does not fire when the deployment scales by *replicas*
+    # (the identical defect) and never runs outside Docker at all.
+    #
+    # The election is started before the scheduler and never blocks the boot: a
+    # process that loses simply runs no leader-only jobs, and keeps campaigning
+    # so it takes over within one lease if the holder dies.
+    try:
+        from infrastructure.leader import LeaderLease, SCHEDULER_LEASE
+
+        scheduler_lease = LeaderLease(db, SCHEDULER_LEASE)
+        acquired = await scheduler_lease.acquire()
+        scheduler_lease.start()
+        app.state.scheduler_lease = scheduler_lease
+        logger.info(
+            "Scheduler leader election: this process (%s) %s the lease.",
+            scheduler_lease.identity, "ACQUIRED" if acquired else "did not win")
+    except Exception as e:
+        # An election that cannot run must not take the scheduler down with it.
+        # `setup_scheduler(lease=None)` restores the pre-D6.7 behaviour exactly,
+        # and the per-trade exit claim in `trading_engine.claim_exit` still makes
+        # a duplicate order impossible regardless — see `scheduler.is_leader`.
+        scheduler_lease = None
+        logger.error("Scheduler leader election failed, falling back to "
+                     "ungated scheduling: %s", e)
+
     try:
         setup_scheduler(
             db=db,
             ai_summary_func=ai_market_summary,
             ws_broadcast=ws_manager.broadcast,
+            lease=scheduler_lease,
         )
         logger.info("Cron scheduler initialized")
     except Exception as e:
@@ -8138,6 +8238,19 @@ async def shutdown():
     from services.scheduler import scheduler
     if scheduler.running:
         scheduler.shutdown(wait=False)
+
+    # Release the scheduler lease AFTER the scheduler stops, so no job of ours
+    # can still be running when another process takes over. Releasing is what
+    # makes a rolling deploy hand leadership over in under a second instead of
+    # leaving the platform schedulerless for the length of one lease (D6.7).
+    lease = getattr(app.state, "scheduler_lease", None)
+    if lease is not None:
+        try:
+            await lease.stop()
+            logger.info("Scheduler lease released")
+        except Exception as e:
+            # A lease nobody releases simply expires. Never block a shutdown.
+            logger.warning("Releasing the scheduler lease failed: %s", e)
 
     # Stop the perpetual application loops BEFORE the resources they use (PH3.6).
     #

@@ -9,6 +9,7 @@ import logging
 from typing import Optional
 
 from observability import instruments
+from services import ai_health
 from services.ai_provider import AIProvider, AIMessage, AIResponse
 
 logger = logging.getLogger(__name__)
@@ -64,10 +65,20 @@ class ClaudeProvider(AIProvider):
 
         target_model = model or self.default_model
 
+        # D6.9 — record the OUTCOME, not just the attempt. `track_ai` counts
+        # this call into Prometheus; `ai_health` keeps the small amount of
+        # state `/api/ai/status` needs to stop reporting "AI ready" for a key
+        # that has never successfully answered. Both read the same response, so
+        # the metric and the status line can never disagree.
         with instruments.track_ai("claude") as _ai_call:
-            return await self._complete_instrumented(
+            resp = await self._complete_instrumented(
                 _ai_call, key, target_model, messages, max_tokens
             )
+        if resp.success:
+            ai_health.record_success("claude", resp.model or target_model)
+        else:
+            ai_health.record_failure("claude", ai_health.classify(resp.error))
+        return resp
 
     async def _complete_instrumented(
         self,

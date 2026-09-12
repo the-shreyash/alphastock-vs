@@ -35,13 +35,13 @@ function relativeTime(timestamp) {
 
 function HitCard({ hit }) {
   const ref = useCardEntrance();
-  const meta = KIND_META[hit.kind] || { label: hit.kind, Icon: Radar, className: "bg-[var(--bg-tertiary)] text-[var(--text-secondary)]" };
+  const meta = KIND_META[hit.kind] || { label: hit.kind, Icon: Radar, className: "bg-[var(--bg-elevated)] text-[var(--text-secondary)]" };
   const { Icon } = meta;
 
   return (
     <div
       ref={ref}
-      className="rounded-xl border border-[var(--border)] bg-[var(--bg-tertiary)] p-3"
+      className="rounded-xl border border-[var(--border)] bg-[var(--bg-elevated)] p-3"
     >
       <div className="flex items-center justify-between mb-2">
         <span className={`text-[10px] font-medium px-2 py-0.5 rounded-full flex items-center gap-1 ${meta.className}`}>
@@ -88,7 +88,7 @@ export default function ScannerLiveFeed() {
   const live = status === "live";
 
   return (
-    <div className="rounded-xl bg-[var(--bg-secondary)] border border-[var(--border)] overflow-hidden">
+    <div className="rounded-xl bg-[var(--bg-card-glass)] border border-[var(--border)] overflow-hidden">
       <div className="px-4 py-3 border-b border-[var(--border)] flex items-center gap-2">
         <Radar size={14} className="text-[var(--ai-accent)]" />
         <span className="text-sm font-semibold text-[var(--text-primary)]">Live Scanner Hits</span>

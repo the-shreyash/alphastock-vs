@@ -21,7 +21,7 @@ import { useRealtimeStore, selectFeedState } from "../../store/realtimeStore";
 import { describeFeed } from "../../lib/feedState";
 
 const TONE = {
-  profit: "var(--profit)",
+  profit: "var(--gain)",
   neutral: "var(--text-secondary)",
   warn: "#F59E0B",
   loss: "var(--loss)",

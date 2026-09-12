@@ -35,6 +35,7 @@ everything. The next person to use an operator this double does not model gets a
 loud, named failure in their own test instead of a silently wrong count in
 someone else's.
 """
+import copy
 import re
 
 from bson import ObjectId
@@ -56,6 +57,27 @@ _SUPPORTED_FIELD_OPS = frozenset({
 })
 
 
+def _mongo_eq(value, target):
+    """MongoDB's equality semantics, including the ARRAY rule (D6.7).
+
+    In MongoDB a filter `{tags: "x"}` matches a document whose `tags` is the
+    string `"x"` *and* one whose `tags` is a list containing `"x"`. The
+    consequence that matters here is the negation: `{tags: {$ne: "x"}}` does NOT
+    match `{tags: ["x"]}`.
+
+    This double compared with a plain `==`, so `["SL"] == "SL"` was False and a
+    document that Mongo excludes was reported as matching. That is invisible for
+    every scalar field in the repository and load-bearing for exactly one
+    pattern: the compare-and-swap claim in `services/trading_engine.claim_exit`,
+    whose entire safety argument is that `{$ne: claim}` stops matching once the
+    claim is in the array. Under the old comparison the second caller matched
+    too, so a test of the guard would have passed with the guard removed.
+    """
+    if isinstance(value, list) and not isinstance(target, list):
+        return value == target or target in value
+    return value == target
+
+
 def _match_field(value, cond):
     """Evaluate one `{field: {<op>: ...}}` condition against a document value."""
     unknown = set(cond) - _SUPPORTED_FIELD_OPS
@@ -64,7 +86,7 @@ def _match_field(value, cond):
             f"FakeDB does not implement {sorted(unknown)}. Extend tests/_fakedb.py "
             f"rather than asserting against an unmodelled operator."
         )
-    if "$ne" in cond and value == cond["$ne"]:
+    if "$ne" in cond and _mongo_eq(value, cond["$ne"]):
         return False
     if "$exists" in cond and (value is not None) != bool(cond["$exists"]):
         return False
@@ -114,7 +136,7 @@ def _match(doc, flt):
             if not _match_field(doc.get(key), cond):
                 return False
         else:
-            if doc.get(key) != cond:
+            if not _mongo_eq(doc.get(key), cond):
                 return False
     return True
 
@@ -247,6 +269,70 @@ class FakeCollection:
             self.docs.append(newd)
         return _Result(modified=0, matched=0)
 
+    async def replace_one(self, flt, replacement, upsert=False):
+        """Motor's `replace_one` (D6.9).
+
+        Added because production started depending on it, and for the reason it
+        did: `update_one` with `$set` MERGES, so re-persisting a document whose
+        new shape has fewer keys leaves the previous version's keys standing
+        beside the new ones. For the morning report that meant a failed
+        regeneration left yesterday's sections and `available: true` sitting
+        next to a `status: failed` provenance record — a partial artifact
+        presented as a complete one. A double that only offers `$set` would let
+        that defect pass its tests.
+
+        `_id` is preserved across the replacement, as MongoDB does.
+        """
+        for d in self.docs:
+            if _match(d, flt or {}):
+                existing_id = d.get("_id")
+                d.clear()
+                d.update(copy.deepcopy(replacement))
+                d.pop("_id", None)
+                if existing_id is not None:
+                    d["_id"] = existing_id
+                return _Result(modified=1, matched=1)
+        if upsert:
+            newd = copy.deepcopy(replacement)
+            newd.setdefault("_id", ObjectId())
+            self.docs.append(newd)
+        return _Result(modified=0, matched=0)
+
+    async def find_one_and_update(self, flt, update, upsert=False,
+                                  return_document=False, projection=None,
+                                  sort=None):
+        """Motor's `find_one_and_update` (D6.7).
+
+        Added because production started depending on it, and for the reason it
+        did: `$inc` followed by a separate `find_one` is a read-modify-write,
+        so a caller that needs the value its OWN increment produced has to get
+        it from the same operation. A double that cannot express that forces the
+        code under test back into the racy shape.
+
+        `return_document` follows pymongo's `ReturnDocument`, whose `AFTER` is
+        literally `True` and `BEFORE` literally `False`.
+        """
+        for d in self.docs:
+            if _match(d, flt or {}):
+                before = dict(d)
+                self._apply_update(d, update)
+                chosen = d if return_document else before
+                return _project(dict(chosen), projection)
+        if not upsert:
+            return None
+        newd = {}
+        _id = (flt or {}).get("_id")
+        if _id is not None:
+            newd["_id"] = _id if isinstance(_id, ObjectId) else ObjectId(str(_id))
+        for k, v in (flt or {}).items():
+            if k != "_id" and not isinstance(v, dict):
+                newd[k] = v
+        self._apply_update(newd, update)
+        self.docs.append(newd)
+        # An upsert that inserted has no "before" document; Mongo returns None
+        # for BEFORE and the new document for AFTER.
+        return _project(dict(newd), projection) if return_document else None
+
     async def update_many(self, flt, update):
         n = 0
         for d in self.docs:
@@ -268,6 +354,11 @@ class FakeCollection:
         if "$push" in update:
             for k, v in update["$push"].items():
                 doc.setdefault(k, []).append(v)
+        if "$addToSet" in update:
+            for k, v in update["$addToSet"].items():
+                bucket = doc.setdefault(k, [])
+                if v not in bucket:
+                    bucket.append(v)
 
     async def delete_one(self, flt):
         for i, d in enumerate(self.docs):

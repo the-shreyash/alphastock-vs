@@ -5,9 +5,10 @@ import { formatCurrency, formatPercent } from "../utils/formatters";
 import { applyLivePrices } from "../lib/livePrices";
 import { useRealtimeStore, selectPriceTicks } from "../store/realtimeStore";
 
-import { Target, Shield, TrendingUp, AlertTriangle, Brain, RefreshCw, ChevronDown, ChevronUp, Info, BarChart3 } from "lucide-react";
+import { Target, Shield, TrendingUp, Brain, RefreshCw, ChevronDown, ChevronUp, Info, BarChart3 } from "lucide-react";
 import { BarChart, Bar, Cell, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts";
 import { motion } from "framer-motion";
+import { PageHeader } from "../components/ds";
 
 /* Scroll-reveal wrapper — fades/slides content in as it enters the viewport */
 function Reveal({ children, delay = 0, className }) {
@@ -208,7 +209,15 @@ function PickCard({ pick, onExplain, explaining, onTrade }) {
           <RiskBadge level={pick.risk_level} />
           <span className="text-xs text-muted font-mono">R:R {pick.risk_reward}</span>
           <PatternBadges pick={pick} />
-          <span className="text-xs text-muted font-mono">Win: {pick.historical_success}</span>
+          {/* D6.9 — "Win: 87%" was rendered here from `pick.historical_success`,
+              which the backend computed as `65 + confidence / 3`. No backtest
+              and no trade outcome went into it: it was the confidence score put
+              through arithmetic and relabelled as a realised win rate, on the
+              screen where a user decides position size. The field is gone from
+              the API and nothing replaces it — a fabricated statistic's
+              replacement is its absence, not a different fabricated statistic.
+              A real win rate needs a tracked outcome history, which is its own
+              piece of work. */}
         </div>
       </div>
 
@@ -226,12 +235,11 @@ function PickCard({ pick, onExplain, explaining, onTrade }) {
                 <span className="text-secondary">{r}</span>
               </div>
             ))}
-            {pick.risk_factors?.map((r, i) => (
-              <div key={i} className="flex items-start gap-2 text-xs">
-                <AlertTriangle size={10} className="text-amber-500 mt-0.5 shrink-0" />
-                <span className="text-muted">{r}</span>
-              </div>
-            ))}
+            {/* D6.9 — `pick.risk_factors` rendered here was a two-item constant
+                in the scanner, identical for every pick on every day, asserting
+                pending earnings and index resistance that nothing had checked.
+                Removed at the source; the real, per-pick evidence is the
+                `reasons` list above. */}
           </div>
         )}
 
@@ -453,15 +461,15 @@ export default function StockPicks() {
   return (
     <div data-testid="stock-picks-page" className="space-y-4">
       <Reveal>
-        <div className="flex items-center justify-between">
-          <div>
-            <h1 className="page-title">AI Stock Picks</h1>
-            <p className="page-subtitle mt-1">Top 3 AI-selected stocks. Click "Full AI Report" for complete analysis or "Trade Now" to execute instantly.</p>
-          </div>
-          <button data-testid="refresh-picks-btn" onClick={fetchPicks} className="btn-ghost btn-sm" style={{ padding: "10px" }}>
-            <RefreshCw size={16} className={loading ? "animate-spin" : ""} />
-          </button>
-        </div>
+        <PageHeader
+          title="AI Stock Picks"
+          subtitle={'Top 3 AI-selected stocks. Open "Full AI Report" for the complete analysis, or "Trade Now" to execute.'}
+          actions={
+            <button data-testid="refresh-picks-btn" onClick={fetchPicks} className="btn-ghost btn-sm" style={{ padding: "10px" }} aria-label="Refresh picks">
+              <RefreshCw size={16} className={loading ? "animate-spin" : ""} />
+            </button>
+          }
+        />
       </Reveal>
 
       {loading ? (

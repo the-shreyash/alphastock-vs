@@ -38,9 +38,13 @@ No simulated trading: every call goes to the official broker API; when a
 broker is not connected the engine raises BrokerAuthError and endpoints
 surface an explicit "connect your broker" state.
 """
+import asyncio
 import logging
+import time
 from datetime import datetime, timezone
 from typing import Optional, Sequence
+
+from pymongo import ReturnDocument
 
 from services.brokers import BrokerCapability, broker_gateway, broker_registry
 from services.brokers.accounts import (
@@ -52,6 +56,7 @@ from services.brokers.base import BrokerAdapter
 from services.brokers.crypto import decrypt_token, encrypt_token, is_encrypted
 from services.brokers.errors import BrokerAuthError, BrokerError
 from services.brokers.instruments import InstrumentMap, canonical_ticks
+from infrastructure.mongo_errors import is_duplicate_key
 from services.brokers.market_feed import (
     # D5.13 — the Market Engine's consumer-facing transition vocabulary,
     # re-exported by the seam that already owns this layer's contact with it.
@@ -152,6 +157,18 @@ def _bind_shard(handler, shard: str):
 TOKEN_FIELDS = ("access_token", "refresh_token", "public_token", "feed_token")
 
 
+#: How long a decrypted broker session may sit unused in `BrokerEngine._sessions`
+#: before its plaintext copy is dropped (D6.7 / A5). Thirty minutes is longer
+#: than any burst of user activity and far shorter than a broker session's
+#: lifetime, so an active account is never evicted and an idle one does not keep
+#: a plaintext credential resident for the rest of the trading day.
+SESSION_CACHE_IDLE_SECONDS = 1800
+
+#: How often the sweeper wakes. Well below the idle threshold, so an eligible
+#: entry is dropped within a few minutes rather than up to a full threshold late.
+CREDENTIAL_SWEEP_INTERVAL_SECONDS = 300
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -182,6 +199,35 @@ class BrokerEngine:
         #: implies its user and its broker, so this is one key where there were
         #: two, and there is no longer a key a second account can land on.
         self._sessions: dict = {}
+        #: broker_account_id -> monotonic timestamp of the last touch (D6.7 / A5).
+        #:
+        #: WHY THE PLAINTEXT CACHE IS NOW BOUNDED IN TIME
+        #: ----------------------------------------------
+        #: `_sessions` holds broker access tokens **decrypted**. At rest they are
+        #: Fernet-encrypted; in this dict they are not, and before D6.7 they were
+        #: evicted only by an explicit disconnect, an observed expiry or a
+        #: process restart. A long-lived process therefore accumulated the
+        #: plaintext credential of every account that had ever been touched, for
+        #: as long as it ran — including accounts whose token the broker had
+        #: already killed at its daily cut-off, and whose owner had logged out
+        #: hours earlier.
+        #:
+        #: This is a blast-radius control, not an authorization control. Nothing
+        #: was reachable through the cache that was not reachable without it:
+        #: `get_session` re-derives freshness on every call and refuses an
+        #: expired session regardless of what is cached, so a stale entry could
+        #: never be *used*. What it could do is sit in a heap dump, a core file
+        #: or a debugger long after it had any business existing.
+        #:
+        #: The lifetime is deliberately independent of the broker's own session
+        #: expiry. Those run to a daily cut-off — up to 24 hours away, per D6.6
+        #: §6 — so keying eviction on them would keep an idle account's plaintext
+        #: token resident for most of a day. This is an *idle* timeout: an
+        #: account in active use re-touches on every call and is never evicted,
+        #: and an account that goes quiet loses its plaintext copy while keeping
+        #: its encrypted one, so the next call simply reloads and decrypts it.
+        #: The only cost of an eviction is one `find_one`.
+        self._session_touched: dict = {}
         #: broker_account_id -> InstrumentMap. The account's broker-identifier →
         #: canonical-symbol table (D4.3), rebuilt whenever the account's portfolio
         #: is re-synced rather than expired on a timer: holdings only change
@@ -194,6 +240,9 @@ class BrokerEngine:
         #: callables bind to *this* engine — the recovery module holds no engine
         #: import, which is what keeps `services.brokers.recovery` free of a
         #: cycle and every branch in it assertable without a database.
+        #: The credential-cache sweeper's task (D6.7), held here for the reason
+        #: `asyncio` documents: it keeps only a weak reference to a running task.
+        self._credential_sweeper = None
         self._recovery = RecoveryService(
             recovery_register,
             attach=self._reattach_channel,
@@ -345,7 +394,7 @@ class BrokerEngine:
         doc["updated_at"] = _now_iso()
         await self.db.broker_accounts.update_one(
             {"broker_account_id": account.broker_account_id}, {"$set": doc}, upsert=True)
-        self._sessions[account.broker_account_id] = dict(session)
+        self._cache_session(account.broker_account_id, dict(session))
 
     async def _load_session(self, account: BrokerAccountRef) -> Optional[dict]:
         doc = await self.db.broker_accounts.find_one(
@@ -373,6 +422,44 @@ class BrokerEngine:
                         f"storage for account {account.broker_account_id}")
         return session
 
+    def _cache_session(self, broker_account_id: str, session: dict) -> None:
+        """Put a decrypted session in the cache and mark it touched.
+
+        Every write to `_sessions` goes through here so the touch map cannot
+        drift from the cache it describes — an entry with no timestamp would be
+        invisible to the sweeper and would live forever, which is the exact
+        condition this pair exists to remove.
+        """
+        self._sessions[broker_account_id] = session
+        self._session_touched[broker_account_id] = time.monotonic()
+
+    def _forget_session(self, broker_account_id: str) -> None:
+        """Drop a cached session and its timestamp together."""
+        self._sessions.pop(broker_account_id, None)
+        self._session_touched.pop(broker_account_id, None)
+
+    def evict_idle_sessions(self, *, idle_seconds: int = SESSION_CACHE_IDLE_SECONDS) -> int:
+        """Drop the plaintext copy of every session idle for `idle_seconds`.
+
+        Returns how many were evicted. Safe to call at any time and from any
+        path: an evicted account's encrypted row is untouched, so the next
+        `get_session` reloads and decrypts it and the user notices nothing.
+
+        An entry with no recorded touch is treated as idle rather than as fresh.
+        That is the fail-safe direction — the cost of evicting something that is
+        actually in use is one database read, and the cost of keeping something
+        that should have gone is the retention this method exists to bound.
+        """
+        now = time.monotonic()
+        stale = [key for key in list(self._sessions)
+                 if now - self._session_touched.get(key, 0.0) > idle_seconds]
+        for key in stale:
+            self._forget_session(key)
+        if stale:
+            logger.info("Evicted %d idle broker session(s) from the in-memory "
+                        "cache; their encrypted rows are untouched.", len(stale))
+        return len(stale)
+
     async def get_session(self, account: BrokerAccountRef) -> dict:
         """Return a live (fresh) decrypted session for ONE account, or raise.
 
@@ -389,7 +476,7 @@ class BrokerEngine:
             raise BrokerAuthError(f"{adapter.display_name} is not connected. "
                                   "Connect your account in Settings.")
         if broker_gateway.session_is_fresh(broker, session):
-            self._sessions[key] = session
+            self._cache_session(key, session)
             return session
         # The gateway answers None both for "this broker has no refresh grant"
         # and for "the refresh failed"; the engine's response is the same either
@@ -400,7 +487,7 @@ class BrokerEngine:
             await self._audit(account.user_id, "broker.token.refreshed", {
                 "broker": broker, "broker_account_id": key})
             return self._sessions[key]
-        self._sessions.pop(key, None)
+        self._forget_session(key)
         await broker_accounts.set_status(key, BrokerAccountStatus.REAUTH_REQUIRED)
         raise BrokerAuthError(f"{adapter.display_name} session expired. Please reconnect from Settings.")
 
@@ -499,7 +586,7 @@ class BrokerEngine:
             # a duck-typing check that could not distinguish "this broker cannot
             # revoke tokens" from "someone renamed the method".
             await broker_gateway.invalidate_session(broker, session)
-        self._sessions.pop(account.broker_account_id, None)
+        self._forget_session(account.broker_account_id)
         self._forget_instrument_map(account)
         # D5.6. The user removed the account; there is nothing left to recover,
         # and leaving a candidate behind would re-probe a broker the user has
@@ -712,6 +799,123 @@ class BrokerEngine:
         return await broker_gateway.get_trades(account.broker, await self.get_session(account))
 
     # -- portfolio sync ---------------------------------------------------------------------
+    async def _next_sync_generation(self, user_id: str, account_id: str) -> int:
+        """The next strictly-increasing sync generation for ONE account.
+
+        Issued by `$inc` on the account's portfolio row rather than read from a
+        clock: two syncs starting in the same millisecond would draw the same
+        timestamp, and a generation that is not strictly increasing makes the
+        ordering in `_replace_holdings` meaningless. Mongo increments under the
+        document lock, so N concurrent callers get N distinct, ordered values.
+        """
+        # `find_one_and_update`, NOT `$inc` followed by `find_one`. The first
+        # draft of this method was the latter, and it was the same read-modify-
+        # write defect it exists to prevent, one level down: two concurrent
+        # callers increment to 1 and 2, then both read — and can both read 2.
+        # Two syncs holding the same generation are unordered, and the ordering
+        # is the entire fix. Found by
+        # `test_concurrent_syncs_of_one_account_never_double_the_portfolio`.
+        try:
+            row = await self.db.portfolios.find_one_and_update(
+                {"user_id": user_id, "broker_account_id": account_id},
+                {"$inc": {"sync_generation": 1}},
+                upsert=True, return_document=ReturnDocument.AFTER,
+                projection={"sync_generation": 1})
+            return int((row or {}).get("sync_generation") or 1)
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning("Could not draw a sync generation for %s: %s",
+                           account_id, e)
+            return 1
+
+    async def _replace_holdings(self, account: BrokerAccountRef, holdings: list,
+                                *, generation: int, now: str) -> None:
+        """Make `db.holdings` for ONE account match `holdings`, race-safely.
+
+        WHAT THIS REPLACED, AND WHY IT WAS WRONG
+        ----------------------------------------
+        It was `delete_many({user_id, broker_account_id})` followed by
+        `insert_many(...)`. Two statements, no atomicity between them, and two
+        distinct failure modes for a user who syncs twice at once (two clicks,
+        or a manual sync landing on top of the sync that follows a reconnect):
+
+        * **delete, delete, insert, insert** leaves *both* result sets in the
+          collection. Nothing removed the second write's rows, so the account
+          holds every position twice and the portfolio value on the dashboard is
+          exactly doubled.
+        * between the delete and the insert the account has **no holdings at
+          all**, and any read landing in that window — the portfolio snapshot
+          job, a dashboard refresh, the tick re-mark path — sees an empty
+          portfolio and reports it as fact.
+
+        HOW THE GENERATION FIXES BOTH
+        -----------------------------
+        Nothing is deleted before the new rows exist, so the empty window is
+        gone outright. Each row is upserted under `sync_generation <= ours`, so a
+        sync can refresh a row it is newer than but can never **downgrade** one a
+        newer sync already wrote; the cleanup then removes only rows *strictly
+        older* than this generation, so a newer sync's rows always survive an
+        older sync's cleanup. Whichever order the two interleave, the collection
+        ends up holding each symbol exactly once, at the newest generation that
+        wrote it.
+
+        The unique index on `(broker_account_id, symbol)` is what makes the
+        per-symbol upsert atomic against a concurrent insert of the same symbol
+        — without it, two callers both find nothing and both insert, which is
+        the duplication this method exists to prevent, merely relocated. A
+        duplicate-key error here therefore means "a newer sync already owns this
+        row", which is a correct outcome and is skipped rather than raised.
+        """
+        user_id, account_id = account.user_id, account.broker_account_id
+        for h in holdings:
+            symbol = h.get("symbol")
+            if not symbol:
+                continue
+            doc = {**h, "user_id": user_id, "broker": account.broker,
+                   "broker_account_id": account_id, "updated_at": now,
+                   "sync_generation": generation}
+            claim = {"broker_account_id": account_id, "symbol": symbol,
+                     "sync_generation": {"$lte": generation}}
+            try:
+                await self.db.holdings.update_one(claim, {"$set": doc}, upsert=True)
+            except Exception as e:
+                if not is_duplicate_key(e):
+                    raise
+                # A CONCURRENT SYNC INSERTED THIS SYMBOL BETWEEN OUR FILTER AND
+                # OUR INSERT — and the retry below is load-bearing, not defensive.
+                #
+                # The first version of this method treated a duplicate key as
+                # "a newer sync owns this row" and skipped. That is wrong, and
+                # the way it was wrong cost rows: two syncs racing on the SAME
+                # symbol both find nothing, one inserts at generation N, the
+                # other collides — and if the collider was the NEWER sync, it
+                # never wrote its generation onto the row, so its own cleanup
+                # below then deleted the row as stale. A three-position account
+                # synced twice ended up holding one or two positions.
+                # Reproduced by `test_concurrent_syncs_of_one_account_never_
+                # double_the_portfolio`, which is why that test seeds three
+                # symbols rather than one.
+                #
+                # The retry is an UPDATE, never an upsert: the row demonstrably
+                # exists now. Its filter still carries the generation guard, so
+                # a genuinely older sync matches nothing and correctly leaves a
+                # newer sync's row alone — the skip's intended behaviour, applied
+                # only where it is actually true.
+                await self.db.holdings.update_one(claim, {"$set": doc})
+        # Anything this account carried that an OLDER sync wrote and this one did
+        # not refresh is a position that is no longer held. `$lt`, never `$ne`:
+        # `$ne` would delete the rows of a concurrent NEWER sync and leave the
+        # account holding whichever set finished its cleanup last.
+        await self.db.holdings.delete_many(
+            {"user_id": user_id, "broker_account_id": account_id,
+             "sync_generation": {"$lt": generation}})
+        # Pre-D6.7 rows carry no generation at all. They belong to this account
+        # and predate this sync, so they are exactly what the cleanup means; they
+        # are removed in their own statement because `$lt` does not match a
+        # missing field.
+        await self.db.holdings.delete_many(
+            {"user_id": user_id, "broker_account_id": account_id,
+             "sync_generation": {"$exists": False}})
+
     async def sync_portfolio(self, account: BrokerAccountRef) -> dict:
         """Pull holdings/positions/funds for ONE account, persist them and
         broadcast a portfolio.synced event. Restarts the realtime stream so
@@ -741,6 +945,13 @@ class BrokerEngine:
         now = _now_iso()
         invested = round(sum(h["invested_value"] for h in holdings), 2)
         current = round(sum(h["market_value"] for h in holdings), 2)
+        # D6.7 — A MONOTONE GENERATION, TAKEN BEFORE ANY HOLDING IS WRITTEN.
+        #
+        # `$inc` on the account's own portfolio row, so the value is issued by
+        # the server under the document lock and two concurrent syncs of one
+        # account can never draw the same number. Everything below is ordered by
+        # it; see `_replace_holdings` for why that ordering is the whole fix.
+        generation = await self._next_sync_generation(user_id, account_id)
         await self.db.portfolios.update_one(
             {"user_id": user_id, "broker_account_id": account_id},
             {"$set": {
@@ -756,13 +967,8 @@ class BrokerEngine:
                 "last_synced": now,
             }},
             upsert=True)
-        await self.db.holdings.delete_many(
-            {"user_id": user_id, "broker_account_id": account_id})
-        if holdings:
-            await self.db.holdings.insert_many([
-                {**h, "user_id": user_id, "broker": broker,
-                 "broker_account_id": account_id, "updated_at": now}
-                for h in holdings])
+        await self._replace_holdings(account, holdings, generation=generation,
+                                     now=now)
         # D4.3: the instrument map is derived from exactly these rows, so a sync
         # is the moment — and the only moment — it can go stale. Rebuilt from
         # the fetched rows rather than dropped, so the very next tick resolves
@@ -1409,7 +1615,7 @@ class BrokerEngine:
         """
         user_id, broker = account.user_id, account.broker
         account_id = account.broker_account_id
-        self._sessions.pop(account_id, None)
+        self._forget_session(account_id)
         # D5.6. Recorded, and recorded as SESSION rather than merely left out:
         # an expired token must be *visibly* excluded from re-probe rather than
         # absent from the register, so the exclusion is a fact a test can read
@@ -1581,16 +1787,101 @@ class BrokerEngine:
         """Begin the bounded background re-probe sweep. Idempotent.
 
         Started from the same place session restore is, and it is the only timer
-        this sprint adds. A sweep with an empty register performs no I/O: it
-        reads two dictionaries and goes back to sleep, so a deployment where
-        nothing has ever been refused pays a dictionary lookup a minute.
+        D5.6 added. A sweep with an empty register performs no I/O: it reads two
+        dictionaries and goes back to sleep, so a deployment where nothing has
+        ever been refused pays a dictionary lookup a minute.
+
+        D6.7 attaches the credential-cache sweeper here for the same reasons and
+        at the same point in the lifecycle — it is cheap, it is idempotent, and
+        starting it anywhere else would mean a second place that has to remember
+        session restore has happened.
         """
+        self._start_credential_sweeper()
         return self._recovery.start()
+
+    def _start_credential_sweeper(self):
+        """Run `evict_idle_sessions` on a slow tick. Idempotent.
+
+        THE TASK IS HELD ON THIS ENGINE, NOT IN THE GLOBAL TASK REGISTRY.
+        -----------------------------------------------------------------
+        `asyncio` keeps only a weak reference to a running task, so *some*
+        strong reference is mandatory: a credential sweeper that was silently
+        garbage-collected would restore exactly the unbounded retention it
+        exists to bound, with nothing logged and no symptom until somebody read
+        a heap dump. `self._credential_sweeper` is that reference, and
+        `shutdown()` cancels it — the same lifecycle `self._recovery` has had
+        since D5.6, for the same reasons.
+
+        It was first registered with `infrastructure.tasks`, and that was wrong
+        in a way worth recording rather than quietly correcting. That registry is
+        **process-global and outlives an event loop**; this engine is a
+        module-level singleton whose `start_recovery()` runs in every test that
+        restores a session. The first such test left a perpetual task in the
+        registry bound to a loop that then closed, and a later test's
+        `cancel_all()` reached across the dead loop — surfacing as two failures
+        in the *observability* suite that appeared only in a full run and passed
+        in isolation. A supervisor was the right idea at the wrong scope: this
+        engine already owns this task's lifetime, so the registry added a second,
+        longer-lived owner for something that has one.
+        """
+        if self._credential_sweeper is not None and not self._credential_sweeper.done():
+            return self._credential_sweeper
+
+        async def _loop():
+            while True:
+                # A tick well below the idle threshold, so an entry is evicted
+                # within a few minutes of becoming eligible rather than up to a
+                # full threshold late. The sweep is a dictionary scan over at
+                # most the number of connected accounts in this process; it
+                # performs no I/O and touches no broker.
+                await asyncio.sleep(CREDENTIAL_SWEEP_INTERVAL_SECONDS)
+                try:
+                    self.evict_idle_sessions()
+                except Exception as e:  # pragma: no cover - defensive
+                    logger.warning("Credential cache sweep failed: %s", e)
+
+        try:
+            self._credential_sweeper = asyncio.create_task(
+                _loop(), name="broker-credential-sweeper")
+        except RuntimeError:
+            # No running loop (a synchronous caller). The cache is still bounded
+            # by every explicit eviction path — disconnect, observed expiry, a
+            # direct `evict_idle_sessions()` — only the timer is absent.
+            self._credential_sweeper = None
+        return self._credential_sweeper
+
+    async def _stop_credential_sweeper(self) -> None:
+        """Cancel the sweeper and wait for it. Safe when it was never started."""
+        task, self._credential_sweeper = self._credential_sweeper, None
+        if task is None:
+            return
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
 
     async def stop_recovery(self):
         await self._recovery.stop()
 
     # -- startup ---------------------------------------------------------------------------------------
+    async def _mark_reauth_required(self, account: BrokerAccountRef, why: str) -> None:
+        """Record that this account needs a user re-login, best-effort.
+
+        Best-effort deliberately: startup restore must not abort because one
+        account's status write failed. The account is already unusable — a
+        failed status write leaves it exactly as unusable as it was, whereas an
+        exception here would stop every *other* account from being restored.
+        """
+        try:
+            await broker_accounts.set_status(
+                account.broker_account_id, BrokerAccountStatus.REAUTH_REQUIRED)
+            logger.info("Broker account %s (%s) marked REAUTH_REQUIRED at startup: %s",
+                        account.broker_account_id, account.broker, why)
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning("Could not mark %s REAUTH_REQUIRED: %s",
+                           account.broker_account_id, e)
+
     async def load_sessions(self):
         """Restore fresh sessions (and streams) for every connected account on
         startup; encrypt any legacy plaintext tokens found along the way."""
@@ -1611,14 +1902,43 @@ class BrokerEngine:
                     continue
                 try:
                     session = await self._load_session(account)
+                    # LIM-D6.5-3 (closed in D6.6). Both branches below leave a
+                    # CONNECTED account with no usable session, and until D6.6
+                    # neither wrote that fact down: `status` stayed "connected"
+                    # while the credential behind it was months dead, so
+                    # `account_statuses` answered `connected: false` and
+                    # `status: "connected"` in the same record. Nothing routed
+                    # on the stale value — every call path re-derives freshness
+                    # and `get_session` refuses — but the account directory is
+                    # what the UI, the reconnect prompt and any operator read,
+                    # and a directory that claims a dead session is live is a
+                    # directory that cannot be trusted to say when a re-login is
+                    # owed.
+                    #
+                    # It is owed *always*, which is why this matters here and
+                    # not merely cosmetically: no adapter on this platform
+                    # declares SESSION_REFRESH, because Indian retail broker
+                    # APIs issue daily tokens with no refresh grant. There is no
+                    # unattended path back from an expired session, so
+                    # REAUTH_REQUIRED is the entire recovery contract.
+                    #
+                    # Writing it here rather than leaving it to the first call
+                    # makes startup agree with `get_session`, which has always
+                    # set exactly this status on exactly this condition
+                    # (see `get_session` above) — the two paths now reach the
+                    # same state instead of differing by whoever got there
+                    # first.
                     if not session or not session.get("access_token"):
+                        await self._mark_reauth_required(
+                            account, "no usable credential on a live account")
                         continue
                     if not broker_gateway.session_is_fresh(broker, session):
                         logger.info(f"Saved {broker} session for account "
                                     f"{account.broker_account_id} has expired; "
                                     f"reconnect required.")
+                        await self._mark_reauth_required(account, "session expired")
                         continue
-                    self._sessions[account.broker_account_id] = session
+                    self._cache_session(account.broker_account_id, session)
                     restored += 1
                     # DB-2 (D4.1). A restored session IS a live broker
                     # connection and must produce the same lifecycle event a
@@ -1658,6 +1978,7 @@ class BrokerEngine:
 
     async def shutdown(self):
         await self.stop_recovery()
+        await self._stop_credential_sweeper()
         await stream_manager.stop_all()
 
     # -- ownership invariant (D6.1 / S3) ---------------------------------------------------------------

@@ -115,8 +115,8 @@ export default function MarketScanner() {
           onClick={() => runScan(null)}
           className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-all ${
             !activeStrategy
-              ? "bg-[var(--accent)] text-white"
-              : "bg-[var(--bg-tertiary)] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]"
+              ? "bg-[var(--brand-accent)] text-[var(--brand-accent-fg)]"
+              : "bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:bg-[var(--hover)]"
           }`}
         >
           All Stocks
@@ -130,8 +130,8 @@ export default function MarketScanner() {
               title={p.description}
               className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-all flex items-center gap-1.5 ${
                 activeStrategy === p.key
-                  ? "bg-[var(--accent)] text-white"
-                  : "bg-[var(--bg-tertiary)] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]"
+                  ? "bg-[var(--brand-accent)] text-[var(--brand-accent-fg)]"
+                  : "bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:bg-[var(--hover)]"
               }`}
             >
               <Icon size={12} />
@@ -142,7 +142,7 @@ export default function MarketScanner() {
 
         <button
           onClick={() => setShowFilters(!showFilters)}
-          className="px-3 py-1.5 rounded-lg text-xs font-medium bg-[var(--bg-tertiary)] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] flex items-center gap-1.5 ml-auto"
+          className="px-3 py-1.5 rounded-lg text-xs font-medium bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:bg-[var(--hover)] flex items-center gap-1.5 ml-auto"
         >
           <Filter size={12} />
           Filters
@@ -159,13 +159,13 @@ export default function MarketScanner() {
             exit={{ height: 0, opacity: 0 }}
             className="overflow-hidden"
           >
-            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 p-4 rounded-xl bg-[var(--bg-secondary)] border border-[var(--border)]">
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 p-4 rounded-xl bg-[var(--bg-card-glass)] border border-[var(--border)]">
               <div>
                 <label className="text-[10px] text-[var(--text-muted)] uppercase tracking-wider">Sector</label>
                 <select
                   value={sector}
                   onChange={(e) => setSector(e.target.value)}
-                  className="w-full mt-1 px-2 py-1.5 rounded-lg bg-[var(--bg-tertiary)] text-[var(--text-primary)] text-xs border border-[var(--border)]"
+                  className="w-full mt-1 px-2 py-1.5 rounded-lg bg-[var(--bg-elevated)] text-[var(--text-primary)] text-xs border border-[var(--border)]"
                 >
                   <option value="">All Sectors</option>
                   {SECTORS.map((s) => (
@@ -180,7 +180,7 @@ export default function MarketScanner() {
                   placeholder="e.g. 30"
                   value={customFilters.rsi_min || ""}
                   onChange={(e) => setCustomFilters({ ...customFilters, rsi_min: e.target.value })}
-                  className="w-full mt-1 px-2 py-1.5 rounded-lg bg-[var(--bg-tertiary)] text-[var(--text-primary)] text-xs border border-[var(--border)]"
+                  className="w-full mt-1 px-2 py-1.5 rounded-lg bg-[var(--bg-elevated)] text-[var(--text-primary)] text-xs border border-[var(--border)]"
                 />
               </div>
               <div>
@@ -190,7 +190,7 @@ export default function MarketScanner() {
                   placeholder="e.g. 70"
                   value={customFilters.rsi_max || ""}
                   onChange={(e) => setCustomFilters({ ...customFilters, rsi_max: e.target.value })}
-                  className="w-full mt-1 px-2 py-1.5 rounded-lg bg-[var(--bg-tertiary)] text-[var(--text-primary)] text-xs border border-[var(--border)]"
+                  className="w-full mt-1 px-2 py-1.5 rounded-lg bg-[var(--bg-elevated)] text-[var(--text-primary)] text-xs border border-[var(--border)]"
                 />
               </div>
               <div>
@@ -201,13 +201,13 @@ export default function MarketScanner() {
                   placeholder="e.g. 1.5"
                   value={customFilters.volume_ratio_min || ""}
                   onChange={(e) => setCustomFilters({ ...customFilters, volume_ratio_min: e.target.value })}
-                  className="w-full mt-1 px-2 py-1.5 rounded-lg bg-[var(--bg-tertiary)] text-[var(--text-primary)] text-xs border border-[var(--border)]"
+                  className="w-full mt-1 px-2 py-1.5 rounded-lg bg-[var(--bg-elevated)] text-[var(--text-primary)] text-xs border border-[var(--border)]"
                 />
               </div>
               <div className="col-span-2 sm:col-span-4 flex gap-2 pt-1">
                 <button
                   onClick={() => runScan(activeStrategy)}
-                  className="px-4 py-1.5 rounded-lg bg-[var(--accent)] text-white text-xs font-medium hover:opacity-90 flex items-center gap-1"
+                  className="px-4 py-1.5 rounded-lg bg-[var(--brand-accent)] text-[var(--brand-accent-fg)] text-xs font-medium hover:opacity-90 flex items-center gap-1"
                 >
                   <Search size={12} /> Apply Filters
                 </button>
@@ -217,7 +217,7 @@ export default function MarketScanner() {
                     setSector("");
                     runScan(activeStrategy);
                   }}
-                  className="px-4 py-1.5 rounded-lg bg-[var(--bg-tertiary)] text-[var(--text-secondary)] text-xs hover:bg-[var(--bg-hover)] flex items-center gap-1"
+                  className="px-4 py-1.5 rounded-lg bg-[var(--bg-elevated)] text-[var(--text-secondary)] text-xs hover:bg-[var(--hover)] flex items-center gap-1"
                 >
                   <X size={12} /> Clear
                 </button>
@@ -228,16 +228,16 @@ export default function MarketScanner() {
       </AnimatePresence>
 
       {/* Results */}
-      <div className="rounded-xl bg-[var(--bg-secondary)] border border-[var(--border)] overflow-hidden">
+      <div className="rounded-xl bg-[var(--bg-card-glass)] border border-[var(--border)] overflow-hidden">
         {/* Header */}
         <div className="px-4 py-3 border-b border-[var(--border)] flex items-center justify-between">
           <div className="flex items-center gap-2">
-            <SlidersHorizontal size={14} className="text-[var(--accent)]" />
+            <SlidersHorizontal size={14} className="text-[var(--brand-accent)]" />
             <span className="text-sm font-semibold text-[var(--text-primary)]">
               {results?.strategy_label || "Scanner Results"}
             </span>
             {results && (
-              <span className="text-[10px] text-[var(--text-muted)] bg-[var(--bg-tertiary)] px-2 py-0.5 rounded-full">
+              <span className="text-[10px] text-[var(--text-muted)] bg-[var(--bg-elevated)] px-2 py-0.5 rounded-full">
                 {results.total_matched}/{results.total_scanned} matched
               </span>
             )}
@@ -266,7 +266,7 @@ export default function MarketScanner() {
           <button
             onClick={() => runScan(activeStrategy)}
             disabled={loading}
-            className="text-[var(--text-muted)] hover:text-[var(--accent)] transition-colors"
+            className="text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors"
           >
             <RotateCcw size={14} className={loading ? "animate-spin" : ""} />
           </button>
@@ -275,7 +275,7 @@ export default function MarketScanner() {
         {/* Loading state */}
         {loading && (
           <div className="p-8 text-center">
-            <div className="w-6 h-6 border-2 border-[var(--accent)] border-t-transparent rounded-full animate-spin mx-auto mb-2" />
+            <div className="w-6 h-6 border-2 border-[var(--brand-accent)] border-t-transparent rounded-full animate-spin mx-auto mb-2" />
             <p className="text-xs text-[var(--text-muted)]">Scanning market...</p>
           </div>
         )}
@@ -304,7 +304,7 @@ export default function MarketScanner() {
                       initial={{ opacity: 0, x: -10 }}
                       animate={{ opacity: 1, x: 0 }}
                       transition={{ delay: i * 0.03 }}
-                      className="border-b border-[var(--border)] last:border-0 hover:bg-[var(--bg-hover)] transition-colors cursor-pointer"
+                      className="border-b border-[var(--border)] last:border-0 hover:bg-[var(--hover)] transition-colors cursor-pointer"
                     >
                       <td className="px-4 py-2.5">
                         <div className="font-semibold text-[var(--text-primary)]">{stock.symbol}</div>
@@ -348,7 +348,7 @@ export default function MarketScanner() {
                         {stock.volume_ratio?.toFixed(1) || "—"}x
                       </td>
                       <td className="px-3 py-2.5">
-                        <span className="text-[10px] px-2 py-0.5 rounded-full bg-[var(--bg-tertiary)] text-[var(--text-muted)]">
+                        <span className="text-[10px] px-2 py-0.5 rounded-full bg-[var(--bg-elevated)] text-[var(--text-muted)]">
                           {stock.sector || "—"}
                         </span>
                       </td>

@@ -168,7 +168,7 @@ export default function OrderTicket({ symbol, exchange = "NSE", price }) {
   if (statuses === null) {
     return (
       <div data-testid="order-ticket" className="glass-card p-4">
-        <div className="h-24 animate-pulse rounded-lg bg-[var(--bg-tertiary)]" />
+        <div className="h-24 animate-pulse rounded-lg bg-[var(--bg-elevated)]" />
       </div>
     );
   }
@@ -286,7 +286,7 @@ export default function OrderTicket({ symbol, exchange = "NSE", price }) {
               data-testid="order-broker"
               value={broker}
               onChange={(e) => setBroker(e.target.value)}
-              className="w-full rounded-lg border border-[var(--border)] bg-[var(--bg-tertiary)] px-2 py-2 text-[11px] text-[var(--text-primary)]"
+              className="w-full rounded-lg border border-[var(--border)] bg-[var(--bg-elevated)] px-2 py-2 text-[11px] text-[var(--text-primary)]"
             >
               {/* Deliberately unselected. Choosing the account that will spend
                   the money is the user's decision, not a default. */}
@@ -309,7 +309,7 @@ export default function OrderTicket({ symbol, exchange = "NSE", price }) {
                 min="1"
                 value={quantity}
                 onChange={(e) => setQuantity(e.target.value)}
-                className="w-full rounded-lg border border-[var(--border)] bg-[var(--bg-tertiary)] px-2 py-2 text-[11px] font-mono text-[var(--text-primary)]"
+                className="w-full rounded-lg border border-[var(--border)] bg-[var(--bg-elevated)] px-2 py-2 text-[11px] font-mono text-[var(--text-primary)]"
               />
             </label>
             <label className="block">
@@ -318,7 +318,7 @@ export default function OrderTicket({ symbol, exchange = "NSE", price }) {
                 data-testid="order-type"
                 value={orderType}
                 onChange={(e) => setOrderType(e.target.value)}
-                className="w-full rounded-lg border border-[var(--border)] bg-[var(--bg-tertiary)] px-2 py-2 text-[11px] text-[var(--text-primary)]"
+                className="w-full rounded-lg border border-[var(--border)] bg-[var(--bg-elevated)] px-2 py-2 text-[11px] text-[var(--text-primary)]"
               >
                 {ORDER_TYPES.map((t) => <option key={t} value={t}>{t}</option>)}
               </select>
@@ -337,7 +337,7 @@ export default function OrderTicket({ symbol, exchange = "NSE", price }) {
                 min="0"
                 value={limitPrice}
                 onChange={(e) => setLimitPrice(e.target.value)}
-                className="w-full rounded-lg border border-[var(--border)] bg-[var(--bg-tertiary)] px-2 py-2 text-[11px] font-mono text-[var(--text-primary)]"
+                className="w-full rounded-lg border border-[var(--border)] bg-[var(--bg-elevated)] px-2 py-2 text-[11px] font-mono text-[var(--text-primary)]"
               />
             </label>
           )}
@@ -354,7 +354,7 @@ export default function OrderTicket({ symbol, exchange = "NSE", price }) {
               setReviewing(true);
             }}
             className="w-full rounded-lg px-3 py-2 text-[11px] font-semibold text-[var(--text-primary)] border border-[var(--border)] disabled:opacity-40 disabled:cursor-not-allowed"
-            style={{ background: "var(--bg-tertiary)" }}
+            style={{ background: "var(--bg-elevated)" }}
           >
             Review order
           </button>

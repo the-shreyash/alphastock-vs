@@ -40,6 +40,47 @@
     --nav-bg: rgba(248, 249, 252, 0.85);
 
     /* =============================================
+       ACTION / STATUS TOKENS  (D7.1 design system)
+
+       `--brand-accent` is the product's primary action colour. It is
+       deliberately a near-neutral rather than a saturated hue: the landing
+       page's "Get Started" button already reads near-black, and every
+       authenticated primary action now inherits that same language.
+
+       `--confirm` is the *execution* green — reserved for actions that commit
+       something (Place Order, Connect Broker). It is intentionally a deeper,
+       more legible green than `--gain`, which stays purely a market-state
+       colour (P&L, price movement) and must never be used as a button fill.
+       ============================================= */
+    --brand-accent: #1A1D29;
+    --brand-accent-hover: #2A2E3D;
+    --brand-accent-fg: #FFFFFF;
+    --brand-accent-soft: rgba(26, 29, 41, 0.05);
+
+    --confirm: #00875A;
+    --confirm-hover: #00714B;
+    --confirm-fg: #FFFFFF;
+    --confirm-soft: rgba(0, 135, 90, 0.07);
+
+    --warning: #D97706;
+    --warning-bg: rgba(217, 119, 6, 0.08);
+    --info: #0369A1;
+    --info-bg: rgba(3, 105, 161, 0.07);
+
+    /* Navigation active state — a subtle tint plus an accent marker, never a
+       loud filled highlight. */
+    --nav-active-bg: rgba(26, 29, 41, 0.055);
+    --nav-active-fg: #1A1D29;
+    --nav-active-marker: #00875A;
+
+    /* Elevation scale. Cards use --shadow-sm at rest and --shadow-md on
+       hover; --shadow-lg is for genuinely floating surfaces (dialogs,
+       popovers, command palette). */
+    --shadow-sm: 0 1px 2px rgba(16, 24, 40, 0.04);
+    --shadow-md: 0 4px 12px rgba(16, 24, 40, 0.06);
+    --shadow-lg: 0 12px 32px rgba(16, 24, 40, 0.10);
+
+    /* =============================================
        TYPOGRAPHY SCALE (theme-independent)
        ============================================= */
     --fs-display: clamp(2.25rem, 1.85rem + 1.8vw, 2.75rem); /* hero */
@@ -122,6 +163,33 @@
     --card-radius-lg: 20px;
     --sidebar-bg: #09090e;
     --nav-bg: rgba(9, 10, 14, 0.85);
+
+    /* Action / status tokens — dark counterparts. The primary action inverts
+       to a near-white surface with dark text (the Linear / Vercel language),
+       which keeps "primary" reading as the highest-contrast element in both
+       themes rather than as a specific hue. */
+    --brand-accent: #F0F2F5;
+    --brand-accent-hover: #FFFFFF;
+    --brand-accent-fg: #09090e;
+    --brand-accent-soft: rgba(255, 255, 255, 0.06);
+
+    --confirm: #22C55E;
+    --confirm-hover: #16A34A;
+    --confirm-fg: #06140D;
+    --confirm-soft: rgba(34, 197, 94, 0.12);
+
+    --warning: #FBBF24;
+    --warning-bg: rgba(251, 191, 36, 0.12);
+    --info: #38BDF8;
+    --info-bg: rgba(56, 189, 248, 0.12);
+
+    --nav-active-bg: rgba(255, 255, 255, 0.06);
+    --nav-active-fg: #F0F2F5;
+    --nav-active-marker: #4ade80;
+
+    --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
+    --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.45);
+    --shadow-lg: 0 12px 32px rgba(0, 0, 0, 0.55);
 
     /* shadcn compat */
     --background: 230 28% 4%;

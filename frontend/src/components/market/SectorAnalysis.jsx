@@ -41,10 +41,10 @@ export default function SectorAnalysis() {
 
   if (loading) {
     return (
-      <div className="rounded-xl bg-[var(--bg-secondary)] border border-[var(--border)] p-4">
+      <div className="rounded-xl bg-[var(--bg-card-glass)] border border-[var(--border)] p-4">
         <div className="animate-pulse space-y-3">
           {[...Array(5)].map((_, i) => (
-            <div key={i} className="h-10 bg-[var(--bg-tertiary)] rounded-lg" />
+            <div key={i} className="h-10 bg-[var(--bg-elevated)] rounded-lg" />
           ))}
         </div>
       </div>
@@ -62,7 +62,7 @@ export default function SectorAnalysis() {
       {(rotation.inflow?.length > 0 || rotation.outflow?.length > 0) && (
         <div className="grid grid-cols-2 gap-3">
           {rotation.inflow?.length > 0 && (
-            <div className="rounded-xl bg-[var(--bg-secondary)] border border-[var(--border)] p-3">
+            <div className="rounded-xl bg-[var(--bg-card-glass)] border border-[var(--border)] p-3">
               <div className="flex items-center gap-1.5 mb-2">
                 <ArrowUpRight size={12} className="text-[var(--gain)]" />
                 <span className="text-[10px] font-medium text-[var(--gain)] uppercase tracking-wider">
@@ -79,7 +79,7 @@ export default function SectorAnalysis() {
             </div>
           )}
           {rotation.outflow?.length > 0 && (
-            <div className="rounded-xl bg-[var(--bg-secondary)] border border-[var(--border)] p-3">
+            <div className="rounded-xl bg-[var(--bg-card-glass)] border border-[var(--border)] p-3">
               <div className="flex items-center gap-1.5 mb-2">
                 <ArrowDownRight size={12} className="text-[var(--loss)]" />
                 <span className="text-[10px] font-medium text-[var(--loss)] uppercase tracking-wider">
@@ -99,14 +99,14 @@ export default function SectorAnalysis() {
       )}
 
       {/* Sector cards */}
-      <div className="rounded-xl bg-[var(--bg-secondary)] border border-[var(--border)] overflow-hidden">
+      <div className="rounded-xl bg-[var(--bg-card-glass)] border border-[var(--border)] overflow-hidden">
         <div className="px-4 py-3 border-b border-[var(--border)] flex items-center justify-between">
           <div className="flex items-center gap-2">
-            <Layers size={14} className="text-[var(--accent)]" />
+            <Layers size={14} className="text-[var(--brand-accent)]" />
             <span className="text-sm font-semibold text-[var(--text-primary)]">Sector Deep Dive</span>
             <span className="text-[10px] text-[var(--text-muted)]">{sectors.length} sectors</span>
           </div>
-          <button onClick={fetchData} className="text-[var(--text-muted)] hover:text-[var(--accent)]">
+          <button onClick={fetchData} className="text-[var(--text-muted)] hover:text-[var(--text-primary)]">
             <RefreshCw size={13} className={loading ? "animate-spin" : ""} />
           </button>
         </div>
@@ -128,7 +128,7 @@ export default function SectorAnalysis() {
               {/* Sector row */}
               <button
                 onClick={() => setExpandedSector(isExpanded ? null : sector.name)}
-                className="w-full px-4 py-3 border-b border-[var(--border)] last:border-0 flex items-center gap-3 hover:bg-[var(--bg-hover)] transition-colors text-left"
+                className="w-full px-4 py-3 border-b border-[var(--border)] last:border-0 flex items-center gap-3 hover:bg-[var(--hover)] transition-colors text-left"
               >
                 {/* Strength indicator */}
                 <div className="w-1 h-8 rounded-full shrink-0" style={{
@@ -156,7 +156,7 @@ export default function SectorAnalysis() {
                 </div>
 
                 {/* Breadth mini bar */}
-                <div className="w-16 h-1.5 rounded-full bg-[var(--bg-tertiary)] overflow-hidden shrink-0">
+                <div className="w-16 h-1.5 rounded-full bg-[var(--bg-elevated)] overflow-hidden shrink-0">
                   <div
                     className="h-full rounded-full"
                     style={{
@@ -175,7 +175,7 @@ export default function SectorAnalysis() {
                 <motion.div
                   initial={{ height: 0, opacity: 0 }}
                   animate={{ height: "auto", opacity: 1 }}
-                  className="px-4 py-3 bg-[var(--bg-tertiary)]/50 border-b border-[var(--border)]"
+                  className="px-4 py-3 bg-[var(--bg-elevated)]/50 border-b border-[var(--border)]"
                 >
                   <div className="grid grid-cols-3 gap-3 text-[10px]">
                     {/* Breadth */}

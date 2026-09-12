@@ -12,6 +12,7 @@ import {
 } from "../lib/brokerAccounts";
 import { useAuth } from "../context/AuthContext";
 import { Save, User, Shield, ShieldAlert, Bell, Link2, ExternalLink, Database, Check, X, Wifi, MessageSquare, Mail, Workflow, Clock, RefreshCw, Unplug, Zap } from "lucide-react";
+import { PageHeader } from "../components/ds";
 
 const fadeUp = {
   initial: { opacity: 0, y: 16 },
@@ -226,8 +227,10 @@ export default function SettingsPage() {
   return (
     <div data-testid="settings-page" className="space-y-6 max-w-3xl">
       <motion.div initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.4 }}>
-        <h1 className="page-title">Settings</h1>
-        <p className="page-subtitle mt-1">Configure your trading preferences and integrations</p>
+        <PageHeader
+          title="Settings"
+          subtitle="Manage your account and preferences"
+        />
       </motion.div>
 
       {/* Broker Accounts — Top Priority */}
