@@ -156,6 +156,12 @@ def _bind_shard(handler, shard: str):
 #: that SECURITY.md's encryption-at-rest rule did not cover.
 TOKEN_FIELDS = ("access_token", "refresh_token", "public_token", "feed_token")
 
+#: Lifecycle states whose contract is "credentials withdrawn". A session is never
+#: served from a row in one of them, whatever it still holds (D6.8 / F-6).
+_CREDENTIAL_WITHDRAWN_STATES = frozenset({
+    BrokerAccountStatus.DISCONNECTED, BrokerAccountStatus.REVOKED,
+})
+
 
 #: How long a decrypted broker session may sit unused in `BrokerEngine._sessions`
 #: before its plaintext copy is dropped (D6.7 / A5). Thirty minutes is longer
@@ -400,6 +406,27 @@ class BrokerEngine:
         doc = await self.db.broker_accounts.find_one(
             {"broker_account_id": account.broker_account_id})
         if not doc:
+            return None
+        if doc.get("status") in _CREDENTIAL_WITHDRAWN_STATES:
+            # D6.8 / F-6 — the lifecycle state is authoritative, not the token.
+            #
+            # `BrokerAccountStatus` documents DISCONNECTED and REVOKED as states
+            # whose credentials are cleared, and CONNECTED as the only state a
+            # broker call starts from. Nothing enforced it: this method served
+            # any row that still held a token. Every current writer blanks the
+            # token in the same update, so the gap was a promise kept by
+            # convention — and the first writer that set the state without
+            # blanking (an admin revocation, a partial failure, a restore from
+            # backup) would have kept a withdrawn account tradeable.
+            #
+            # Explicit values only. A row with NO status is a pre-D6.4 legacy
+            # row that `ref_from_doc` defaults to DISCONNECTED for display; it is
+            # judged by its token and freshness exactly as before.
+            #
+            # REAUTH_REQUIRED is deliberately NOT here: the broker is the
+            # authority on a token it rejected, calendar expiry already refuses
+            # an aged one in `get_session`, and a stream-side rejection must not
+            # also cut REST access the broker is still granting.
             return None
         needs_migration = any(
             doc.get(f) and not is_encrypted(doc[f]) for f in TOKEN_FIELDS)

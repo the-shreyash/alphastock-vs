@@ -5263,6 +5263,44 @@ test for "did I pick the right scope" is simple: *does something else already
 have a `shutdown()` that must cancel this?* `self._recovery` had had exactly
 this shape since D5.6, one method away, and was the answer.
 
+## D6.7-9 — A fixture that pre-seeds the field a branch tests for has deleted the branch (re-verification, 2026-09-13)
+
+**Decision.** `update_paper_balance`'s increment is filtered on
+`paper_capital: {$exists: True}`, and every real-Mongo balance test family now
+includes a user row with **no** `paper_capital` field.
+
+**What happened.** D6.7-3's `$inc` fix carried a seeding branch whose docstring
+said the increment matching a row meant "that row had a balance". The filter was
+`{"_id": oid}`, which matches every user. The seed was reachable only for a user
+document that does not exist, and an unseeded user's first credit replaced
+₹1,00,000 with the credit. `execute_paper_trade` seeds only on a BUY, so a
+user whose first paper trade was a short and closed at ₹100 profit was left with
+**₹100**. Reproduced end to end against real `mongod`.
+
+**Why nothing caught it.** Every balance test in D6.3 and D6.7 inserted its user
+with `"paper_capital": 100000.0`. The branch the docstring spent a paragraph
+defending was never executed by any test. This is D6.6/M13 ("a uniform test
+environment deletes a dimension from every assertion made in it") one field
+over, and D6.7-6 ("correct and unreachable") inverted — here the helper was
+*incorrect* and unreachable-by-tests, so a comment was the only evidence.
+
+**The rule.** When code branches on a field's presence, a test must construct
+the absent case through the same entry point production uses. A docstring
+explaining why a branch is safe is a claim, and a claim with no test that
+executes the branch is not evidence.
+
+**Also recorded.** (1) D6.7's sync tests made 41 outbound Yahoo Finance requests
+per run through `portfolio_stream.publish_snapshot` — refused only because the
+host had no route out. Patched; a mocked test must not become a live-data test
+on a networked machine. (2) Three real-Mongo tests assigned
+`real_market.fetch_real_stock_quote` without restoring it, leaking a fake quote
+into every later test in the process; moved to `monkeypatch`. (3)
+`test_concurrent_order_reads_never_cross_tenants` queried `db.orders` itself and
+touched no production code; it now drives `unified_orders`. (4) Frontend
+mutation M12b (drop `ws !== wsRef.current` from `onmessage`) survived all 815
+tests: on an identity change `disposed` already drops the stale frames, so the
+clause is load-bearing only on a same-identity reconnect, which no test drove.
+
 ---
 
 # ADR-064 — An artifact is AI-generated only if a model generated it, and freshness is a property of the artifact, not of the reader (D6.9)
@@ -5383,3 +5421,128 @@ docstring was the only thing between a provider's error text (request ids,
 account identifiers, echoed prompts) and a field `/api/ai/status` serves. It is
 now coerced to the closed vocabulary in the function. The same reasoning is why
 `ai.provider` has one writer rather than a rule that callers must check first.
+
+---
+
+# D6.8 — ENTITLEMENTS & CAPABILITY AUTHORIZATION (2026-09-13)
+
+## D6.8-1 — A conversation is `(user_id, session_id)`; the D6.1 / S5 403 is withdrawn
+
+**Decision.** `POST /api/chat` no longer checks whether another account has used
+a `session_id`. A session id is a label *inside* an account. Every read and write
+of `chat_messages` filters by `user_id`: the `ai_chat` context load,
+`/chat/history`, `list_conversations` and `delete_conversation`.
+
+**Why the reversal.** S5's 403 made an authorization decision on the wrong key.
+D6.8 reproduced three failures that came from it:
+
+1. **An existence oracle.** A label another user had used returned 403, and an
+   unused label returned 200 (stop condition 11).
+2. **Squatting.** Posting first to `chat-<victim_id>` locked the victim out of
+   their own default chat for good. ObjectIds minted in one process differ by a
+   counter step, so an attacker's own id points at neighbouring users' ids.
+3. **Collisions.** The SPA mints `chat-<epoch ms>` and `quick-<epoch ms>` with no
+   user in the label, so two users in the same millisecond shared one.
+
+S5's *confidentiality* guard, the owner-filtered context load, is unchanged and
+still pinned by `test_the_context_load_is_owner_filtered_even_if_the_route_check_were_gone`.
+The user approved the reversal after the stop-condition report.
+
+**The rule.** A resource identifier chosen by a client is namespaced by the
+authenticated owner. It is never checked against other owners, because any
+answer that depends on other owners' data is an oracle.
+
+## D6.8-2 — An admin action is authorized on its target as well as its actor
+
+**Decision.** `security.roles.authorize_admin_target(target_role, actor_role)`
+checks the role *stored* on the target account. An admin-tier account can be
+modified only by a `super_admin`. It is applied through `_admin_target` to
+`PUT /admin/users/{id}`, `block`, `unblock` and `grant-plan`. A missing target
+now returns 404; before, the write went to no one and still reported success.
+
+**Why.** `validate_role_assignment` governs *what* may be written. Nothing
+governed *who* it is written to. A plain admin could demote a super_admin to
+`pro`, overwrite their role through `grant-plan`, or block them. That removes,
+from below, the only accounts able to delete users or mint admins. The two
+checks answer different questions, so a route that writes another account's
+role needs both.
+
+`grant-plan` now validates against `PLAN_ROLES` itself. Its private copy had
+already drifted (it was missing `premium`) while the module claimed the two were
+"kept in sync".
+
+## D6.8-3 — The public route set is pinned, not derived
+
+**Decision.** `PINNED_PUBLIC_ROUTES` in `tests/test_d68_entitlements.py` lists
+every route reachable without a credential, each with a reason. The derived set
+must equal it exactly.
+
+**Why.** `tests/_routes.py` treats a route as protected when `get_current_user`
+appears in its dependency tree. Deleting that dependency therefore turned the
+route into a "public" route and deleted its 401 test in the same step. The
+sweep's docstring claimed the opposite. Mutation M19b (swap a route's identity
+dependency for one that trusts an `X-User-Id` header) survived every
+pre-existing suite, and only the pin kills it. **A classifier that derives its
+expectation from the thing it checks cannot detect that thing's removal. Pin the
+complement.**
+
+## D6.8-4 — `/api/trades` does not create paper trades
+
+**Decision.** `is_paper: true` on `POST /api/trades` returns 422. The refusal
+comes before the risk check and before any account is resolved. The only paper
+entry point is `POST /api/paper/trade`. `/api/trades/validate` still accepts the
+field, because it is a stateless dry run and the k6 harness sends it.
+
+**Why.** A client-supplied boolean decided which domain a row belonged to:
+
+* The paper service closes, credits and resets `is_paper` rows, but only
+  `execute_paper_trade` debits. That was reproduced as **+₹10,000 of paper
+  capital from two zero-P&L round trips**, and it could be repeated.
+* With a broker account named, a **real order** was placed and filed as paper.
+  The live auto-exit engine skips paper rows, so that position's stop-loss never
+  ran, and `/api/paper/reset` could mark it closed without touching the broker.
+
+PH3.12R forbade `is_paper` and `broker` on `PaperTradeCreate`. D6.8 closes the
+mirror image. `analytics.quality` already classified `paper_trade_with_broker`
+as a broken state, and the endpoint could produce it.
+
+## D6.8-5 — A route that invokes a paid model requires an authenticated user
+
+**Decision.** `GET /market/summary`, `POST /analysis/explain`,
+`GET /analysis/morning-report`, `POST /analysis/full-report` and
+`GET /gemini/market-pulse` take `Depends(get_current_user)`. A source sweep
+(`test_no_public_route_can_invoke_a_model`) fails if any public handler names a
+model invocation. Its regex is proven against the original five.
+
+**Why.** The SPA's `ProtectedRoute` was the only thing standing between an
+anonymous caller and model spend, and `force: true` bypassed the explain cache.
+No signed-out page calls any of the five, so no real user's behaviour changes.
+This is Layer 1 (identity), **not** an entitlement: no plan or credit system
+exists to consult (LIM-D6.8-1).
+
+## D6.8-6 — A withdrawn broker account serves no session, whatever it still holds
+
+**Decision.** `BrokerEngine._load_session` returns nothing for a row whose
+explicit `status` is `DISCONNECTED` or `REVOKED`. A row with no status (pre-D6.4
+legacy) is judged by its token, as before. `REAUTH_REQUIRED` is deliberately
+excluded: the broker is the authority on a token it rejected, calendar expiry
+already refuses an aged token, and a stream-side rejection must not also cut
+REST access the broker still grants.
+
+**Why.** `BrokerAccountStatus` documents both states as "credentials cleared".
+Every current writer happens to blank the token in the same update, so the
+contract held by convention alone. `REVOKED` has no writer yet, and whichever
+writer comes first would have left a withdrawn account tradeable. This is
+D6.9's rule: a contract enforced only by a docstring is not a control. Verified
+on real mongod as well as FakeDB.
+
+## D6.8-7 — A test double must not answer a question the driver cannot
+
+**Decision.** `FakeDB.delete_one` and `delete_many` return `_DeleteResult`, which
+exposes `deleted_count` only, matching pymongo.
+
+**Why.** The double returned `modified_count` on deletes. Real `DeleteResult`
+has no such attribute, so `delete_conversation`'s
+`getattr(res, "modified_count", 0)` reported **0 for every real deletion**
+(confirmed on mongod) and the true count in every test. This is the same shape
+as PH2's stub that agreed with the bug.

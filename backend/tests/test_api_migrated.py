@@ -343,12 +343,18 @@ class TestValidationFromLiveSuites:
             resp = client.get("/api/stocks/search", params={"q": ""})
         assert resp.status_code < 500
 
-    def test_full_report_rejects_an_unknown_symbol(self, client, fake_db, monkeypatch):
-        """`test_phase5::test_full_report_invalid_symbol`."""
+    def test_full_report_rejects_an_unknown_symbol(self, client, fake_db, auth_headers, monkeypatch):
+        """`test_phase5::test_full_report_invalid_symbol`.
+
+        D6.8 / F-5 made this route authenticated. The old `400 <= status < 500`
+        kept passing on the 401 an anonymous call now gets, i.e. it stopped
+        testing symbol handling at all. Authenticated, and pinned to the 404 the
+        handler actually returns for a symbol with no quote and no metadata.
+        """
         monkeypatch.setattr(server, "real_quote", AsyncMock(return_value=None))
         resp = client.post("/api/analysis/full-report",
-                           json={"symbol": "NOSUCHSTOCK"})
-        assert 400 <= resp.status_code < 500
+                           json={"symbol": "NOSUCHSTOCK"}, headers=auth_headers)
+        assert resp.status_code == 404, resp.text
 
 
 # --------------------------------------------------------------------------- #

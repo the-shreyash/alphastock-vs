@@ -56,16 +56,28 @@ async def update_paper_balance(user_id: str, amount: float, db):
     accident (its Python-side default did the work), and losing it would be a
     financial regression dressed as a concurrency fix.
 
-    So the increment runs first and unconditionally: if it matched a row, that
-    row had a balance and the arithmetic is done. Only when it matches nothing
-    does the seeding branch run, and that branch is itself conditional on the
-    balance still being absent — so of N concurrent callers that all find the
-    row missing, the `_id` unique index admits exactly one creator and the rest
-    fall back to the increment they should have taken.
+    So the increment runs first, against a row that ALREADY HAS a balance: if it
+    matched, the arithmetic is done. Only when it matches nothing does the
+    seeding branch run, and that branch is itself conditional on the balance
+    still being absent — so of N concurrent callers that all find the field
+    missing, exactly one seeds it and the rest fall back to the increment they
+    should have taken (a filter that no longer matches turns the upsert into an
+    insert, which the `_id` unique index refuses).
+
+    D6.7 RE-VERIFICATION (2026-09-13) — `$exists: True` IS THE FIX, NOT A NICETY.
+    The increment's filter was `{"_id": oid}` alone, which matches every user
+    row, including the ordinary one with no `paper_capital` field — so the seed
+    ran only for a user row that did not exist, and an unseeded user's first
+    credit replaced ₹1,00,000 with the credit. Reachable: `execute_paper_trade`
+    seeds only on a BUY, so closing a user's first trade when it was a short
+    did exactly that. Every balance test had pre-seeded the field and never
+    drove this path; `tests/test_d67_concurrency.py::TestAnUnseededBalance
+    StartsFromTheDefault` does.
     """
     oid = ObjectId(user_id)
     delta = round(amount, 2)
-    result = await db.users.update_one({"_id": oid}, {"$inc": {"paper_capital": delta}})
+    has_balance = {"_id": oid, "paper_capital": {"$exists": True}}
+    result = await db.users.update_one(has_balance, {"$inc": {"paper_capital": delta}})
     if not getattr(result, "matched_count", 0):
         try:
             await db.users.update_one(
@@ -76,7 +88,7 @@ async def update_paper_balance(user_id: str, amount: float, db):
         except Exception:
             # A concurrent creator won the `_id` index. The row exists now, so
             # the increment this call owes it is the one that was skipped above.
-            await db.users.update_one({"_id": oid}, {"$inc": {"paper_capital": delta}})
+            await db.users.update_one(has_balance, {"$inc": {"paper_capital": delta}})
     row = await db.users.find_one({"_id": oid}, {"paper_capital": 1})
     return round((row or {}).get("paper_capital", DEFAULT_CAPITAL + delta), 2)
 

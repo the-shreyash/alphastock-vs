@@ -526,7 +526,7 @@ class TestConcurrentWritesDoNotCrossTenants:
         assert by_user[a_id] == "RELIANCE"
         assert by_user[b_id] == "TCS"
 
-    def test_a_concurrent_cross_user_close_matches_nothing_and_leaves_the_trade_open(self, mongo_db):
+    def test_a_concurrent_cross_user_close_matches_nothing_and_leaves_the_trade_open(self, mongo_db, monkeypatch):
         """§3 IDOR under concurrency. B fires A's trade id three times, in parallel.
 
         The owner-positive control runs in the same test: after B's attack, A
@@ -540,7 +540,9 @@ class TestConcurrentWritesDoNotCrossTenants:
             async def fake_quote(symbol):
                 return {"price": 150.0}
 
-            real_market.fetch_real_stock_quote = fake_quote
+            # Restored by monkeypatch: a bare assignment leaked this fake quote
+            # into every later test in the process (D6.7 re-verification).
+            monkeypatch.setattr(real_market, "fetch_real_stock_quote", fake_quote)
 
             a_id, b_id = str(ObjectId()), str(ObjectId())
             trade_id = ObjectId()
@@ -645,7 +647,7 @@ class TestSingleOwnerIntegrityRaces:
 
         assert _run(mongo_db, body) == 100400.0
 
-    def test_a_paper_trade_should_only_close_once(self, mongo_db):
+    def test_a_paper_trade_should_only_close_once(self, mongo_db, monkeypatch):
         """The write must be conditional on the status the decision was made against.
 
         Note the interaction, which is why the two markers had to clear
@@ -661,7 +663,9 @@ class TestSingleOwnerIntegrityRaces:
             async def fake_quote(symbol):
                 return {"price": 150.0}
 
-            real_market.fetch_real_stock_quote = fake_quote
+            # Restored by monkeypatch: a bare assignment leaked this fake quote
+            # into every later test in the process (D6.7 re-verification).
+            monkeypatch.setattr(real_market, "fetch_real_stock_quote", fake_quote)
 
             user_id = ObjectId()
             trade_id = ObjectId()

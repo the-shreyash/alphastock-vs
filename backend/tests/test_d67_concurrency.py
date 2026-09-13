@@ -1035,12 +1035,27 @@ class TestTenantIsolationHoldsUnderConcurrentLoad:
             f"above prove nothing about isolation")
         assert len(results) == 1 + (self.USERS - 1) * 3
 
-    def test_concurrent_order_reads_never_cross_tenants(self, mongo_db):
+    def test_concurrent_order_reads_never_cross_tenants(self, mongo_db, monkeypatch):
+        """Drives the production `/api/orders` handler, not the database.
+
+        STRENGTHENED IN THE D6.7 RE-VERIFICATION. This test used to run
+        `db.orders.find({"user_id": user_id})` itself — a query written by the
+        test, against the database, touching no production code. It could not
+        fail however broken the order endpoint was: it verified that MongoDB
+        honours a filter. It now calls `unified_orders`, whose filter is the one
+        under test.
+        """
+        import server
+
         async def body(db):
             expected = await self._seed(db)
+            monkeypatch.setattr(server, "db", db)
             try:
                 async def read(user_id):
-                    rows = await db.orders.find({"user_id": user_id}).to_list(100)
+                    body = await server.unified_orders(
+                        user={"_id": user_id}, broker=None,
+                        broker_account_id=None, refresh=False)
+                    rows = body["orders"]
                     return user_id, {r["order_id"] for r in rows}, {
                         r["user_id"] for r in rows}
 
@@ -1313,6 +1328,13 @@ class TestSyncPortfolioActuallyUsesTheGenerationPath:
                   new=AsyncMock(return_value=[])),
             patch("services.brokers.broker_gateway.get_funds",
                   new=AsyncMock(return_value={"available_margin": 100.0})),
+            # D6.7 re-verification: `sync_portfolio` publishes a snapshot, and
+            # the snapshot fetches live quotes. Unpatched, this class made 41
+            # outbound Yahoo Finance requests per run — refused only because the
+            # host had no route out. A test that would read live market data on
+            # a networked machine is not a mocked test.
+            patch("services.portfolio_stream.publish_snapshot",
+                  new=AsyncMock(return_value=None)),
         ]
 
     def test_two_concurrent_syncs_both_succeed_and_leave_one_copy(self, mongo_db):
@@ -1644,7 +1666,7 @@ class TestIdentityTransitionsUnderConcurrency:
         assert laptop_revoked is False, "logging out one device killed another"
         assert outcome == "rotated"
 
-    def test_a_stale_identitys_writes_cannot_land_on_the_new_identity(self, mongo_db):
+    def test_a_stale_identitys_writes_cannot_land_on_the_new_identity(self, mongo_db, monkeypatch):
         """The store-reset question, asked at the data layer.
 
         A request issued as user A, still in flight when the tab becomes user B,
@@ -1672,7 +1694,9 @@ class TestIdentityTransitionsUnderConcurrency:
             async def fake_quote(symbol):
                 return {"price": 150.0}
 
-            real_market.fetch_real_stock_quote = fake_quote
+            # Restored by monkeypatch: a bare assignment leaked this fake quote
+            # into every later test in the process (D6.7 re-verification).
+            monkeypatch.setattr(real_market, "fetch_real_stock_quote", fake_quote)
 
             # B — the identity the tab now holds — tries to close A's trade,
             # concurrently with A's own legitimate close.
@@ -1692,3 +1716,476 @@ class TestIdentityTransitionsUnderConcurrency:
         other = [v for k, v in balances.items() if k != str(trade["user_id"])]
         assert other == [100000.0], (
             f"a stale identity's close credited another user: {other}")
+
+
+# =========================================================================== #
+# §11 — D6.7 RE-VERIFICATION (2026-09-13)                                     #
+# =========================================================================== #
+# The D6.7 brief was re-issued after D6.7 had completed and been committed. It
+# was treated as a verify-not-redo pass: the suite above was re-run against
+# HEAD, the mutation campaign was re-executed independently, and the brief was
+# diffed against what §1–§10 actually assert. Everything below is what that
+# diff found missing — including one financial defect in a D6.7 fix.
+
+
+class TestAnUnseededBalanceStartsFromTheDefault:
+    """A D6.7 fix that reset a user's paper capital to the size of one credit.
+
+    THE DEFECT
+    ----------
+    `update_paper_balance` issues `$inc` against `{"_id": oid}` and runs its
+    seeding branch only when that matches nothing. Its docstring says a match
+    means "that row had a balance". It does not: the filter matches every user
+    row, including the ordinary one that has **no `paper_capital` field yet**,
+    and `$inc` on an absent field starts from zero. The seeding branch was
+    reachable only for a user row that does not exist at all.
+
+    REACHABLE FROM THE PRODUCT, NOT ONLY IN THEORY
+    ----------------------------------------------
+    `execute_paper_trade` debits — and so seeds — only for a BUY. A user whose
+    first paper trade is a SELL (a short) never has the field written; closing
+    that short calls `update_paper_balance(profit)`, and the account that read
+    ₹1,00,000 a moment earlier now holds the profit alone.
+
+    WHY NO D6.7 TEST SAW IT
+    -----------------------
+    Every real-Mongo balance test in D6.3 and D6.7 inserts its user with
+    `"paper_capital": 100000.0` already set, so the unseeded path — the one the
+    docstring spends a paragraph defending — was never driven. The fixture had
+    removed exactly the dimension the code branched on (D6.6's M13 shape).
+    """
+
+    def test_a_credit_to_a_user_who_never_paper_traded_starts_from_the_default(self, mongo_db):
+        async def body(db):
+            from services import paper_trade
+
+            user_id = ObjectId()
+            await db.users.insert_one({"_id": user_id, "email": "fixture@test.invalid"})
+            before = await paper_trade.get_paper_balance(str(user_id), db)
+            after = await paper_trade.update_paper_balance(str(user_id), 500.0, db)
+            stored = (await db.users.find_one({"_id": user_id}))["paper_capital"]
+            return before["balance"], after, stored
+
+        before, after, stored = _run(mongo_db, body)
+        assert before == 100000.0, "precondition: an unseeded user reads the default"
+        assert stored == 100500.0, (
+            f"a ₹500 credit to a user who read ₹1,00,000 left ₹{stored:,.2f}. "
+            f"`$inc` on an absent field starts from zero, so the starting "
+            f"capital was discarded.")
+        assert after == 100500.0
+
+    def test_a_first_trade_that_is_a_short_keeps_the_starting_capital(self, mongo_db, monkeypatch):
+        """The same defect, reached through the product's own two calls."""
+        import services.real_market as real_market
+
+        async def exit_quote(symbol):
+            return {"price": 90.0}
+
+        monkeypatch.setattr(real_market, "fetch_real_stock_quote", exit_quote)
+
+        async def body(db):
+            from services import paper_trade
+
+            user_id = ObjectId()
+            await db.users.insert_one({"_id": user_id, "email": "fixture@test.invalid"})
+            trade = await paper_trade.execute_paper_trade(
+                user_id=str(user_id), symbol="RELIANCE", stock_name="Reliance",
+                quantity=10, entry_price=100.0, trade_type="SELL",
+                stop_loss=110.0, target1=90.0, target2=85.0,
+                setup_type="MOMENTUM", notes="", db=db)
+            await paper_trade.close_paper_trade(str(trade["_id"]), str(user_id), db)
+            return (await paper_trade.get_paper_balance(str(user_id), db))["balance"]
+
+        balance = _run(mongo_db, body)
+        # Short 10 @ ₹100, covered @ ₹90 → ₹100 profit on ₹1,00,000.
+        assert balance == 100100.0, (
+            f"a user whose first paper trade was a profitable short ended with "
+            f"₹{balance:,.2f}; expected ₹1,00,100.00")
+
+    def test_concurrent_credits_to_an_unseeded_row_are_all_applied(self, mongo_db):
+        """The seeding branch under contention — the race it claims to handle.
+
+        Four credits start at one rendezvous against a row with no balance, so
+        every caller misses the increment and more than one reaches the seed.
+        The spy proves that last part: if only one caller ever entered the seed,
+        the concurrent-creator fallback was never exercised and a green result
+        would say nothing about it.
+        """
+
+        async def body(db):
+            from services import paper_trade
+
+            user_id = ObjectId()
+            await db.users.insert_one({"_id": user_id, "email": "fixture@test.invalid"})
+            seed_attempts = []
+
+            class _Spy(_StartGate):
+                async def update_one(self, filter, update, *args, **kwargs):
+                    if isinstance(filter.get("paper_capital"), dict) and \
+                            filter["paper_capital"].get("$exists") is False:
+                        seed_attempts.append(1)
+                    return await super().update_one(filter, update, *args, **kwargs)
+
+            gated = _StartGatedDb(db, {})
+            gated._gated["users"] = _Spy(db.users, asyncio.Barrier(4))
+            await _gather(*[paper_trade.update_paper_balance(str(user_id), 100.0, gated)
+                            for _ in range(4)])
+            stored = (await db.users.find_one({"_id": user_id}))["paper_capital"]
+            return stored, len(seed_attempts)
+
+        stored, seeds = _run(mongo_db, body)
+        assert stored == 100400.0, (
+            f"four concurrent ₹100 credits to an unseeded account left "
+            f"₹{stored:,.2f}; expected ₹1,00,400.00")
+        assert seeds >= 2, (
+            f"only {seeds} caller(s) reached the seeding branch, so the barrier "
+            f"did not overlap them and this test proves nothing about the race")
+
+
+class TestFourAccountOwnershipMatrixUnderConcurrency:
+    """Phase 6's exact fixture, through production code, all at once.
+
+        USER_A: A_UPSTOX_1, A_UPSTOX_2      (two accounts at ONE broker)
+        USER_B: B_UPSTOX_1, B_ZERODHA_1
+
+    §6 above resolves accounts under load but never puts two accounts of one
+    user at one broker in flight together — the shape where every coarser key
+    (broker name, "the user's upstox", array position, latest account) looks
+    right and routes into the wrong brokerage account. It also never ran a
+    disconnect, a status update, a sync and a session read concurrently.
+
+    NO BROKER IS CONTACTED. The gateway's network calls are spies that echo the
+    credential they were handed, so a session served to the wrong account is
+    visible in the data it produced rather than inferred.
+    """
+
+    ACCOUNTS = {
+        "A_UPSTOX_1": ("user-a", "upstox"),
+        "A_UPSTOX_2": ("user-a", "upstox"),
+        "B_UPSTOX_1": ("user-b", "upstox"),
+        "B_ZERODHA_1": ("user-b", "zerodha"),
+    }
+
+    def test_no_concurrent_operation_crosses_an_account(self, mongo_db):
+        import contextlib
+        from unittest.mock import AsyncMock, patch
+
+        refs = {label: account_ref(user, broker, suffix=label.lower())
+                for label, (user, broker) in self.ACCOUNTS.items()}
+        token_of = {r.broker_account_id: f"TOKEN-{label}" for label, r in refs.items()}
+        label_of = {r.broker_account_id: label for label, r in refs.items()}
+        by_token = {v: k for k, v in token_of.items()}
+
+        async def echo_holdings(broker, session):
+            owner = by_token[session["access_token"]]
+            return [{"symbol": f"HOLD-{label_of[owner]}", "quantity": 1,
+                     "invested_value": 1.0, "market_value": 1.0}]
+
+        async def echo_orders(broker, session):
+            return [{"order_id": f"ORD-{session['access_token']}"}]
+
+        invalidated = []
+
+        async def spy_invalidate(broker, session):
+            invalidated.append(session["access_token"])
+
+        async def body(db):
+            from services.broker_engine import BrokerEngine
+            from services.brokers.accounts import (
+                AmbiguousBrokerAccount, UnknownBrokerAccount, broker_accounts)
+            from services.brokers.order_identity import ensure_holding_identity_index
+
+            await ensure_holding_identity_index(db)
+            for i, (label, r) in enumerate(refs.items()):
+                await db.broker_accounts.insert_one({
+                    "broker_account_id": r.broker_account_id, "user_id": r.user_id,
+                    "broker": r.broker, "status": "connected",
+                    "access_token": "encrypted-at-rest-placeholder",
+                    "created_at": f"2026-01-0{i + 1}T00:00:00+00:00"})
+            engine = BrokerEngine()
+            engine.configure(db)
+            for account_id, token in token_of.items():
+                engine._cache_session(account_id, {"access_token": token})
+
+            ops = []
+
+            def op(name, coro):
+                async def run():
+                    try:
+                        return name, await coro
+                    except Exception as e:  # noqa: BLE001 - recorded, asserted below
+                        return name, e
+                ops.append(run())
+
+            a1, a2, b1, bz = (refs[k] for k in self.ACCOUNTS)
+            for _ in range(3):
+                for label, r in refs.items():
+                    other = "user-b" if r.user_id == "user-a" else "user-a"
+                    op(f"resolve-own:{label}", broker_accounts.resolve(r.user_id, r.broker_account_id))
+                    op(f"resolve-foreign:{label}", broker_accounts.resolve(other, r.broker_account_id))
+                    if r is not b1:
+                        op(f"session:{label}", engine.get_session(r))
+                        op(f"orders:{label}", engine.get_orders(r))
+                op("sole:user-a:upstox", broker_accounts.sole_for_broker("user-a", "upstox"))
+                op("sole:user-a:zerodha", broker_accounts.sole_for_broker("user-a", "zerodha"))
+                op("sole:user-b:upstox", broker_accounts.sole_for_broker("user-b", "upstox"))
+                op("sole:user-b:zerodha", broker_accounts.sole_for_broker("user-b", "zerodha"))
+                op("list:user-a", broker_accounts.list_for_user("user-a"))
+                op("list:user-b", broker_accounts.list_for_user("user-b"))
+            op("update:A_UPSTOX_2", broker_accounts.set_status(a2.broker_account_id, "connected", last_sync="x"))
+            op("disconnect:B_UPSTOX_1", engine.disconnect(b1))
+            for label in ("A_UPSTOX_1", "A_UPSTOX_2", "B_ZERODHA_1"):
+                op(f"sync:{label}", engine.sync_portfolio(refs[label]))
+
+            with contextlib.ExitStack() as stack:
+                for target, value in (
+                    ("services.brokers.broker_gateway.session_is_fresh", lambda *a, **k: True),
+                    ("services.brokers.broker_gateway.get_holdings", echo_holdings),
+                    ("services.brokers.broker_gateway.get_positions", AsyncMock(return_value=[])),
+                    ("services.brokers.broker_gateway.get_funds", AsyncMock(return_value=None)),
+                    ("services.brokers.broker_gateway.get_orders", echo_orders),
+                    ("services.brokers.broker_gateway.invalidate_session", spy_invalidate),
+                    ("services.broker_engine.stream_manager.stop_stream", AsyncMock(return_value=None)),
+                    ("services.broker_engine.detach_market_feed", AsyncMock(return_value=None)),
+                    ("services.broker_engine.BrokerEngine.start_stream", AsyncMock(return_value=None)),
+                    ("services.portfolio_stream.publish_snapshot", AsyncMock(return_value=None)),
+                    ("services.broker_engine.BrokerEngine._publish_connection", AsyncMock(return_value=None)),
+                    ("services.broker_engine.BrokerEngine._push", AsyncMock(return_value=None)),
+                ):
+                    stack.enter_context(patch(target, new=value))
+                results = await _gather(*ops)
+
+            holdings = await db.holdings.find({}).to_list(100)
+            rows = {d["broker_account_id"]: d for d in await db.broker_accounts.find({}).to_list(10)}
+            return results, holdings, rows, AmbiguousBrokerAccount, UnknownBrokerAccount
+
+        results, holdings, rows, Ambiguous, Unknown = _run(mongo_db, body)
+        failures = []
+        for name, value in results:
+            kind, _, subject = name.partition(":")
+            if kind == "resolve-own":
+                if isinstance(value, Exception) or value.broker_account_id != refs[subject].broker_account_id:
+                    failures.append(f"{name} → {value!r}")
+            elif kind == "resolve-foreign":
+                if not isinstance(value, Unknown):
+                    failures.append(f"{name} RESOLVED a foreign account → {value!r}")
+            elif kind == "session":
+                if isinstance(value, Exception) or value["access_token"] != f"TOKEN-{subject}":
+                    failures.append(f"{name} served {value!r}")
+            elif kind == "orders":
+                if isinstance(value, Exception) or value != [{"order_id": f"ORD-TOKEN-{subject}"}]:
+                    failures.append(f"{name} read {value!r}")
+            elif name == "sole:user-a:upstox":
+                if not isinstance(value, Ambiguous):
+                    failures.append(f"{name} PICKED one of two accounts → {value!r}")
+            elif name == "sole:user-a:zerodha":
+                if value is not None:
+                    failures.append(f"{name} fell back to another broker → {value!r}")
+            elif name == "sole:user-b:upstox":
+                if isinstance(value, Exception) or value.broker_account_id != refs["B_UPSTOX_1"].broker_account_id:
+                    failures.append(f"{name} → {value!r}")
+            elif name == "sole:user-b:zerodha":
+                if isinstance(value, Exception) or value.broker_account_id != refs["B_ZERODHA_1"].broker_account_id:
+                    failures.append(f"{name} → {value!r}")
+            elif kind == "list":
+                owned = {r.broker_account_id for r in refs.values() if r.user_id == subject}
+                if isinstance(value, Exception) or {r.broker_account_id for r in value} != owned:
+                    failures.append(f"{name} → {value!r}")
+            elif isinstance(value, Exception):
+                failures.append(f"{name} raised {value!r}")
+        assert failures == [], "\n".join(failures)
+
+        # The disconnect touched exactly one account, and invalidated exactly
+        # that account's credential — never a sibling's at the same broker.
+        assert invalidated == ["TOKEN-B_UPSTOX_1"], invalidated
+        b1_id = refs["B_UPSTOX_1"].broker_account_id
+        assert rows[b1_id]["status"] == "disconnected"
+        assert rows[b1_id]["access_token"] == ""
+        for label in ("A_UPSTOX_1", "A_UPSTOX_2", "B_ZERODHA_1"):
+            row = rows[refs[label].broker_account_id]
+            assert row["access_token"] == "encrypted-at-rest-placeholder", (
+                f"disconnecting B_UPSTOX_1 cleared {label}'s credential")
+            assert row["status"] == "connected"
+
+        # Every holding row was produced by its own account's credential, and is
+        # owned by that account's user.
+        seen = {(h["broker_account_id"], h["symbol"], h["user_id"]) for h in holdings}
+        expected = {(refs[l].broker_account_id, f"HOLD-{l}", refs[l].user_id)
+                    for l in ("A_UPSTOX_1", "A_UPSTOX_2", "B_ZERODHA_1")}
+        assert seen == expected, f"holdings crossed accounts: {seen ^ expected}"
+
+
+class TestMixedTenantLoad:
+    """Phase 13 — every tenant-scoped operation in flight at once.
+
+    10 users × 2 accounts (upstox + zerodha), one process, one database, one
+    engine, one socket manager. §6 ran one kind of read at a time; the shape a
+    module-level "current user" or "current session" leaks through is different
+    kinds of operation for different tenants interleaving, so they are mixed:
+    session reads, portfolio syncs, order reads, refresh-token rotation (two
+    tabs each), logout of half the users, and private + public realtime events
+    delivered through the REAL `ConnectionManager` to fake sockets.
+
+    Mocked brokers and mocked events. Not production scale and not live data.
+    """
+
+    USERS = 10
+
+    def test_no_cross_tenant_state_under_mixed_concurrent_load(self, mongo_db):
+        import contextlib
+        from unittest.mock import AsyncMock, patch
+
+        import server
+
+        users = [f"load-u{i}" for i in range(self.USERS)]
+        refs = {(u, b): account_ref(u, b, suffix=b) for u in users for b in ("upstox", "zerodha")}
+        token_of = {r.broker_account_id: f"TOK-{u}-{b}" for (u, b), r in refs.items()}
+        owner_of_token = {t: refs_key for refs_key, t in
+                          ((r.broker_account_id, token_of[r.broker_account_id]) for r in refs.values())}
+        user_of_account = {r.broker_account_id: r.user_id for r in refs.values()}
+
+        async def echo_holdings(broker, session):
+            account_id = owner_of_token[session["access_token"]]
+            return [{"symbol": f"H-{account_id}", "quantity": 1,
+                     "invested_value": 1.0, "market_value": 1.0}]
+
+        class _Socket:
+            def __init__(self, user_id):
+                self.user_id = user_id
+                self.received = []
+
+            async def accept(self, subprotocol=None):
+                return None
+
+            async def send_text(self, payload):
+                import json
+                self.received.append(json.loads(payload))
+
+            async def close(self, code=None):
+                return None
+
+        async def body(db):
+            from services.broker_engine import BrokerEngine
+            from services.brokers.order_identity import ensure_holding_identity_index
+            from services.realtime.event_bridge import _deliver
+            from security.sessions import GRACE_REPLAY, ROTATED, SessionStore
+
+            await ensure_holding_identity_index(db)
+            engine = BrokerEngine()
+            engine.configure(db)
+            for account_id, token in token_of.items():
+                engine._cache_session(account_id, {"access_token": token})
+            store = SessionStore(db)
+            manager = server.ConnectionManager()
+            sockets = {}
+            sids = {}
+            for u in users:
+                sids[u] = await store.create(u, f"jti-{u}-0")
+                sock = _Socket(u)
+                await manager.connect(sock, user_id=u, session_id=sids[u])
+                manager.subscribe(sock, ["market", "trades", "*"])
+                sockets[u] = sock
+
+            logged_out = set(users[::2])
+            ops = []
+            for u in users:
+                for b in ("upstox", "zerodha"):
+                    r = refs[(u, b)]
+                    ops.append(("session", r.broker_account_id, engine.get_session(r)))
+                    ops.append(("sync", r.broker_account_id, engine.sync_portfolio(r)))
+                # Two tabs refresh the same generation at once.
+                ops.append(("refresh", u, store.rotate(sids[u], f"jti-{u}-0", f"jti-{u}-tabA")))
+                ops.append(("refresh", u, store.rotate(sids[u], f"jti-{u}-0", f"jti-{u}-tabB")))
+                if u in logged_out:
+                    ops.append(("logout", u, store.revoke_all_for_user(u)))
+                for n in range(5):
+                    ops.append(("event", u, _deliver(manager, {
+                        "type": "portfolio.updated",
+                        "data": {"user_id": u, "n": n,
+                                 "broker_account_id": refs[(u, "upstox")].broker_account_id}})))
+                ops.append(("event", u, _deliver(manager, {
+                    "type": "trade.updated", "data": {"symbol": "ORPHAN"}})))
+                ops.append(("event", u, _deliver(manager, {
+                    "type": "price.updated", "data": {"symbol": "NIFTY", "price": 1.0}})))
+
+            async def tagged(kind, subject, coro):
+                try:
+                    return kind, subject, await coro
+                except Exception as e:  # noqa: BLE001 - asserted below
+                    return kind, subject, e
+
+            with contextlib.ExitStack() as stack:
+                for target, value in (
+                    ("services.brokers.broker_gateway.session_is_fresh", lambda *a, **k: True),
+                    ("services.brokers.broker_gateway.get_holdings", echo_holdings),
+                    ("services.brokers.broker_gateway.get_positions", AsyncMock(return_value=[])),
+                    ("services.brokers.broker_gateway.get_funds", AsyncMock(return_value=None)),
+                    ("services.broker_engine.BrokerEngine.start_stream", AsyncMock(return_value=None)),
+                    ("services.portfolio_stream.publish_snapshot", AsyncMock(return_value=None)),
+                    ("services.broker_engine.BrokerEngine._push", AsyncMock(return_value=None)),
+                ):
+                    stack.enter_context(patch(target, new=value))
+                results = await _gather(*[tagged(k, s, c) for k, s, c in ops])
+
+            holdings = await db.holdings.find({}).to_list(1000)
+            sessions = {d["user_id"]: d for d in await db.sessions.find({}).to_list(100)}
+            # After the logouts, a third refresh from each side must not revive
+            # a revoked family.
+            late = await _gather(*[store.rotate(sids[u], f"jti-{u}-tabA", f"jti-{u}-late")
+                                   for u in sorted(logged_out)])
+            return (results, holdings, sessions, late, sockets, logged_out,
+                    ROTATED, GRACE_REPLAY, manager)
+
+        (results, holdings, sessions, late, sockets, logged_out,
+         ROTATED, GRACE_REPLAY, manager) = _run(mongo_db, body)
+
+        errors = [(k, s, v) for k, s, v in results if isinstance(v, Exception)
+                  and k != "refresh"]
+        assert errors == [], f"operations failed under load: {errors[:5]}"
+
+        for kind, subject, value in results:
+            if kind == "session":
+                assert value["access_token"] == token_of[subject], (
+                    f"account {subject} was served another account's credential")
+
+        # Holdings: exactly one row per account, produced by that account's own
+        # credential and owned by that account's user.
+        by_account = {}
+        for h in holdings:
+            by_account.setdefault(h["broker_account_id"], []).append(h)
+            assert h["symbol"] == f"H-{h['broker_account_id']}", (
+                f"{h['broker_account_id']} holds a row fetched with another credential")
+            assert h["user_id"] == user_of_account[h["broker_account_id"]]
+        assert set(by_account) == set(token_of) and all(len(v) == 1 for v in by_account.values())
+
+        # Refresh: per user, the two tabs never both ROTATED (no fork). Users
+        # not logged out always get exactly one ROTATED + one GRACE_REPLAY.
+        for u in sockets:
+            outcomes = sorted(v.outcome for k, s, v in results
+                              if k == "refresh" and s == u and not isinstance(v, Exception))
+            assert outcomes.count(ROTATED) <= 1, f"{u}'s session family forked: {outcomes}"
+            if u not in logged_out:
+                assert outcomes == sorted([ROTATED, GRACE_REPLAY]), f"{u}: {outcomes}"
+                assert sessions[u]["revoked"] is False, f"another user's logout revoked {u}"
+                assert sessions[u]["refresh_count"] == 1
+            else:
+                assert sessions[u]["revoked"] is True
+        assert all(r.outcome == REVOKED for r in late), (
+            f"a revoked family refreshed back to life: {[r.outcome for r in late]}")
+
+        # Realtime: every socket received only its own user's private events —
+        # all five of them — plus the public tick; no ownerless private event
+        # reached anybody, even on a socket subscribed to `*`.
+        for u, sock in sockets.items():
+            private = [m for m in sock.received if m["event"] == "portfolio.updated"]
+            assert sorted(m["data"]["n"] for m in private) == [0, 1, 2, 3, 4], (
+                f"{u} received {len(private)} of its 5 private events")
+            assert all(m["data"]["user_id"] == u for m in private), (
+                f"{u} received another user's private event")
+            assert not [m for m in sock.received if m["event"] == "trade.updated"], (
+                f"{u} received an ownerless private event")
+        # The "*" subscription was refused, so the public tick reached sockets
+        # through `market` — the positive control that delivery works at all.
+        assert all(any(m["event"] == "price.updated" for m in s.received)
+                   for s in sockets.values())
+        assert all("*" not in subs for subs in manager.channels.values())

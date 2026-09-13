@@ -238,6 +238,43 @@ describe("D6.2-F — no duplicate or orphaned sockets", () => {
     expect(useRealtimeStore.getState().portfolioUpdate).toBeNull();
   });
 
+  it("a socket superseded by a reconnect cannot write to the store either", async () => {
+    // D6.7 re-verification — closes mutation M12b, which survived all 815
+    // frontend tests. The test above changes identity, and an identity change
+    // runs the effect cleanup, which sets `disposed`: that flag alone drops A's
+    // frames, so deleting `ws !== wsRef.current` from `onmessage` changed
+    // nothing any test could see. The clause is load-bearing on the path that
+    // test never takes — the SAME identity reconnecting, where nothing is
+    // disposed and the only thing distinguishing the dead socket from the live
+    // one is the ref. Without it, a late frame from the dropped connection
+    // lands after (and over) whatever the new connection has already written.
+    render(<RealtimeProvider><div /></RealtimeProvider>);
+    const first = socket();
+    dropAfterOpen();
+    act(() => { jest.advanceTimersByTime(5000); });
+    const second = socket();
+    expect(second).not.toBe(first);
+    act(() => { second.readyState = 1; second.onopen?.(); });
+
+    act(() => {
+      second.onmessage?.({ data: JSON.stringify({
+        type: "portfolio_update", data: { total: 2 },
+      }) });
+      jest.advanceTimersByTime(200);
+    });
+    // Positive control: the live socket does write. Without this, "the stale
+    // frame was ignored" is also what a provider that ignores everything does.
+    expect(useRealtimeStore.getState().portfolioUpdate).toEqual({ total: 2 });
+
+    act(() => {
+      first.onmessage?.({ data: JSON.stringify({
+        type: "portfolio_update", data: { total: 1 },
+      }) });
+      jest.advanceTimersByTime(200);
+    });
+    expect(useRealtimeStore.getState().portfolioUpdate).toEqual({ total: 2 });
+  });
+
   it("a superseded socket's close does not disturb the live connection", async () => {
     const { rerender } = render(<RealtimeProvider><div /></RealtimeProvider>);
     const aSocket = socket();

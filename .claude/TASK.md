@@ -9618,3 +9618,561 @@ and each is held closed by a mutation that starts red. **Not claimed:** live
 browser confirmation, or provenance for any artifact but the Morning Report.
 
 **D6.9 IS COMPLETE. D6.8 (Data Quality / Intelligence Isolation) NOT STARTED.**
+
+---
+
+# D6.7 — RE-VERIFICATION PASS (2026-09-13)
+
+**STATUS: D6.7 COMPLETE — PARTIALLY VERIFIED (unchanged). One financial defect
+found in a D6.7 fix, and closed.**
+
+The D6.7 brief was re-issued after D6.7 had completed (2026-09-11) and been
+committed in `b79ff7d` alongside D6.9. It was **verified, not redone**: the D6.7
+suites were re-run against HEAD, the whole mutation campaign was re-executed
+with a fresh harness under the brief's M1–M14 numbering, and the brief was
+compared phase by phase against what the D6.7 tests actually assert. The
+historical D6.7 section above is not edited. This section records only what the
+comparison found.
+
+## 1. Evidence at HEAD before any change
+
+`test_d67_concurrency.py` 48 passed, `test_d63_real_db_races.py` 11 passed,
+against real MongoDB (Homebrew `mongod`, standalone), 0 skipped. D6.9 did not
+regress any D6.7 control.
+
+## 2. New finding — F-11: an unseeded paper balance was reset to one credit
+
+| | |
+|---|---|
+| **Defect** | `update_paper_balance` ran `$inc` against `{"_id": oid}`. That matches every user row, including one with no `paper_capital` field, and `$inc` on an absent field starts from 0. The seeding branch was reachable only for a user row that does not exist. |
+| **Reachability** | `execute_paper_trade` debits, and so seeds, **only on a BUY**. A user whose first paper trade is a SELL (short) never has the field written. Closing it calls `update_paper_balance(profit)`. |
+| **Reproduced** | Real mongod: short 10 @ ₹100, cover @ ₹90 → balance **₹100.00** instead of ₹1,00,100.00. Four concurrent ₹100 credits to an unseeded row → ₹400.00. |
+| **Origin** | Introduced by D6.7's own `$inc` fix (F-4). The pre-D6.7 read-modify-write applied the default in Python. The docstring claimed the opposite of the code. |
+| **Why D6.7 missed it** | Every real-Mongo balance test inserted `"paper_capital": 100000.0`. The absent-field branch was never executed. |
+| **Fix** | `paper_capital: {$exists: True}` in the increment filter, and in the concurrent-creator retry. One condition. No transaction. |
+| **Severity** | MEDIUM — simulated capital, recoverable by reset, never touches a broker. It is still financially relevant state being corrupted, so it was fixed rather than recorded. |
+| **Tests** | `TestAnUnseededBalanceStartsFromTheDefault` (3). All three were red before the fix. The concurrent test has a spy asserting ≥2 callers reached the seed, so the barrier really did overlap them. |
+
+## 3. Gaps between the brief and the D6.7 tests, now closed
+
+* **Phase 6 fixture shape.** No D6.7 test put two accounts of one user at one
+  broker in flight together. `TestFourAccountOwnershipMatrixUnderConcurrency`
+  runs USER_A {A_UPSTOX_1, A_UPSTOX_2} and USER_B {B_UPSTOX_1, B_ZERODHA_1}
+  through production code, all concurrently: owner and foreign `resolve`,
+  `sole_for_broker` (A/upstox must **raise**, A/zerodha must return None, never
+  fall back), `list_for_user`, `get_session`, `get_orders`, `set_status`,
+  `disconnect(B_UPSTOX_1)` and `sync_portfolio` ×3. Gateway spies echo the
+  credential they received, so a session served to the wrong account shows up
+  in the data it produced. The disconnect invalidated exactly
+  `B_UPSTOX_1`'s credential and cleared no sibling's.
+* **Phase 13 mixed load.** D6.7's stress matrix ran one kind of read at a time.
+  `TestMixedTenantLoad` has 10 users × 20 accounts with every operation kind in
+  flight at once: session reads, syncs, two-tab refresh per user, logout of half
+  the users, 5 private events per user, an ownerless private event, and a
+  public tick through the **real** `ConnectionManager`. Assertions: no
+  credential crossed accounts; one holding row per account from its own
+  credential; no family forked; other users' logouts touched nobody else; late
+  refreshes of revoked families answer `REVOKED`; each socket got exactly its 5
+  events and no ownerless event even when it asked for `*`. Mocked brokers and
+  mocked events, **not** production scale.
+* **Unfalsifiable test strengthened.** `test_concurrent_order_reads_never_cross_tenants`
+  queried `db.orders` with its own filter and touched no production code. It now
+  drives `server.unified_orders`.
+* **Test hermeticity (two pre-existing defects).**
+  (a) D6.7's sync tests made **41 outbound Yahoo Finance requests** per run via
+  `portfolio_stream.publish_snapshot`. They were refused only because this host
+  had no route out, so D6.7 §13's "no live market data was consumed" was true
+  here by accident. Now patched; 0 attempts across the D6.3/4/6/7 and broker
+  framework suites.
+  (b) Three real-Mongo tests assigned `real_market.fetch_real_stock_quote`
+  without restoring it. Moved to `monkeypatch`.
+
+## 4. Mutation campaign (re-executed, brief numbering)
+
+Harness: an exact anchor (must match once), then `py_compile` (a SyntaxError is
+INVALID, never SURVIVED), then the targeted set (558 backend tests; 6 frontend
+suites / 143 tests), then restore and a SHA-256 check that the file is
+byte-identical. Suspicious results were re-run against the full suite.
+
+| # | Mutation | Result | Killed by |
+|---|---|---|---|
+| M1 | `resolve` drops `user_id` | KILLED | D6.4 ownership, and the new four-account matrix |
+| M2a | `resolve` drops `broker_account_id` | KILLED | D6.4 matrix, and the new four-account matrix |
+| M2b | `_broker_exit` drops `owned_by` | KILLED | D6.4 auto-exit ownership |
+| M3 | global session fallback on cache miss | KILLED | D6.7 M3 closure |
+| M4 | order identity index non-unique | KILLED | D6.7 §1 |
+| M5 | silent fan-out cap of 100 | KILLED | D6.7 §5 |
+| M6 | ownerless private event broadcast | KILLED | D6.3 bridge |
+| M7a | private channels subscribable | KILLED | D6.7 §8 |
+| M7b | `*` wildcard subscribable | KILLED | D6.1 S6 `[*]`, and the new mixed load |
+| M8 | balance `$inc` → read-modify-write | KILLED | D6.3 production credit path |
+| M8b | **F-11 seed guard removed** | KILLED | new unseeded-balance tests |
+| M9a | close loses status CAS | KILLED | D6.3 close-once |
+| M9b | credit not gated on winning close | KILLED | D6.3 close-once |
+| M10 | rotate CAS filter removed | KILLED | D6.3 rotation race, and the new mixed load |
+| M11a | scheduler gate always leader | KILLED | D6.7 §3 |
+| M11b | lease acquire admits any holder | KILLED | D6.7 §3 |
+| M11c | exit claim not exclusive | KILLED | D6.7 §2 |
+| M12a | stale-epoch 200 resolves into new identity | KILLED | D6.3 frontend epoch |
+| **M12b** | `onmessage` drops `ws !== wsRef.current` | **SURVIVED 815 → KILLED** | new D6.2-F reconnect test |
+| M12c | realtime store not reset on identity change | KILLED | D6.1 S8 |
+| M12d | stale-socket guard removed entirely | KILLED | D6.2-F |
+| M13a | revoked family rotates | KILLED | D6.2 grace, and the new mixed load |
+| M13b | `is_active` ignores revocation | KILLED | D6.2 / jwt sessions (note: `is_active` has **no production caller**) |
+| M13c | logout does not close the session's sockets | KILLED | D6.2 socket teardown |
+| M14a | ambiguous broker-name bridge picks an account | KILLED | D6.4 bridge, and the new four-account matrix |
+| M14b | `resolve` falls back to the user's account at the same broker | KILLED | D6.4 matrix, and the new four-account matrix |
+| M14c | account route falls back by broker name | KILLED | D6.4 matrix (rewritten to avoid `get_unscoped` so the caller sweep could not be what kills it) |
+
+**27 executable mutants, 27 killed, after 1 genuine survivor (M12b).** M12b is
+equivalent for the cross-identity case: an identity change runs the effect
+cleanup, and `disposed` alone drops A's frames. The clause matters only when
+the **same** identity reconnects, where a late frame from the dropped socket
+overwrites the live socket's state. The new test covers that, with a
+positive control.
+
+Where the new backend tests do **not** kill a mutant alone, it is recorded rather
+than implied. The four-account and mixed tests leave M3 alive, because every
+account's session is cached, so no miss occurs. The mixed test leaves M6 alive,
+because the ownerless event is broadcast to `trades` and channel refusal means
+no socket can hold that subscription. Each is killed by its own dedicated test.
+The composite test proves the layers compose, not that each layer holds on its
+own.
+
+No mutation remains in the tree: every restore is SHA-verified, and `git status`
+shows only the intended files.
+
+## 5. Analysed, not changed
+
+* **Rotation CAS and expiry.** The brief asks for `not expired` in the CAS
+  filter. It is checked on the read, not in the write filter. The window is one
+  round trip at the exact expiry instant, which is equivalent to that request
+  arriving a millisecond earlier. It is not a lifetime extension beyond policy.
+  Adding `expires_at > now` to the filter would make the miss path read a
+  legacy string-typed `expires_at` as REUSE and revoke a live family. Not
+  changed.
+* **Access tokens after revocation.** Stateless for their 15-minute life
+  (PH1 design, `security/jwt.py`). Revocation takes effect at refresh and closes
+  that session's sockets. This does not violate stop condition 5 (no
+  resurrection); it is an existing bounded tail, recorded as-is.
+* **Private events are user-scoped, not account-scoped.** This is by design: a
+  user owns every account whose events they receive. Per-account selection is
+  a client concern.
+* **`BrokerAccountDirectory.list_for_user` `to_list(200)`.** A per-user answer,
+  sorted after truncation. It is only reachable by a user holding more than 200
+  brokerage accounts. Category A, not a silent tenant skip.
+* **Narrow false refusal.** A BUY racing the first credit to an unseeded row can
+  miss both its `$gte` debit and its `$exists: False` seed and answer
+  "Insufficient paper capital" (by analysis; not reproduced). This fails closed, the user retries, and no
+  money moves. Recorded, not fixed.
+
+## 6. Regression
+
+| Suite | D6.7 (2026-09-11) | Now |
+|---|---|---|
+| Backend full | 5 316 passed, 66 skipped, 4 xfailed, 15 failed | **5 360 passed**, 66 skipped, 4 xfailed, **15 failed** (95 deselected by the conftest marker contract) |
+| `test_d67_concurrency.py` | 48 | **53** |
+| `test_d63_real_db_races.py` | 11 | 11 |
+| Frontend full | 774 / 47 suites | **816 / 49 suites** (D6.9's additions + 1 new) |
+
+The 15 failures are the same pre-existing, environmental `test_entrypoint_log_level.py`
+set: `docker/entrypoint.sh: line 191: python: command not found`. No NEW
+REGRESSION. No test was weakened; three tests were strengthened and five added.
+
+## 7. Real broker safety
+
+**NO REAL ORDER EXECUTED.** No place, modify, cancel or exit call reached any
+broker. Every gateway call in the new tests is a spy. No broker session was
+opened, and with the hermeticity fix no test attempts an outbound market-data
+request.
+
+## 8. Limitations
+
+LIM-D6.7-1, -2 (OPEN), -3 and -4 carry forward unchanged. The verdict stays
+**B** for LIM-D6.7-4's reason: no two uvicorn workers were run under load, and
+N broker sockets per account across workers (LIM-D6.7-3) remains open.
+
+**D6.7 RE-VERIFICATION COMPLETE. Nothing committed. D6.8 NOT STARTED.**
+
+---
+
+# D6.8 — ENTITLEMENTS, CAPABILITY AUTHORIZATION & ACCESS CONTROL (2026-09-13)
+
+**STATUS: D6.8 COMPLETE — ARCHITECTURALLY VERIFIED / ENTITLEMENT SYSTEM
+INCOMPLETE (verdict C).**
+
+D6.8 audited whether a request, broker name, account id, role, URL, frontend
+state or client payload can grant a user a capability. It found **six defects
+and fixed them** (F-1 to F-6). One of them hit stop condition 11 (an existence
+oracle); the audit stopped, reported it, and continued only after the user
+approved the fix. **No real broker order was placed, modified or cancelled.**
+Nothing was committed.
+
+## 1. Current entitlement model
+
+| Concept | What exists | Server-side enforcement |
+|---|---|---|
+| Platform role | `users.role`, one of `security.roles.ASSIGNABLE_ROLES` | `require_admin` (admin, super_admin), inline super_admin checks, and `validate_role_assignment` plus `authorize_admin_target` (D6.8) |
+| Plan tier | `free, pro, premium, elite, lifetime, developer, investor, beta_tester`, stored **in the same `role` field** | **None.** No server-side or client-side code grants or refuses a feature by plan |
+| Plan expiry | `plan_expires_at`, written by `grant-plan` | **Never read** |
+| Feature flags | `db.feature_flags`, admin CRUD plus seed | **Never read** by server or SPA |
+| Payments / subscriptions | `SUBSCRIPTIONS.md`, `PAYMENT_SYSTEM.md` | **Not implemented**: `db.payments` has no writer |
+| Market-data entitlement | D5.5: whether a broker grants an account a data feed | Broker-side, per account. This is not a product entitlement |
+| Broker capability | `BrokerAdapter.capabilities`, validated at registration | `BrokerGateway.require_capability`, before the adapter is called |
+
+**Product entitlement is not implemented, and none was invented.** Admin-granted
+plans are currently labels. Before any plan-gated feature ships it needs its own
+field (not `role`), a server-side gate, and enforced expiry (LIM-D6.8-1).
+
+## 2. Authorization layers
+
+| # | Layer | Status | Mechanism |
+|---|---|---|---|
+| 1 | Platform identity | IMPLEMENTED | JWT (cookie or Bearer) → `get_current_user`, re-read from `db.users` on every request; honours `blocked` and `password_changed_at` |
+| 2 | Platform role | IMPLEMENTED (admin only) | `require_admin`; the role is read from the DB, never from the token or request (tested by demoting mid-token) |
+| 3 | Broker account ownership | IMPLEMENTED | `BrokerAccountDirectory.resolve(user_id, id)`; `_account` returns a uniform 404 |
+| 4 | Broker capability | IMPLEMENTED | `require_capability` in `gateway.call` and `gateway.place_order` |
+| 5 | Product entitlement | **NOT IMPLEMENTED** | none |
+| 6 | Resource authorization | IMPLEMENTED | `user_id` in every read and write filter (trades, paper, chat, notifications, watchlist) |
+| 7 | Irreversible action | PARTIAL | owner → capability → risk check → broker, all in one request (D6.6 §11). The direct broker order routes skip the risk check (LIM-D6.8-3) |
+
+## 3. Protected capability matrix
+
+Legend: **Own** = the resource is filtered by the authenticated `user_id`.
+**Acct** = `broker_account_id` resolved owner-scoped. **Cap** = gateway
+capability check. No capability requires a product entitlement (none exists).
+No frontend gate is a control.
+
+| Capability | Role | Broker cap | Ownership | Server-side enforcement | Frontend gate | Status |
+|---|---|---|---|---|---|---|
+| Account settings | user | — | Own | explicit field copy; `role`/`blocked`/plan not settable | ProtectedRoute | VERIFIED |
+| Broker connect (OAuth) | user | — | server state record + cookie | D6.1 S1, D6.4 V-1 | — | VERIFIED (D6.1/D6.4) |
+| Broker disconnect / sync | user | SESSION_INVALIDATE (best effort) | Acct | `_account` | Settings | VERIFIED |
+| Holdings / positions / funds / margins / profile | user | yes | Acct | `_account` + Cap | Portfolio | VERIFIED |
+| Orders read / trades read | user | ORDERS / TRADES | Acct | `_account` + Cap | TradeMonitor | VERIFIED |
+| Order place | user | PLACE_ORDER | Acct | `_account` + Cap, adapter spy | account filter | VERIFIED (CODE); live permanently pending |
+| Order modify / cancel | user | MODIFY / CANCEL | Acct | `_account` + Cap, adapter spy | — | VERIFIED (CODE) |
+| Trade entry (`/api/trades`) | user | PLACE_ORDER if account named | Acct + Own | risk check + **F-4** + `_account` + Cap | TradeMonitor | VERIFIED |
+| Paper trading | user | — | Own | owner + status CAS (D6.3/D6.7) | PaperTrading | VERIFIED |
+| Portfolio / watchlist / notifications | user | — | Own | `user_id` filters | ProtectedRoute | VERIFIED (PH3.3/D6.3) |
+| AI chat / history / conversations | user | — | Own (**F-1**) | `(user_id, session_id)` | AIAssistant | VERIFIED |
+| AI analysis (explain, full-report, summary, morning-report, pulse) | user (**F-5**) | — | — | `get_current_user` | StockPicks | VERIFIED |
+| AI memory / learn / trade-review | user | — | Own | `get_current_user` | AIAssistant | VERIFIED (sweep) |
+| Scanner / market / news / stock reference | public | — | optional identity | pinned public (**F-3**) | — | VERIFIED |
+| Admin console (29 routes) | admin | — | — | `require_admin` | AdminRoute | VERIFIED |
+| Admin: modify an admin-tier account | super_admin (**F-2**) | — | — | `authorize_admin_target` | — | VERIFIED |
+| Delete user / grant admin-tier role | super_admin | — | — | inline + `validate_role_assignment` | — | VERIFIED |
+| Scheduler webhooks | webhook key | — | — | `verify_webhook_key`, fail closed | — | VERIFIED |
+| Metrics / diagnostics | ops token in prod | — | — | `require_operational_access` | — | VERIFIED (PH2.5) |
+| Private realtime channels | user | — | user-scoped `send_to_user` | subscribe refuses private channels and `*` | — | VERIFIED |
+| Zerodha postback | none | — | — | none (LIM-D6.8-4) | — | OPEN, LOW |
+
+## 4. Server-side authorization
+
+The route table holds **117 user-protected, 29 admin and 69 public** routes (74
+public before F-5). Attacks tried against the real app, each with a positive
+control:
+
+* Client authority fields sent to register, settings, admin routes and order
+  bodies: `role`, `admin`, `is_admin`, `plan`, `entitlement(s)`,
+  `capability(ies)`, `blocked`, `user_id`, `paper_capital`, `email_verified`.
+  **Nothing is persisted and nothing is decided on them.**
+* `?admin=true`, `X-Admin`, `X-User-Role`, and admin fields in a body → 403,
+  including on block and grant-plan, which have no second check (M20).
+* Changing `broker_account_id` to another user's id, an unknown id, or a
+  malformed id → 404, all three byte-identical.
+* Changing `broker`: a foreign-held broker returns 409; an ambiguous broker
+  returns 409 and never picks; an unresolvable id with a valid broker name
+  returns 404 and never falls back (M14).
+* `user_id` in the body is ignored, and orders go to the path-named account.
+* Replay: the role is re-read on every request, so the same admin token turns
+  403 once the account is demoted.
+
+## 5. Role / admin authorization
+
+Admin identity comes only from `db.users.role` behind a verified JWT. A normal
+user can't become admin through register, settings, a request field, a header
+or the token. A malformed or missing stored role (`""`, `None`, `"ADMIN"`,
+`"admin "`, a list, a dict, `1`, or absent) fails closed.
+
+**F-2 (HIGH, fixed).** `validate_role_assignment` checked only the role being
+written. A plain `admin` could demote a `super_admin` (`PUT role=pro`),
+overwrite their role via `grant-plan`, block them, or edit them. The fix adds
+`authorize_admin_target` on the *stored* target role, so admin-tier targets
+require `super_admin`. That includes an admin modifying themselves through the
+console. A missing target is now 404 instead of a successful write to no one.
+`grant-plan` now validates against `PLAN_ROLES` (its copy had dropped `premium`)
+and rejects non-string plans. The frontend plan picker is a subset, so nothing
+changes for it.
+
+## 6. Broker capability vs platform entitlement
+
+These are kept separate because only one of them exists. Capability is checked
+per broker at the gateway, before the adapter. An own Angel One account
+(no PLACE_ORDER) is refused with 502 `BROKER_UNSUPPORTED` and **the adapter spy
+is never called**. The capable sibling (`A_KITE`, same owner) is not substituted.
+No product entitlement exists that capability could grant or bypass.
+
+## 7. Broker account ownership
+
+The fixture has A with three Upstox accounts (live, expired, REVOKED with a
+fresh token), a sole Zerodha account and an Angel One account; B has Upstox and
+Zerodha. Results:
+
+* A + A's live account → the adapter is called exactly once, with A's token.
+* A + B's accounts → 404, spy not called.
+* B + each of A's five accounts → 404.
+* Expired account → 409 and REVOKED account → 409 on account routes (502 via
+  `/api/trades`), spy not called.
+* Ambiguous broker name → 409.
+
+Across place, modify and cancel, **place_order_called == false for every
+unauthorized scenario** (§7 of the test module).
+
+**F-6 (MEDIUM, hardening, fixed).** `get_session` never consulted `status`: a
+DISCONNECTED or REVOKED row still holding a fresh token was served, and the
+"credentials cleared" promise was kept only by convention. `_load_session` now
+refuses explicit DISCONNECTED/REVOKED rows; legacy rows with no status and
+REAUTH_REQUIRED rows are unchanged, for the reasons in D6.8-6. **Verified on
+real mongod.**
+
+## 8. Realtime authorization
+
+Unchanged, and re-verified by mutation. Private domains (trade, portfolio,
+broker, notification, watchlist) are delivered only via `send_to_user`, keyed by
+the authenticated socket's `user_id`. `subscribe` refuses all five private
+channels and `*`. Channel delivery is exact-match, so near-miss names
+(`Trades`, `trades `, `portfolio.*`) are accepted but receive nothing (tested).
+Private events are user-scoped, not account-scoped, by design (D6.7). Public
+market ticks stay global.
+
+## 9. AI / private data authorization
+
+**F-1 (stop condition 11; MEDIUM; fixed after user approval).** The chat
+`session_id` was treated as a global name. Reproduced:
+
+* **Oracle:** a label used by another account returned 403, an unused label
+  returned 200.
+* **Squat:** B posted to `chat-<A_id>` first, and A's default chat returned 403
+  permanently.
+* **Collision:** the SPA's `chat-<epoch ms>` labels collided across users.
+
+A conversation is now `(user_id, session_id)`, and a response depends only on
+the caller's data. The context load, history, list and delete were already
+owner-filtered, so no content crossed users (stop condition 7 was never hit).
+
+Side defect: `delete_conversation` read `modified_count` off a `DeleteResult`,
+returning 0 for every real deletion (confirmed on mongod). The FakeDB double
+exposed that field, which is why no test noticed. Both are fixed.
+
+**F-5 (HIGH cost-abuse, fixed).** Five public handlers invoked paid models:
+`market/summary`, `analysis/explain` (with a `force` cache bypass),
+`analysis/morning-report`, `analysis/full-report` and `gemini/market-pulse`.
+The SPA route guard was their only protection (stop condition 12's shape). All
+five now require an authenticated user, and a source sweep fails if any public
+handler invokes a model. The model is never the authorization boundary: context
+comes from `build_chat_context(db, user)` for the authenticated user.
+
+## 10. Paper trading authorization
+
+**F-4 (HIGH, fixed).** `POST /api/trades` honoured client `is_paper`:
+
+* It created a paper row with no debit, and `/api/paper/close` credited it.
+  Reproduced: ₹1,00,000 became **₹1,10,000** after two zero-P&L round trips.
+* With a broker account named, it placed a **real order** filed as paper, so
+  auto-exit skipped it and paper reset could close it without touching the
+  broker.
+
+`is_paper` now returns 422 before the risk check or any account resolution.
+Cross-user checks: B closing A's paper trade gets the same response as a
+nonexistent id; B's reset leaves A's rows and balance untouched; A can still
+close (positive control). D6.7's CAS and `$inc` protections are intact
+(`test_d67_concurrency.py` and `test_d63_real_db_races.py` 64 passed on real
+mongod; M8/M11 killed).
+
+## 11. Order authorization
+
+Boundary, as implemented:
+
+```
+JWT user → broker_account_id → owner-scoped resolve (404) → [F-4 is_paper 422]
+→ risk check (422, /api/trades only) → get_session (freshness, F-6 status)
+→ require_capability → ‖ adapter.place_order  ← spy; never crossed
+```
+
+Validation and execution still happen in one request: `/api/trades/validate` is
+a stateless dry run with no review artifact (D6.6 §11, unchanged). The direct
+routes (`/brokers/accounts/{id}/orders`, `/brokers/{broker}/orders`,
+`/zerodha/order`, `/zerodha/quick-trade`, `/zerodha/emergency-stop`) enforce
+ownership and capability but **not** `validate_trade`, and `/zerodha/order`
+takes an unvalidated raw JSON body (LIM-D6.8-3). These are the user's own risk
+limits, not cross-tenant, so they're recorded rather than redesigned.
+
+## 12. Information leakage
+
+* A foreign, unknown or malformed account id gets an identical
+  `404 {"detail":"Broker account not found"}` on 8 account routes.
+* A foreign or nonexistent trade id gets identical responses on update, exit and
+  coaching.
+* A foreign or nonexistent paper trade id gets identical close responses.
+* A non-admin gets the identical `403 "Admin access required"` for real and
+  fabricated user ids.
+* The account list never names another user's `broker_account_id` or external
+  id.
+* The chat oracle was removed (F-1).
+
+## 13. Fail-closed behaviour
+
+| Missing / invalid input | Result |
+|---|---|
+| No identity | 401 on all 146 authenticated routes (sweep) |
+| Missing or malformed role | 403, never admin (M17 killed) |
+| Missing account id, broker named, several accounts | 409, never the first account (M15 killed) |
+| Unresolvable account id plus a broker name | 404, never a name fallback (M14 killed) |
+| Unsupported capability | refused before the adapter (M6, M7, M13 killed) |
+| Expired session | 409, REAUTH_REQUIRED written (M16a killed) |
+| Revoked or disconnected account holding a token | refused (F-6; M16b killed) |
+| Missing entitlement | not applicable: no entitlement system. No request field substitutes for one (M3 killed) |
+| No webhook key configured | 403 (tested with the key unset and with a wrong key) |
+
+## 14. Mutation testing
+
+Harness (scratchpad only): each anchor must match exactly once, then
+`py_compile` (a SyntaxError counts as INVALID), then 18 targeted suites (1,353
+tests), then restore from backup with a SHA-256 byte-identity check. **28
+executable mutants, 28 killed on the first pass, 0 invalid, 0 remaining in the
+tree** (`git status` identical to the pre-campaign snapshot; full suite green
+afterwards).
+
+| # | Mutation | Killed by (D6.8 / total failing) |
+|---|---|---|
+| M1 | remove role check | 17 / 50 |
+| M2 | trust `?admin=true` / `X-Admin` | **2 / 2 (D6.8 only)** |
+| M3 | settings mass-assigns `role` | **1 / 1 (D6.8 only)** |
+| M4 | resolve drops `user_id` | 18 / 47 |
+| M5 | `_account` falls back to an unscoped lookup | 18 / 45 |
+| M6 | `require_capability` never refuses | 3 / 6 |
+| M7 | `supports()` lies for PLACE_ORDER | 3 / 9 |
+| M8 | private channels subscribable | 1 / 7 |
+| M9 | `*` subscribable | 1 / 2 |
+| M10 | `ai_chat` context without `user_id` | 0 / 1 (D6.1 direct test) |
+| M10b | chat history without `user_id` | 2 / 5 |
+| M11 | paper close without owner | 1 / 3 |
+| M12 | F-4 guard removed | 3 / 3 |
+| M12b | risk check removed | 1 / 2 |
+| M13 | gateway resolves without capability | 3 / 6 |
+| M14 | unresolvable id falls back to broker name | **2 / 2 (D6.8 only)** |
+| M15 | ambiguous picks first | 1 / 6 |
+| M16a | expired session treated as live | 4 / 7 |
+| M16b | F-6 status guard removed | 6 / 6 |
+| M17 | missing role defaults to admin | **1 / 1 (D6.8 only)** |
+| M18a | chat 403 oracle restored | 4 / 5 |
+| M18b | foreign account → 403 | 18 / 45 |
+| M19a | full-report relies on the SPA guard | 3 / 3 |
+| M19b | route trusts an `X-User-Id` header | **1 / 1 (D6.8 pin only)** |
+| M20 | admin decided by a body field | **2 / 2 (D6.8 only)** |
+| F2a | admin-tier target check removed | 15 / 15 |
+| F2b | grant-plan admits `admin` | 1 / 2 |
+| F1b | delete count misread | 1 / 2 |
+
+**Six mutants on pre-existing code (M2, M3, M14, M17, M19b, M20) were killed
+only by D6.8's tests,** so the pre-D6.8 suite would have let them survive.
+M19b is the evidence for F-3: with the dependency swapped, `_routes.py`
+reclassified the route as public and PH3.3's 401 sweep dropped it silently.
+
+One test was strengthened before the campaign: M20 would have survived the
+role-write body test, because `validate_role_assignment` refuses further down.
+Block and grant-plan were added.
+
+A test D6.8 disarmed and then re-armed: `test_full_report_rejects_an_unknown_symbol`
+asserted `400 <= status < 500` and kept passing on F-5's 401. It now
+authenticates and asserts 404.
+
+## 15. Live verification
+
+**No broker was contacted.** No session is live: Upstox expired at the 03:30 IST
+cutoff after 2026-09-10, Zerodha has been expired since 2026-07-10, and Angel
+One, Fyers and Dhan have no credentials. D6.8's boundaries are platform-side, so
+they were verified in-process against the real app, **and against a real
+mongod** for the two DB-shape-sensitive fixes: F-1 (`deleted_count` = 1, the
+pre-fix read returned 0) and F-6 (REVOKED and DISCONNECTED refused; CONNECTED
+and legacy served). Throwaway database, dropped afterwards. The broker leg is
+**CODE VERIFIED / LIVE PENDING**; order placement stays permanently code-only.
+
+## 16. Regression
+
+| Suite | D6.7 re-verification | D6.8 |
+|---|---|---|
+| Backend full | 5,360 passed / 66 skipped / 4 xfailed / 15 failed | **5,529 passed** / 66 skipped / 4 xfailed / **15 failed** (95 deselected) |
+| New `test_d68_entitlements.py` | — | 159 |
+| Authz sweep growth (5 routes × anonymous + garbage token) | — | +10 |
+| D6.3 + D6.7 real-mongod suites | 11 + 53 | 64 passed, 0 skipped |
+| Frontend full | 816 / 49 suites | **816 / 49 suites** (no frontend change) |
+
+* **FAIL, PRE-EXISTING / ENVIRONMENTAL:** 15 × `test_entrypoint_log_level.py`
+  (`python: command not found`).
+* **NEW REGRESSION:** none.
+* **Tests changed:**
+  * `test_d61_security.py` S5: 403 replaced with the stronger no-crossing
+    assertion (D6.8-1).
+  * `test_d69_ai_provenance.py`: now authenticates.
+  * `test_api_migrated.py`: now authenticates and asserts 404.
+  * `tests/_fakedb.py`: deletes now return the driver's result shape.
+* **Other checks:** 0 outbound network attempts in the full run. flake8 on every
+  touched production file is identical to HEAD.
+
+## 17. Remaining limitations
+
+* **LIM-D6.8-1: product entitlement is not implemented.** Plans are `role`
+  values nothing enforces; expiry is unread; feature flags are unread; there is
+  no payment writer; plan and admin tiers share one field. AI usage has no
+  per-user metering.
+* **LIM-D6.8-2: broker status is advisory for REAUTH_REQUIRED, and the session
+  cache is per process.** A disconnect on one worker leaves another worker's
+  decrypted session cached until idle eviction. For a broker without
+  SESSION_INVALIDATE (Dhan) that token also stays valid at the broker. This is
+  same-owner, not cross-tenant, and belongs with LIM-D6.7-4.
+* **LIM-D6.8-3:** the direct broker order routes skip `validate_trade`,
+  `/zerodha/order` takes an unvalidated body, and validation and execution are
+  still one request.
+* **LIM-D6.8-4:** `/api/zerodha/postback` is unauthenticated, has no Kite
+  checksum and writes unboundedly. Nothing reads it; the checksum must be
+  verified before any consumer is written.
+* **LIM-D6.8-5:** no last-super_admin guard. A super_admin can demote, block or
+  delete the last super_admin.
+* **LIM-D6.8-6:** a capability refusal is HTTP 502 `BROKER_UNSUPPORTED`, and
+  `/api/trades` reports session failures as 502. Fail-closed, but the status is
+  misleading.
+* **LIM-D6.8-7 (pre-existing harness bug):** `scripts/load/k6/lib/flows.js`
+  posts a `TradeCreate`-shaped body to `/api/paper/trade`, which forbids extra
+  keys (PH3.12R), so that step always returns 422. Not changed.
+* **LIM-D6.8-8:** realtime `subscribe` is a deny-list. Near-miss names are inert
+  (tested), but an allow-list would be the stronger form.
+* **LIM-D6.8-9:** no live broker leg (§15).
+
+LIM-D6.7-1 to -4 carry forward unchanged.
+
+## Files changed
+
+* `backend/server.py` (F-1, F-2, F-4, F-5)
+* `backend/security/roles.py` (F-2)
+* `backend/services/broker_engine.py` (F-6)
+* `backend/services/ai_memory.py` (F-1 count)
+* `backend/tests/_fakedb.py`
+* `backend/tests/test_d68_entitlements.py` (new, 159 tests)
+* `backend/tests/test_d61_security.py`, `test_d69_ai_provenance.py`,
+  `test_api_migrated.py`
+
+The pre-existing uncommitted D6.7 re-verification changes are untouched.
+
+## Verdict
+
+**C — D6.8 COMPLETE — ARCHITECTURALLY VERIFIED / ENTITLEMENT SYSTEM INCOMPLETE.**
+The authorization that exists (identity, admin role, account ownership,
+capability, resource ownership, realtime scoping) is verified and made
+falsifiable by 28/28 killed mutants. It was **not** sound at the start of
+D6.8: six defects were found and closed. A was not chosen because there is no
+product entitlement system to verify, and B was not chosen for the same reason.
+No critical vulnerability remains open, so D is not warranted.
+
+**D6.8 COMPLETE. Nothing committed. D6.9 NOT STARTED by this brief.**

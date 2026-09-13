@@ -142,7 +142,7 @@ from security.passwords import hash_password, verify_password
 # allowlist and least privilege on elevation (only super_admin grants admin-tier
 # roles). See SECURITY_ARCHITECTURE.md and backend/security/{identifiers,roles}.py.
 from security.identifiers import parse_object_id
-from security.roles import validate_role_assignment
+from security.roles import PLAN_ROLES, authorize_admin_target, validate_role_assignment
 
 # Supervised background tasks (PH3.6). Every perpetual loop this process starts
 # is registered here so it (a) keeps a strong reference for its whole life — the
@@ -1790,7 +1790,11 @@ async def fii_dii():
     return await market_gateway.get_fii_dii()
 
 @market_router.get("/summary")
-async def market_summary():
+async def market_summary(user: dict = Depends(get_current_user)):
+    # D6.8 / F-5 — authenticated. This handler invokes a paid AI model and was
+    # public: the only thing between an anonymous caller and model spend was the
+    # SPA's `ProtectedRoute`, which is UX, not a control. No signed-out page
+    # calls it. See `_MODEL_INVOKING_ROUTES` in tests/test_d68_entitlements.py.
     summary = await ai_market_summary()
     return {"summary": summary, "generated_at": datetime.now(timezone.utc).isoformat()}
 
@@ -2210,7 +2214,11 @@ async def top_picks():
     return {"picks": picks, "date": today, "available": True}
 
 @analysis_router.post("/explain")
-async def explain_stock(data: StockAnalysisRequest):
+async def explain_stock(data: StockAnalysisRequest, user: dict = Depends(get_current_user)):
+    # D6.8 / F-5 — authenticated. This handler invokes a paid AI model and was
+    # public: the only thing between an anonymous caller and model spend was the
+    # SPA's `ProtectedRoute`, which is UX, not a control. No signed-out page
+    # calls it. See `_MODEL_INVOKING_ROUTES` in tests/test_d68_entitlements.py.
     # AI debates are expensive — cache per symbol per day (4h TTL);
     # `force: true` bypasses for an explicit re-run.
     from services.cache import cache_get, cache_set
@@ -2246,7 +2254,11 @@ Explain: WHY this stock could be a good trade, momentum factors, entry reasoning
     return response
 
 @analysis_router.get("/morning-report")
-async def morning_report():
+async def morning_report(user: dict = Depends(get_current_user)):
+    # D6.8 / F-5 — authenticated. This handler invokes a paid AI model and was
+    # public: the only thing between an anonymous caller and model spend was the
+    # SPA's `ProtectedRoute`, which is UX, not a control. No signed-out page
+    # calls it. See `_MODEL_INVOKING_ROUTES` in tests/test_d68_entitlements.py.
     from services.real_market import fetch_real_top_picks, fetch_real_sectors
     picks_res = await fetch_real_top_picks(3)
     picks = picks_res.get("picks", [])
@@ -2403,6 +2415,30 @@ async def validate_trade_route(data: TradeCreate, user: dict = Depends(get_curre
 @trades_router.post("")
 async def create_trade(data: TradeCreate, user: dict = Depends(get_current_user)):
     from services import trading_engine
+
+    # 0. D6.8 / F-4 — THIS ENDPOINT DOES NOT CREATE PAPER TRADES.
+    #
+    # `is_paper` is a client-supplied boolean, and it decides which domain a
+    # trade row belongs to: the paper service closes, credits and resets any
+    # `is_paper: True` row, and the live auto-exit engine and scheduler skip
+    # every one. Honouring it here let a caller cross that boundary both ways:
+    #
+    # * a paper row created here was never DEBITED (only `execute_paper_trade`
+    #   debits), yet `/api/paper/close` CREDITS it — reproduced as +₹5,000 of
+    #   paper capital per zero-P&L round trip, repeatable;
+    # * with a broker account named, a REAL order was placed and then filed as
+    #   paper, so its stop-loss auto-exit never ran and `/api/paper/reset` could
+    #   mark a live position closed without touching the broker.
+    #
+    # PH3.12R closed the mirror image (`PaperTradeCreate` forbids `is_paper` and
+    # `broker`). Refused before the risk check and before any account is
+    # resolved, so no broker call can precede it. The one paper entry point is
+    # `POST /api/paper/trade`. `/validate` keeps accepting the field: it is a
+    # stateless dry run and writes nothing.
+    if data.is_paper:
+        raise HTTPException(status_code=422, detail=(
+            "Paper trades are placed through POST /api/paper/trade. "
+            "This endpoint records live and manual trades only."))
 
     # 1. Risk Manager gate — violations always block (warnings educate).
     trades_today, realized_today = await _risk_inputs(user["_id"])
@@ -3131,29 +3167,37 @@ async def mark_read(notif_id: str, user: dict = Depends(get_current_user)):
 
 @chat_router.post("")
 async def chat_endpoint(data: ChatMessage, user: dict = Depends(get_current_user)):
-    """Send a chat turn. The conversation is the caller's or it is refused.
+    """Send a chat turn into one of the caller's own conversations.
 
-    D6.1 / S5. `session_id` is client-supplied and its default (`chat-<user_id>`)
-    is derivable from any user id, so it is an identifier, never a capability.
-    Two independent guards:
+    A CONVERSATION IS `(user_id, session_id)`, NOT `session_id` (D6.8 / F-1)
+    ------------------------------------------------------------------------
+    `session_id` is a client-chosen label. The frontend mints it as
+    `chat-<epoch ms>` / `quick-<epoch ms>` and the default is `chat-<user_id>`,
+    so the string is neither secret nor unique across users. It names a thread
+    *within* an account; the account is what makes it a conversation.
 
-    1. **Here** — a session id that already has turns belonging to someone else
-       is a 403, an explicit authorization failure rather than a silent
-       reinterpretation. This also stops one user squatting on another's
-       conversation id.
-    2. **In `ai_chat`** — the context load filters on `user_id` as well as
-       `session_id`, so even if this check were removed the model could not be
-       fed another user's turns.
+    D6.1 / S5 treated the label as globally owned: a label that already held
+    another user's turns answered 403 "belongs to another account". That was
+    an authorization decision made on the wrong key, and it failed three ways
+    D6.8 reproduced:
 
-    Two guards because they fail differently: this one gives the caller a
-    truthful answer, and that one is the invariant that holds regardless of
-    which routes exist.
+    * **Existence oracle.** 403 for a label someone else used, 200 for one
+      nobody used — so any account could test whether another user had ever
+      chatted, and when.
+    * **Squatting.** Posting first to `chat-<victim_id>` permanently 403'd the
+      victim's own default conversation. ObjectIds minted by one process
+      differ by a counter step, so a victim's id is derivable from the
+      attacker's own.
+    * **Collision.** Two users opening a chat in the same millisecond got the
+      same label, and the second was refused their own conversation.
+
+    Every read and write of `chat_messages` is already filtered by `user_id`
+    (the context load in `ai_chat`, `/chat/history`, `list_conversations`,
+    `delete_conversation`), so no other account's use of a label can reach this
+    caller. The response therefore depends on nothing but the caller's own
+    data, which is the only way it cannot be an oracle.
     """
     session_id = data.session_id or f"chat-{user['_id']}"
-    foreign = await db.chat_messages.find_one(
-        {"session_id": session_id, "user_id": {"$ne": user["_id"]}})
-    if foreign:
-        raise HTTPException(status_code=403, detail="This conversation belongs to another account")
     response = await ai_chat(data.message, session_id, user, run_id=data.run_id)
 
     # Save to DB
@@ -6011,8 +6055,12 @@ async def _publish_watchlist_updated(user_id: str, action: str, symbol: str):
 # ============ ENHANCED AI EXPLAIN ============
 
 @analysis_router.post("/full-report")
-async def full_ai_report(data: StockAnalysisRequest):
+async def full_ai_report(data: StockAnalysisRequest, user: dict = Depends(get_current_user)):
     """Generate comprehensive AI analysis report with full transparency."""
+    # D6.8 / F-5 — authenticated. This handler invokes a paid AI model and was
+    # public: the only thing between an anonymous caller and model spend was the
+    # SPA's `ProtectedRoute`, which is UX, not a control. No signed-out page
+    # calls it. See `_MODEL_INVOKING_ROUTES` in tests/test_d68_entitlements.py.
     quote = await real_quote(data.symbol)
     if not quote:
         if not get_stock_meta(data.symbol):
@@ -6129,8 +6177,12 @@ async def gemini_analyze_stock(data: StockAnalysisRequest, user: dict = Depends(
     return {"symbol": data.symbol, "analysis": analysis, "quote": stock_data}
 
 @gemini_router.get("/market-pulse")
-async def gemini_market_pulse_endpoint():
+async def gemini_market_pulse_endpoint(user: dict = Depends(get_current_user)):
     """Get Gemini market pulse."""
+    # D6.8 / F-5 — authenticated. This handler invokes a paid AI model and was
+    # public: the only thing between an anonymous caller and model spend was the
+    # SPA's `ProtectedRoute`, which is UX, not a control. No signed-out page
+    # calls it. See `_MODEL_INVOKING_ROUTES` in tests/test_d68_entitlements.py.
     from services.gemini_direct import gemini_market_pulse
     pulse = await gemini_market_pulse()
     return {"pulse": pulse or "Gemini key not configured", "source": "gemini-2.5-flash"}
@@ -6287,6 +6339,24 @@ async def require_admin(request: Request) -> dict:
     if user.get("role") not in ("admin", "super_admin"):
         raise HTTPException(status_code=403, detail="Admin access required")
     return user
+
+
+async def _admin_target(user_id: str, actor: dict) -> ObjectId:
+    """Resolve the account an admin action modifies, and authorize the actor on it.
+
+    D6.8 / F-2. `require_admin` answers "may this caller use the admin console";
+    it does not answer "may this caller modify *that* account". Without the
+    second check a plain admin could demote, re-plan or block a super_admin —
+    the accounts that alone may delete users and mint admins. The target's role
+    is read from the database, never from the request, and a missing account is
+    a 404 rather than a silent no-op write reporting success.
+    """
+    oid = parse_object_id(user_id, "user")
+    target = await db.users.find_one({"_id": oid}, {"role": 1})
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    authorize_admin_target(target.get("role", ""), actor.get("role", ""))
+    return oid
 
 
 async def log_admin_action(admin_id: str, action: str, target: str = "", details: dict = None):
@@ -6511,7 +6581,7 @@ async def admin_get_user(user_id: str, user: dict = Depends(require_admin)):
 
 @admin_router.put("/users/{user_id}")
 async def admin_update_user(user_id: str, request: Request, user: dict = Depends(require_admin)):
-    oid = parse_object_id(user_id, "user")
+    oid = await _admin_target(user_id, user)
     body = await request.json()
     allowed = {"name", "role", "capital", "risk_level", "max_daily_loss", "max_trades_per_day"}
     update = {k: v for k, v in body.items() if k in allowed}
@@ -6529,7 +6599,7 @@ async def admin_update_user(user_id: str, request: Request, user: dict = Depends
 
 @admin_router.post("/users/{user_id}/block")
 async def admin_block_user(user_id: str, user: dict = Depends(require_admin)):
-    oid = parse_object_id(user_id, "user")
+    oid = await _admin_target(user_id, user)
     await db.users.update_one({"_id": oid}, {"$set": {"blocked": True}})
     # PH3.10 made `blocked` take effect within the access token's 15-minute life
     # on every path that re-resolves an identity. A WebSocket resolves its
@@ -6544,7 +6614,7 @@ async def admin_block_user(user_id: str, user: dict = Depends(require_admin)):
 
 @admin_router.post("/users/{user_id}/unblock")
 async def admin_unblock_user(user_id: str, user: dict = Depends(require_admin)):
-    oid = parse_object_id(user_id, "user")
+    oid = await _admin_target(user_id, user)
     await db.users.update_one({"_id": oid}, {"$set": {"blocked": False}})
     await log_admin_action(user["_id"], "user.unblocked", user_id)
     return {"success": True}
@@ -6628,13 +6698,17 @@ async def admin_delete_user(user_id: str, user: dict = Depends(require_admin)):
 
 @admin_router.post("/users/{user_id}/grant-plan")
 async def admin_grant_plan(user_id: str, request: Request, user: dict = Depends(require_admin)):
-    oid = parse_object_id(user_id, "user")
+    oid = await _admin_target(user_id, user)
     body = await request.json()
     plan = body.get("plan", "pro")
     duration_days = body.get("duration_days", 30)
-    valid_plans = {"free", "pro", "elite", "lifetime", "developer", "investor", "beta_tester"}
-    if plan not in valid_plans:
-        raise HTTPException(status_code=400, detail=f"Invalid plan. Choose from: {', '.join(valid_plans)}")
+    # D6.8 — validated against `security.roles.PLAN_ROLES` itself. This route
+    # kept its own copy, which had drifted (no `premium`), while the module
+    # claimed the two were "kept in sync". A plan grant overwrites `role`, so
+    # this allowlist is the only thing stopping it from writing `admin`.
+    if not isinstance(plan, str) or plan not in PLAN_ROLES:
+        raise HTTPException(status_code=400,
+                            detail=f"Invalid plan. Choose from: {', '.join(sorted(PLAN_ROLES))}")
     # PH3.3 (D-3): `duration_days` went straight from an untyped JSON body into
     # `timedelta(days=...)`, which raises TypeError for a string/null/list and
     # OverflowError for an astronomically large int — both uncaught, both a 500

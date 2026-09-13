@@ -637,9 +637,18 @@ class TestS5ChatOwnership:
         assert client.get("/api/chat/history").status_code == 401
 
     def test_user_b_cannot_load_user_as_conversation_as_context(
-            self, client, fake_db, test_user, other_headers, no_ai):
+            self, client, fake_db, test_user, other_user, other_headers, no_ai):
         """The default session id is `chat-<user_id>`, i.e. derivable from any
-        user id. Naming it must not load its turns."""
+        user id. Naming it must not load its turns.
+
+        D6.8 / F-1 changed what this asserts. It used to require a 403, and that
+        403 was itself the defect: it answered differently for a label another
+        account had used than for one nobody had, which is an existence oracle,
+        and it let whoever posted first lock the owner out. A conversation is
+        `(user_id, session_id)`, so B naming A's label addresses B's own, empty
+        thread under that label — and nothing of A's can reach B's reply, B's
+        history, or A's thread.
+        """
         victim_session = f"chat-{test_user['_id']}"
         self._seed_conversation(fake_db, test_user["_id"], victim_session,
                                 "my broker password is hunter2")
@@ -649,9 +658,16 @@ class TestS5ChatOwnership:
                                  "session_id": victim_session},
                            headers=other_headers)
 
-        assert resp.status_code == 403, \
-            "another user's conversation id was accepted"
+        assert resp.status_code == 200, resp.text[:300]
         assert "hunter2" not in resp.text
+        b_history = client.get(f"/api/chat/history?session_id={victim_session}",
+                               headers=other_headers).json()
+        assert "hunter2" not in repr(b_history)
+        assert {m["user_id"] for m in b_history} == {str(other_user["_id"])}
+        a_turns = [d for d in fake_db.chat_messages.docs
+                   if d["user_id"] == str(test_user["_id"])]
+        assert [d["content"] for d in a_turns] == ["my broker password is hunter2"], \
+            "B's turns were written into A's conversation"
 
     def test_the_owner_can_still_use_their_own_conversation(
             self, client, fake_db, test_user, auth_headers, no_ai):

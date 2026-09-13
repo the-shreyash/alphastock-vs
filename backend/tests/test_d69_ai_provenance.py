@@ -569,7 +569,8 @@ def test_the_api_exposes_provenance_without_leaking_anything(client, fake_db, au
     assert "you are a morning market analyst" not in body
 
 
-def test_the_compact_endpoint_never_publishes_a_failure_as_a_report(client, monkeypatch):
+def test_the_compact_endpoint_never_publishes_a_failure_as_a_report(client, fake_db, auth_headers,
+                                                                   monkeypatch):
     """It assigned `f"Morning report generation failed: {e}"` to the report body
     and returned `available: True` — a failure served as a successful report,
     carrying the raw exception text."""
@@ -592,7 +593,8 @@ def test_the_compact_endpoint_never_publishes_a_failure_as_a_report(client, monk
              "bank_nifty": {"value": 52000.0, "change_pct": -0.2},
              "market_status": "CLOSED", "market_sentiment": 55, "india_vix": 14.0,
          }):
-        response = client.get("/api/analysis/morning-report")
+        # D6.8 / F-5 — the route invokes a paid model and is now authenticated.
+        response = client.get("/api/analysis/morning-report", headers=auth_headers)
 
     assert response.status_code == 200
     body = response.json()

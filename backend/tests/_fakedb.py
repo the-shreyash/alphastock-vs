@@ -174,6 +174,22 @@ class _Result:
         self.upserted_id = None
 
 
+class _DeleteResult:
+    """pymongo's `DeleteResult` shape: `deleted_count` and nothing else.
+
+    D6.8. Deletes used to return `_Result`, which also carries
+    `modified_count`. Real `DeleteResult` has no such attribute, so production
+    code that read `modified_count` after a delete got 0 against MongoDB and the
+    true count against this double — `delete_conversation` did exactly that.
+    A double that answers a question the driver cannot is one that agrees with
+    the bug.
+    """
+
+    def __init__(self, deleted):
+        self.deleted_count = deleted
+        self.acknowledged = True
+
+
 class _Cursor:
     def __init__(self, docs):
         self._docs = docs
@@ -364,14 +380,13 @@ class FakeCollection:
         for i, d in enumerate(self.docs):
             if _match(d, flt or {}):
                 del self.docs[i]
-                return _Result(modified=1, matched=1, deleted=1)
-        return _Result(modified=0, matched=0, deleted=0)
+                return _DeleteResult(1)
+        return _DeleteResult(0)
 
     async def delete_many(self, flt):
         before = len(self.docs)
         self.docs = [d for d in self.docs if not _match(d, flt or {})]
-        n = before - len(self.docs)
-        return _Result(modified=n, matched=n, deleted=n)
+        return _DeleteResult(before - len(self.docs))
 
     async def distinct(self, key, flt=None):
         """Motor's `distinct`, including its filter argument (D5.15).
