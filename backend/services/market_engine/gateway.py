@@ -785,6 +785,49 @@ class MarketGateway:
 
         return valid
 
+    def universe_coverage(self, served: int) -> Dict[str, Any]:
+        """How much of the tracked universe a universe fetch actually returned.
+
+        D6.8-A / STEP 13 — "provider failure must not look like a smaller
+        healthy universe."
+
+        WHY THIS IS A GATEWAY METHOD AND NOT THE SCANNER'S OWN ARITHMETIC
+        -----------------------------------------------------------------
+        Half the answer is a platform fact and half is a provider fact, and only
+        this layer may hold both. `requested` comes from the instrument
+        catalogue: `Capability.UNIVERSE_QUOTES` is defined as "batched quotes for
+        the tracked universe", so the registry IS the definition of what was
+        asked for, and it is a platform constant rather than anything a provider
+        said. The `provider_error` split comes from the producer, which is the
+        only layer that saw one symbol raise and another simply return nothing —
+        and Developer Rule 2 means the scanner may not ask it directly. This
+        method is the documented door, alongside the FII/DII and pattern reads
+        already here.
+
+        `provider_error` is present only when a live fetch actually happened in
+        this process. A cached universe is served without one, and reporting an
+        earlier fetch's failures as though they had just occurred would be the
+        same class of error this counter exists to remove.
+
+        Every value is an integer. Nothing names a provider, and nothing says
+        *which* symbol failed: a per-symbol failure map is a per-symbol coverage
+        map of whichever feed answered, which is a discriminator Developer
+        Rule 4 would have to be argued about, for no product gain.
+        """
+        from market_data import STOCK_UNIVERSE
+        from services.real_market import universe_coverage as _producer_coverage
+
+        requested = len(STOCK_UNIVERSE)
+        coverage: Dict[str, Any] = {
+            "requested": requested,
+            "available": served,
+            "unavailable": max(0, requested - served),
+        }
+        live = _producer_coverage()
+        if live.get("requested") == requested:
+            coverage["provider_error"] = live.get("provider_error", 0)
+        return coverage
+
     # ── Index quotes ─────────────────────────────────────
 
     async def get_indices(self, *, user_id: Optional[str] = None) -> Dict[str, Any]:

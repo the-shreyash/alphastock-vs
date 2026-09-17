@@ -12,6 +12,16 @@ from typing import Any, Dict, Optional
 from services.cache import cache_get, cache_set, cache_get_many
 from services import http_client
 
+# D6.8-A — the producer is the authority for field quality, so the module that
+# derives the indicators is the module that classifies them. Every name below is
+# imported from the one contract module; nothing in this file defines a state.
+from services.market_engine import field_quality
+from services.market_engine.field_quality import (
+    OBSERVED_AT_KEY,
+    QUALITY_KEY,
+    FieldQuality,
+)
+
 logger = logging.getLogger(__name__)
 executor = ThreadPoolExecutor(max_workers=5)
 
@@ -198,8 +208,26 @@ async def fetch_yahoo_quote(symbol: str, range_str: str = "2d"):
                 if len(daily_closes) >= 2
                 else meta.get("chartPreviousClose", meta.get("previousClose", 0))
             )
-            change = round(price - prev_close, 2) if prev_close else 0
-            change_pct = round((change / prev_close) * 100, 2) if prev_close else 0
+            # D6.8-A — `else 0` WAS THE FABRICATION THE COMMENT ABOVE FORBIDS.
+            #
+            # D5.19 wrote, thirty lines up, that "reporting a zero change there
+            # would render 'unchanged' over a price that may have moved several
+            # percent — the fabrication the tick contract and `applyLivePrices`
+            # both exist to refuse", and then this expression did exactly that:
+            # with no previous close from the series and none from the vendor
+            # meta, `change` and `change_pct` became a real-looking **0.0**, and
+            # the ranking engine turned it into a sentence about the day.
+            #
+            # Absence is now returned as absence and classified, so `change_pct`
+            # is MISSING rather than flat. Every scorer's arithmetic still
+            # substitutes 0.0 at its own call site, so no score moves.
+            if prev_close:
+                change = round(price - prev_close, 2)
+                change_pct = round((change / prev_close) * 100, 2)
+                change_quality = {}
+            else:
+                change = change_pct = None
+                change_quality = {"change_pct": FieldQuality.MISSING}
 
             # Get OHLV from latest period
             opens = [o for o in indicators.get("open", []) if o is not None]
@@ -216,9 +244,10 @@ async def fetch_yahoo_quote(symbol: str, range_str: str = "2d"):
 
             quote = {
                 "price": round(price, 2),
-                "prev_close": round(prev_close, 2),
+                "prev_close": round(prev_close, 2) if prev_close else None,
                 "change": change,
                 "change_pct": change_pct,
+                QUALITY_KEY: field_quality.sanitize(change_quality),
                 "open": round(opens[-1], 2) if opens else round(price, 2),
                 "high": round(highs[-1], 2) if highs else round(price, 2),
                 "low": round(lows[-1], 2) if lows else round(price, 2),
@@ -422,6 +451,21 @@ async def fetch_real_market_overview():
             # Imported at call time, not at module scope, so a test can
             # monkeypatch `validator.is_market_hours` and have this read it.
             "market_status": "OPEN" if _market_is_open() else "CLOSED",
+            # D6.8-A — WHEN THIS SNAPSHOT WAS ACTUALLY TAKEN.
+            #
+            # The overview had no observation instant at all, so every consumer
+            # that wanted one had to use its own clock — and a payload served
+            # from the 30-second cache would then be described as current at the
+            # moment it was *read*. `ai_context_builder` documents that the AI
+            # context "carries `source_tier` and timestamps so the model can say
+            # 'live price' or 'as of 10:42 AM'"; this is the timestamp half of
+            # that sentence, which did not exist until now (G-8).
+            #
+            # Stamped before the cache write, so a cache hit carries the instant
+            # the vendor was actually asked rather than the instant it was
+            # served. That is the whole difference between a real observation
+            # time and `datetime.now()` wearing one's clothes.
+            "observed_at": datetime.now(timezone.utc).isoformat(),
             # See the note in `fetch_yahoo_quote`: no provider name in a payload.
             # `/api/market/overview` stamps `source_tier` from the Source Manager.
         }
@@ -433,8 +477,17 @@ async def fetch_real_market_overview():
 
 
 def calculate_rsi(prices, period=14):
+    """Wilder's RSI, or None when the window is not satisfied.
+
+    D6.8-A — this used to `return 50.0` for a series it could not measure. That
+    literal was the last live producer of a fabricated RSI inside this module
+    (`derive_technicals` already guards the call, so it was unreachable there,
+    but an unreachable fabrication is one refactor away from a reachable one).
+    Absence is returned as absence here for the same reason it is returned as
+    absence one level up: a null is visibly missing, and a 50 scores as real.
+    """
     if len(prices) < period + 1:
-        return 50.0
+        return None
     gains = []
     losses = []
     for i in range(1, len(prices)):
@@ -472,14 +525,28 @@ def calculate_ema(values, period):
 
 
 def calculate_macd(prices):
+    """(MACD, signal), or (None, None) when 26 bars are not available.
+
+    D6.8-A — see :func:`calculate_rsi`. `0.0, 0.0` is worse than a fabricated
+    RSI because `macd > macd_signal` is *false* at the substitute, so every
+    consumer comparing the pair read "MACD bearish" about a stock nobody had
+    measured.
+    """
     if len(prices) < 26:
-        return 0.0, 0.0
+        return None, None
     ema12 = calculate_ema(prices, 12)
     ema26 = calculate_ema(prices, 26)
     macd_line = [e12 - e26 for e12, e26 in zip(ema12, ema26)]
     macd_signal_line = calculate_ema(macd_line, 9)
     return round(macd_line[-1], 2), round(macd_signal_line[-1], 2)
 
+
+#: The fields `derive_technicals` computes, and therefore the only ones it may
+#: classify. A subset of `field_quality.QUALITY_TRACKED_FIELDS`: `change_pct` is
+#: tracked too, but it comes from the vendor payload rather than from the bar
+#: series, and a whole-record verdict here must not speak for a field this
+#: function never looked at.
+_SERIES_DERIVED_FIELDS = ("rsi", "macd", "macd_signal", "avg_volume", "volume_ratio")
 
 #: Daily bars a quote must carry before each indicator is answerable.
 #:
@@ -530,23 +597,92 @@ def derive_technicals(quote: Dict[str, Any]) -> Dict[str, Any]:
     closes = quote.get("historical_closes") or []
     volumes = quote.get("historical_volumes") or []
 
-    rsi = calculate_rsi(closes) if len(closes) >= _MIN_BARS_RSI else None
+    quality: Dict[str, FieldQuality] = {}
 
-    if len(closes) >= _MIN_BARS_MACD:
-        macd, macd_signal = calculate_macd(closes)
-    else:
-        macd, macd_signal = None, None
+    # NO SERIES AT ALL IS A DIFFERENT ANSWER FROM A SHORT SERIES (D6.8-A).
+    #
+    # Zero bars does not mean "this stock is too young for a 26-bar MACD"; it
+    # means the bar series these indicators derive from was never served, so
+    # there is no input for any of them. Calling that INSUFFICIENT_HISTORY would
+    # tell a user a newly-listed-stock story about a feed that returned nothing.
+    # See `field_quality`'s record-scoped/field-scoped rule.
+    if not closes and not volumes:
+        return {
+            "rsi": None,
+            "macd": None,
+            "macd_signal": None,
+            "avg_volume": None,
+            "volume_ratio": None,
+            OBSERVED_AT_KEY: _series_observed_at(quote),
+            QUALITY_KEY: _merged_quality(
+                quote,
+                field_quality.all_missing(
+                    _SERIES_DERIVED_FIELDS, FieldQuality.UNAVAILABLE
+                ),
+            ),
+        }
 
-    if len(volumes) >= _MIN_BARS_AVG_VOLUME:
-        # The latest bar is the in-progress session and is excluded: comparing
-        # a partial day's volume against an average that already contains it
-        # damps exactly the spike the ratio exists to detect.
-        avg_volume = int(sum(volumes[-_MIN_BARS_AVG_VOLUME:-1]) / (_MIN_BARS_AVG_VOLUME - 1))
+    # Each indicator is computed inside its own guard, so a series the vendor
+    # sent in an unusable shape costs that indicator and not the whole quote.
+    # Before D6.8-A a non-numeric close raised out of this function, out of
+    # `fetch_all_universe_quotes`'s gather, and the symbol vanished from the
+    # universe entirely — a provider fault presenting as a smaller market.
+    if len(closes) < _MIN_BARS_RSI:
+        rsi = None
+        quality["rsi"] = FieldQuality.INSUFFICIENT_HISTORY
     else:
+        try:
+            rsi = calculate_rsi(closes)
+        except Exception as exc:  # noqa: BLE001 - classified, never re-raised
+            logger.warning("derive_technicals: RSI input unusable: %s", exc)
+            rsi, quality["rsi"] = None, FieldQuality.PROVIDER_ERROR
+
+    if len(closes) < _MIN_BARS_MACD:
+        macd = macd_signal = None
+        quality["macd"] = FieldQuality.INSUFFICIENT_HISTORY
+        quality["macd_signal"] = FieldQuality.INSUFFICIENT_HISTORY
+    else:
+        try:
+            macd, macd_signal = calculate_macd(closes)
+        except Exception as exc:  # noqa: BLE001 - classified, never re-raised
+            logger.warning("derive_technicals: MACD input unusable: %s", exc)
+            macd = macd_signal = None
+            quality["macd"] = FieldQuality.PROVIDER_ERROR
+            quality["macd_signal"] = FieldQuality.PROVIDER_ERROR
+
+    if len(volumes) < _MIN_BARS_AVG_VOLUME:
         avg_volume = None
+        quality["avg_volume"] = FieldQuality.INSUFFICIENT_HISTORY
+    else:
+        try:
+            # The latest bar is the in-progress session and is excluded:
+            # comparing a partial day's volume against an average that already
+            # contains it damps exactly the spike the ratio exists to detect.
+            avg_volume = int(
+                sum(volumes[-_MIN_BARS_AVG_VOLUME:-1]) / (_MIN_BARS_AVG_VOLUME - 1)
+            )
+        except Exception as exc:  # noqa: BLE001 - classified, never re-raised
+            logger.warning("derive_technicals: volume series unusable: %s", exc)
+            avg_volume, quality["avg_volume"] = None, FieldQuality.PROVIDER_ERROR
 
-    latest_volume = quote.get("volume") or 0
-    volume_ratio = round(latest_volume / avg_volume, 2) if avg_volume else None
+    # `volume_ratio` has two inputs and therefore two ways to be absent, and
+    # they are not the same absence. A baseline it could not compute is the
+    # baseline's reason; a session volume the payload did not carry is MISSING.
+    #
+    # It used to be neither: `quote.get("volume") or 0` turned an absent volume
+    # into a ratio of **0.0**, a real-looking number that reads downstream as
+    # "Low volume 0.0x avg" — a claim about a company, derived from a null,
+    # which is precisely the failure ADR-058 named.
+    latest_volume = quote.get("volume")
+    if avg_volume is None:
+        volume_ratio = None
+        quality["volume_ratio"] = quality.get("avg_volume", FieldQuality.MISSING)
+    elif latest_volume is None:
+        volume_ratio, quality["volume_ratio"] = None, FieldQuality.MISSING
+    else:
+        volume_ratio = round(latest_volume / avg_volume, 2) if avg_volume else None
+        if volume_ratio is None:
+            quality["volume_ratio"] = FieldQuality.MISSING
 
     return {
         "rsi": rsi,
@@ -554,7 +690,45 @@ def derive_technicals(quote: Dict[str, Any]) -> Dict[str, Any]:
         "macd_signal": macd_signal,
         "avg_volume": avg_volume,
         "volume_ratio": volume_ratio,
+        # The instant these readings describe. Real, or absent — never "now".
+        OBSERVED_AT_KEY: _series_observed_at(quote),
+        QUALITY_KEY: _merged_quality(quote, quality),
     }
+
+
+def _merged_quality(quote: Dict[str, Any], derived: Dict[str, Any]) -> Dict[str, str]:
+    """This function's verdicts on top of whatever the payload already carried.
+
+    Merged rather than replaced because the result is SPREAD over the quote
+    (`{**res, **derive_technicals(res)}`), so a bare assignment would silently
+    erase a classification made upstream — `fetch_yahoo_quote`'s `change_pct`
+    verdict is one this module makes before the indicators are derived at all.
+    """
+    return {**field_quality.quality_map(quote), **field_quality.sanitize(derived)}
+
+
+def _series_observed_at(quote: Dict[str, Any]) -> Optional[str]:
+    """When the newest bar behind these indicators was observed, ISO-8601.
+
+    D6.8-A — the one honest observation instant available on this path. The
+    canonical quote's `timestamp` is not it: `normalizer._normalize_yahoo_quote`
+    falls back to `datetime.now()` because the vendor payload carries no quote
+    time, so a quote served from a dead feed would be stamped with the instant
+    it was *served* and could never be classified stale.
+
+    `historical_close_timestamps` is filtered in lockstep with
+    `historical_closes` (see `fetch_yahoo_quote`), so its last element is the
+    timestamp of the last bar the indicators actually used. Returns None when
+    the series carries no usable timestamp — and a payload with no observation
+    instant is never called stale, rather than being assigned an invented one.
+    """
+    stamps = quote.get("historical_close_timestamps") or []
+    if not stamps:
+        return None
+    try:
+        return datetime.fromtimestamp(float(stamps[-1]), tz=timezone.utc).isoformat()
+    except (TypeError, ValueError, OSError, OverflowError):
+        return None
 
 
 def _vwap_of(quote: Dict[str, Any]) -> Optional[float]:
@@ -576,23 +750,26 @@ async def fetch_real_stock_quote(symbol: str):
     # Strip out the historical lists so we don't return giant lists to frontend
     clean_data = {k: v for k, v in data.items() if not k.startswith("historical_")}
 
+    # D6.8-A — LIM-D5.19-2 IS CLOSED HERE.
+    #
+    # This block used to substitute `rsi = 50.0`, `macd = 0.0`,
+    # `macd_signal = 0.0`, `avg_volume = 1000000`, `volume_ratio = 1.0` for any
+    # indicator `derive_technicals` had honestly returned as absent. D5.19 kept
+    # them because `_advisor_score` and the top-pick scorer compare
+    # `macd > macd_signal` arithmetically and would have raised on a None — a
+    # consumer-side constraint that this phase removed first (every one of those
+    # consumers now reads through `field_quality.scoring_input`, which supplies
+    # the placeholder at the call site where it is visible, rather than baking
+    # it into the payload where it is indistinguishable from a reading).
+    #
+    # The technicals are now spread verbatim, quality map included, so the
+    # single definition of "how an indicator is computed" stays single and there
+    # is no longer a second place where a substitute is knowingly used.
     return {
         **clean_data,
+        **technicals,
         "symbol": symbol.upper(),
         "vwap": _vwap_of(data),
-        # D5.19 — the legacy non-null defaults, applied HERE and not inside
-        # `derive_technicals`. This endpoint's consumers (`_advisor_score`, the
-        # top-pick scorer) compare `macd > macd_signal` arithmetically and would
-        # raise on a None, so removing the defaults from this path is a wider
-        # change than this sprint should make in passing. Keeping them local
-        # means there is still exactly one definition of how an indicator is
-        # computed, and exactly one place where a substitute is knowingly used.
-        # Tracked as LIM-D5.19-2.
-        "rsi": technicals["rsi"] if technicals["rsi"] is not None else 50.0,
-        "macd": technicals["macd"] if technicals["macd"] is not None else 0.0,
-        "macd_signal": technicals["macd_signal"] if technicals["macd_signal"] is not None else 0.0,
-        "avg_volume": technicals["avg_volume"] if technicals["avg_volume"] is not None else 1000000,
-        "volume_ratio": technicals["volume_ratio"] if technicals["volume_ratio"] is not None else 1.0,
     }
 
 
@@ -969,9 +1146,36 @@ async def fetch_all_universe_quotes():
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     quotes = []
+    # D6.8-A — WHY THE DROPPED SYMBOLS ARE COUNTED AND NOT JUST SKIPPED (G-3).
+    #
+    # The two branches below are already different facts and this loop used to
+    # discard the difference: an exception is a provider that FAILED, and a
+    # `None` is a provider that had nothing to serve. Collapsed, a degraded
+    # vendor and a quiet market produce the identical outcome — a shorter list —
+    # and every consumer downstream reads that list as the whole universe.
+    # `scanner_engine` then published `total_scanned: 24` for a 31-symbol
+    # universe with seven failures, which does not look like an incident; it
+    # looks like a smaller, healthy market.
+    #
+    # The counts are recorded on the module, not on the returned list, because
+    # this function's contract is a list of quotes and several callers spread it
+    # directly. `universe_coverage()` is the read side.
+    coverage = {
+        "requested": len(STOCK_UNIVERSE),
+        "available": 0,
+        FieldQuality.PROVIDER_ERROR.value: 0,
+        FieldQuality.UNAVAILABLE.value: 0,
+    }
     for s, res in zip(STOCK_UNIVERSE, results):
-        if isinstance(res, Exception) or res is None:
-            # Live quote unavailable — skip. Never substitute simulated data.
+        if isinstance(res, Exception):
+            # The provider was asked and raised. Recorded as a failure, never
+            # as an absence: a stock that vanished because a vendor errored is
+            # not a stock the market stopped quoting.
+            coverage[FieldQuality.PROVIDER_ERROR.value] += 1
+            continue
+        if res is None:
+            # Asked, answered, nothing to serve. Never substitute simulated data.
+            coverage[FieldQuality.UNAVAILABLE.value] += 1
             continue
         # Indicators are derived here rather than inside `fetch_yahoo_quote`
         # because that function is the raw vendor adapter and its result is
@@ -992,41 +1196,111 @@ async def fetch_all_universe_quotes():
         quote["symbol"] = s["symbol"]
         quotes.append(quote)
 
+    coverage["available"] = len(quotes)
+    _record_universe_coverage(coverage)
+
     if not quotes:
         return []  # do not cache an empty result — retry on next call
     await cache_set(cache_key, quotes, 30)
     return quotes
 
 
+#: Coverage of the most recent universe fetch, as `universe_coverage()` reports
+#: it. Module state because the fetch returns a list and several callers spread
+#: it; see the comment in `fetch_all_universe_quotes`. Deliberately NOT cached
+#: alongside the quotes: a cache hit serves quotes that were fetched earlier,
+#: and reporting that earlier fetch's failures as if they had just happened
+#: would be the same class of error this counter exists to remove.
+_UNIVERSE_COVERAGE: Dict[str, int] = {}
+
+
+def _record_universe_coverage(coverage: Dict[str, int]) -> None:
+    _UNIVERSE_COVERAGE.clear()
+    _UNIVERSE_COVERAGE.update(coverage)
+
+
+def universe_coverage() -> Dict[str, int]:
+    """How much of the tracked universe the last live fetch actually returned.
+
+    `{requested, available, provider_error, unavailable}`. Empty when no live
+    fetch has happened in this process — a cached universe is served without
+    one, and inventing a clean coverage report for a fetch that did not run
+    would assert exactly the completeness this function exists to question.
+    """
+    return dict(_UNIVERSE_COVERAGE)
+
+
+def _measured_movers(quotes):
+    """The quotes whose day change is a real reading, and only those.
+
+    D6.8-A FIX (F-6) — A GAINER IS A STOCK THAT ROSE, NOT A STOCK WE DID NOT
+    MEASURE.
+
+    `sorted(quotes, key=lambda x: x.get("change_pct", 0))` had two defects and
+    the `dict.get` default masked neither. The key is always present on a
+    canonical quote, so the default never fired; since D6.8-A stopped
+    fabricating a flat 0.0 the key carries `None`, and `None < 0.0` raises
+    `TypeError` — one unmeasured symbol aborted the entire top-gainers list.
+    Had it not raised, the substituted 0 would have placed an unmeasured stock
+    in the middle of a *ranking of day changes* and published it as one.
+
+    Filtering is the honest answer rather than a sort fallback: unlike the
+    scanner's ordering, membership in this list IS the claim. A stock is in
+    "Top Gainers" because it gained, and a stock whose day change nobody has is
+    not evidence of anything. It is excluded, not ranked last and not shown as
+    0%.
+    """
+    return [
+        q for q in (quotes or [])
+        if q and field_quality.reading(q, "change_pct") is not None
+    ]
+
+
 async def fetch_real_gainers(count=5):
     """Get real-time top gainers from the stock universe."""
-    quotes = await fetch_all_universe_quotes()
-    sorted_quotes = sorted(quotes, key=lambda x: x.get("change_pct", 0), reverse=True)
+    quotes = _measured_movers(await fetch_all_universe_quotes())
+    sorted_quotes = sorted(quotes, key=lambda x: x["change_pct"], reverse=True)
     return sorted_quotes[:count]
 
 
 async def fetch_real_losers(count=5):
     """Get real-time top losers from the stock universe."""
-    quotes = await fetch_all_universe_quotes()
-    sorted_quotes = sorted(quotes, key=lambda x: x.get("change_pct", 0))
+    quotes = _measured_movers(await fetch_all_universe_quotes())
+    sorted_quotes = sorted(quotes, key=lambda x: x["change_pct"])
     return sorted_quotes[:count]
 
 
 async def fetch_real_sectors():
-    """Get real-time sector performance by averaging stock changes in each sector."""
+    """Get real-time sector performance by averaging stock changes in each sector.
+
+    D6.8-A FIX (F-6) — an unmeasured stock is left OUT of its sector's average
+    rather than folded in. `sum()` over a list containing `None` raises, and the
+    old `q.get("change_pct", 0)` default never fired because the key is always
+    present; had it fired, a stock whose day change nobody had would have pulled
+    its sector's published performance toward zero — a number on the Sectors
+    page, derived from a null.
+
+    A sector all of whose stocks are unmeasured is omitted entirely, for the
+    same reason: "Oil & Gas 0.00%" is a claim about the sector, and reporting it
+    from zero measurements is exactly the fabrication this phase removes.
+    """
     quotes = await fetch_all_universe_quotes()
     sector_data = {}
-    for q in quotes:
+    for q in quotes or []:
         sector = q.get("sector")
-        change_pct = q.get("change_pct", 0)
-        if sector:
+        change_pct = field_quality.reading(q, "change_pct")
+        if sector and change_pct is not None:
             sector_data.setdefault(sector, []).append(change_pct)
-            
+
+    # No `if not changes` guard: a sector reaches `sector_data` only when a
+    # measured stock put a number in it, so the list is never empty and a guard
+    # for that state would be unreachable code asserting a policy nothing can
+    # exercise. A sector with no measured stock never appears at all.
     result = []
     for sector, changes in sector_data.items():
-        avg_change = round(sum(changes) / len(changes), 2) if changes else 0.0
+        avg_change = round(sum(changes) / len(changes), 2)
         result.append({"sector": sector, "change_pct": avg_change})
-        
+
     return sorted(result, key=lambda x: x["change_pct"], reverse=True)
 
 
@@ -1256,38 +1530,60 @@ async def fetch_real_top_picks(count=3):
     for s in valid_stocks:
         symbol = s["symbol"]
         price = s["price"]
-        rsi = s.get("rsi", 50.0)
-        volume_ratio = s.get("volume_ratio", 1.0)
-        macd = s.get("macd", 0.0)
-        macd_signal = s.get("macd_signal", 0.0)
-        
+        # D6.8-A — THE SAME EVIDENCE RULE D5.19 APPLIED TO THE RANKING ENGINE,
+        # APPLIED HERE. This scorer was one of the three surfaces D5.19 did not
+        # reach (§G-6), and it was the one that mattered most: these strings are
+        # rendered on the AI Picks card under an entry, a stop and a target.
+        #
+        # `s.get("rsi", 50.0)` was worse than the ranking engine's `or 50.0`,
+        # because a default argument only fires on a MISSING KEY — and the key
+        # was always present, carrying `fetch_real_stock_quote`'s substituted
+        # 50.0. The default was dead code covering for a fabrication upstream,
+        # which is now gone (see `fetch_real_stock_quote`).
+        #
+        # Two reads per field, deliberately: `scoring_input` for the arithmetic,
+        # which preserves every score exactly, and `is_available` for whether the
+        # pick may SAY anything about the field. A reason is appended only inside
+        # an `is_available` branch, so no sentence can outlive its reading.
+        rsi = field_quality.scoring_input(s, "rsi", 50.0)
+        volume_ratio = field_quality.scoring_input(s, "volume_ratio", 1.0)
+        macd = field_quality.scoring_input(s, "macd", 0.0)
+        macd_signal = field_quality.scoring_input(s, "macd_signal", 0.0)
+        rsi_known = field_quality.is_available(s, "rsi")
+        volume_ratio_known = field_quality.is_available(s, "volume_ratio")
+        macd_known = (
+            field_quality.is_available(s, "macd")
+            and field_quality.is_available(s, "macd_signal")
+        )
+
         # Detect patterns
         patterns_res = await detect_chart_patterns(symbol)
         patterns_list = patterns_res.get("patterns", [])
-        
+
         score = 50.0  # base score
         reasons = []
-        
+
         # RSI score
         if 50 <= rsi <= 70:
             score += 15
-            reasons.append(f"RSI is at a strong bullish zone of {rsi}")
+            field_quality.claim(reasons, rsi_known, f"RSI is at a strong bullish zone of {rsi}")
         elif rsi < 35:
             score += 10
-            reasons.append(f"RSI is oversold at {rsi}, indicating potential reversal")
-            
+            field_quality.claim(reasons, rsi_known, f"RSI is oversold at {rsi}, indicating potential reversal")
+
         # Volume score
         if volume_ratio > 1.5:
             score += 20
-            reasons.append(f"Trading volume is {volume_ratio}x above the 20-day average")
+            field_quality.claim(reasons, volume_ratio_known,
+                                f"Trading volume is {volume_ratio}x above the 20-day average")
         elif volume_ratio > 1.1:
             score += 10
-            reasons.append(f"Volume is elevated ({volume_ratio}x 20-day avg)")
-            
+            field_quality.claim(reasons, volume_ratio_known, f"Volume is elevated ({volume_ratio}x 20-day avg)")
+
         # MACD score
         if macd > macd_signal:
             score += 15
-            reasons.append("MACD is currently in a bullish crossover")
+            field_quality.claim(reasons, macd_known, "MACD is currently in a bullish crossover")
             
         # Patterns score
         for p in patterns_list:
@@ -1321,8 +1617,13 @@ async def fetch_real_top_picks(count=3):
             "target2": t2,
             "risk_reward": rr,
             "confidence": confidence,
-            "rsi": rsi,
-            "volume_ratio": volume_ratio,
+            # The READING, not the scoring placeholder. These two keys are
+            # rendered verbatim on the pick card, so publishing the substitute
+            # would put "RSI 50" beside a stock whose RSI nobody measured — the
+            # exact sentence ADR-058 exists to prevent, one surface over.
+            "rsi": field_quality.reading(s, "rsi"),
+            "volume_ratio": field_quality.reading(s, "volume_ratio"),
+            QUALITY_KEY: field_quality.quality_map(s),
             "pattern": patterns_list[0]["pattern"] if patterns_list else "Momentum Play",
             "patterns": [
                 {"pattern": p["pattern"], "signal": p["signal"]}

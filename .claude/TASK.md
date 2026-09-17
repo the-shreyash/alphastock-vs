@@ -10176,3 +10176,539 @@ product entitlement system to verify, and B was not chosen for the same reason.
 No critical vulnerability remains open, so D is not warranted.
 
 **D6.8 COMPLETE. Nothing committed. D6.9 NOT STARTED by this brief.**
+
+---
+
+# D6.8 — RE-VERIFICATION (2026-09-16)
+
+**STATUS: VERDICT C UPHELD. No re-audit performed; no production code changed.**
+
+The D6.8 brief was re-issued after the audit above had already been completed
+and committed as `8a10b91` ("add admin target authorization and strengthen
+security and concurrency tests", 2026-09-14). D6.8 was therefore **verified,
+not redone**. Redoing it would have re-derived conclusions the tree already
+records; what was actually in question was whether those conclusions still
+hold at `8a10b91`, which is a different and cheaper question.
+
+## What was checked
+
+| Check | Result |
+|---|---|
+| The six fixes are present in the tree | F-1 `(user_id, session_id)` scoping in `services/ai_memory.py`; F-2 `authorize_admin_target` in `security/roles.py` + `_admin_target` at `server.py:6344`; F-3 `PINNED_PUBLIC_ROUTES` at `tests/test_d68_entitlements.py:291`; F-4 the `is_paper` refusal at `server.py:2438`; F-5 auth on the paid-model routes; F-6 `_CREDENTIAL_WITHDRAWN_STATES` at `services/broker_engine.py:410` — all six present |
+| No mutation residue in the tree | none; working tree clean before and after |
+| Verdict-C rationale still true | `plan_expires_at` written at `server.py:6727`, read by no gate; `feature_flags` is admin CRUD + seeding with no consumer; `db.payments` still has no writer. There is still no product entitlement system to verify |
+
+## Falsifiability campaign (independent of the original 28)
+
+Eight executable mutants were written fresh against `8a10b91` — not replayed
+from the D6.8 run — each applied to production code, compile-checked (a
+non-compiling mutant is not a survivor), run, and reverted.
+
+| # | Mutation | Site | Result |
+|---|---|---|---|
+| V1 | `require_admin` role check removed | `server.py` | KILLED |
+| V2 | admin may act on any target (`authorize_admin_target` dropped) | `server.py` | KILLED |
+| V3 | missing role defaults to admin | `server.py` | KILLED |
+| V4 | foreign `broker_account_id` accepted (owner filter dropped) | `services/brokers/accounts.py` | KILLED |
+| V5 | `close_paper_trade` without owner scope | `services/paper_trade.py` | KILLED |
+| V6 | `delete_conversation` without user scope | `services/ai_memory.py` | KILLED |
+| V7 | `/api/trades` honours client `is_paper` (F-4 reverted) | `server.py` | KILLED |
+| V8 | withdrawn broker account still serves a session (F-6 reverted) | `services/broker_engine.py` | KILLED |
+
+**8/8 killed, 0 survivors.** V2, V4, V5, V6, V7 and V8 each map to a stop
+condition in the brief (1, 3, 8, 7, and the paper/live boundary), so each is a
+boundary that would have halted the audit had it survived.
+
+## Regression
+
+| Suite | Result |
+|---|---|
+| `test_d68_entitlements.py` | 159 passed |
+| D6.1–D6.7 + D6.9 + cookie/header/provider-entitlement suites | 677 passed |
+| Backend full | **5529 passed**, 66 skipped, 4 xfailed, **15 failed** |
+| Frontend full | **816 passed / 49 suites**, 0 failed |
+
+The 15 backend failures are all `tests/test_entrypoint_log_level.py` and are
+the documented pre-existing Docker-daemon failures, unchanged in count and
+identity from the D6.8 run and from the standing baseline. **No new
+regression.** The counts match the original D6.8 report exactly (5529 / 15,
+816 / 49), which is itself evidence the tree has not drifted.
+
+## Limitations
+
+`LIM-D6.8-1` through `LIM-D6.8-9` are unchanged and remain open as recorded
+above. In particular **LIM-D6.8-9 (no live broker leg) is still open** — no
+broker session was available for this re-verification either, so the live
+credential work of Phase 17 remains `CODE VERIFIED / LIVE PENDING`.
+
+**D6.8 RE-VERIFIED. Nothing committed. D6.9 NOT STARTED.**
+
+---
+
+# D6.8 GAP CLOSURE — LIM-D6.8-3 and LIM-D6.8-4 (2026-09-16)
+
+Scope: investigate and, where safely possible, close the two findings D6.8 left
+open. **Nothing else.** No product entitlement system was built, no broker was
+added, D6.9 was not started, and **no real broker order was placed, modified or
+cancelled** — every adapter order method is a spy for the whole of the order
+test surface, and a spy that must not be called is asserted empty rather than
+inferred from a status code.
+
+## 1. LIM-D6.8-3 — the two claims were not the same claim
+
+The finding read: *"the direct broker order routes skip `validate_trade`,
+`/zerodha/order` takes an unvalidated body, and validation and execution are
+still one request."* Those are three statements with three different answers,
+and bundling them is why the finding looked like one thing.
+
+### 1.1 "The direct routes skip `validate_trade`" — CLOSED, FALSE POSITIVE
+
+`validate_trade(user, trade, trades_today, today_realized_pnl)` is a pure
+function of four values. It has **no** `broker_account_id` parameter, no
+session, no database handle and no request — so it is not physically capable of
+resolving an account, proving ownership, reading a broker session or checking a
+capability. It writes nothing and leaves no artifact, so nothing downstream can
+later ask "was this approved?". Its verdict flips on the caller's own
+`max_trades_per_day`. It is the user's personal risk-discipline check over the
+user's own settings, and **calling it is not an authorization boundary, so
+skipping it crosses none.**
+
+Forcing it onto the relay routes would have been worse than leaving them.
+`BrokerOrderCreate` — the body of every relay route — carries no `entry_price`,
+no `stop_loss` and no `target1`, which are the only relationships
+`validate_trade` evaluates. Handed one it approves vacuously: a route that
+"runs the risk check" and can never fail it.
+
+**The invariant adopted instead:** *a route that creates a `db.trades` row runs
+the Risk Manager; a route that only relays an order to the broker does not.*
+`/zerodha/emergency-stop` is on the relay side for a stronger reason — it only
+ever CLOSES positions, and a user who has hit their daily loss limit must still
+be able to flatten.
+
+### 1.2 The boundary that *is* load-bearing, and is enforced everywhere
+
+```
+JWT identity (get_current_user, re-read from db.users)
+  → owner-scoped account   (_account / _sole_account / _trade_broker_account
+                            → BrokerAccountDirectory.resolve, filter carries
+                            broker_account_id AND user_id)
+  → live session           (BrokerEngine.get_session → _load_session, which
+                            refuses DISCONNECTED/REVOKED rows (D6.8/F-6) and
+                            stale tokens)
+  → broker capability      (BrokerGateway.require_capability, inside gateway.call)
+  → ‖ adapter.place_order   ← spy; never crossed in any refusal test
+```
+
+Twelve handlers in `server.py` can reach `broker_engine.place_order` /
+`modify_order` / `cancel_order`. All twelve are pinned by an **AST sweep** that
+fails when a handler is added, removed, or loses its owner-scoped resolver — so
+the map cannot fall behind the code. M20 (a new order route that indexes
+`list_for_user(...)[0]` instead of resolving) is killed by it.
+
+### 1.3 "`/zerodha/order` takes an unvalidated body" — CLOSED, FIXED (G-1, G-2)
+
+Genuine, and **wider than recorded**. Two routes read `await request.json()`
+and indexed the result. Reproduced against the real app with a spy below the
+gateway — every one of these was answered **200** and forwarded to the Kite
+adapter, while the identical payload to `/api/brokers/accounts/{id}/orders` was
+refused **422** before an account was resolved:
+
+| Payload to `POST /api/zerodha/order` | Before | After |
+|---|---|---|
+| `quantity: -50` / `0` / `1_000_000_000` / `1.5` / `"abc"` | 200, sent to broker | 422, adapter not called |
+| `transaction_type: "STEAL"` | 200, sent to broker | 422 |
+| `order_type: "WHATEVER"` | 200, sent to broker | 422 |
+| `price: -999` | 200, sent to broker | 422 |
+| 5,000-character symbol / `symbol: {"$ne": null}` | 200, sent to broker | 422 |
+| missing `symbol` or `quantity`, empty body | **500** (`KeyError`) | 422 |
+
+`POST /api/zerodha/quick-trade` had the same defect **and** no Risk Manager,
+while doing exactly what `POST /api/trades` does — place a live entry order,
+then write a `db.trades` row the auto-exit engine acts on. `quantity: -5` and
+`entry_price: -100` reached the adapter and were written to the journal.
+`stop_loss: 150` on a `entry_price: 100` BUY was accepted, which is not merely
+an unenforced discipline limit: it writes a trade **whose stop is already
+breached at entry**, and the auto-exit engine reads that row.
+
+**Fix.** `ZerodhaOrderCreate` subclasses `BrokerOrderCreate`, overriding only
+the two DEFAULTS the legacy route chose (`order_type=LIMIT`, `product=MIS`) —
+adopting the parent's `MARKET` default would have silently turned an omitted
+order type from a price-bounded order into an unbounded one, and a validation
+fix that moves a valid order is not a validation fix (G1b/G1c kill it).
+`ZerodhaQuickTradeCreate` is spelled in the PH3.12R/B-1 aliases, making it the
+third trade-entry model that cannot drift from the other two, and quick-trade
+now runs the same `validate_trade` gate as `/api/trades` before any account is
+resolved. **No second validation system was created: both models reuse the one
+that already existed.**
+
+### 1.4 G-7 — a live defect on a route D6.8 had already certified
+
+Found while testing the above: **`Field(ge=0)` admits `Infinity`.** `inf >= 0`
+is True, Starlette parses bodies with `json.loads`, and `json.loads` accepts the
+non-standard `Infinity` literal — so `{"price": Infinity}` passed validation on
+**every** order route, the account-addressed one included, and `price: inf` was
+handed to the live adapter. `NaN` was refused, but only because `nan >= 0` is
+False: an accident of comparison, not a bound. `models.py` documents this exact
+trap above `TradeSide`; `BrokerOrderCreate` had never picked it up.
+
+It cannot be sent through a test client's `json=` argument — which is why it
+went unnoticed: every attempt raises `ValueError` in the test process instead of
+issuing a request. The tests send the literal as raw bytes.
+
+Same gap on `BrokerOrderModify` (modifying a live order is as irreversible as
+placing one), and on `TradeCreate.target2/target3`, which were bare
+`Optional[float] = None`: `POST /api/trades` with `target2: Infinity` **wrote
+the trade row** and only then failed serializing its own response — a 500 to the
+caller and an infinite target left in the journal for every downstream aggregate
+to inherit. `TradeModify` and `TradeExitRequest` carried the same bare bounds
+and were closed with them.
+
+## 2. LIM-D6.8-4 — the postback
+
+The finding read: *"unauthenticated, has no Kite checksum and writes
+unboundedly."* Two of the three are right.
+
+### 2.1 What it actually does — measured, not read
+
+Driven anonymously against the real app with a seeded world (two users, five
+brokerage accounts, a live trade) and every other collection snapshotted before
+and after:
+
+| Question | Answer |
+|---|---|
+| Authenticated? | No. Pinned public in `test_d68_entitlements.PINNED_PUBLIC_ROUTES` |
+| Mutates orders / trades / sessions / accounts / users / notifications / activity / audit? | **No — byte-identical snapshots across all 9 collections, for all 9 attack payloads** |
+| Calls a broker API? | **No — adapter spy empty** |
+| Accepts arbitrary `user_id` / `broker_account_id` / `order_id`? | Accepts them as *text*; nothing resolves them |
+| Signature / HMAC? | **None** |
+| Replay protection? | Was none. Now idempotent by body digest |
+| Schema validation? | Was none. Now bounded, and non-objects are refused |
+| Information disclosure? | None — the response is a constant `{"status": ...}` for every payload |
+| Attacker-caused state change? | **Only rows in `db.zerodha_postbacks`, which nothing reads** |
+
+"Writes unboundedly" was true of **volume**, not of count: the platform-wide
+`PUBLIC_API` limiter already caps anonymous callers at 60 req/min per IP (an
+anonymous flood measurably reaches 429). What was unbounded was the size — a
+2 MB body was stored verbatim, MongoDB accepts documents to 16 MB, there was no
+TTL and nothing pruned. That is roughly **a gigabyte a minute of database
+growth per source address**, unauthenticated. It was the one reachable harm.
+
+### 2.2 A latent bug the matrix found (G-4)
+
+A JSON **array** or scalar body was `insert_one`-ed and *then* answered
+`{"status": "error"}` — the row was written before `body.get(...)` raised on it.
+The endpoint's answer and its effect disagreed. The shape is checked before the
+write now.
+
+### 2.3 What was fixed, and what deliberately was not
+
+Fixed — the controls available **without** authenticating the sender:
+
+* **G-3 size bound** (64 KiB; a real Kite postback is under a kilobyte). Two
+  layered checks: the `Content-Length` header, refused *before the body is
+  read* so a 99 MB upload is never buffered, and the bytes actually read, so a
+  chunked request carrying no declared length is bounded too.
+* **G-4** non-objects are refused before the write.
+* **G-5 idempotency by content digest.** Kite's retries and an attacker's
+  replay are identical bytes and collapse to one row. Keyed on `order_id`
+  instead, a forged payload could have **overwritten a genuine record** — inert
+  today, a planted lie for the first consumer that verifies checksums (M13).
+* **G-6 retention** — a TTL index at 30 days, plus a unique index on the digest
+  so idempotency is enforced by the database and not only by the upsert filter.
+* The body is stored **as received and is not reshaped to a schema.** This is
+  the one place where "validate strictly" would do harm: a future checksum must
+  run over what Zerodha actually sent, and a field dropped here is evidence
+  destroyed. The bound, not the shape, is the control.
+
+**Not fixed — and deliberately.** Kite Connect does publish a `checksum` on the
+postback. It is **not** implemented here, because the exact construction was not
+confirmed against Zerodha's live specification in this session, and a signature
+check written from memory is worse than none: the first real postback it
+wrongly rejects gets it relaxed to fail open. Recording an unverified message is
+safe; **acting** on one is not, and nothing acts on one — a test sweeps the AST
+of every production module and fails the moment `db.zerodha_postbacks` acquires
+any operation beyond its writer and its two indexes. That test is the gate: the
+checksum must be verified **before** the first consumer is written.
+
+No state machine was invented (§9 of the brief): the endpoint does not change
+order state, so there are no transitions to constrain. M11 — a mutant that makes
+it upsert `db.orders` — is killed.
+
+## 3. Tests
+
+`backend/tests/test_d68_gap_closure.py` — **115 tests**, six sections:
+
+| § | Subject |
+|---|---|
+| 1 | `validate_trade` is not an authorization boundary (signature, no writes, caller-settings-driven, vacuous on relay payloads, + positive control) |
+| 2 | The 12 irreversible handlers: AST pin, owner-scoped resolver, identity required, foreign/unknown/expired/revoked/uncapable refusals, no-identity sweep, forged-authority sweep |
+| 3 | 13 rejected legacy order bodies × **both** routes (the drift check), defaults preserved, non-finite prices |
+| 4 | quick-trade bounds + Risk Manager + positive control + shared-vocabulary assertion |
+| 5 | Postback attack matrix A–N: 9 payloads × (state snapshot, adapter spy, identical response) |
+| 6 | Postback bound, layered size checks, idempotency, forged-variant isolation, expiry, indexes, rate limit |
+
+Every refusal test asserts the adapter spy is empty, the database is unchanged
+and — where a row was possible — that none was written. A status code is never
+the only assertion.
+
+One test-double defect was found and fixed: **`FakeDB` silently ignored
+`$setOnInsert`**, in both the matched and the upsert path. An endpoint whose
+only write is `$setOnInsert` stored a document containing nothing but its filter
+keys, so every assertion about what it recorded was unfalsifiable while the
+endpoint was correct. Mutant M21 restores the omission and is killed.
+
+## 4. Mutations — 32/32 killed
+
+| Mutant | Verdict |
+|---|---|
+| M1 owner filter dropped from `resolve` | KILLED |
+| M2 `require_capability` returns the adapter unchecked | KILLED |
+| M3 withdrawn-session (`F-6`) check disabled | KILLED |
+| M4 ambiguous broker bridge picks the first account | KILLED |
+| M5 `resolve` falls through to `get_unscoped` | KILLED |
+| M6 client-supplied `entitlement` selects the account | KILLED |
+| M7 client-supplied `role` selects the account | KILLED |
+| M8 legacy order route takes a raw body again | KILLED |
+| G1a/G1b/G1c legacy bounds and the LIMIT/MIS defaults | KILLED |
+| G2a quick-trade risk check removed | KILLED |
+| G2b/G2c quick-trade bounds removed | KILLED |
+| G7a/G7b/G7c non-finite bounds removed (create/modify/journal) | KILLED |
+| M9 postback writes an arbitrary `user_id` to the journal | KILLED |
+| M10 postback writes an arbitrary `broker_account_id` | KILLED |
+| M11 postback forces an order state transition | KILLED |
+| M12 postback idempotency removed | KILLED |
+| M13 postback dedupes on `order_id` (forgery overwrites) | KILLED |
+| M14a/M14b/M14c shape check, body bound, header bound | KILLED |
+| M15 response becomes an existence oracle | KILLED |
+| M16 postback exempted from the rate limiter | KILLED |
+| M17/M18/M19 expiry field, TTL index, unique index | KILLED |
+| M20 a new order route with no owner-scoped resolver | KILLED |
+| M21 `FakeDB` ignores `$setOnInsert` again | KILLED |
+
+Three mutants had to be rewritten before they counted. **M12** was a
+`SyntaxError` on the first pass — not a survivor, rewritten into an executable
+form. **G2b** appeared to SURVIVE and did not: the injected field was declared
+*above* the real one and overridden by it, so the mutation was inert. **M1/M4/M5**
+were written against a helper that did not exist and were rewritten against
+`services/brokers/accounts.py`.
+
+**M14b and M14c genuinely survived the first pass** — and that was a real test
+defect, not a code one. The two size checks are layered, and every size test
+went through `httpx`, which always sets `Content-Length`; the header check alone
+satisfied all of them, so deleting the body check changed nothing any test could
+see. Killing them needed two tests that can tell the guards apart: a **chunked**
+request (no declared length, so only the body measurement can refuse it) and a
+**huge declared length with a generator body that records whether it was
+consumed** (proving the refusal happens before the read). Both now assert the
+distinguishing observable rather than the shared status code.
+
+Every mutation was restored and all seven touched files verified **byte-identical**
+by SHA-256.
+
+## 5. Regression
+
+| Suite | Result |
+|---|---|
+| `test_d68_gap_closure.py` (new) | **115 passed** |
+| `test_d68_entitlements.py` | 159 passed |
+| Backend full | **5644 passed**, 66 skipped, 4 xfailed, **15 failed** |
+| Frontend full | **816 passed / 49 suites**, 0 failed |
+
++115 tests, 0 regressions. The 15 backend failures are the documented
+pre-existing `tests/test_entrypoint_log_level.py` Docker failures
+(`python: command not found` in `docker/entrypoint.sh` — this host has no bare
+`python`), unchanged in count and identity. flake8 on every touched production
+file produces no new rule class versus HEAD (+1 `E402` for `import hashlib`,
+−1 `E302`; no new `E501`, `F401` or `C901`).
+
+## 6. Files changed
+
+* `backend/models.py` — `ZerodhaOrderCreate`, `ZerodhaQuickTradeCreate` (G-1,
+  G-2); `allow_inf_nan=False` on `BrokerOrderCreate`, `BrokerOrderModify`,
+  `TradeCreate.target2/3`, `TradeModify`, `TradeExitRequest` (G-7)
+* `backend/server.py` — `zerodha_order`, `zerodha_quick_trade`,
+  `zerodha_postback`, the two `zerodha_postbacks` indexes, `import hashlib`
+* `backend/tests/_fakedb.py` — `$setOnInsert`
+* `backend/tests/test_d68_gap_closure.py` — new
+
+## 7. Status of the two findings
+
+* **LIM-D6.8-3 — CLOSED.** The `validate_trade` half is a **false positive**
+  (it is not a security boundary). The unvalidated-body half is **FIXED**, on
+  both raw-body routes plus the non-finite gap it exposed on the routes D6.8 had
+  already certified. The third clause — "validation and execution are still one
+  request" — is **unchanged and remains an architectural limitation**, recorded
+  below as LIM-D6.8-3a.
+* **LIM-D6.8-4 — remains OPEN, narrowed.** The unbounded-write and
+  replay-amplification halves are **FIXED**. The unauthenticated half is
+  **DEFERRED — EXTERNAL PREREQUISITE**: the Kite checksum must be verified
+  against Zerodha's live specification before it is implemented, and before any
+  consumer of `db.zerodha_postbacks` is written. The endpoint is now bounded,
+  idempotent, non-authoritative, information-minimal and rate-limited — which is
+  **not** the same as authenticated, and is not claimed to be.
+
+## 8. Limitations after this sprint
+
+* **LIM-D6.8-3a (new, replaces the third clause of LIM-D6.8-3): validation and
+  execution are still one request.** `/api/trades/validate` is a stateless dry
+  run that mints no review artifact, so there is no reservation an execution can
+  be checked against. Unchanged since D6.6 §11. Same-owner, not cross-tenant.
+* **LIM-D6.8-4 (narrowed):** `/api/zerodha/postback` is unauthenticated and has
+  no Kite checksum. Bounded, idempotent and consumer-free; the checksum is the
+  prerequisite for the first consumer.
+* **LIM-D6.8-3b (new, LIM-D6.8-6's shape on the legacy routes):** the four
+  legacy zerodha order routes each translate "you have no account at this
+  broker" differently — `200` with `status: FAILED`, `502`, and **`500`** from
+  `/zerodha/emergency-stop`. All four fail closed and none reaches a broker
+  (pinned by test), but the status codes are misleading. Recorded rather than
+  changed: an order route's status code is a client contract.
+* `LIM-D6.8-1`, `-2`, `-5`, `-6`, `-7`, `-8`, `-9` are **unchanged and open**.
+  In particular **LIM-D6.8-9 (no live broker leg) is still open** — no broker
+  session was used, and none was needed: every finding here is provable with a
+  spy, and none required a real order.
+* `LIM-D6.7-1` to `-4` carry forward unchanged.
+
+**D6.8 STATUS UNCHANGED: COMPLETE — ARCHITECTURALLY VERIFIED / ENTITLEMENT
+SYSTEM INCOMPLETE.** No unresolved critical vulnerability was found. No stop
+condition was met: no unauthenticated postback can change another user's state
+or create an order; no foreign `broker_account_id`, missing account, withdrawn
+session, uncapable broker or client-supplied role reached broker execution in
+any test.
+
+**Nothing committed. Nothing pushed. D6.9 NOT STARTED.**
+
+---
+
+# D6.8-A — DATA QUALITY / INTELLIGENCE ISOLATION (2026-09-17)
+
+**STATUS: D6.8-A COMPLETE — CODE VERIFIED / LIVE VERIFICATION PENDING.**
+
+Architecture and reasoning: **ADR-065** in `.claude/DECISIONS.md`.
+
+## 0. The naming collision, stated once
+
+Do not confuse these. None is renamed and no history is rewritten:
+
+| Name | Scope | Status |
+|---|---|---|
+| **D6.8-A — Data Quality / Intelligence Isolation** | D6-Q1's six-state `FieldQuality` | this section |
+| **D6.8-B — Entitlements & Capability Authorization** | who may invoke what | complete 2026-09-13 |
+| **D6.9-A — AI Artifact Provenance & Freshness** | ADR-064 | complete |
+
+§I of the D6.0 addendum assigns data quality to D6.8 and entitlement to D6.9;
+implementation ran the other way round. Earlier sections headed "D6.8" mean
+D6.8-B.
+
+## 1. The ten audited gaps, and what closed each
+
+| # | Gap | Closed by |
+|---|---|---|
+| G-1 | No `FieldQuality` type exists | `services/market_engine/field_quality.py` — six states, closed vocabulary |
+| G-2 | `derive_technicals` knows why and returns `None` | per-indicator classification + `observed_at` |
+| G-3 | Provider errors are swallowed | per-indicator `PROVIDER_ERROR`; universe loop counts failures separately from absences |
+| G-4 | No field-level STALE | derived on read from the newest bar's instant |
+| G-5 | Six `or 50.0 / 1.0 / 0.0` sites | `SCORING_PLACEHOLDERS` + `field_quality.scoring_input` |
+| G-6 | D5.19 rule misses three surfaces | `_advisor_score`, `fetch_real_top_picks`, Stock Detail — plus `/analysis/full-report`, which the audit did not list |
+| G-7 | AI receives unqualified values | `describe_field` on `/analysis/explain`, `_advisor_ai_enrich`, `/analysis/full-report` |
+| G-8 | `ai_context_builder` documents timing it does not carry | `observed_at` on the overview; "Observed at: 10:42 IST" + tier |
+| G-9 | D5.19-2 substituted defaults in `real_market` | removed; LIM-D5.19-2 closed |
+| G-10 | Quality must not be a provider side-channel | `sanitize` is the only constructor; closed key set and closed value set |
+
+**Two findings the audit did not list.**
+
+* **`/analysis/full-report`** indexed `quote["rsi"]`, `quote["volume_ratio"]` and
+  `quote["change_pct"]` and compared them. Removing the substitutes (G-9)
+  without fixing it first would have turned the route into a 500 for every
+  stock with under 15 bars of history. This is why STEP 9 orders consumer
+  safety before default removal, and the ordering was load-bearing.
+* **`fetch_yahoo_quote`'s `change_pct = … if prev_close else 0`** — a sixth
+  substituted default, thirty lines below a D5.19 comment stating that
+  reporting a zero change there "would render 'unchanged' over a price that may
+  have moved several percent — the fabrication the tick contract and
+  `applyLivePrices` both exist to refuse".
+
+## 2. The measured defect
+
+Driven against the pre-D6.8-A top-pick scorer with what
+`fetch_real_stock_quote` actually supplied in production — the substituted
+`rsi = 50.0` — a stock whose RSI had never been computed was published as:
+
+```
+rsi: 50.0    confidence: 65
+reasons: ["RSI is at a strong bullish zone of 50.0"]
+```
+
+After: `rsi: null`, `confidence: 65` (**unchanged**), `reasons: []`.
+
+## 3. Scores
+
+Byte-identical, measured against the pre-change engine at both extremes:
+
+| Input | Pre | Post |
+|---|---|---|
+| fully measured quote | 84.4 `strong_buy` | 84.4 `strong_buy` |
+| quote with no technicals | 55.0 | 55.0 |
+| advisor, measured | 95 | 95 |
+| advisor, unmeasured | 61 | 61 |
+| top pick, substituted | 65 | 65 |
+
+## 4. Deliberate behaviour changes
+
+Three, all of them a fabricated *pass* being removed. None affects a preset.
+
+1. A bound over a non-AVAILABLE field can no longer be satisfied by a
+   substitute (`change_pct_min: -5` used to admit every unmeasured stock).
+2. A stock whose sort key the platform does not have sorts **last** in both
+   directions, instead of at zero.
+3. `change_pct` is `None` rather than `0` when there is no previous close.
+   `test_no_usable_previous_close_reports_no_change_rather_than_a_wrong_one`
+   was inverted — on that test's own written instruction, which named this as
+   the future improvement it was deferring.
+
+## 5. Verification
+
+| Suite | Result |
+|---|---:|
+| Backend, full | **15 failed / 5782 passed** — the same 15 pre-existing `test_entrypoint_log_level.py` Docker failures as the baseline (15 / 5644) |
+| `test_d68_data_quality.py` (new) | 137 passed |
+| Frontend | 50 suites / 832 passed (824 at baseline + 8 new) |
+| Mutation campaign | **37 / 37 killed** |
+
+**Mutation survivors on the first pass were five test defects, all fixed:** a
+coverage test that asserted on its own fixture; a key-refusal test whose keys
+carried invalid values so the value check alone satisfied it; a sort assertion
+guarded by `if` and therefore vacuous; a coverage assertion made against the
+test's own gateway double, which reimplemented the arithmetic under test and so
+agreed with the bug; and a placeholder mutation (50.0 → 60.0) that was **inert**
+— it left every score identical, so the goldens could not see it. The last is
+why `SCORING_PLACEHOLDERS` is now pinned as values.
+
+**One leak.** Mutation M5b was found back in the working tree after the
+campaign. Restored, every anchor re-checked, and the campaign now ends with a
+byte-for-byte integrity check of all eight mutated files.
+
+## 6. Limitations
+
+* **LIM-D6.8A-1:** `scoring_input` preserves `or`'s treatment of a falsy real
+  reading — an RSI of exactly 0 scores as 50. Reachable; fixing it changes a
+  score for valid input, which this phase may not do.
+* **LIM-D6.8A-2:** quality is carried on quotes only, not on index, sector or
+  news payloads.
+* **LIM-D6.8A-3:** the broker/AV/canonical normalizers carry quality but do not
+  classify, so their absent technicals resolve to MISSING — safest, not most
+  precise.
+* **LIM-D6.8A-4:** no live market verification and no browser leg (§7).
+* **LIM-D6.8A-5:** `black` and `isort` fail on all eight modified modules both
+  before and after, as they do on `ai_provenance.py` and `analytics/contract.py`.
+  Unchanged from baseline; the repo is not formatted with either.
+* **LIM-D6.8A-6:** `CI=true npx craco build` fails at baseline on pre-existing
+  `no-unused-vars` warnings in untouched files. The plain build compiles.
+
+## 7. Live verification
+
+**PENDING / ENVIRONMENT BLOCKED.** No broker session and no live vendor call was
+made; no order of any kind was placed, modified or cancelled. Every claim in
+this section is CODE VERIFIED — against tests, and against pre-change behaviour
+reproduced in-process from the real functions. Nothing here is LIVE VERIFIED.
+
+**D6.8-A COMPLETE. Nothing committed. Nothing pushed.**

@@ -32,6 +32,9 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+from services.market_engine import field_quality
+from services.market_engine.field_quality import OBSERVED_AT_KEY, QUALITY_KEY
+
 logger = logging.getLogger(__name__)
 
 
@@ -100,6 +103,24 @@ def _normalize_yahoo_quote(raw: Dict[str, Any]) -> Dict[str, Any]:
         "ema_20": _to_float(raw.get("ema_20")),
         "sma_50": _to_float(raw.get("sma_50")),
         "timestamp": raw.get("timestamp", datetime.now(timezone.utc).isoformat()),
+
+        # D6.8-A — FIELD QUALITY IS CARRIED, NEVER DECIDED, HERE.
+        #
+        # The producer is the authority (`field_quality`'s module contract): it
+        # is the only layer that knows whether a window was short, a vendor
+        # raised, or a payload simply omitted a value. This boundary copies the
+        # map across unchanged apart from `sanitize`, which is the containment
+        # gate — a key that is not a tracked field and a value that is not one
+        # of the six states do not survive normalization, so no provider name,
+        # account id or upstream error string can ride in on this key.
+        #
+        # Both keys are present on EVERY normalizer in this module, including
+        # the providers that carry no indicators at all. A key present on a
+        # delayed quote and absent on a streaming one is a consumer able to tell
+        # which provider answered — the leak Developer Rule 4 forbids and
+        # `test_the_payload_shape_is_identical_across_tiers` pins.
+        OBSERVED_AT_KEY: raw.get(OBSERVED_AT_KEY),
+        QUALITY_KEY: field_quality.quality_map(raw),
     }
 
 
@@ -140,6 +161,24 @@ def _normalize_av_quote(raw: Dict[str, Any]) -> Dict[str, Any]:
         "ema_20": None,
         "sma_50": None,
         "timestamp": datetime.now(timezone.utc).isoformat(),
+
+        # D6.8-A — FIELD QUALITY IS CARRIED, NEVER DECIDED, HERE.
+        #
+        # The producer is the authority (`field_quality`'s module contract): it
+        # is the only layer that knows whether a window was short, a vendor
+        # raised, or a payload simply omitted a value. This boundary copies the
+        # map across unchanged apart from `sanitize`, which is the containment
+        # gate — a key that is not a tracked field and a value that is not one
+        # of the six states do not survive normalization, so no provider name,
+        # account id or upstream error string can ride in on this key.
+        #
+        # Both keys are present on EVERY normalizer in this module, including
+        # the providers that carry no indicators at all. A key present on a
+        # delayed quote and absent on a streaming one is a consumer able to tell
+        # which provider answered — the leak Developer Rule 4 forbids and
+        # `test_the_payload_shape_is_identical_across_tiers` pins.
+        OBSERVED_AT_KEY: gq.get(OBSERVED_AT_KEY),
+        QUALITY_KEY: field_quality.quality_map(gq),
     }
 
 
@@ -179,6 +218,24 @@ def _normalize_broker_quote(raw: Dict[str, Any]) -> Dict[str, Any]:
         "ema_20": None,
         "sma_50": None,
         "timestamp": datetime.now(timezone.utc).isoformat(),
+
+        # D6.8-A — FIELD QUALITY IS CARRIED, NEVER DECIDED, HERE.
+        #
+        # The producer is the authority (`field_quality`'s module contract): it
+        # is the only layer that knows whether a window was short, a vendor
+        # raised, or a payload simply omitted a value. This boundary copies the
+        # map across unchanged apart from `sanitize`, which is the containment
+        # gate — a key that is not a tracked field and a value that is not one
+        # of the six states do not survive normalization, so no provider name,
+        # account id or upstream error string can ride in on this key.
+        #
+        # Both keys are present on EVERY normalizer in this module, including
+        # the providers that carry no indicators at all. A key present on a
+        # delayed quote and absent on a streaming one is a consumer able to tell
+        # which provider answered — the leak Developer Rule 4 forbids and
+        # `test_the_payload_shape_is_identical_across_tiers` pins.
+        OBSERVED_AT_KEY: raw.get(OBSERVED_AT_KEY),
+        QUALITY_KEY: field_quality.quality_map(raw),
     }
 
 
@@ -242,6 +299,24 @@ def _normalize_canonical_quote(raw: Dict[str, Any]) -> Dict[str, Any]:
         "ema_20": None,
         "sma_50": None,
         "timestamp": raw.get("ingested_at") or datetime.now(timezone.utc).isoformat(),
+
+        # D6.8-A — FIELD QUALITY IS CARRIED, NEVER DECIDED, HERE.
+        #
+        # The producer is the authority (`field_quality`'s module contract): it
+        # is the only layer that knows whether a window was short, a vendor
+        # raised, or a payload simply omitted a value. This boundary copies the
+        # map across unchanged apart from `sanitize`, which is the containment
+        # gate — a key that is not a tracked field and a value that is not one
+        # of the six states do not survive normalization, so no provider name,
+        # account id or upstream error string can ride in on this key.
+        #
+        # Both keys are present on EVERY normalizer in this module, including
+        # the providers that carry no indicators at all. A key present on a
+        # delayed quote and absent on a streaming one is a consumer able to tell
+        # which provider answered — the leak Developer Rule 4 forbids and
+        # `test_the_payload_shape_is_identical_across_tiers` pins.
+        OBSERVED_AT_KEY: raw.get(OBSERVED_AT_KEY),
+        QUALITY_KEY: field_quality.quality_map(raw),
     }
 
 
@@ -337,6 +412,12 @@ def _apply_defaults(raw: Dict[str, Any]) -> Dict[str, Any]:
         "sector": "", "exchange": "NSE", "rsi": None, "macd": None,
         "macd_signal": None, "vwap": None, "ema_20": None, "sma_50": None,
         "timestamp": datetime.now(timezone.utc).isoformat(),
+        OBSERVED_AT_KEY: None,
     }
     result = {**defaults, **raw}
+    # Sanitized rather than passed through: this is the *unrecognized* payload
+    # path, so `raw` is the one input to this module that nothing has vetted,
+    # and it is exactly where an un-normalized key would otherwise reach a
+    # consumer wearing the platform's own field name.
+    result[QUALITY_KEY] = field_quality.quality_map(raw)
     return result

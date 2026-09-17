@@ -281,7 +281,7 @@ class FakeCollection:
             for k, v in (flt or {}).items():
                 if k != "_id" and not isinstance(v, dict):
                     newd[k] = v
-            self._apply_update(newd, update)
+            self._apply_update(newd, update, inserting=True)
             self.docs.append(newd)
         return _Result(modified=0, matched=0)
 
@@ -343,7 +343,7 @@ class FakeCollection:
         for k, v in (flt or {}).items():
             if k != "_id" and not isinstance(v, dict):
                 newd[k] = v
-        self._apply_update(newd, update)
+        self._apply_update(newd, update, inserting=True)
         self.docs.append(newd)
         # An upsert that inserted has no "before" document; Mongo returns None
         # for BEFORE and the new document for AFTER.
@@ -358,9 +358,22 @@ class FakeCollection:
         return _Result(modified=n, matched=n)
 
     @staticmethod
-    def _apply_update(doc, update):
+    def _apply_update(doc, update, *, inserting=False):
+        """Apply one update document.
+
+        `inserting` says whether this call is creating the document (the upsert
+        path) rather than modifying an existing one. It exists for
+        `$setOnInsert`, which is the one operator whose whole meaning is that
+        distinction — and which the double used to IGNORE entirely, in both
+        paths. A silently-ignored operator is the worst shape a double can take:
+        an endpoint whose only write is `$setOnInsert` stored a document
+        containing nothing but its filter keys, so every assertion about what it
+        recorded was unfalsifiable while the endpoint itself was correct.
+        """
         if "$set" in update:
             doc.update(update["$set"])
+        if "$setOnInsert" in update and inserting:
+            doc.update(update["$setOnInsert"])
         if "$unset" in update:
             for k in update["$unset"]:
                 doc.pop(k, None)

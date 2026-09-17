@@ -51,7 +51,10 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
+from datetime import timedelta
 from typing import Any, Awaitable, Callable, Optional
+
+from services.market_engine import field_quality
 
 logger = logging.getLogger(__name__)
 
@@ -176,7 +179,36 @@ async def _safe(coro, label: str, default=None):
 # --------------------------------------------------------------------------- #
 # Section renderers (pure — operate on already-fetched data)
 # --------------------------------------------------------------------------- #
-def _render_market(overview: Optional[dict]) -> Optional[str]:
+#: IST is UTC+5:30 with no DST, so a fixed offset is exact. Same constant and
+#: same reasoning as `morning_report._IST_OFFSET`: "10:42 IST" is the only form
+#: in which a reader — or a model writing for one — can place an instant against
+#: the NSE session.
+_IST_OFFSET = timedelta(hours=5, minutes=30)
+
+
+def observed_at_str(payload: Optional[dict]) -> Optional[str]:
+    """`payload`'s observation instant as an NSE wall clock, or None.
+
+    D6.8-A / G-8 — this module's own docstring has claimed since D1 that the
+    context "carries `source_tier` and timestamps so the model can say 'live
+    price' or 'as of 10:42 AM'". It did not: not one rendered section carried a
+    time, so the model was given a market snapshot with no way to date it and
+    the documentation described an intention rather than the code.
+
+    The instant is the payload's own `observed_at` — when the data was fetched —
+    and never the moment this context was built. Those two diverge by up to the
+    cache TTL, and the direction of the error is the dangerous one: rendering
+    the read time would stamp a cached snapshot as current. A payload with no
+    observation instant returns None and the line is omitted, rather than being
+    given the clock's answer to a question it was not asked.
+    """
+    observed = field_quality.parse_instant((payload or {}).get("observed_at"))
+    if observed is None:
+        return None
+    return (observed + _IST_OFFSET).strftime("%H:%M IST")
+
+
+def _render_market(overview: Optional[dict], source_tier: Optional[str] = None) -> Optional[str]:
     if not overview:
         return None
     nifty = overview.get("nifty") or {}
@@ -184,6 +216,18 @@ def _render_market(overview: Optional[dict]) -> Optional[str]:
     sensex = overview.get("sensex") or {}
     lines = [
         "## Live Market Snapshot (source of truth)",
+    ]
+    # Freshness, never provenance. `source_tier` is the ONLY provenance allowed
+    # past the gateway (MARKET_DATA_ARCHITECTURE.md, Developer Rule 4) and it is
+    # a tier word — "streaming" / "delayed" — not a vendor. The observation time
+    # is what lets the model write "as of 10:42 IST" instead of implying that
+    # everything below is true at the instant the user is reading it.
+    when = observed_at_str(overview)
+    if when:
+        lines.append(f"- Observed at: {when}")
+    if source_tier:
+        lines.append(f"- Data freshness: {source_tier}")
+    lines += [
         f"- Market status: {overview.get('market_status', 'n/a')}",
         f"- NIFTY 50: {_fmt(nifty.get('value'))} ({_pct(nifty.get('change_pct'))})",
         f"- Bank NIFTY: {_fmt(bank.get('value'))} ({_pct(bank.get('change_pct'))})",
@@ -413,7 +457,7 @@ async def _assemble(db, user: dict, quotes_map_func: QuotesMapFunc) -> ChatConte
     keeps module import cheap and avoids import cycles at server startup."""
     from services import portfolio_engine, news_service, ai_memory
     from services.activity_logger import get_recent_activity
-    from services.market_engine import market_gateway
+    from services.market_engine import Capability, market_gateway
 
     user_id = (user or {}).get("_id")
 
@@ -479,8 +523,17 @@ async def _assemble(db, user: dict, quotes_map_func: QuotesMapFunc) -> ChatConte
         logger.warning("AI context memory render failed: %s", e)
 
     # ---- Render every section; drop the ones with no data ---- #
+    # The tier is read with no user because the sections above were: asking a
+    # different identity would describe a different resolution than the one that
+    # produced these numbers (`ranking_engine.rank_universe_report` states the
+    # same rule for the same reason).
+    try:
+        source_tier = market_gateway.source_tier(Capability.INDICES)
+    except Exception:  # noqa: BLE001 - a label must never cost the reply
+        source_tier = None
+
     blocks = [
-        _render_market(overview),
+        _render_market(overview, source_tier),
         _render_movers(gainers, losers),
         _render_sectors(sectors),
         _render_global(global_markets),
@@ -508,6 +561,10 @@ async def _assemble(db, user: dict, quotes_map_func: QuotesMapFunc) -> ChatConte
         live_market_available=bool(overview),
         sections={
             "overview": overview,
+            # D6.8-A — the caller (and the tests) can read the snapshot's age
+            # without re-parsing the rendered markdown.
+            "observed_at_str": observed_at_str(overview),
+            "source_tier": source_tier,
             "holdings_count": len(holdings) if holdings else 0,
             "open_trades": len(open_trades),
             "watchlist": len(watchlist),

@@ -2,6 +2,8 @@
 import logging
 from datetime import datetime, timezone, timedelta
 
+from services.market_engine import field_quality
+
 # Suppress re-sending the same (user, type, symbol) alert within this window so
 # a monitoring cycle running every 60s doesn't flood notifications or burn
 # WhatsApp/Telegram/email provider daily quotas.
@@ -41,9 +43,28 @@ async def analyze_portfolio_health(db, user_id, market_func, quote_func, ai_func
         sl_distance_pct = round(((current - sl) / current) * 100, 2)
         t1_distance_pct = round(((t1 - current) / current) * 100, 2)
 
-        # RSI check
-        rsi = quote.get("rsi", 50)
-        volume_ratio = quote.get("volume_ratio", 1.0)
+        # D6.8-A FIX (F-2) — AN ALERT IS A FACTUAL CLAIM, SO IT NEEDS A
+        # READING.
+        #
+        # This was `quote.get("rsi", 50)` / `quote.get("volume_ratio", 1.0)`,
+        # and a `dict.get` default only fires on a MISSING KEY. The canonical
+        # quote always carries both keys; before D6.8-A they carried a
+        # fabricated 50.0 / 1.0, and since D6.8-A removed the fabrication they
+        # carry `None` — which the defaults do not cover, so `None > 75` reached
+        # the comparison and raised `TypeError` out of the whole monitoring
+        # cycle.
+        #
+        # The fix is not a `try`/`except` and not `or 50`: both would restore a
+        # comparison against a number nobody measured, and the alert message
+        # interpolates that number ("RSI at 50 (overbought)"). Only a real
+        # reading may produce an RSI_OVERBOUGHT or VOLUME_SPIKE alert; every
+        # other state — MISSING, INSUFFICIENT_HISTORY, STALE, PROVIDER_ERROR,
+        # UNAVAILABLE — yields None here and simply emits no alert about a
+        # field the platform does not have. The price-based alerts above and
+        # the P&L alert below are unaffected, so a position with no technicals
+        # is still monitored for the things that actually matter to it.
+        rsi = field_quality.reading(quote, "rsi")
+        volume_ratio = field_quality.reading(quote, "volume_ratio")
 
         # Alert: Near stop loss (within 1.5%)
         if sl_distance_pct <= 1.5 and sl_distance_pct > 0:
@@ -92,7 +113,7 @@ async def analyze_portfolio_health(db, user_id, market_func, quote_func, ai_func
             })
 
         # Alert: RSI overbought
-        if rsi > 75:
+        if rsi is not None and rsi > 75:
             alerts.append({
                 "type": "RSI_OVERBOUGHT",
                 "severity": "warning",
@@ -103,7 +124,7 @@ async def analyze_portfolio_health(db, user_id, market_func, quote_func, ai_func
             })
 
         # Alert: Volume spike (could mean big move)
-        if volume_ratio > 2.5:
+        if volume_ratio is not None and volume_ratio > 2.5:
             alerts.append({
                 "type": "VOLUME_SPIKE",
                 "severity": "info",

@@ -187,8 +187,14 @@ class TradeCreate(BaseModel):
     quantity: TradeQuantity
     stop_loss: TradePrice
     target1: TradePrice
-    target2: Optional[float] = None
-    target3: Optional[float] = None
+    # D6.8 gap / G-7 — these two were the last bare floats on the model the
+    # aliases above were written for, and `Optional[float]` has no bound at all:
+    # `POST /api/trades` accepted `target2: Infinity`, WROTE the trade row, and
+    # only then failed serializing its own response. `OptionalTradePrice` keeps
+    # 0 and null (both mean "no such target" here) and refuses negative,
+    # infinite and NaN.
+    target2: Optional[OptionalTradePrice] = None
+    target3: Optional[OptionalTradePrice] = None
     trailing_stop: Optional[TrailingStopConfig] = None
     notes: Optional[str] = None
     setup_type: Optional[str] = None
@@ -255,11 +261,16 @@ class PaperTradeCreate(BaseModel):
 
 
 class TradeModify(BaseModel):
-    """Editable fields of an OPEN trade (validated against entry side)."""
-    stop_loss: Optional[float] = Field(default=None, gt=0)
-    target1: Optional[float] = Field(default=None, gt=0)
-    target2: Optional[float] = None       # 0/None clears the target
-    target3: Optional[float] = None
+    """Editable fields of an OPEN trade (validated against entry side).
+
+    Bounded the same way `TradeCreate` is (D6.8 gap / G-7). An unbounded edit
+    reaches the same stored fields an unbounded entry would, and the auto-exit
+    engine reads them.
+    """
+    stop_loss: Optional[float] = Field(default=None, gt=0, allow_inf_nan=False)
+    target1: Optional[float] = Field(default=None, gt=0, allow_inf_nan=False)
+    target2: Optional[OptionalTradePrice] = None   # 0/None clears the target
+    target3: Optional[OptionalTradePrice] = None
     trailing_stop: Optional[TrailingStopConfig] = None
     notes: Optional[str] = None
 
@@ -267,7 +278,7 @@ class TradeModify(BaseModel):
 class TradeExitRequest(BaseModel):
     """Exit an open trade — fully or partially, manually or at market via the
     connected broker (`at_market` requires the trade to be broker-linked)."""
-    exit_price: Optional[float] = Field(default=None, gt=0)
+    exit_price: Optional[float] = Field(default=None, gt=0, allow_inf_nan=False)
     quantity: Optional[int] = Field(default=None, gt=0)   # None = all remaining
     at_market: bool = False
 
@@ -457,16 +468,89 @@ class BrokerOrderCreate(BaseModel):
     quantity: int = Field(gt=0, le=100000)
     order_type: str = Field(default="MARKET", pattern="^(MARKET|LIMIT|SL|SL-M)$")
     product: Optional[str] = None       # CNC/MIS/NRML (Zerodha) or D/I (Upstox)
-    price: Optional[float] = Field(default=None, ge=0)
-    trigger_price: Optional[float] = Field(default=None, ge=0)
+    # `allow_inf_nan=False` for the reason spelled out above `TradeSide`, which
+    # this model had never picked up (D6.8 gap / G-7): a bare `ge=0` ADMITS
+    # `Infinity`, because `inf >= 0` is True. Starlette parses bodies with
+    # `json.loads`, which accepts the non-standard literal, so
+    # `{"price": Infinity}` passed validation on EVERY order route — including
+    # the account-addressed one — and `price: inf` was handed to the live broker
+    # adapter. `NaN` was already refused, but only as a side effect of
+    # `nan >= 0` being False: an accident of comparison, not a bound.
+    price: Optional[float] = Field(default=None, ge=0, allow_inf_nan=False)
+    trigger_price: Optional[float] = Field(default=None, ge=0, allow_inf_nan=False)
     validity: str = Field(default="DAY", pattern="^(DAY|IOC)$")
     instrument_token: Optional[str] = None
     tag: Optional[str] = Field(default=None, max_length=20)
 
 
 class BrokerOrderModify(BaseModel):
+    # Same `allow_inf_nan=False` as `BrokerOrderCreate` (D6.8 gap / G-7), for the
+    # same reason and on the same routes: modifying an order is as irreversible
+    # as placing one, and `{"price": Infinity}` reached `adapter.modify_order`.
     quantity: Optional[int] = Field(default=None, gt=0, le=100000)
-    price: Optional[float] = Field(default=None, ge=0)
-    trigger_price: Optional[float] = Field(default=None, ge=0)
+    price: Optional[float] = Field(default=None, ge=0, allow_inf_nan=False)
+    trigger_price: Optional[float] = Field(default=None, ge=0, allow_inf_nan=False)
     order_type: Optional[str] = Field(default=None, pattern="^(MARKET|LIMIT|SL|SL-M)$")
     validity: Optional[str] = Field(default=None, pattern="^(DAY|IOC)$")
+
+
+# --- Legacy Zerodha order bodies (D6.8 gap closure / G-1, G-2) ---
+#
+# WHY THESE EXIST AT ALL
+# ----------------------
+# `POST /api/zerodha/order` and `POST /api/zerodha/quick-trade` predate the
+# broker framework. Both read `await request.json()` and indexed the result
+# directly, so NOTHING validated the order they handed to a live Kite account:
+# `quantity: -50`, `quantity: 0`, `quantity: 1_000_000_000`, `quantity: "abc"`,
+# `transaction_type: "STEAL"`, `price: -999` and a 5,000-character symbol all
+# reached the adapter, while the identical payload sent to
+# `/api/brokers/accounts/{id}/orders` was refused 422 before an account was even
+# resolved. Same operation, same irreversibility, two different contracts — and
+# the weaker one was on the older, less-reviewed route.
+#
+# They are declared HERE, beside the models they derive from, for the reason
+# PH3.12R gave for moving `PaperTradeCreate` out of `server.py`: a constraint
+# that lives next to its route handler is a constraint nobody tightening the
+# real model can see.
+
+
+class ZerodhaOrderCreate(BrokerOrderCreate):
+    """Body of the legacy `POST /api/zerodha/order`.
+
+    Subclasses `BrokerOrderCreate` rather than restating its rules, so the
+    account-addressed route and this one cannot drift: tightening a bound there
+    tightens it here by construction.
+
+    Only the two DEFAULTS the legacy route chose are overridden. That is not
+    cosmetic — `BrokerOrderCreate` defaults `order_type` to MARKET, and adopting
+    that default here would silently turn a caller's omitted order type from a
+    price-bounded LIMIT order into an unbounded MARKET one. A validation fix
+    that changes what a valid request does is not a validation fix.
+    """
+    order_type: str = Field(default="LIMIT", pattern="^(MARKET|LIMIT|SL|SL-M)$")
+    product: str = Field(default="MIS", max_length=16)
+
+
+class ZerodhaQuickTradeCreate(BaseModel):
+    """Body of `POST /api/zerodha/quick-trade` — one-click entry from an AI pick.
+
+    Spelled in the same aliases as `TradeCreate` and `PaperTradeCreate` because
+    this is the THIRD surface that writes a `db.trades` row from the same six
+    numbers, and it was the one with no bounds at all: it called `float()` and
+    `int()` on the raw body, which happily accept `-5`, `0`, `1e9` and
+    `Infinity`. Unlike the other two it places a LIVE broker order *first*, so an
+    unbounded number here was an unbounded number at the broker.
+
+    `stock_name` and `target2` keep the route's own sentinels (empty → the
+    symbol; 0 → no second target) and are resolved in the handler, not here.
+    """
+    symbol: TradeSymbol
+    stock_name: TradeShortText = ""
+    quantity: TradeQuantity
+    entry_price: TradePrice
+    stop_loss: TradePrice
+    target1: TradePrice
+    target2: OptionalTradePrice = 0.0
+    #: Surfaced in the trade journal as `ai_confidence`. Bounded because it is
+    #: persisted and rendered; a percentage is the only thing it has ever meant.
+    confidence: Optional[float] = Field(default=None, ge=0, le=100)

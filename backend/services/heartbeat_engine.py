@@ -29,7 +29,7 @@ import logging
 import os
 from datetime import datetime, timezone, timedelta
 
-from services.market_engine import scanner_worker
+from services.market_engine import field_quality, scanner_worker
 
 logger = logging.getLogger(__name__)
 
@@ -119,6 +119,20 @@ def _next_volume_batch():
     return batch
 
 
+def _measured_change_pct(payload):
+    """A day change that is a real number, or None.
+
+    D6.8-A FIX (F-6) — for the index/commodity payloads, which are NOT canonical
+    quotes and carry no quality map: `fetch_yahoo_quote` returns
+    `change_pct=None` when the vendor served no previous close, and
+    `payload.get("change_pct", 0)` never covered it because the key is present.
+    `None > 1` and `format(None, "+.2f")` both raise, and both raise inside a
+    comprehension or an aggregate that takes the whole task down with them.
+    """
+    value = payload.get("change_pct") if isinstance(payload, dict) else None
+    return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # REAL TASKS — each logs running -> done/warning around genuine work
 # ═══════════════════════════════════════════════════════════════════════════
@@ -133,11 +147,20 @@ async def task_global_markets():
         if not valid:
             log_activity("Global markets data unavailable", "scan", "warning")
             return
-        leader = max(valid, key=lambda m: m.get("change_pct", 0))
-        log_activity(
-            f"Read {len(valid)} global indices — {leader['name']} {leader['change_pct']:+.2f}%",
-            "scan", "done",
-        )
+        # D6.8-A FIX (F-6) — the leader is chosen among the indices whose day
+        # change is a real number. An index served without one used to raise out
+        # of `max` and lose the whole reading, and naming a leader from a
+        # substituted 0 would assert a ranking that was never measured. Indices
+        # with a value but no change still stream and still count.
+        ranked = [m for m in valid if _measured_change_pct(m) is not None]
+        if ranked:
+            leader = max(ranked, key=_measured_change_pct)
+            log_activity(
+                f"Read {len(valid)} global indices — {leader['name']} {leader['change_pct']:+.2f}%",
+                "scan", "done",
+            )
+        else:
+            log_activity(f"Read {len(valid)} global indices", "scan", "done")
         # Stream live global indices to the Markets page.
         await _publish("market.global.updated", {"markets": valid})
     except Exception as e:
@@ -158,8 +181,14 @@ async def task_us_markets():
         )
         parts = []
         for name, q in (("S&P 500", sp), ("Nasdaq", nasdaq), ("Dow", dow)):
-            if isinstance(q, dict) and q:
-                parts.append(f"{name} {q.get('change_pct', 0):+.2f}%")
+            # D6.8-A FIX (F-6) — an index the vendor served without a previous
+            # close has `change_pct=None`, which `format(…, "+.2f")` cannot
+            # render; before this, one such index took all three down. Named,
+            # not defaulted: "Nasdaq +0.00%" is a flat market, and that is a
+            # claim.
+            change_pct = _measured_change_pct(q) if isinstance(q, dict) else None
+            if change_pct is not None:
+                parts.append(f"{name} {change_pct:+.2f}%")
         if parts:
             log_activity("US Markets — " + ", ".join(parts), "scan", "done")
         else:
@@ -223,14 +252,26 @@ async def task_find_breakouts():
     log_activity("Finding Breakouts", "scan", "running")
     try:
         quotes = await fetch_all_universe_quotes()
-        candidates = [
-            q for q in (quotes or [])
-            if q.get("high") and q.get("price")
-            and q["price"] >= q["high"] * 0.995
-            and q.get("change_pct", 0) > 1
-        ]
+        # D6.8-A FIX (F-6) — `q.get("change_pct", 0) > 1` raised on the first
+        # quote whose day change the platform does not have, and the raise
+        # escaped the comprehension: ONE unmeasured symbol turned the whole
+        # breakout scan into "Finding Breakouts failed". Read under the quality
+        # contract (these ARE canonical quotes), per symbol, so an unmeasured
+        # one is simply not a breakout candidate — it cannot be, since a
+        # breakout is defined by a day change — and every other symbol is still
+        # scanned.
+        candidates = []
+        for q in (quotes or []):
+            if not (q.get("high") and q.get("price")):
+                continue
+            if q["price"] < q["high"] * 0.995:
+                continue
+            change_pct = field_quality.reading(q, "change_pct")
+            if change_pct is None or change_pct <= 1:
+                continue
+            candidates.append(q)
         if candidates:
-            candidates.sort(key=lambda q: q.get("change_pct", 0), reverse=True)
+            candidates.sort(key=lambda q: q["change_pct"], reverse=True)
             names = ", ".join(q["symbol"] for q in candidates[:3])
             log_activity(
                 f"Found {len(candidates)} breakout candidate(s): {names}", "scan", "done"
@@ -261,10 +302,16 @@ async def task_check_volume():
         results = await asyncio.gather(
             *[fetch_real_stock_quote(s) for s in batch], return_exceptions=True
         )
-        surges = [
-            r for r in results
-            if isinstance(r, dict) and r and r.get("volume_ratio", 0) > 1.5
-        ]
+        # D6.8-A FIX (F-6) — same shape as the breakout scan: `None > 1.5`
+        # raised and lost the whole batch. A symbol with no volume ratio is not
+        # a volume surge, and the rest of the batch is unaffected.
+        surges = []
+        for r in results:
+            if not (isinstance(r, dict) and r):
+                continue
+            ratio = field_quality.reading(r, "volume_ratio")
+            if ratio is not None and ratio > 1.5:
+                surges.append(r)
         if surges:
             names = ", ".join(r["symbol"] for r in surges[:3])
             log_activity(

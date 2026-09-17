@@ -64,6 +64,19 @@ class _Gateway:
         return "delayed"
 
 
+
+    def universe_coverage(self, served):
+        """D6.8-A — the real gateway's coverage read, kept on the double.
+
+        A double that omitted it would make the scanner raise instead of
+        answering, which is a failure that tells you nothing about the scanner.
+        It answers from the universe registry exactly as the real one does, so
+        a test asserting on coverage is asserting on the same arithmetic.
+        """
+        from market_data import STOCK_UNIVERSE
+        requested = len(STOCK_UNIVERSE)
+        return {"requested": requested, "available": served,
+                "unavailable": max(0, requested - served)}
 @pytest.fixture
 def gateway(monkeypatch):
     def _install(quotes):

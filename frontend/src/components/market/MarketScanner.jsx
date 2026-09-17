@@ -331,6 +331,25 @@ export default function MarketScanner() {
                             ))}
                           </ul>
                         )}
+                        {/* D6.8-A — the other half of the same honesty.
+                            `matched_on` says what this stock satisfied;
+                            `unverified_filters` says which of the scan's own
+                            criteria it was never actually tested against,
+                            because the platform does not have that reading for
+                            it. Without this the row is indistinguishable from
+                            one that passed every filter on real data. Muted and
+                            one line: a caveat, not an error — the stock is a
+                            legitimate result, it is simply less verified than
+                            it looked. */}
+                        {stock.unverified_filters?.length > 0 && (
+                          <div
+                            data-testid={`scanner-unverified-${stock.symbol}`}
+                            className="mt-1 text-[9px] leading-snug text-[var(--text-muted)]"
+                            title="This stock passed the scan without being tested against these criteria, because the platform does not have those readings for it."
+                          >
+                            Not checked: {stock.unverified_filters.join(", ")}
+                          </div>
+                        )}
                       </td>
                       <td className="text-right px-3 py-2.5 font-mono text-[var(--text-primary)]">
                         {stock.price?.toLocaleString("en-IN", { minimumFractionDigits: 2 })}

@@ -41,6 +41,8 @@ import asyncio
 import pytest
 
 from services import real_market
+from services.market_engine import field_quality
+from services.market_engine.field_quality import FieldQuality
 
 
 def _run(coro):
@@ -209,16 +211,39 @@ def test_single_bar_falls_back_to_the_vendor_field(yahoo):
 
 
 def test_no_usable_previous_close_reports_no_change_rather_than_a_wrong_one(yahoo):
-    """Neither a series nor a vendor field: the change is unknown.
+    """Neither a series nor a vendor field: the change is unknown, and says so.
 
-    The pre-existing contract returns 0 here, and this pins it rather than
-    changing it — but it pins the *reason*: `prev_close` is falsy, so there is
-    nothing to subtract from. A future improvement should make this `None`;
-    doing so inside this sprint would change a field's type for every consumer.
+    D6.8-A — THIS ASSERTION WAS INVERTED, ON THIS TEST'S OWN INSTRUCTIONS.
+
+    Until D6.8-A this pinned `change == 0` and `change_pct == 0`, with the note:
+    "A future improvement should make this `None`; doing so inside this sprint
+    would change a field's type for every consumer." D6.8-A is that improvement,
+    and making every consumer safe for a null technical field is precisely its
+    scope — so the substituted zero is gone and the absence is classified.
+
+    Zero is the wrong answer here in the way that matters: it is a *reading*.
+    "Flat at 0.0% — consolidating" is a sentence the platform published, under a
+    recommendation, about a stock whose previous close it never had.
     """
     yahoo["payloads"] = {"1d": _payload([110.0], chart_prev=0, price=110.0)}
 
     quote = _run(real_market.fetch_yahoo_quote("TESTSYM", range_str="1d"))
 
-    assert quote["change"] == 0
-    assert quote["change_pct"] == 0
+    assert quote["change"] is None
+    assert quote["change_pct"] is None
+    assert quote["prev_close"] is None
+    assert field_quality.quality_of(quote, "change_pct") is FieldQuality.MISSING
+
+
+def test_a_usable_previous_close_leaves_the_day_change_unqualified(yahoo):
+    """The falsifying twin: with a real previous close nothing is withheld.
+
+    Without this, the assertion above passes just as well against a producer
+    that classified EVERY day change as MISSING.
+    """
+    yahoo["payloads"] = {"1d": _payload([100.0, 110.0], chart_prev=0, price=110.0)}
+
+    quote = _run(real_market.fetch_yahoo_quote("TESTSYM", range_str="1d"))
+
+    assert quote["change_pct"] == pytest.approx(10.0)
+    assert field_quality.quality_of(quote, "change_pct") is FieldQuality.AVAILABLE

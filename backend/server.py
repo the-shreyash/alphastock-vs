@@ -64,6 +64,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
 from bson.errors import InvalidId
 import os
+import hashlib
 import logging
 import secrets
 import httpx
@@ -94,6 +95,9 @@ from services.scheduler import setup_scheduler
 # whole body is the gateway call, and a function-local import in each would be
 # more import machinery than route.
 from services.market_engine import Capability, SourceTier, market_gateway
+# D6.8-A — every market field this module narrates or hands to a model is
+# read through this contract, never straight off the quote dict.
+from services.market_engine import field_quality
 
 # Centralized authentication-cookie policy (PH1.3). Every auth cookie is set or
 # cleared through this module so the Secure/HttpOnly/SameSite/Path/Max-Age
@@ -197,6 +201,7 @@ from models import (
     AdvisorRequest, AdvisorRecommendation, AdvisorEntryZone,
     AIMemoryUpdate, LearnRequest, TradeReviewRequest, PortfolioReviewRequest,
     BrokerOrderCreate, BrokerOrderModify,
+    ZerodhaOrderCreate, ZerodhaQuickTradeCreate,
 )
 from market_data import get_stock_meta, search_stocks, STOCK_UNIVERSE
 # NOTE: market_data contains ONLY factual reference metadata (symbols, company
@@ -866,11 +871,31 @@ def _advisor_score(quote: dict, patterns: list, horizon: str) -> tuple:
     """Technical score (0-100 conviction) + human-readable reasons for a stock,
     computed entirely from REAL indicators. Weighting is nudged per horizon:
     shorter horizons lean on momentum/volume, longer ones on trend (MACD)."""
-    rsi = quote.get("rsi", 50.0) or 50.0
-    volume_ratio = quote.get("volume_ratio", 1.0) or 1.0
-    macd = quote.get("macd", 0.0) or 0.0
-    macd_signal = quote.get("macd_signal", 0.0) or 0.0
-    change_pct = quote.get("change_pct", 0.0) or 0.0
+    # D6.8-A — THE SECOND OF THE THREE SURFACES D5.19 DID NOT REACH (§G-6).
+    #
+    # These `reasons` are published as `technical_reasons` on every advisor
+    # recommendation and are quoted verbatim into the deterministic narrative
+    # ("Reasoning is driven by live technicals: …"). Before this phase every one
+    # of them was emitted unconditionally from a coalesced value, so a stock
+    # whose RSI the platform never had was told, under a buy recommendation,
+    # that its "RSI at 50 sits in a healthy bullish zone with room before
+    # overbought" — a complete, confident, fabricated sentence.
+    #
+    # The arithmetic is untouched: `scoring_input` is `or <default>` by
+    # construction, so every confidence, risk level, entry band, stop and target
+    # is numerically identical for identical input. Only the sentences are gated.
+    rsi = field_quality.scoring_input(quote, "rsi", 50.0)
+    volume_ratio = field_quality.scoring_input(quote, "volume_ratio", 1.0)
+    macd = field_quality.scoring_input(quote, "macd", 0.0)
+    macd_signal = field_quality.scoring_input(quote, "macd_signal", 0.0)
+    change_pct = field_quality.scoring_input(quote, "change_pct", 0.0)
+    rsi_known = field_quality.is_available(quote, "rsi")
+    volume_known = field_quality.is_available(quote, "volume_ratio")
+    macd_known = (
+        field_quality.is_available(quote, "macd")
+        and field_quality.is_available(quote, "macd_signal")
+    )
+    change_known = field_quality.is_available(quote, "change_pct")
 
     short_horizon = horizon in ("intraday", "swing")
     score = 50.0
@@ -879,39 +904,43 @@ def _advisor_score(quote: dict, patterns: list, horizon: str) -> tuple:
     # RSI — momentum vs mean-reversion
     if 50 <= rsi <= 68:
         score += 15
-        reasons.append(f"RSI at {rsi:.0f} sits in a healthy bullish zone with room before overbought.")
+        field_quality.claim(reasons, rsi_known, f"RSI at {rsi:.0f} sits in a healthy bullish zone with room before overbought.")
     elif 40 <= rsi < 50:
         score += 8
-        reasons.append(f"RSI at {rsi:.0f} is neutral-to-constructive, basing before a potential move up.")
+        field_quality.claim(reasons, rsi_known, f"RSI at {rsi:.0f} is neutral-to-constructive, basing before a potential move up.")
     elif rsi < 35:
         score += 10
-        reasons.append(f"RSI at {rsi:.0f} is oversold, hinting at a mean-reversion bounce.")
+        field_quality.claim(reasons, rsi_known, f"RSI at {rsi:.0f} is oversold, hinting at a mean-reversion bounce.")
     elif rsi > 72:
         score -= 6
-        reasons.append(f"RSI at {rsi:.0f} is overbought — momentum is strong but entries need discipline.")
+        field_quality.claim(reasons, rsi_known, f"RSI at {rsi:.0f} is overbought — momentum is strong but entries need discipline.")
 
     # Volume — conviction behind the move (weighted more for short horizons)
     vol_weight = 20 if short_horizon else 12
     if volume_ratio >= 1.5:
         score += vol_weight
-        reasons.append(f"Volume is {volume_ratio:.1f}x the 20-day average — strong participation.")
+        field_quality.claim(reasons, volume_known, f"Volume is {volume_ratio:.1f}x the 20-day average — strong participation.")
     elif volume_ratio >= 1.1:
         score += vol_weight * 0.5
-        reasons.append(f"Volume is elevated at {volume_ratio:.1f}x the 20-day average.")
+        field_quality.claim(reasons, volume_known, f"Volume is elevated at {volume_ratio:.1f}x the 20-day average.")
 
     # MACD — trend (weighted more for longer horizons)
     macd_weight = 18 if not short_horizon else 12
     if macd > macd_signal:
         score += macd_weight
-        reasons.append("MACD is in a bullish crossover, confirming upward trend momentum.")
+        field_quality.claim(reasons, macd_known, "MACD is in a bullish crossover, confirming upward trend momentum.")
     else:
         score -= 4
-        reasons.append("MACD has yet to cross bullish — wait for confirmation on strength.")
+        # "MACD has yet to cross bullish" is a claim about the indicator, and
+        # this is the branch the substituted `0.0 > 0.0` always took — so before
+        # this phase it was the single most-published fabricated sentence in the
+        # advisor.
+        field_quality.claim(reasons, macd_known, "MACD has yet to cross bullish — wait for confirmation on strength.")
 
     # Live day change
     if change_pct >= 1.0:
         score += 6
-        reasons.append(f"Trading up {change_pct:+.1f}% today with positive intraday momentum.")
+        field_quality.claim(reasons, change_known, f"Trading up {change_pct:+.1f}% today with positive intraday momentum.")
     elif change_pct <= -1.5:
         score -= 4
 
@@ -947,13 +976,34 @@ def _advisor_deterministic_narrative(rec: dict, horizon_label: str) -> dict:
     name = rec["name"]
     entry = rec["entry_zone"]
     t = rec["targets"]
+    # D6.8-A — the clause used to end "…: positive setup" when there were no
+    # technical reasons, which asserts a setup nothing had assessed. Its first
+    # entry is either a real reading or an explicit statement that there is
+    # none, so the fallback string is gone rather than softened.
+    #
+    # D6.8-A FIX (F-5) — BOUND TO THE CLAUSE, NOT TO THE WHOLE SUMMARY.
+    #
+    # This was one conditional expression spanning every `+` above it, so
+    # Python's precedence made `if rec["technical_reasons"]` govern the entire
+    # concatenation: an empty reasons list did not swap the Reasoning clause,
+    # it replaced the WHOLE narrative — name, confidence, entry zone, stop,
+    # targets and expected move all vanished, leaving `ai_summary` as the bare
+    # sentence "No technical evidence supports this level." That is a worse
+    # failure than the one the conditional was added to fix: the levels a user
+    # is asked to trade on are exactly the part that is still true when the
+    # technicals are absent. The clause is now built separately and appended.
+    reasoning = (
+        f"Reasoning: {rec['technical_reasons'][0]}"
+        if rec["technical_reasons"]
+        else "No technical evidence supports this level."
+    )
     summary = (
         f"{name} scores {rec['confidence']}/100 as a {horizon_label.lower()} idea "
         f"({rec['risk'].lower()} risk). Accumulate in the ₹{entry['low']}–₹{entry['high']} zone "
         f"with a stop at ₹{rec['stop_loss']}, targeting ₹{t[0]}"
         + (f" and ₹{t[1]}" if len(t) > 1 else "")
         + f" — an expected move of about {rec['expected_return_pct']:+.1f}%. "
-        f"Reasoning is driven by live technicals: {rec['technical_reasons'][0] if rec['technical_reasons'] else 'positive setup'}"
+        + reasoning
     )
     news = (
         f"No stock-specific news feed is modeled for this recommendation. "
@@ -973,9 +1023,24 @@ async def _advisor_ai_enrich(recs: list, horizon_label: str, risk_appetite, capi
     engine = get_debate_engine()
     lines = []
     for r in recs:
+        # D6.8-A — A MODEL MAY NOT BE HANDED A NUMBER THE PLATFORM DOES NOT HAVE.
+        #
+        # `RSI {r.get('rsi')}` printed `RSI None` when the reading was absent —
+        # under a system prompt asserting these are REAL pre-computed technicals
+        # — and printed a substituted `RSI 50.0` before this phase removed the
+        # substitution. Either way the model was asked to explain a number
+        # nobody measured, and its whole job here is to be persuasive about it.
+        #
+        # An absent field is LABELLED rather than dropped, because a silently
+        # missing line reads to a model as an omission it may fill in, while
+        # "not enough price history to compute" is a fact it can state.
+        # `describe_field` is the one formatter for this, shared with every
+        # other surface, and its vocabulary is provider-free by construction.
         lines.append(
             f"- {r['symbol']} ({r['name']}, {r['sector']}): live price ₹{r['price']}, "
-            f"RSI {r.get('rsi')}, volume {r.get('volume_ratio')}x avg, pattern "
+            f"RSI {field_quality.describe_field(r, 'rsi')}, "
+            f"volume {field_quality.describe_field(r, 'volume_ratio')}"
+            f"{'x avg' if field_quality.is_available(r, 'volume_ratio') else ''}, pattern "
             f"'{r.get('pattern') or 'none'}', confidence {r['confidence']}/100, {r['risk']} risk, "
             f"entry ₹{r['entry_zone']['low']}-₹{r['entry_zone']['high']}, SL ₹{r['stop_loss']}, "
             f"targets {r['targets']}, sector today: {r['sector_strength']}"
@@ -984,7 +1049,11 @@ async def _advisor_ai_enrich(recs: list, horizon_label: str, risk_appetite, capi
     system_msg = (
         "You are AlphaPartner's senior equity strategist for Indian markets (NSE/BSE). "
         "You are given REAL, pre-computed price levels and technicals — never change or invent "
-        "any number, only explain them. For EACH stock write a crisp 2-3 sentence 'summary' "
+        "any number, only explain them. Some technical readings may be given as a short "
+        "phrase instead of a number (for example 'not enough price history to compute'); "
+        "that field is genuinely unavailable — say so plainly if it matters, and never "
+        "estimate, assume or substitute a value for it. "
+        "For EACH stock write a crisp 2-3 sentence 'summary' "
         "(why it fits this horizon, referencing the given levels) and a 1-2 sentence 'news_impact' "
         "(likely news/earnings catalysts and risks for that sector — be honest, no fabricated headlines). "
         "Return ONLY a JSON object mapping each SYMBOL to {\"summary\": str, \"news_impact\": str}."
@@ -1169,15 +1238,29 @@ async def build_advisor_recommendations(
             "entry_zone": {"low": entry_low, "high": entry_high},
             "stop_loss": stop_loss,
             "targets": targets,
-            "technical_reasons": tech_reasons[:4] or ["Constructive technical setup on the daily timeframe."],
+            # D6.8-A — the fallback used to read "Constructive technical setup
+            # on the daily timeframe", which is a claim about the chart made
+            # precisely when the scorer had nothing to say about it. It fired
+            # rarely before, because every branch above emitted a sentence from
+            # a coalesced value; now that the sentences are gated on real
+            # readings it is the honest answer for a stock with no technicals,
+            # and it has to BE honest. It states the absence instead.
+            "technical_reasons": tech_reasons[:4] or [
+                "No technical indicator readings are available for this stock, "
+                "so this recommendation is not supported by technical evidence."
+            ],
             "fundamental_reasons": fundamental_reasons,
             "news_impact": "",
             "sector_strength": sector_strength,
             "ai_summary": "",
             "price": round(price, 2),
             "horizon": horizon,
-            "rsi": quote.get("rsi"),
-            "volume_ratio": quote.get("volume_ratio"),
+            # D6.8-A — readings, not whatever the quote dict happened to carry.
+            # Both keys are rendered on the advisor card AND fed to the model in
+            # `_advisor_ai_enrich`, so a substitute here becomes a number the AI
+            # is asked to explain.
+            "rsi": field_quality.reading(quote, "rsi"),
+            "volume_ratio": field_quality.reading(quote, "volume_ratio"),
             "pattern": pattern_name,
         }
         scored.append(rec)
@@ -2235,14 +2318,29 @@ async def explain_stock(data: StockAnalysisRequest, user: dict = Depends(get_cur
             raise HTTPException(status_code=404, detail="Stock not found")
         raise HTTPException(status_code=503, detail="Live market data temporarily unavailable for this stock")
     name = data.name or quote.get("name", data.symbol)
+    # D6.8-A — this prompt used to index `quote['rsi']`, `quote['volume_ratio']`
+    # and `quote['macd']` directly. Those keys were guaranteed non-null only
+    # because `fetch_real_stock_quote` substituted 50.0 / 1.0 / 0.0 for them, so
+    # the debate that produced the user's "why this could be a good trade" was
+    # reasoning about a fabricated RSI on any stock without 15 bars of history —
+    # and on a stock WITH them, about a reading that might be a day out of date.
+    #
+    # Each line now states the reading or states why there is none, in the
+    # platform's one shared vocabulary. No provider is named and no exception
+    # text is exposed: `describe` maps a closed enum to fixed English.
+    volume_ratio_line = field_quality.describe_field(quote, "volume_ratio")
+    if field_quality.is_available(quote, "volume_ratio"):
+        volume_ratio_line += "x"
     prompt = f"""Analyze this NSE stock for intraday trading:
 Stock: {name} ({data.symbol})
 Price: INR {quote['price']}
-RSI: {quote['rsi']}
-Volume vs Avg: {quote['volume_ratio']}x
+RSI: {field_quality.describe_field(quote, 'rsi')}
+Volume vs Avg: {volume_ratio_line}
 Sector: {quote['sector']}
-MACD: {quote['macd']}
+MACD: {field_quality.describe_field(quote, 'macd')}
 VWAP: {quote['vwap']}
+
+{_UNAVAILABLE_FIELD_INSTRUCTION}
 
 Explain: WHY this stock could be a good trade, momentum factors, entry reasoning, risks, and what to watch after entering. Simple language, bullet points, under 200 words."""
 
@@ -5251,17 +5349,40 @@ async def zerodha_positions(user: dict = Depends(get_current_user)):
         return {"source": "zerodha", "net": [], "day": [], "error": e.user_message}
 
 @zerodha_router.post("/order")
-async def zerodha_order(request: Request, user: dict = Depends(get_current_user)):
-    body = await request.json()
+async def zerodha_order(order: ZerodhaOrderCreate, user: dict = Depends(get_current_user)):
+    """Place a LIVE order in the user's sole Zerodha account (legacy route).
+
+    D6.8 GAP / G-1 — THE BODY IS VALIDATED BEFORE ANY ACCOUNT IS RESOLVED.
+    ---------------------------------------------------------------------
+    This handler took `request: Request` and indexed `await request.json()`
+    directly. Nothing checked the numbers it handed to a live brokerage account:
+    `quantity` of -50, 0, 1_000_000_000, 1.5 and `"abc"`, a `transaction_type`
+    of "STEAL", an `order_type` of "WHATEVER", a negative `price` and a
+    5,000-character symbol were all forwarded to the Kite adapter and answered
+    200 — while `/api/brokers/accounts/{id}/orders`, which performs the same
+    irreversible operation through the same engine, refused every one of them
+    with 422. A missing `symbol` or `quantity` raised `KeyError` and became a
+    500 rather than a 422.
+
+    `ZerodhaOrderCreate` is `BrokerOrderCreate` with this route's own historical
+    defaults, so there is ONE set of order constraints and not two that must
+    agree. The payload built below is byte-identical to the old one for any
+    request that was already valid: the fix removes reachable states, it does
+    not move a valid order.
+
+    The authorization boundary is unchanged and was never the gap: identity
+    (`get_current_user`) → owner-scoped account (`_sole_account`) → live session
+    (`BrokerEngine.get_session`) → capability (`BrokerGateway.require_capability`).
+    """
     try:
         result = await broker_engine.place_order(await _sole_account(user, "zerodha"), {
-            "symbol": body["symbol"],
-            "transaction_type": body.get("transaction_type", "BUY"),
-            "quantity": body["quantity"],
-            "price": body.get("price"),
-            "order_type": body.get("order_type", "LIMIT"),
-            "product": body.get("product", "MIS"),
-            "exchange": body.get("exchange", "NSE"),
+            "symbol": order.symbol,
+            "transaction_type": order.transaction_type,
+            "quantity": order.quantity,
+            "price": order.price,
+            "order_type": order.order_type,
+            "product": order.product,
+            "exchange": order.exchange,
         })
         return {"source": "zerodha", "order_id": result.get("order_id"), "status": "PLACED"}
     except BrokerError as e:
@@ -5332,19 +5453,68 @@ async def zerodha_account(user: dict = Depends(get_current_user)):
     }
 
 @zerodha_router.post("/quick-trade")
-async def zerodha_quick_trade(request: Request, user: dict = Depends(get_current_user)):
-    """One-click trade from AI picks — places order on Zerodha + creates trade record."""
-    try:
-        body = await request.json()
-        symbol = body["symbol"]
-        entry = float(body["entry_price"])
-        qty = int(body["quantity"])
-        sl = float(body["stop_loss"])
-        t1 = float(body["target1"])
-        t2 = float(body.get("target2", 0)) or None
-        stock_name = body.get("stock_name", symbol)
-    except (KeyError, ValueError, TypeError) as e:
-        raise HTTPException(status_code=400, detail=f"Invalid payload: missing or malformed {str(e)}")
+async def zerodha_quick_trade(order: ZerodhaQuickTradeCreate,
+                              user: dict = Depends(get_current_user)):
+    """One-click trade from AI picks — places order on Zerodha + creates trade record.
+
+    D6.8 GAP / G-2 — THE THIRD TRADE-ENTRY SURFACE NOW OBEYS THE SAME TWO GATES.
+    ---------------------------------------------------------------------------
+    This route does exactly what `POST /api/trades` does — place a live entry
+    order, then write a `db.trades` row the auto-exit engine will act on — and it
+    did it with neither of that route's gates:
+
+    * **No bounds.** It read the raw body and called `float()`/`int()`, which
+      accept `-5`, `0`, `1e9` and `Infinity`. `quantity: -5` and
+      `entry_price: -100` reached the Kite adapter AND were written to the
+      journal. `ZerodhaQuickTradeCreate` is spelled in the same aliases as
+      `TradeCreate` and `PaperTradeCreate` (PH3.12R / B-1), so the three cannot
+      drift.
+    * **No Risk Manager.** `stop_loss: 150` on a `entry_price: 100` BUY was
+      accepted, which is not merely an unenforced discipline limit: it writes a
+      trade whose stop is ALREADY breached at entry, and the auto-exit engine
+      reads that row. `/api/trades` refuses it with 422.
+
+    THE INVARIANT THE RISK CHECK FOLLOWS (and why it is not on every route)
+    ----------------------------------------------------------------------
+    A route that **creates a `db.trades` row** runs `validate_trade`; a route
+    that only **relays an order to the broker** does not. That is not a
+    convenience — `validate_trade` evaluates entry/stop/target relationships and
+    daily limits, and the relay routes (`/zerodha/order`,
+    `/brokers/{broker}/orders`, `/brokers/accounts/{id}/orders`) carry no stop
+    and no target, so there is nothing for it to evaluate. `/zerodha/emergency-stop`
+    is on the relay side for a stronger reason: it only ever CLOSES positions, and
+    a user who has hit their daily loss limit must still be able to flatten.
+
+    `validate_trade` is a personal risk-discipline function, not an authorization
+    boundary: it resolves no account, proves no ownership, checks no capability
+    and persists nothing. The authorization boundary here is the same one every
+    order route has — identity → `_sole_account` → session → capability — and it
+    ran before this change too.
+    """
+    symbol = order.symbol
+    entry = order.entry_price
+    qty = order.quantity
+    sl = order.stop_loss
+    t1 = order.target1
+    t2 = order.target2 or None
+    stock_name = order.stock_name or symbol
+
+    # Risk Manager gate — the same call, on the same inputs, as POST /api/trades.
+    # Runs BEFORE the account is resolved and before any broker call, so a
+    # refusal cannot have placed an order.
+    from services import trading_engine
+    trades_today, realized_today = await _risk_inputs(user["_id"])
+    check = trading_engine.validate_trade(user, {
+        "symbol": symbol, "type": "BUY", "entry_price": entry, "quantity": qty,
+        "stop_loss": sl, "target1": t1, "target2": t2,
+    }, trades_today, realized_today)
+    if not check["approved"]:
+        raise HTTPException(status_code=422, detail={
+            "message": "Risk check failed — trade was not placed.",
+            "violations": check["violations"],
+            "warnings": check["warnings"],
+            "metrics": check["metrics"],
+        })
 
     # Place LIVE order on Zerodha via the Broker Engine (no simulation)
     try:
@@ -5373,7 +5543,7 @@ async def zerodha_quick_trade(request: Request, user: dict = Depends(get_current
         "pnl": None,
         "entry_time": datetime.now(timezone.utc).isoformat(),
         "zerodha_order_id": order_result.get("order_id"),
-        "ai_confidence": body.get("confidence"),
+        "ai_confidence": order.confidence,
     }
     result = await db.trades.insert_one(trade_doc)
     trade_doc["_id"] = str(result.inserted_id)
@@ -5760,16 +5930,96 @@ async def zerodha_callback(request: Request):
     """
     return await broker_oauth_callback("zerodha", request)
 
+#: Largest Kite postback body this endpoint will read. A real Kite order
+#: postback is well under a kilobyte; 64 KiB leaves three orders of magnitude of
+#: headroom for a field Zerodha adds later. See `zerodha_postback` for why a
+#: bound is the load-bearing control on an endpoint nothing authenticates.
+ZERODHA_POSTBACK_MAX_BYTES = 64 * 1024
+
+#: How long a recorded postback is kept. Nothing reads the collection yet
+#: (LIM-D6.8-4), so the only reason to hold one is forensic — long enough to
+#: investigate a settlement dispute, short enough that the collection has a
+#: ceiling instead of a slope.
+ZERODHA_POSTBACK_RETENTION_DAYS = 30
+
+
 @zerodha_router.post("/postback")
 async def zerodha_postback(request: Request):
-    """Handle Zerodha order postback webhooks."""
+    """Record a Zerodha order postback. Unauthenticated by protocol.
+
+    WHAT THIS ENDPOINT IS, AND WHAT IT IS NOT (D6.8 GAP / G-3..G-5)
+    --------------------------------------------------------------
+    It is a bounded, idempotent, NON-AUTHORITATIVE recorder. It writes to exactly
+    one collection, `db.zerodha_postbacks`, which nothing in the platform reads.
+    It resolves no user, touches no order, trade, session or account, sends no
+    notification and makes no broker call — verified by asserting every other
+    collection is untouched, not by reading this docstring.
+
+    **It is not authenticated, and nothing here pretends otherwise.** Kite
+    Connect does publish a `checksum` on the postback, and verifying it is the
+    prerequisite for the FIRST consumer of this data — not for storing it.
+    Recording an unverified message is safe; acting on one is not. That gate is
+    LIM-D6.8-4 and is deliberately still open: a signature check written from
+    memory rather than from Zerodha's live specification is worse than none,
+    because the first real postback it wrongly rejects gets it relaxed to fail
+    open.
+
+    So the controls that ARE available without authenticating the sender:
+
+    * **A size bound (G-3).** This was the only reachable harm. A 2 MB body was
+      stored verbatim, MongoDB accepts documents up to 16 MB, the collection had
+      no TTL and nothing ever pruned it — so an anonymous caller could grow the
+      platform's database at roughly a gigabyte a minute per source address
+      (the global 60 req/min/IP limiter is the only other brake, and it bounds
+      the COUNT, not the volume). `Content-Length` is checked before the body is
+      read, and the read itself is capped, so a lying header does not help.
+    * **Idempotency by content (G-5).** The dedupe key is a digest of the raw
+      bytes, so Kite's own retries and an attacker's replay both collapse to one
+      row. Keying on `order_id` instead would have let a forged payload OVERWRITE
+      a genuine record — an inert bug today, a landmine for the consumer that
+      verifies checksums tomorrow.
+    * **Retention (G-6).** A TTL index reaps rows after
+      `ZERODHA_POSTBACK_RETENTION_DAYS`, so the collection has a ceiling.
+    * **Faithful storage.** The body is stored as received and is NOT reshaped to
+      a schema. That is deliberate and it is the one place where "validate
+      strictly" would do harm: a future checksum verification must run over what
+      Zerodha actually sent, and a field dropped here is evidence destroyed. The
+      bound, not the shape, is the control.
+    * **A constant response.** Always `200 {"status": ...}`, carrying nothing
+      about whether the order exists, whom it belongs to, or whether it was
+      stored as new. A caller learns nothing it did not already know.
+
+    G-4: a non-object body (a JSON array, a bare number) used to be INSERTED and
+    then answered `{"status": "error"}` — the row was written before
+    `body.get(...)` raised on it. The shape is checked before the write now, so
+    the answer and the effect agree.
+    """
+    declared = request.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > ZERODHA_POSTBACK_MAX_BYTES:
+        return _JSONResponse(status_code=413, content={"status": "too_large"})
     try:
-        body = await request.json()
-        await db.zerodha_postbacks.insert_one({
-            "data": body,
-            "received_at": datetime.now(timezone.utc).isoformat(),
-        })
-        logger.info(f"Zerodha postback received: {body.get('order_id', 'unknown')}")
+        raw = await request.body()
+        if len(raw) > ZERODHA_POSTBACK_MAX_BYTES:
+            return _JSONResponse(status_code=413, content={"status": "too_large"})
+        body = json.loads(raw)
+        if not isinstance(body, dict):
+            # Checked BEFORE the write (G-4). Kite sends a JSON object; anything
+            # else is not a postback and is not recorded.
+            logger.warning("Zerodha postback ignored: body was %s, not an object",
+                           type(body).__name__)
+            return {"status": "error"}
+        digest = hashlib.sha256(raw).hexdigest()
+        await db.zerodha_postbacks.update_one(
+            {"body_sha256": digest},
+            {"$setOnInsert": {
+                "body_sha256": digest,
+                "data": body,
+                "received_at": datetime.now(timezone.utc).isoformat(),
+                "expires_at": datetime.now(timezone.utc) + timedelta(
+                    days=ZERODHA_POSTBACK_RETENTION_DAYS),
+            }},
+            upsert=True)
+        logger.info("Zerodha postback received: %s", body.get("order_id", "unknown"))
         return {"status": "ok"}
     except Exception as e:
         logger.error(f"Postback error: {e}")
@@ -6054,6 +6304,24 @@ async def _publish_watchlist_updated(user_id: str, action: str, symbol: str):
 
 # ============ ENHANCED AI EXPLAIN ============
 
+#: What a model must do with a technical field it is given as a phrase rather
+#: than a number (D6.8-A).
+#:
+#: One sentence, defined once and used by every prompt that can carry an
+#: unavailable reading, because the instruction has to say the same thing in
+#: every prompt or the model will treat the phrasing itself as a signal.
+_UNAVAILABLE_FIELD_INSTRUCTION = (
+    "Any field above given as a phrase rather than a number is genuinely "
+    "unavailable: do not estimate it, do not assume a value for it, and do not "
+    "describe it as if you had measured it."
+)
+
+#: Which quote field each `/analysis/full-report` scoring factor reads.
+#: Declared so a factor that could not be assessed can say *why* in the
+#: platform's shared vocabulary rather than with a bespoke string per branch.
+_FACTOR_FIELD = {"RSI": "rsi", "Volume": "volume_ratio", "Price Action": "change_pct"}
+
+
 @analysis_router.post("/full-report")
 async def full_ai_report(data: StockAnalysisRequest, user: dict = Depends(get_current_user)):
     """Generate comprehensive AI analysis report with full transparency."""
@@ -6070,40 +6338,70 @@ async def full_ai_report(data: StockAnalysisRequest, user: dict = Depends(get_cu
     name = data.name or quote["name"]
 
     # Scoring breakdown
+    #
+    # D6.8-A — THIS BLOCK INDEXED `quote["rsi"]` AND COMPARED IT.
+    #
+    # It worked only because `fetch_real_stock_quote` guaranteed a non-null RSI
+    # by substituting 50.0 for one it did not have, so removing that
+    # substitution (STEP 9) would have turned this route into a 500 on every
+    # stock with under 15 bars of history. This is the consumer-safety half of
+    # "make every consumer safe, THEN remove the defaults".
+    #
+    # The `reason` strings are the point, not the arithmetic: they are published
+    # as a scoring breakdown a user reads to decide whether to trade. A factor
+    # scored from a substitute keeps its score (no score moves in this phase)
+    # and loses its claim, exactly as the ranking engine's evidence does.
     score = 0
     breakdown = []
-    rsi = quote["rsi"]
+
+    def _factor(name: str, points: int, maximum: int, reason: Optional[str]) -> None:
+        """One scoring row. `reason=None` means "scored, nothing to say"."""
+        nonlocal score
+        score += points
+        row = {"factor": name, "score": points, "max": maximum}
+        if reason:
+            row["reason"] = reason
+        else:
+            row["reason"] = (
+                f"{name} could not be assessed — "
+                f"{field_quality.describe(field_quality.quality_of(quote, _FACTOR_FIELD[name]))}."
+            )
+            row["available"] = False
+        breakdown.append(row)
+
+    rsi = field_quality.scoring_input(quote, "rsi", 50.0)
+    rsi_known = field_quality.is_available(quote, "rsi")
     if 55 < rsi < 70:
-        score += 20
-        breakdown.append({"factor": "RSI", "score": 20, "max": 20, "reason": f"RSI at {rsi} — bullish momentum without being overbought"})
+        _factor("RSI", 20, 20, rsi_known and f"RSI at {rsi} — bullish momentum without being overbought")
     elif rsi >= 70:
-        score += 5
-        breakdown.append({"factor": "RSI", "score": 5, "max": 20, "reason": f"RSI at {rsi} — overbought territory, may pull back"})
+        _factor("RSI", 5, 20, rsi_known and f"RSI at {rsi} — overbought territory, may pull back")
     else:
-        score += 10
-        breakdown.append({"factor": "RSI", "score": 10, "max": 20, "reason": f"RSI at {rsi} — moderate momentum"})
+        _factor("RSI", 10, 20, rsi_known and f"RSI at {rsi} — moderate momentum")
 
-    vol_ratio = quote["volume_ratio"]
+    vol_ratio = field_quality.scoring_input(quote, "volume_ratio", 1.0)
+    vol_known = field_quality.is_available(quote, "volume_ratio")
     if vol_ratio > 1.5:
-        score += 20
-        breakdown.append({"factor": "Volume", "score": 20, "max": 20, "reason": f"Volume {vol_ratio}x above average — strong institutional interest"})
+        _factor("Volume", 20, 20, vol_known and f"Volume {vol_ratio}x above average — strong institutional interest")
     else:
-        score += 8
-        breakdown.append({"factor": "Volume", "score": 8, "max": 20, "reason": f"Volume {vol_ratio}x — below average activity"})
+        _factor("Volume", 8, 20, vol_known and f"Volume {vol_ratio}x — below average activity")
 
-    change_pct = quote["change_pct"]
+    change_pct = field_quality.scoring_input(quote, "change_pct", 0.0)
+    change_known = field_quality.is_available(quote, "change_pct")
     if change_pct > 0.5:
-        score += 20
-        breakdown.append({"factor": "Price Action", "score": 20, "max": 20, "reason": f"Up {change_pct}% today — positive momentum"})
+        _factor("Price Action", 20, 20, change_known and f"Up {change_pct}% today — positive momentum")
     elif change_pct > -0.5:
-        score += 12
-        breakdown.append({"factor": "Price Action", "score": 12, "max": 20, "reason": f"Flat at {change_pct}% — consolidating"})
+        _factor("Price Action", 12, 20, change_known and f"Flat at {change_pct}% — consolidating")
     else:
-        score += 5
-        breakdown.append({"factor": "Price Action", "score": 5, "max": 20, "reason": f"Down {change_pct}% — bearish pressure"})
+        _factor("Price Action", 5, 20, change_known and f"Down {change_pct}% — bearish pressure")
 
-    vwap = quote["vwap"]
-    if quote["price"] > vwap:
+    vwap = quote.get("vwap")
+    if vwap is None or quote.get("price") is None:
+        score += 8
+        breakdown.append({
+            "factor": "VWAP", "score": 8, "max": 20, "available": False,
+            "reason": "VWAP could not be assessed — the session's range is not available.",
+        })
+    elif quote["price"] > vwap:
         score += 20
         breakdown.append({"factor": "VWAP", "score": 20, "max": 20, "reason": f"Price INR {quote['price']} above VWAP INR {vwap} — buyers in control"})
     else:
@@ -6128,10 +6426,14 @@ async def full_ai_report(data: StockAnalysisRequest, user: dict = Depends(get_cu
     def _na(v):
         return v if v is not None else "unavailable"
 
+    change_line = field_quality.describe_field(quote, "change_pct") + ("%" if change_known else "")
+    rsi_line = field_quality.describe_field(quote, "rsi")
+    macd_line = field_quality.describe_field(quote, "macd")
+    vol_line = field_quality.describe_field(quote, "volume_ratio") + ("x avg" if vol_known else "")
     prompt = f"""Deep analysis for {name} ({data.symbol}):
-Price: INR {quote['price']} ({quote['change_pct']}%)
-RSI: {rsi} | MACD: {quote['macd']} | Volume: {vol_ratio}x avg
-VWAP: {vwap} | Sector: {quote['sector']}
+Price: INR {quote['price']} ({change_line})
+RSI: {rsi_line} | MACD: {macd_line} | Volume: {vol_line}
+VWAP: {_na(vwap)} | Sector: {quote['sector']}
 52W Range: {_na(quote['week_52_low'])} - {_na(quote['week_52_high'])}
 P/E: {_na(quote['pe_ratio'])} | Market Cap: {_na(quote['market_cap_cr'])} Cr
 
@@ -8045,6 +8347,14 @@ async def ensure_indexes():
     await db.recovery_tokens.create_index("token_id", unique=True)
     await db.recovery_tokens.create_index([("user_id", 1), ("purpose", 1)])
     await db.recovery_tokens.create_index("expires_at", expireAfterSeconds=0)
+    # Zerodha postbacks (D6.8 gap / G-5, G-6) — an unauthenticated endpoint
+    # writes here, so the collection needs a ceiling and not a slope. The unique
+    # index on the body digest is what makes a replayed delivery idempotent (and
+    # is enforced by the database, not only by the upsert filter); the TTL index
+    # reaps rows once past their retention Date. Nothing reads the collection
+    # yet — LIM-D6.8-4.
+    await db.zerodha_postbacks.create_index("body_sha256", unique=True)
+    await db.zerodha_postbacks.create_index("expires_at", expireAfterSeconds=0)
     await db.feature_flags.create_index("key", unique=True)
     await db.announcements.create_index("created_at")
     await db.support_tickets.create_index("status")

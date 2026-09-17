@@ -5546,3 +5546,305 @@ has no such attribute, so `delete_conversation`'s
 `getattr(res, "modified_count", 0)` reported **0 for every real deletion**
 (confirmed on mongod) and the true count in every test. This is the same shape
 as PH2's stub that agreed with the bug.
+
+## D6.8-GAP-1 — Calling a risk check is not an authorization boundary
+
+**Decision.** `validate_trade` is **not** added to the broker relay routes
+(`/zerodha/order`, `/brokers/{broker}/orders`,
+`/brokers/accounts/{id}/orders`, `/zerodha/emergency-stop`). The rule is:
+*a route that creates a `db.trades` row runs the Risk Manager; a route that only
+relays an order to the broker does not.*
+
+**Why.** `validate_trade(user, trade, trades_today, today_realized_pnl)` takes
+no account, no session, no database and no request — it cannot resolve an
+account, prove ownership, read a session or check a capability, and it writes no
+artifact anything could later verify. Skipping it crosses no boundary. And
+`BrokerOrderCreate` carries no `entry_price`, `stop_loss` or `target1`, which
+are the only relationships it evaluates, so bolting it on would produce a route
+that "runs the risk check" and can never fail it — an unfalsifiable control,
+which is worse than an absent one. `/zerodha/emergency-stop` is excluded for a
+stronger reason: it only closes positions, and a user who has hit their daily
+loss limit must still be able to flatten.
+
+`/zerodha/quick-trade` IS given the gate, because it writes a trade row and
+places a live order — the same operation as `POST /api/trades`. Its absence
+there was not only an unenforced discipline limit: `stop_loss: 150` on an
+`entry_price: 100` BUY wrote a trade whose stop was already breached at entry,
+and the auto-exit engine reads that row.
+
+## D6.8-GAP-2 — A validation fix must not move a valid order
+
+**Decision.** `ZerodhaOrderCreate` subclasses `BrokerOrderCreate` and overrides
+only its two historical defaults (`order_type=LIMIT`, `product=MIS`).
+
+**Why.** Adopting the parent's `MARKET` default would have silently turned every
+caller's omitted order type from a price-bounded order into an unbounded one at
+a live broker. Subclassing rather than restating is the PH3.12R/B-1 rule: a
+copied constraint drifts, and the drift is invisible because nothing links the
+two declarations. Two parametrized mutants (`G1b`, `G1c`) exist solely to kill a
+silent default change.
+
+## D6.8-GAP-3 — `Field(ge=0)` admits Infinity
+
+**Decision.** Every persisted or broker-bound price field carries
+`allow_inf_nan=False`: `BrokerOrderCreate`, `BrokerOrderModify`,
+`TradeCreate.target2/target3`, `TradeModify`, `TradeExitRequest`.
+
+**Why.** `inf >= 0` is True, Starlette parses request bodies with `json.loads`,
+and `json.loads` accepts the non-standard `Infinity` literal — so
+`{"price": Infinity}` passed validation on **every** order route, including the
+account-addressed one D6.8 certified, and was handed to the live adapter. `NaN`
+was refused only because `nan >= 0` is False: an accident of comparison, not a
+bound. `models.py` documents this exact trap above `TradeSide`;
+`BrokerOrderCreate` had never picked it up. `POST /api/trades` with
+`target2: Infinity` **wrote the trade row** and then failed serializing its own
+response — a 500 to the caller, an infinite target in the journal.
+
+It is invisible to any test that uses a client's `json=` argument, which raises
+`ValueError` in the test process instead of issuing a request. The tests send
+the literal as raw bytes.
+
+## D6.8-GAP-4 — An unauthenticated webhook is bounded, not authenticated
+
+**Decision.** `/api/zerodha/postback` gets a 64 KiB size bound (header-checked
+before the body is read, and re-checked on the bytes actually read), a
+content-digest idempotency key, a 30-day TTL and a shape check before the write.
+The body is stored **as received**, not reshaped to a schema. The Kite checksum
+is **not** implemented.
+
+**Why.** The only reachable harm was volume: a 2 MB body stored verbatim, no
+TTL, nothing pruning — roughly a gigabyte a minute of database growth per source
+address, since the `PUBLIC_API` limiter bounds the count and not the size.
+Everything else the endpoint could do, it already did not do: nine collections
+were snapshotted byte-for-byte across nine attack payloads and none moved.
+
+The digest is the dedupe key rather than `order_id` because keying on
+`order_id` would let a forged payload **overwrite a genuine record** — inert
+while nothing reads the collection, a planted lie for the first consumer that
+does.
+
+The body is not schema-validated because a future checksum must run over what
+Zerodha actually sent; a field dropped at the door is evidence destroyed. The
+bound, not the shape, is the control.
+
+The checksum is deferred because its construction was not confirmed against
+Zerodha's live specification, and a signature check written from memory is worse
+than none: the first real postback it wrongly rejects gets it relaxed to fail
+open. Recording an unverified message is safe; acting on one is not — and an AST
+sweep over every production module fails the moment `db.zerodha_postbacks`
+acquires any operation beyond its writer and its indexes. That test is the gate.
+
+## D6.8-GAP-5 — Layered guards need tests that can tell them apart
+
+**Decision.** The postback's two size checks are asserted by two tests that each
+defeat the other guard: a chunked request with no `Content-Length` (only the
+body measurement can refuse it) and a huge declared length with a generator body
+that records whether it was consumed (proving the refusal precedes the read).
+
+**Why.** Both size mutants initially SURVIVED. Every size test went through
+`httpx`, which always sets `Content-Length`, so the header check alone satisfied
+all of them and deleting the body check changed nothing any test could observe.
+Two redundant guards behind one shared status code are one guard as far as the
+suite is concerned. The general rule: when two controls produce the same
+observable, at least one test must assert the observable that distinguishes
+them.
+
+## D6.8-GAP-6 — A silently-ignored operator is the worst test-double defect
+
+**Decision.** `FakeDB._apply_update` implements `$setOnInsert`, with an
+`inserting` flag so it applies on the upsert path only.
+
+**Why.** The double ignored the operator entirely, in both paths. An endpoint
+whose only write is `$setOnInsert` stored a document containing nothing but its
+filter keys — so every assertion about what it recorded was unfalsifiable while
+the endpoint itself was correct. Same family as D6.8-7's `modified_count` on
+deletes and PH2's stub that agreed with the bug, with the sign reversed: this
+one disagreed with correct code and would have driven a "fix" to working
+production.
+
+# ADR-065 — A number is a measurement or it is a state, and the producer is the only layer that knows which (D6.8-A)
+
+**Status:** Accepted (2026-09-17). Uncommitted; branch `d61-security-p0`.
+
+## A naming collision, resolved before anything else
+
+Three separate pieces of work have been called "D6.8" or "D6.9" in this
+repository. They are different phases and none of them is renamed here:
+
+| Name | Scope | Status |
+|---|---|---|
+| **D6.8-A — Data Quality / Intelligence Isolation** | D6-Q1's six-state `FieldQuality` over market-data fields | **this ADR** |
+| **D6.8-B — Entitlements & Capability Authorization** | who may invoke what (ADR under "D6.8 — ENTITLEMENTS") | complete, 2026-09-13 |
+| **D6.9-A — AI Artifact Provenance & Freshness** | ADR-064, `services/ai_provenance.py` | complete |
+
+`.claude/TASK.md` §I assigns *data quality* to D6.8 and entitlement to D6.9;
+the implementation order ran the other way round. The history stands as written.
+From here the suffixed names are the ones to use.
+
+## Context
+
+ADR-058 (D5.19) established the platform's evidence rule — "a system that cannot
+distinguish *neutral* from *we do not know* must not be given a microphone" —
+and said, in its own text, that it had fixed the **instance** and not the
+**class**:
+
+> Every defect above is one bug written eight times: `x or default`.
+
+The coalescing survived it. `ranking_engine.dimension_is_supported` asked
+`quote.get(field) is not None`, and that two-state predicate had to stand in for
+five genuinely different situations: a newly listed stock with no 26-bar MACD; a
+broker feed that carries no indicators at all; a vendor that raised while
+supplying the bar series; a field the payload simply omitted; and — the one it
+could not express even in principle — **a real reading from a feed that stopped
+advancing this morning**, which is a number, and therefore scored as fresh.
+
+Two consequences were measured rather than reasoned about.
+
+**The advisor and the AI Picks card published fabricated sentences.** Driven
+against the pre-D6.8-A scorer with what `fetch_real_stock_quote` actually gave
+it — the substituted `rsi = 50.0` — a stock whose RSI had never been computed
+was published as:
+
+```
+    rsi: 50.0
+    confidence: 65
+    reasons: ["RSI is at a strong bullish zone of 50.0"]
+```
+
+under an entry, a stop and a target.
+
+**`/analysis/explain` and `/analysis/full-report` asked a model to explain those
+numbers**, under a system prompt asserting "You are given REAL, pre-computed
+price levels and technicals — never change or invent any number, only explain
+them."
+
+## Decision
+
+**Four decisions, in dependency order.**
+
+**1. Quality is a property of a field, carried beside it.**
+`services/market_engine/field_quality.py` defines the six states D6-Q1 names and
+nothing else. It travels as one sidecar key (`field_quality`) on the canonical
+quote — never as a wrapper around the value — so no consumer's arithmetic
+changes and the payload shape stays identical across every tier, which is what
+`test_the_payload_shape_is_identical_across_tiers` exists to protect.
+
+**MISSING and UNAVAILABLE are distinguished by scope, and the distinction was
+already in the code.** `fetch_all_universe_quotes` and `derive_technicals` both
+tell these apart and both used to discard the difference:
+
+    UNAVAILABLE  the input record this field derives from was never served
+    MISSING      the record was served and this field is not in it
+
+A quote with no bar series has no input for *any* indicator (UNAVAILABLE); a
+quote with a bar series and no session volume has an input for `avg_volume` and
+none for `volume_ratio` (MISSING). The vocabulary is the repository's own:
+`Freshness.UNAVAILABLE` in `ai_provenance` already means "there is no successful
+generation, so there is no age to report". MISSING is also the **safest
+default** — it is byte-for-byte what `value is None` meant before — so a path
+that has not been taught to classify cannot make a stronger claim than the old
+code made.
+
+**2. The producer classifies, because it is the only layer that can.**
+`derive_technicals` knew that RSI needs 15 bars, MACD 26 and the volume baseline
+21, and collapsed all three into `None`. It now says which, and it says
+PROVIDER_ERROR when a vendor's series is unusable — each indicator computed
+inside its own guard, so a malformed series costs that indicator rather than
+raising out of the universe fetch and deleting the symbol from the market.
+
+**3. STALE is derived on read, from a real observation instant.** The window is
+not a tuned number: every quality-tracked field is computed from **daily** bars,
+so the reading a payload carries is the newest daily bar and stays operative
+until the series advances to the next session. NSE runs one session per trading
+day at a fixed clock, so a bar older than one day means the series did not
+advance into a session that has since opened. Checked against the live cadence:
+NSE daily bars are stamped at the 09:15 IST open, so at 09:14 the newest bar is
+23h59m old and still current, and by 09:16 the new one has arrived — the window
+never fires during a normal session and fires within a minute of a feed that has
+stopped.
+
+The instant is the **bar's own timestamp**, not the quote's `timestamp`: that
+field falls back to `datetime.now()` in `_normalize_yahoo_quote` because the
+vendor payload carries no quote time, so a quote from a dead feed would be
+stamped with the moment it was *served* and could never be classified stale. A
+payload with no honest observation instant carries none and is never called
+stale — `ai_provenance`'s rule 3, restated.
+
+**4. The scores do not move.** D6-Q1 is explicit: "Scores stay unchanged; only
+what the platform claims changes." Every `or 50.0` / `or 1.0` / `or 0.0` is now
+`field_quality.scoring_input(quote, field, placeholder)`, which **is** that
+expression numerically — asserted directly and exhaustively, not inferred from
+the goldens. What changed is that the substitution is no longer invisible: it is
+named at every site, and the separate question of whether the platform may *say*
+anything is answered by `is_available`, which asks FieldQuality.
+
+## What this bought, surface by surface
+
+* **Ranking** — `dimension_is_supported` moved from `is not None` to
+  `is_available`, so a stale reading stops being evidence while continuing to
+  score exactly as it did.
+* **Scanner** — one rule replaced six coalescing expressions: **a filter may
+  never be satisfied by a value the platform does not have**. Whether the old
+  substitution was safe depended entirely on which way the bound pointed, which
+  nobody had checked: `volume_ratio_min: 1.3` excluded a substituted 0 (fine),
+  while `change_pct_min: -5` *admitted* it. Every preset is byte-identical,
+  pinned against a transcription of the old function.
+* **Sorting** — `q.get(sort_key) or 0` gave every unmeasured stock a sort value
+  of zero, and zero is not neutral in an ordering, it is an extreme: `reversal`
+  sorts RSI ascending, so a stock with no RSI took the top slot under a heading
+  asserting it was the most oversold thing on the exchange.
+* **Coverage** — a vendor failing on seven of thirty-one symbols made the scan
+  report `total_scanned: 24`, which does not read as an incident; it reads as a
+  smaller, healthy market.
+* **AI** — every technical handed to a model is a number or a phrase from a
+  closed vocabulary, never a bare `None` and never a substitute.
+* **AI context** — `ai_context_builder` has claimed since D1 that it carries
+  timestamps "so the model can say 'as of 10:42 AM'". It did not; not one
+  section carried a time. It does now, from the instant the overview was
+  fetched rather than the instant the context was built.
+
+## The general rule this establishes
+
+ADR-058's rule was about **output**: a surface that explains a decision must be
+able to say nothing. This one is about **input**: an absence has a reason, the
+reason is known only at the point of absence, and any layer that discards it
+forces every layer above to guess. The two-state model did not fail because two
+states are too few; it failed because the reason existed, was thrown away, and
+was then reconstructed downstream as the most plausible number.
+
+So: **carry the reason, or the next layer will invent one.** Four of the six
+states here already existed as distinct situations in the code and were
+collapsed on the way out of the function that knew them.
+
+## Consequences
+
+* LIM-D5.19-2 is **closed**: no live producer substitutes a technical default.
+* A defect D5.19's own comment forbade and its own code committed is closed:
+  `change_pct = … if prev_close else 0` rendered "unchanged" over a price that
+  may have moved, thirty lines under a comment saying that would be a
+  fabrication.
+* `calculate_rsi` and `calculate_macd` return absence rather than 50.0 / 0.0.
+  Their callers guarded them, so those were unreachable — and an unreachable
+  fabrication is one refactor away from a reachable one.
+* `TechnicalIndicators.jsx` had been "extracted verbatim from StockDetail.jsx"
+  and imported by nothing, while the page rendered its own copy. D6.8-A would
+  have corrected only the copy it could see, so the duplicate is gone.
+* **Accepted cost — LIM-D6.8A-1:** `scoring_input` preserves `or`'s treatment of
+  a falsy *real* reading, so an RSI of exactly 0 still scores as 50. It is
+  reachable (fourteen consecutive down closes) and it is the same class of bug.
+  Fixing it changes a score for valid input, which this phase may not do.
+* **Accepted cost — LIM-D6.8A-2:** field quality is carried on quotes; index,
+  sector and news payloads are untouched.
+* **Accepted cost — LIM-D6.8A-3:** a broker or Alpha Vantage payload carries no
+  technicals, and the normalizers do not classify — the fields arrive `None` and
+  resolve to MISSING, which is the safest existing meaning and not the most
+  precise one.
+
+## What this ADR does not claim
+
+**No live market verification.** No broker session and no live vendor call was
+made. Every claim above is code-verified against tests and against measured
+pre-change behaviour reproduced in-process; none is LIVE VERIFIED.
+
+**No browser leg.** The three frontend changes rest on 8 new component tests and
+a production build, not on a rendered page.
