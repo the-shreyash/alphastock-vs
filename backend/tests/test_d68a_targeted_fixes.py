@@ -897,3 +897,197 @@ def test_the_scanner_verdict_is_unchanged_for_a_fully_measured_universe():
 
     # The oracle discriminates — otherwise the loop above compares empty lists.
     assert len(set(outcomes)) > 1, outcomes
+
+
+# --------------------------------------------------------------------------- #
+# 6. The three consumer sites, falsified against a STALE reading               #
+# --------------------------------------------------------------------------- #
+#
+# WHY THIS SECTION EXISTS, AND WHY THE SECTIONS ABOVE DID NOT COVER IT.
+#
+# An independent mutation campaign over this pass found three surviving mutants,
+# all at sites this file already tests. None of them was a production defect —
+# the production reads are correct — and all three were the same coverage hole:
+#
+#     every existing case at these sites expresses absence as a value of `None`
+#     (plus, sometimes, a declared MISSING / PROVIDER_ERROR state)
+#
+# and `None` is refused by `quote.get(field)` just as surely as by
+# `field_quality.reading(quote, field)`. So a mutant that deletes the contract
+# and reads the raw key behaves identically on every one of those fixtures, and
+# survives.
+#
+# STALE is the one state that separates the two reads, because it is the one
+# state in which **the value is really there**: a 3-day-old RSI of 10.0 is a
+# float on the payload, and only the contract knows it is a fact about last
+# Thursday. That makes STALE the only fixture shape that can falsify these three
+# lines, and it is the shape D6-Q1 named as the most dangerous of the five
+# absences precisely because it does not look like one.
+#
+# Each test below therefore carries a FRESH TWIN whose reading is identical in
+# value and differs only in its observation instant. The twin is what makes the
+# assertion a discrimination rather than a constant: a consumer that published
+# nothing at all, or that had simply stopped working, fails on the twin.
+
+#: 3 days old — comfortably past `DAILY_READING_MAX_AGE_SECONDS`, and the age a
+#: feed that stopped delivering daily bars on Thursday actually has by Sunday.
+_STALE_AT = _ago(days=3)
+_FRESH_AT = _ago(hours=1)
+
+
+def test_a_stale_rsi_cannot_take_the_most_oversold_slot():
+    """scanner_engine._sort_key — MUTANT: `value = quote.get(sort_key)`.
+
+    The `value` preset bounds RSI on both sides and sorts it ASCENDING, and both
+    of its bounds are in `_SKIPPED_WHEN_UNAVAILABLE` — so a quote whose whole
+    bar series has gone stale is not filtered out, it reaches the sort. There it
+    carries a real float of 10.0, and 10.0 sorts to the top of an ascending RSI
+    scan: the slot the surface labels as the most oversold stock in the
+    universe, awarded on last Thursday's reading.
+
+    `_bound_reading` returns None for it, which the two-element key ranks LAST.
+    Reading the raw key instead ranks it FIRST, which is the inversion this
+    test exists to catch.
+    """
+    from tests.test_d68_data_quality import _scan
+
+    universe = [
+        {"symbol": "STALE", "price": 100.0, "volume": 1, "rsi": 10.0, OBSERVED_AT_KEY: _STALE_AT},
+        {"symbol": "FRESH", "price": 100.0, "volume": 1, "rsi": 45.0, OBSERVED_AT_KEY: _FRESH_AT},
+    ]
+
+    # The premise, asserted: the stale quote must be STALE and must SURVIVE the
+    # preset's filters. If it were filtered out the ordering below would hold
+    # under the mutant too, and this test would prove nothing.
+    assert field_quality.quality_of(universe[0], "rsi") is FieldQuality.STALE
+    assert field_quality.quality_of(universe[1], "rsi") is FieldQuality.AVAILABLE
+    preset_filters = scanner_engine.STRATEGY_PRESETS["value"]["filters"]
+    assert scanner_engine._passes_filters(universe[0], preset_filters) is True
+
+    symbols = [r["symbol"] for r in _run(_scan(universe, strategy="value"))["results"]]
+
+    assert symbols == ["FRESH", "STALE"], symbols
+
+
+def test_that_ordering_inverts_when_the_same_rsi_is_current(monkeypatch):
+    """The falsifying twin for the test above.
+
+    The identical universe with ONE field changed — the observation instant —
+    must put RSI 10.0 first. Without this, "FRESH, STALE" is satisfied by any
+    implementation that ranks by symbol, by insertion order, or by nothing at
+    all.
+
+    Sorted under a preset carrying NO bounds, and that is not a convenience: on
+    the shipped `value` preset a *current* RSI of 10.0 is refused outright by
+    its `rsi_min` of 30, so it could never reach the sort to be compared. That
+    asymmetry is the defect restated — under the mutant, a three-day-old 10.0 is
+    admitted to a slot a live 10.0 is not eligible for — and an unbounded preset
+    is what isolates the ordering from it.
+    """
+    from tests.test_d68_data_quality import _scan
+
+    monkeypatch.setitem(
+        scanner_engine.STRATEGY_PRESETS,
+        "_d68a_stale_sort_probe",
+        {"label": "probe", "description": "", "filters": {}, "sort_key": "rsi", "sort_desc": False},
+    )
+    universe = [
+        {"symbol": "STALE", "price": 100.0, "volume": 1, "rsi": 10.0, OBSERVED_AT_KEY: _FRESH_AT},
+        {"symbol": "FRESH", "price": 100.0, "volume": 1, "rsi": 45.0, OBSERVED_AT_KEY: _FRESH_AT},
+    ]
+
+    scan = _scan(universe, strategy="_d68a_stale_sort_probe")
+    assert [r["symbol"] for r in _run(scan)["results"]] == ["STALE", "FRESH"]
+
+    # …and with the same quote's instant pushed back three days, it ranks last
+    # under that identical preset. The instant is the only difference.
+    universe[0][OBSERVED_AT_KEY] = _STALE_AT
+    scan = _scan(universe, strategy="_d68a_stale_sort_probe")
+    assert [r["symbol"] for r in _run(scan)["results"]] == ["FRESH", "STALE"]
+
+
+class _Published:
+    """Captures the events a heartbeat task actually put on the bus.
+
+    The activity log says what the task CLAIMED; this says what the browser and
+    the Scanner feed were actually told. A stale reading that is logged but not
+    published is a different failure from one that is published, and "not
+    published as a live breakout" is the claim under test.
+    """
+
+    def __init__(self):
+        self.events = []
+
+    async def __call__(self, event_type, data):
+        self.events.append((event_type, data))
+
+    def symbols(self, event_type):
+        return [
+            c.get("symbol")
+            for name, data in self.events
+            if name == event_type
+            for c in (data or {}).get("candidates", [])
+        ]
+
+
+@pytest.fixture
+def published(monkeypatch):
+    """Replaces the `activity` fixture's no-op `_publish` with a recorder.
+
+    Ordering matters: a test must request `activity` FIRST so this one's
+    `setattr` lands last and wins.
+    """
+    sink = _Published()
+    monkeypatch.setattr(heartbeat_engine, "_publish", sink)
+    monkeypatch.setattr(heartbeat_engine.scanner_worker, "filter_novel", lambda _k, c: list(c))
+    return sink
+
+
+def test_a_stale_day_change_is_not_published_as_a_live_breakout(monkeypatch, activity, published):
+    """heartbeat_engine.task_find_breakouts — MUTANT: `q.get("change_pct")`.
+
+    Two symbols identical in every observable a breakout is defined by — at the
+    day's high, and up 3.0% — differing only in when that 3.0% was measured.
+    One of them is a breakout happening now. The other is Thursday's breakout,
+    re-published to the live Scanner feed every cycle by a feed that has since
+    stopped advancing.
+
+    The existing F-6 test at this site uses `change_pct: None`, which the raw
+    key refuses on its own; only a real-but-old float separates the two reads.
+    """
+
+    async def _quotes():
+        return [
+            {"symbol": "STALE", "price": 100.0, "high": 100.0, "change_pct": 3.0, OBSERVED_AT_KEY: _STALE_AT},
+            {"symbol": "FRESH", "price": 200.0, "high": 200.0, "change_pct": 3.0, OBSERVED_AT_KEY: _FRESH_AT},
+        ]
+
+    monkeypatch.setattr(real_market, "fetch_all_universe_quotes", _quotes)
+    _run(heartbeat_engine.task_find_breakouts())
+
+    # The twin proves the scan still works; the exclusion is the finding.
+    assert published.symbols("scanner.breakout") == ["FRESH"], published.events
+    assert activity.said("Found 1 breakout candidate(s): FRESH"), activity.entries
+    assert "warning" not in activity.statuses, activity.entries
+
+
+def test_a_stale_volume_ratio_is_not_published_as_a_volume_surge(monkeypatch, activity, published):
+    """heartbeat_engine.task_check_volume — MUTANT: `r.get("volume_ratio")`.
+
+    Same shape at the fourth F-6 site: two quotes both carrying a 2.4x ratio,
+    one measured an hour ago and one three days ago. A volume surge is a claim
+    about today's participation, so Thursday's 2.4x is not one — but it is a
+    float, and the raw key cannot tell.
+    """
+
+    async def _quote(symbol, *a, **kw):
+        observed = _STALE_AT if symbol == "STALE" else _FRESH_AT
+        return {"symbol": symbol, "volume_ratio": 2.4, OBSERVED_AT_KEY: observed}
+
+    monkeypatch.setattr(real_market, "fetch_real_stock_quote", _quote)
+    monkeypatch.setattr(heartbeat_engine, "_next_volume_batch", lambda: ["STALE", "FRESH"])
+    _run(heartbeat_engine.task_check_volume())
+
+    assert published.symbols("scanner.volume_spike") == ["FRESH"], published.events
+    assert activity.said("1/2 stocks with unusual volume: FRESH"), activity.entries
+    assert "warning" not in activity.statuses, activity.entries

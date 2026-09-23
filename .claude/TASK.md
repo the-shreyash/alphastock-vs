@@ -10712,3 +10712,194 @@ this section is CODE VERIFIED — against tests, and against pre-change behaviou
 reproduced in-process from the real functions. Nothing here is LIVE VERIFIED.
 
 **D6.8-A COMPLETE. Nothing committed. Nothing pushed.**
+
+---
+
+# D6.8-A — TARGETED FIX PASS AND CORRECTIVE PASS (2026-09-23)
+
+**STATUS: TARGETED FIXES COMPLETE — CODE VERIFIED / LIVE VERIFICATION STILL
+PENDING.** Continues the section above; nothing there is retracted except the
+one claim named in §4.
+
+## 0. Why this section exists
+
+The section above closed at "D6.8-A COMPLETE" on a 37/37 mutation campaign.
+Work continued afterwards and was never written down: four consumer-side
+defects were found and fixed, a targeted regression suite was added, and an
+**independent** mutation campaign was then run against the result. That campaign
+found three surviving mutants. This section is the record of all of it, written
+so the repository state and the documentation agree.
+
+Everything described here is present in the tree at commit **1ba5824**
+("feat: introduce D6.8 field quality validation, model bounds, and
+TechnicalIndicators component reuse") plus the small corrective commit this
+section accompanies. **1ba5824 was not rewritten, reset, rebased, amended or
+split.** It interleaves D6.8-A and D6.8-B work; separating them now would mean
+rewriting history, and the history is more valuable intact than tidy.
+
+## 1. The four fixes — what D6.8-A broke on the way past
+
+Every one is the same shape, and it is the shape a removal always has: D6.8-A
+stopped fabricating a market reading, and four consumers were still relying on
+the fabrication being there. **None of them is a defect in `FieldQuality`.**
+
+| # | Site | Defect | Fix |
+|---|---|---|---|
+| **F-1** | `scanner_engine._bound_reading` | The contract was applied to `price` and `volume`, which it does not cover. Their staleness was judged by the **daily bar series'** clock (`OBSERVED_AT_KEY`), so on a Monday morning — newest bar Friday's — a perfectly current price read STALE and a `price_min` bound silently emptied the scan. | A tracked field is read under the contract; anything else is read directly, with exactly the `None`/missing semantics it had before D6.8-A. |
+| **F-2** | `portfolio_monitor` | A `dict.get(field, default)` whose default never fired, because the key was present carrying `None`. The value it was defaulting *away from* reached the comparison as `None`. | Read under the contract; a non-AVAILABLE reading raises no alert. |
+| **F-5** | `_advisor_narrative` | A conditional expression whose scope was wider than its author intended, so one absent reading deleted the **whole** narrative rather than the one clause it belonged to. | The conditional governs its clause only. |
+| **F-6** | gainers, losers, sector averages, `task_find_breakouts`, `task_check_volume` | `None > 1.5` and `f"{None:+.2f}"` raised, and the raise escaped the enclosing comprehension: **one** unmeasured symbol aborted the entire scan, aggregate or rotating batch, which then logged itself as "failed". | Read per symbol under the contract. An unmeasured symbol is simply not a candidate — a breakout is *defined* by a day change — and every other symbol is still scanned. |
+
+Production behaviour at all four sites is now correct, and the corrective pass
+below changed **no production logic**.
+
+## 2. The targeted regression suite
+
+`backend/tests/test_d68a_targeted_fixes.py` — 49 tests collected at 1ba5824,
+**53 after the corrective pass**. Structured one section per defect, and every section
+pairs the regression test with a **falsifying twin**: the measured case that
+must still behave. Without the twin, "it did not raise" is equally true of a
+function that now returns nothing at all, and every heartbeat task swallows its
+exceptions into a warning log — so "did not raise" is true of the broken code
+too. The status line, and what was actually published to the bus, are the only
+observables that tell a completed scan from an aborted one.
+
+## 3. The independent campaign, and the three survivors
+
+An independent mutation campaign over the fixed tree found **three surviving
+mutants**. All three were **test-coverage holes, not production defects**, and
+all three were the same hole:
+
+> Every existing fixture at those three sites expresses absence as a value of
+> `None`. `None` is refused by `quote.get(field)` exactly as surely as by
+> `field_quality.reading(quote, field)` — so a mutant that deletes the contract
+> and reads the raw key behaves **identically** on every one of those fixtures,
+> and survives.
+
+**STALE is the one state that separates the two reads**, because it is the one
+state in which the value is really there. A three-day-old RSI of 10.0 is a float
+on the payload, and only the contract knows it is a fact about last Thursday.
+That makes STALE the only fixture shape that can falsify these lines — and it is
+the state D6-Q1 named as the most dangerous of the five absences precisely
+because it does not look like one.
+
+| Mutant | Site | What the mutation permitted |
+|---|---|---|
+| **M1** | `scanner_engine._sort_key` (`scanner_engine.py:466`) | A 3-day-stale **RSI of 10.0** takes the top slot of an ascending-RSI scan — the slot the surface labels the most oversold stock in the universe — awarded on last Thursday's reading. Reachable on the shipped `value` preset, whose two RSI bounds are both in `_SKIPPED_WHEN_UNAVAILABLE` and therefore do not filter the stale quote out before the sort. |
+| **M2** | `heartbeat_engine.task_find_breakouts` (`heartbeat_engine.py:269`) | A stale **+3.0% day change** published to the live Scanner feed as a breakout happening now — and re-published every cycle, by a feed that has stopped advancing. |
+| **M3** | `heartbeat_engine.task_check_volume` (`heartbeat_engine.py:312`) | A stale **2.4× volume ratio** published as a volume surge. A surge is a claim about *today's* participation; Thursday's 2.4× is not one, but it is a float, and the raw key cannot tell. |
+
+**Closed by four tests** in §6 of `test_d68a_targeted_fixes.py`, each carrying a
+fresh twin identical in value and differing only in its observation instant:
+
+* `test_a_stale_rsi_cannot_take_the_most_oversold_slot`
+* `test_that_ordering_inverts_when_the_same_rsi_is_current`
+* `test_a_stale_day_change_is_not_published_as_a_live_breakout`
+* `test_a_stale_volume_ratio_is_not_published_as_a_volume_surge`
+
+The breakout and volume tests assert on **what reached the event bus**, not only
+on the activity log: the log says what the task *claimed*, the bus says what the
+Scanner feed and the browser were actually told, and "not published as a live
+breakout" is the claim under test.
+
+One finding came out of writing them and is recorded because it is the defect
+restated: on the `value` preset a **current** RSI of 10.0 is refused outright by
+its `rsi_min` of 30 and never reaches the sort at all. Under M1, a three-day-old
+10.0 would be admitted to a slot a live 10.0 is not even eligible for. The twin
+therefore sorts under an unbounded probe preset, so the ordering is isolated
+from that asymmetry rather than confounded by it.
+
+## 4. What is NOT authoritative
+
+**The 28/28 mutation claim is withdrawn as an authoritative number.** It appears
+in the D6.8 (D6.8-B) verdict above — "made falsifiable by 28/28 killed mutants".
+It is **not reproducible from repository state**: no mutation harness, mutant
+manifest or campaign log is committed anywhere in this repository, so no reader
+can re-run it and no reviewer can check it. It is recorded here as a *historical
+statement of what a pass reported*, and it must not be relied on as evidence
+that any control is falsifiable.
+
+**The same standard applies to the 37/37 campaign** in the section above, and
+to the three-mutant campaign in §5 below. The difference is that §5's is
+reproducible in full from the anchors written into it: the mutation is a
+one-line source substitution at a named file and line, stated in this document,
+which any reader can apply and revert by hand.
+
+This is the standing rule and it is the reason the number is withdrawn rather
+than restated: **a control is only certified if the probe could have failed —
+and a probe nobody else can run is a probe nobody else can watch fail.**
+
+## 5. Verification — the corrective pass
+
+Run against `backend/venv`.
+
+| Gate | Result |
+|---|---:|
+| The four new tests | **4 passed** |
+| `test_d68a_targeted_fixes.py`, whole file | **53 passed** (49 collected at 1ba5824 + 4 new; the diff is purely additive — 194 insertions, 0 deletions, no existing test altered) |
+| `test_d68_data_quality.py` | **137 passed** |
+| D5.19 / scanner / gateway / isolation / AI regression | **180 passed** across 6 suites |
+| Backend, full | **15 failed / 5824 passed / 67 skipped / 4 xfailed** |
+| flake8, blocking gate (`--select=E9,F63,F7,F82,F811,F632`), repo-wide | **0 findings** |
+| flake8, full config, all 5 modified files | **0 findings** (8 → 0) |
+| `isort --check-only`, new/modified test file | **clean** |
+| `black --check`, new/modified test file | **clean** |
+
+**The 15 backend failures are the documented environment-only failures** in
+`tests/test_entrypoint_log_level.py`, unchanged from the standing baseline. They
+fail with `docker/entrypoint.sh: line 191: python: command not found` — the
+container image provides `python`, this host provides only `python3`. Nothing in
+this pass touches that file or that script.
+
+### Mutation verification of the three survivors
+
+Each mutant is a single-line substitution, applied to the real source, run, and
+reverted:
+
+| # | File:line | Real code → mutant | New test | Pre-existing tests at that site |
+|---|---|---|---|---|
+| M1 | `services/market_engine/scanner_engine.py:466` | `_bound_reading(quote, sort_key)` → `quote.get(sort_key)` | **KILLED** | **stayed GREEN** |
+| M2 | `services/heartbeat_engine.py:269` | `field_quality.reading(q, "change_pct")` → `q.get("change_pct")` | **KILLED** | **stayed GREEN** |
+| M3 | `services/heartbeat_engine.py:312` | `field_quality.reading(r, "volume_ratio")` → `r.get("volume_ratio")` | **KILLED** | **stayed GREEN** |
+
+Each row was verified in four steps — green on real code, red under the mutant,
+source restored byte-for-byte, green again — and **the third column is the
+finding**: the pre-existing tests at each site pass with the contract deleted,
+which is the coverage hole §3 describes, demonstrated rather than asserted.
+
+**No global mutation score is claimed.** Three mutants were run, three are
+reported, and no harness is committed that would make a wider number
+reproducible.
+
+## 6. Scope of the corrective pass
+
+Three things, and nothing else:
+
+1. The four stale-twin regression tests (§3).
+2. **Eight blank-line lint findings** — 4 × E303, 4 × E302 — one pair in each of
+   the four test files whose gateway double gained a `universe_coverage` method.
+   The method was pasted with three blank lines above it and none below, running
+   the class body straight into the following module-level fixture. Whitespace
+   only; no test body, name, fixture or assertion changed.
+3. This section.
+
+**No production logic was modified.** §1's fixes are correct and the campaign
+found no defect in them; changing production code to satisfy a test that already
+passes would be the failure this pass exists to avoid.
+
+**`black` and `isort` were NOT run over the four lint-fixed files.** All four
+fail both at HEAD and after (LIM-D6.8A-5 — the repository is not formatted with
+either), and the byte-count of what `black --diff` wants to change is
+**identical before and after** this pass in every one of the four. Reformatting
+them would be an unrelated change to files this pass touched for one reason.
+
+## 7. Live verification
+
+**STILL PENDING / ENVIRONMENT BLOCKED.** No broker was contacted. No broker
+session was opened. No order of any kind was placed, modified, cancelled or
+simulated, and no broker functionality was added or exercised by this pass. No
+live vendor call was made. Every claim in this section is CODE VERIFIED against
+tests run in this repository; **nothing here is LIVE VERIFIED**, and LIM-D6.8A-4
+remains open.
+
+**TARGETED FIX PASS AND CORRECTIVE PASS DOCUMENTED. 1ba5824 NOT REWRITTEN.**

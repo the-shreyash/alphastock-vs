@@ -91,8 +91,6 @@ class _Gateway:
     def source_tier(self, _c=None, *, user_id=None):
         return "streaming"
 
-
-
     def universe_coverage(self, served):
         """D6.8-A — the real gateway's coverage read, kept on the double.
 
@@ -105,6 +103,8 @@ class _Gateway:
         requested = len(STOCK_UNIVERSE)
         return {"requested": requested, "available": served,
                 "unavailable": max(0, requested - served)}
+
+
 @pytest.fixture
 def gateway(monkeypatch):
     import services.market_engine.gateway as gm
