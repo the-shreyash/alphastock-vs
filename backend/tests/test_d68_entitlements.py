@@ -312,9 +312,12 @@ PINNED_PUBLIC_ROUTES = frozenset({
     ("POST", "/api/webhooks/weekly-review"), ("POST", "/api/webhooks/news-digest"),
     # Public market reference data (D5 — market data is a shared public good).
     # Some take `get_optional_user_id` to resolve a signed-in user's own feed.
+    # `/api/market/events` is deliberately absent: D6.10-P0 deleted the route
+    # (it served the process-global EventBus log, which is cross-tenant). If it
+    # reappears here, someone re-added a global event endpoint.
     ("GET", "/api/market/activity-feed"), ("GET", "/api/market/calendar"),
     ("GET", "/api/market/commodities"), ("GET", "/api/market/engine/status"),
-    ("GET", "/api/market/events"), ("GET", "/api/market/fii-dii"),
+    ("GET", "/api/market/fii-dii"),
     ("GET", "/api/market/gainers"), ("GET", "/api/market/global"),
     ("GET", "/api/market/heatmap"), ("GET", "/api/market/losers"),
     ("GET", "/api/market/overview"), ("GET", "/api/market/ranking"),

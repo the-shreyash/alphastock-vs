@@ -1992,12 +1992,21 @@ async def economic_calendar(
     )
 
 
-@market_router.get("/events")
-async def market_events(event_type: Optional[str] = None, limit: int = 50):
-    """Recent market engine events from the event bus."""
-    from services.market_engine.event_bus import event_bus
-    events = event_bus.recent_events(event_type=event_type, limit=min(limit, 200))
-    return {"events": events, "count": len(events)}
+# `GET /api/market/events` was removed in D6.10-P0. It served
+# `EventBus.recent_events()` — a *process-global* 500-entry log that carries
+# `trade.updated`, `portfolio.updated`, `notification.created`,
+# `broker.order.updated` and `trade.review.ready` payloads, each stamped with
+# its owner's `user_id` — to any anonymous caller. Authentication alone would
+# not have fixed it: the log itself is cross-tenant, so every signed-in user
+# would still have read every other user's positions, P&L, notifications and
+# broker orders. It had no frontend or service consumer, so the endpoint was
+# deleted rather than rescoped.
+#
+# Do not reintroduce a route that returns the event log. The per-user delivery
+# path is the WebSocket bridge (`services/realtime/event_bridge.py`), which
+# addresses private domains to their owner; the readable activity surfaces are
+# `/api/market/activity-feed` and `/api/ai/activity`, both scoped by
+# `get_optional_user_id` (D6.1 / S4).
 
 
 @market_router.get("/engine/status")
