@@ -116,7 +116,7 @@ from security.cookies import (
 )
 from security import oauth_state as oauth_state_store
 from security import api_docs
-from security.cors import apply_cors
+from security.cors import apply_cors, is_allowed_websocket_origin
 from security.headers import apply_security_headers
 
 # Centralized CSRF protection (PH1.7). Signed double-submit token bound to the
@@ -4156,7 +4156,25 @@ async def websocket_endpoint(websocket: WebSocket):
     with 1008 *before* `accept()`, so an anonymous caller never occupies a
     connection slot, never appears in the manager's tracking maps, and never
     reaches the subscribe/broadcast surface.
+
+    The ``Origin`` check runs FIRST, before authentication, and closes with the
+    same 1008. Order matters: a cross-site hijack arrives with the victim's
+    genuinely valid cookie, so authentication would succeed — the origin is the
+    only thing that distinguishes it. Checking it first also means a foreign
+    page never triggers the user lookup. See
+    `security.cors.is_allowed_websocket_origin` for the rules.
     """
+    origin = websocket.headers.get("origin")
+    if not is_allowed_websocket_origin(origin):
+        obs_instruments.record_ws_connection("rejected")
+        # Truncated: the header is attacker-controlled, and a log line is not a
+        # place to store an arbitrarily long string.
+        logger.warning(
+            "WebSocket handshake rejected: origin not allowed",
+            extra={"event": "websocket_origin_rejected", "origin": origin[:200]},
+        )
+        await websocket.close(code=WS_CLOSE_POLICY_VIOLATION)
+        return
     identity = await authenticate_websocket(websocket)
     if identity is None:
         obs_instruments.record_ws_connection("rejected")

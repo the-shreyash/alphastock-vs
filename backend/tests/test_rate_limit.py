@@ -334,3 +334,85 @@ class TestLoginEndpoint:
         assert client.post("/api/auth/login", json={"email": "life@example.com", "password": REG_PASSWORD}).status_code == 200
         assert client.post("/api/auth/refresh").status_code == 200
         assert client.post("/api/auth/logout").status_code == 200
+
+
+# --------------------------------------------------------------------------- #
+# Trusted client-IP header (deployment preparation — PH3.5 S-1 on proxied hosts)
+# --------------------------------------------------------------------------- #
+class _Client:
+    def __init__(self, host):
+        self.host = host
+
+
+class _Req:
+    def __init__(self, headers, peer="10.0.0.9"):
+        self.headers = headers
+        self.client = _Client(peer) if peer else None
+
+
+class TestTrustedClientIpHeader:
+    """Both halves are pinned: inert when unset (the certified PH1.7 contract),
+    and effective when set. A green result on only one half proves nothing —
+    a resolver that ignored the variable entirely would pass the first."""
+
+    def test_unset_keeps_leftmost_forwarded_for(self, monkeypatch):
+        monkeypatch.delenv("TRUSTED_CLIENT_IP_HEADER", raising=False)
+        req = _Req({"x-forwarded-for": "1.2.3.4, 5.6.7.8", "x-real-ip": "9.9.9.9"})
+        assert rl.client_ip(req) == "1.2.3.4"
+
+    def test_set_uses_trusted_header_and_ignores_forged_xff(self, monkeypatch):
+        monkeypatch.setenv("TRUSTED_CLIENT_IP_HEADER", "X-Real-IP")
+        req = _Req({"x-forwarded-for": "6.6.6.6", "x-real-ip": "203.0.113.7"})
+        assert rl.client_ip(req) == "203.0.113.7"
+
+    def test_list_shaped_value_takes_rightmost(self, monkeypatch):
+        # Pointed at X-Forwarded-For itself: the rightmost hop is the one the
+        # nearest proxy appended; everything left of it is client-controlled.
+        monkeypatch.setenv("TRUSTED_CLIENT_IP_HEADER", "x-forwarded-for")
+        req = _Req({"x-forwarded-for": "6.6.6.6, 203.0.113.7"})
+        assert rl.client_ip(req) == "203.0.113.7"
+
+    def test_missing_trusted_header_falls_back_to_peer_not_xff(self, monkeypatch):
+        monkeypatch.setenv("TRUSTED_CLIENT_IP_HEADER", "x-real-ip")
+        req = _Req({"x-forwarded-for": "6.6.6.6"}, peer="10.0.0.9")
+        assert rl.client_ip(req) == "10.0.0.9"
+
+    def test_unparseable_trusted_value_falls_back_to_peer(self, monkeypatch):
+        monkeypatch.setenv("TRUSTED_CLIENT_IP_HEADER", "x-real-ip")
+        req = _Req({"x-real-ip": "not-an-ip", "x-forwarded-for": "6.6.6.6"})
+        assert rl.client_ip(req) == "10.0.0.9"
+
+    def test_no_peer_and_no_header_is_unknown(self, monkeypatch):
+        monkeypatch.setenv("TRUSTED_CLIENT_IP_HEADER", "x-real-ip")
+        assert rl.client_ip(_Req({}, peer=None)) == "unknown"
+
+    def test_audit_attributes_the_same_ip_as_the_limiter(self, monkeypatch):
+        from security import audit
+        for configured in (None, "x-real-ip"):
+            if configured:
+                monkeypatch.setenv("TRUSTED_CLIENT_IP_HEADER", configured)
+            else:
+                monkeypatch.delenv("TRUSTED_CLIENT_IP_HEADER", raising=False)
+            req = _Req({"x-forwarded-for": "6.6.6.6", "x-real-ip": "203.0.113.7"})
+            ip, _ua, _rid = audit.request_context(req)
+            assert ip == rl.client_ip(req)
+
+    def test_rotating_forged_xff_no_longer_bypasses_ip_tier(self, monkeypatch):
+        monkeypatch.setenv("TRUSTED_CLIENT_IP_HEADER", "x-real-ip")
+        monkeypatch.setattr(rl, "PUBLIC_API", RateLimitPolicy("api_ip", 2, 60, "ip"))
+        client = _mw_client(FakeDB())
+        codes = [client.get("/api/x", headers={"X-Forwarded-For": f"6.6.6.{i}",
+                                               "X-Real-IP": "203.0.113.7"}).status_code
+                 for i in range(4)]
+        assert codes == [200, 200, 429, 429]
+
+    def test_falsifying_twin_unset_mode_is_bypassable(self, monkeypatch):
+        # Documents WHY the variable must be set behind an appending proxy: with
+        # it unset, each forged value is a fresh bucket. If this ever starts
+        # failing, the default changed — revisit the deployment docs.
+        monkeypatch.delenv("TRUSTED_CLIENT_IP_HEADER", raising=False)
+        monkeypatch.setattr(rl, "PUBLIC_API", RateLimitPolicy("api_ip", 2, 60, "ip"))
+        client = _mw_client(FakeDB())
+        codes = [client.get("/api/x", headers={"X-Forwarded-For": f"6.6.6.{i}"}).status_code
+                 for i in range(4)]
+        assert codes == [200, 200, 200, 200]

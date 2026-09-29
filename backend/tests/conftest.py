@@ -101,6 +101,9 @@ _SECURITY_SUITES = frozenset({
     "test_secret_loading.py",
     "test_secrets.py",
     "test_security_headers.py",
+    # Deployment preparation — the CORS allowlist applied to the WebSocket
+    # handshake `Origin` (cross-site WebSocket hijacking).
+    "test_ws_origin.py",
 })
 
 #: Markers that mean "this test is allowed to touch the outside world".

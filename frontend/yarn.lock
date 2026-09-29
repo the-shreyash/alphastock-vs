@@ -3712,10 +3712,10 @@ balanced-match@^1.0.0:
   resolved "https://registry.npmjs.org/balanced-match/-/balanced-match-1.0.2.tgz"
   integrity sha512-3oSeUO0TMV67hN1AmbXsK4yaqU7tjiHlbxRDZOpH0KW9+CeX4bRAaX0Anxt0tx2MrpRpWwQaPwIlISEJhYU5Pw==
 
-baseline-browser-mapping@^2.10.12:
-  version "2.10.34"
-  resolved "https://registry.npmjs.org/baseline-browser-mapping/-/baseline-browser-mapping-2.10.34.tgz"
-  integrity sha512-IMDedajPifLnHNY0X9n8hKxRTQ6/eTHwr5bDo04WnuqxyKw6LYtQywCuuqPZwhl3aBXMvQpJov42GLCwRRdQzw==
+baseline-browser-mapping@^2.11.26:
+  version "2.11.26"
+  resolved "https://registry.npmjs.org/baseline-browser-mapping/-/baseline-browser-mapping-2.11.26.tgz"
+  integrity sha512-GLQdD3y6UF8iVuMJl5fHgE4jdn/ua7n+toKfLgNlg3BqQtOZjpy68T8Tup8/wGWZCDlm7KMg7tPb4MPn7oN0TQ==
 
 batch@0.6.1:
   version "0.6.1"
@@ -3799,16 +3799,16 @@ browser-process-hrtime@^1.0.0:
   resolved "https://registry.npmjs.org/browser-process-hrtime/-/browser-process-hrtime-1.0.0.tgz"
   integrity sha512-9o5UecI3GhkpM6DrXr69PblIuWxPKk9Y0jHBRhdocZ2y7YECBFCsHm79Pr3OyR2AvjhDkabFJaDJMYRazHgsow==
 
-browserslist@^4.0.0, browserslist@^4.18.1, browserslist@^4.21.4, browserslist@^4.24.0, browserslist@^4.28.1, browserslist@^4.28.2:
-  version "4.28.2"
-  resolved "https://registry.npmjs.org/browserslist/-/browserslist-4.28.2.tgz"
-  integrity sha512-48xSriZYYg+8qXna9kwqjIVzuQxi+KYWp2+5nCYnYKPTr0LvD89Jqk2Or5ogxz0NUMfIjhh2lIUX/LyX9B4oIg==
+browserslist@^4.29.2:
+  version "4.29.2"
+  resolved "https://registry.npmjs.org/browserslist/-/browserslist-4.29.2.tgz"
+  integrity sha512-/u9r8k8ue4ZhHCw9ovDtltpWdXeXzjhdxCGj6vm1RGLPXb8lu33EMdoCHF5Sx8oYBS+Q/FYYNmAqlHncxR3RmA==
   dependencies:
-    baseline-browser-mapping "^2.10.12"
-    caniuse-lite "^1.0.30001782"
-    electron-to-chromium "^1.5.328"
-    node-releases "^2.0.36"
-    update-browserslist-db "^1.2.3"
+    baseline-browser-mapping "^2.11.26"
+    caniuse-lite "^1.0.30001812"
+    electron-to-chromium "^1.5.439"
+    node-releases "^2.0.57"
+    update-browserslist-db "^1.3.3"
 
 bser@2.1.1:
   version "2.1.1"
@@ -3896,10 +3896,10 @@ caniuse-api@^3.0.0:
     lodash.memoize "^4.1.2"
     lodash.uniq "^4.5.0"
 
-caniuse-lite@^1.0.0, caniuse-lite@^1.0.30001782, caniuse-lite@^1.0.30001787:
-  version "1.0.30001797"
-  resolved "https://registry.npmjs.org/caniuse-lite/-/caniuse-lite-1.0.30001797.tgz"
-  integrity sha512-l8xKG+gwAIExZGl9FrF7KUwuOmk6wbEPC9Xoy/RtnWv1XG0Q4LFlagaLpUv3Kiza3W/wm27zy0yWJEieYKAP6w==
+caniuse-lite@^1.0.0, caniuse-lite@^1.0.30001787, caniuse-lite@^1.0.30001812:
+  version "1.0.30001813"
+  resolved "https://registry.npmjs.org/caniuse-lite/-/caniuse-lite-1.0.30001813.tgz"
+  integrity sha512-zfjJo4rM0+fUomGDBW/xcDjhIwz/210DGvip2MAMDZ8KHcRPnOHmEgHPZP0UHlZoxr8fYKVJOqcORhYQcG4FKQ==
 
 case-sensitive-paths-webpack-plugin@^2.4.0:
   version "2.4.0"
@@ -4854,10 +4854,10 @@ ejs@^3.1.6:
   dependencies:
     jake "^10.8.5"
 
-electron-to-chromium@^1.5.328:
-  version "1.5.369"
-  resolved "https://registry.npmjs.org/electron-to-chromium/-/electron-to-chromium-1.5.369.tgz"
-  integrity sha512-XM22K9FNaaCOvMMrBn1caIc8v0g6+pKt660ZbfQqUZvfil0hEzr8ZoiY7VcSLGM3L/x3rz5PqZrk+bKOOmVM9w==
+electron-to-chromium@^1.5.439:
+  version "1.5.439"
+  resolved "https://registry.npmjs.org/electron-to-chromium/-/electron-to-chromium-1.5.439.tgz"
+  integrity sha512-qu6QIPXhsb+CRcAiTMNjR4A1y/7tCYKkKjr5CZXRVih6qkDf79peZ2BpEU3qoDBNCRrcy3Mra3X9nG5oruuA7Q==
 
 embla-carousel-react@^8.6.0:
   version "8.6.0"
@@ -5570,10 +5570,10 @@ fast-levenshtein@^2.0.6:
   resolved "https://registry.npmjs.org/fast-levenshtein/-/fast-levenshtein-2.0.6.tgz"
   integrity sha512-DCXu6Ifhqcks7TZKY3Hxp3y6qphY5SJZmrWMDrKcERSOXWQdMhU9Ig/PYrzyw/ul9jOIyh0N4M0tbC5hodg8dw==
 
-fast-uri@^3.1.5:
-  version "3.1.5"
-  resolved "https://registry.npmjs.org/fast-uri/-/fast-uri-3.1.5.tgz"
-  integrity sha512-gHwA1O9LDIcKunMKhObS/HimwtehO1nPUECKAu5TpKgaO19fcWEl4bliWe1jWxVFvIXztJjjQ4L8XQ1EU9f7Jw==
+fast-uri@^3.1.8:
+  version "3.1.8"
+  resolved "https://registry.npmjs.org/fast-uri/-/fast-uri-3.1.8.tgz"
+  integrity sha512-GZMtZUTNRpOVIECoXwLNZS5xUGE+mVNbTB8h/7Rwh2TFWcBQiPzTgyZi05BF9UMZKkLJv8XBRJTlU7zg8+ZfMg==
 
 fastq@^1.6.0:
   version "1.20.1"
@@ -7212,10 +7212,10 @@ jiti@^1.21.7:
   resolved "https://registry.npmjs.org/js-tokens/-/js-tokens-4.0.0.tgz"
   integrity sha512-RdJUflcE3cUzKiMqQgsCu06FPu9UdIJO0beYbPhHN4k6apgJtifcoCtT9bcxOpYBtpD2kCM6Sbzg4CausW/PKQ==
 
-js-yaml@^4.3.1:
-  version "4.3.1"
-  resolved "https://registry.npmjs.org/js-yaml/-/js-yaml-4.3.1.tgz"
-  integrity sha512-CY6crGq313MX8GkwvB7tzgp99vjQxY1++5y10/BKN/GUfHqWaOGQMNZkBvqSzsZKWk/ijwHlWzzkLulsGHhjWQ==
+js-yaml@^4.3.2:
+  version "4.3.2"
+  resolved "https://registry.npmjs.org/js-yaml/-/js-yaml-4.3.2.tgz"
+  integrity sha512-SFNOvSJ+Dgf/9An904Yx+CgSlIPCkIpao4qo51lpee25TIRejdH3rhR4EZMGoNx3/TP3O+wzWuiTFl4sqbltzA==
   dependencies:
     argparse "^2.0.1"
 
@@ -7767,10 +7767,10 @@ node-int64@^0.4.0:
   resolved "https://registry.npmjs.org/node-int64/-/node-int64-0.4.0.tgz"
   integrity sha512-O5lz91xSOeoXP6DulyHfllpq+Eg00MWitZIbtPfoSEvqIHdl5gfcY6hYzDWnj0qD5tz52PI08u9qUvSVeUBeHw==
 
-node-releases@^2.0.36:
-  version "2.0.47"
-  resolved "https://registry.npmjs.org/node-releases/-/node-releases-2.0.47.tgz"
-  integrity sha512-Uzmd6LXpouKo8EUK68IjH4+E01w/hXyV3R3g/geCJo+rXLNfh1xucB+LOzYEOQPSiUK3h/xZf0cQGcSsmyL2Og==
+node-releases@^2.0.57:
+  version "2.0.57"
+  resolved "https://registry.npmjs.org/node-releases/-/node-releases-2.0.57.tgz"
+  integrity sha512-kQK9LGGFiHtrWiNhZtA7Qbw17AQz+dmsEKODRIVTXA9+e5MS/2gZEBhYJt13GrAz5/IOZKddH/0Z3TP/Zgo+yw==
 
 normalize-path@^3.0.0, normalize-path@~3.0.0:
   version "3.0.0"
@@ -10108,10 +10108,10 @@ svgo@^1.2.2:
     unquote "~1.1.1"
     util.promisify "~1.0.0"
 
-svgo@^2.7.0:
-  version "2.8.3"
-  resolved "https://registry.npmjs.org/svgo/-/svgo-2.8.3.tgz"
-  integrity sha512-5EZD0pafXX6PphdwOGCiVLDSaV1xyuQao2blHajHLsPxr07q4mmEjdtXEWgG07ae2mIz8Ex2CDXNCTiXhy3Khw==
+svgo@^2.8.4:
+  version "2.8.4"
+  resolved "https://registry.npmjs.org/svgo/-/svgo-2.8.4.tgz"
+  integrity sha512-2GJ4h3rl13qYTdwllaK6QlL8tG+UrM8626V2Ylcd/yBUv2Y/EwLsYisVV6UDCRmlk+C74G8nMpxJCk0RWPdDCw==
   dependencies:
     commander "^7.2.0"
     css-select "^4.1.3"
@@ -10501,10 +10501,10 @@ upath@^1.2.0:
   resolved "https://registry.npmjs.org/upath/-/upath-1.2.0.tgz"
   integrity sha512-aZwGpamFO61g3OlfT7OQCHqhGnW43ieH9WZeP7QxN/G/jS4jfqUkZxoryvJgVPEcrl5NL/ggHsSmLMHuH64Lhg==
 
-update-browserslist-db@^1.2.3:
-  version "1.2.3"
-  resolved "https://registry.npmjs.org/update-browserslist-db/-/update-browserslist-db-1.2.3.tgz"
-  integrity sha512-Js0m9cx+qOgDxo0eMiFGEueWztz+d4+M3rGlmKPT+T4IS/jP4ylw3Nwpu6cpTTP8R1MAC1kF4VbdLt3ARf209w==
+update-browserslist-db@^1.3.3:
+  version "1.3.3"
+  resolved "https://registry.npmjs.org/update-browserslist-db/-/update-browserslist-db-1.3.3.tgz"
+  integrity sha512-pJ2sYawQS0R/WI928Gj5GlPhTGzbMelq0+4INtSYNDV9ErKJcX6xjGWkoG/VnB3dpUm00zALaqkrUD77pO5TDQ==
   dependencies:
     escalade "^3.2.0"
     picocolors "^1.1.1"

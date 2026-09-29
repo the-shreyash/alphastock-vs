@@ -129,17 +129,23 @@
   },
   "overrides": {
     "brace-expansion": "^1.1.18",
-    "fast-uri": "^3.1.5",
-    "js-yaml": "^4.3.1",
+    "browserslist": "^4.29.2",
+    "fast-uri": "^3.1.8",
+    "js-yaml": "^4.3.2",
     "nanoid": "^3.3.18",
     "postcss@^8": "^8.5.26",
+    "postcss-svgo": {
+      "svgo": "^2.8.4"
+    },
     "underscore": "^1.13.8"
   },
   "resolutions": {
     "brace-expansion": "^1.1.18",
-    "fast-uri": "^3.1.5",
-    "js-yaml": "^4.3.1",
+    "browserslist": "^4.29.2",
+    "fast-uri": "^3.1.8",
+    "js-yaml": "^4.3.2",
     "nanoid": "^3.3.18",
+    "postcss-svgo/svgo": "^2.8.4",
     "underscore": "^1.13.8"
   },
   "packageManager": "yarn@1.22.22+sha512.a6b2f7906b721bba3d67d4aff083df04dad64c399707841b7acf00f6b133b7ac24255f2652fa22ae3534329dc6180534e98d17432037ff6fd140556e2bb3137e"

@@ -9,6 +9,11 @@ Status: Active Development
 
 # Purpose
 
+> **Operator runbook (2026-09-28):** the concrete, code-verified procedure for the
+> Vercel (frontend) + Railway (backend, MongoDB, Redis) topology lives in
+> `docs/deployment/` — start at `docs/deployment/README.md`. Where this document
+> and those files disagree, the `docs/deployment/` files reflect the code.
+
 This document defines the deployment architecture and operational procedures for StockAssist AI.
 
 It explains:

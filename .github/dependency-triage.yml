@@ -314,6 +314,86 @@ entries:
     owner: frontend
     expires: "2026-11-15"
 
+  # ---------------------------------------------------------------------------
+  # svgo removeScripts bypasses (2026-09-28, deployment preparation)
+  #
+  # The locked tree carried svgo at TWO paths:
+  #   A. react-scripts > @svgr/webpack@5.5.0 > @svgr/plugin-svgo@5.5.0 > svgo@1.3.2
+  #   B. react-scripts > css-minimizer-webpack-plugin > cssnano >
+  #      cssnano-preset-default > postcss-svgo@5.1.0 > svgo@2.8.3
+  #
+  # Path B was FIXED, not triaged: postcss-svgo declares svgo ^2.7.0 and 2.8.4
+  # is the patched release, so a scoped override (`"postcss-svgo": {"svgo":
+  # "^2.8.4"}` in frontend/package.json) takes it inside its own semver range.
+  # Path B is the copy that actually runs in this build (cssnano optimises SVG
+  # data URIs in CSS).
+  #
+  # Path A cannot move. The 1.x line has no patched release, and svgo 2 replaced
+  # the 1.x `new SVGO()` class API that @svgr/plugin-svgo@5 calls, so overriding
+  # it would break the build. The only fix is @svgr/webpack 6+, which
+  # react-scripts@5.0.1 does not accept. Path A is also DEAD CODE in this build:
+  # CRA passes `svgo: false` to @svgr/webpack, and @svgr/plugin-svgo returns the
+  # input unchanged when svgo is false, so svgo@1.3.2 is loaded but never runs.
+  # ---------------------------------------------------------------------------
+
+  - id: GHSA-w27v-7q3p-w38r
+    ecosystem: npm
+    package: svgo
+    affected: "1.3.2 (path A only; path B remediated to 2.8.4)"
+    severity: high
+    classification: not-reachable
+    reason: >-
+      The removeScripts plugin lets executable links through via namespace and
+      control-character bypasses.
+    reachability: >-
+      Build-time only, and not executed. The only remaining vulnerable copy is
+      svgo@1.3.2 at react-scripts > @svgr/webpack > @svgr/plugin-svgo > svgo.
+      react-scripts configures @svgr/webpack with `svgo: false`, and
+      @svgr/plugin-svgo returns early (`if (!config.svgo) return code;`), so
+      svgo 1.x never optimises anything. Even if it ran, the only inputs are
+      repository-controlled SVG files: the application imports no SVG through
+      webpack (the one SVG asset, public/logo.svg, is copied verbatim and never
+      passes through the loader), and it accepts no SVG upload of any kind.
+      svgo is absent from the shipped bundle.
+    evidence: >-
+      grep -n "svgo: false" frontend/node_modules/react-scripts/config/webpack.config.js → 1 match;
+      grep -n "if (!config.svgo) return code" frontend/node_modules/@svgr/plugin-svgo/lib/index.js → 1 match;
+      grep -rnE "\.svg['\"]" frontend/src/ → 0 matches;
+      npm ls svgo --all → svgo@1.3.2 under @svgr/plugin-svgo, svgo@2.8.4 under postcss-svgo
+    mitigation: >-
+      Path B (the svgo copy that runs) is on the patched 2.8.4. Path A inputs
+      are the project's own committed SVG assets, never user data.
+    fixed_in: "2.8.4 (2.x only; no patched 1.x release exists)"
+    blocked_by: >-
+      react-scripts@5.0.1 → @svgr/webpack@5 → @svgr/plugin-svgo@5, which requires
+      the svgo 1.x API. Clears with the CRA → Vite migration (see via:build-chain).
+    owner: frontend
+    expires: "2026-11-15"
+
+  - id: GHSA-4vpr-x523-8j87
+    ecosystem: npm
+    package: svgo
+    affected: "1.3.2 (path A only; path B remediated to 2.8.4)"
+    # GitHub rates this advisory itself `moderate`; npm reports the svgo package
+    # at `high` (its worst advisory), which is why the high-severity gate names it.
+    severity: moderate
+    classification: not-reachable
+    reason: >-
+      removeScripts incompletely sanitises executable HTML inside SVG
+      foreignObject elements.
+    reachability: >-
+      Same remaining path and same reasoning as GHSA-w27v-7q3p-w38r: svgo@1.3.2
+      is reached only through react-scripts > @svgr/webpack > @svgr/plugin-svgo,
+      which CRA runs with `svgo: false`, so it never executes. The build only
+      ever sees repository-controlled SVG files. It is build-time only and not
+      in the shipped bundle.
+    evidence: 'Same commands as GHSA-w27v-7q3p-w38r.'
+    mitigation: Same as GHSA-w27v-7q3p-w38r.
+    fixed_in: "2.8.4 (2.x only; no patched 1.x release exists)"
+    blocked_by: "react-scripts@5.0.1 → @svgr/webpack@5 → @svgr/plugin-svgo@5 (svgo 1.x API)"
+    owner: frontend
+    expires: "2026-11-15"
+
   - id: GHSA-5c6j-r48x-rmvq
     ecosystem: npm
     package: serialize-javascript

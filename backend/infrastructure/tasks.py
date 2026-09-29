@@ -227,6 +227,14 @@ def spawn(name: str, coro: Coroutine[Any, Any, Any]) -> Optional[asyncio.Task]:
     return registry.spawn(name, coro)
 
 
+async def cancel(name: str) -> bool:
+    """Cancel one named task. `LeaderLease.stop()` depends on this wrapper: it
+    was missing, so every graceful shutdown raised AttributeError before the
+    scheduler lease was released, and a successor waited out the full TTL
+    (up to ~60 s with no scheduler) on every rolling deploy."""
+    return await registry.cancel(name)
+
+
 async def cancel_all() -> int:
     return await registry.cancel_all()
 
