@@ -81,7 +81,7 @@ cryptography==50.0.0         # Fernet broker-token encryption; JWT/CSRF crypto b
                              # PH3.11-R2: 48.0.1 → 50.0.0 clears PYSEC-2026-3552/3553/3554.
                              # Fernet tokens written under 48.x decrypt unchanged (verified).
 bcrypt==4.1.3                # password hashing (security)
-PyJWT==2.13.0                # access/refresh JWT signing & verification
+PyJWT==2.15.0                # access/refresh JWT signing & verification (2.13.0 → 2.15.0 clears 14 PYSEC/GHSA advisories, 2026-10-06)
 
 # Market data & content
 feedparser==6.0.12           # services/news_service.py — RSS/Atom financial news
@@ -120,12 +120,12 @@ httpcore==1.0.9
 idna==3.16
 importlib_metadata==9.0.0
 jiter==0.15.0
-multidict==6.7.1
+multidict==6.9.1          # 6.7.1 → 6.9.1 clears GHSA-54p9-h82j-f925 (2026-10-06)
 propcache==0.5.2
 pyasn1==0.6.4
 pyasn1_modules==0.4.2
 pycparser==3.0
-pymongo==4.6.3
+pymongo==4.6.3            # HELD: 4.18.x breaks motor==3.3.1 at import — see .github/dependency-triage.yml
 sgmllib3k==1.0.0
 sniffio==1.3.1
 tenacity==9.1.4
@@ -133,6 +133,6 @@ typing-inspection==0.4.2
 typing_extensions==4.15.0
 tzdata==2026.2
 tzlocal==5.3.1
-urllib3==2.7.0
+urllib3==2.8.0            # 2.7.0 → 2.8.0 clears PYSEC-2026-4175/4176/4177 (2026-10-06)
 yarl==1.24.2
 zipp==4.1.0

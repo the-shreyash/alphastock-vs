@@ -64,7 +64,8 @@ describe("frontend/vercel.json", () => {
 
   test("build runs the guard first and neutralises Vercel's CI=1", () => {
     // CI=1 makes react-scripts fail on the 62 pre-existing ESLint warnings;
-    // frontend-ci.yml builds with CI unset for the same reason.
+    // frontend-ci.yml sets CI: "false" on its Build step for the same reason
+    // (pinned below).
     expect(vercel.buildCommand.startsWith("node scripts/verify-deploy-env.js && ")).toBe(true);
     expect(vercel.buildCommand).toContain("CI=false npm run build");
     expect(vercel.outputDirectory).toBe("build");
@@ -80,5 +81,28 @@ describe("frontend/vercel.json", () => {
     expect(re.test("/broker/callback")).toBe(true);
     // A missing hashed chunk must 404, not return HTML that fails to parse.
     expect(re.test("/static/js/main.abc123.js")).toBe(false);
+  });
+});
+
+describe(".github/workflows/frontend-ci.yml", () => {
+  // GitHub Actions exports CI=true on every runner, so a Build step that leaves
+  // CI unset still builds with warnings-as-errors. That is how every
+  // frontend-ci build failed until 2026-10-06. The assertion is scoped to the
+  // Build step's own block: CI: "false" anywhere else (e.g. the test job) would
+  // not reach `npm run build`.
+  const fs = require("fs");
+  const path = require("path");
+  const workflow = fs.readFileSync(
+    path.join(__dirname, "../../../.github/workflows/frontend-ci.yml"),
+    "utf8",
+  );
+
+  test('the Build step sets CI: "false", matching vercel.json', () => {
+    const start = workflow.indexOf("- name: Build\n");
+    expect(start).toBeGreaterThan(-1);
+    const next = workflow.indexOf("- name:", start + 1);
+    const buildStep = workflow.slice(start, next === -1 ? undefined : next);
+    expect(buildStep).toMatch(/^\s+CI: "false"$/m);
+    expect(buildStep).toContain("npm run build");
   });
 });

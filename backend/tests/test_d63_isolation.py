@@ -45,6 +45,7 @@ Sections mirror the D6.3 brief:
 import ast
 import asyncio
 import pathlib
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from _accounts import account_doc, account_ref, fixture_account_id  # noqa: E402
@@ -197,9 +198,14 @@ class TestPrivateReadsAreOwnerScoped:
         _seed_trade(fake_db, test_user, symbol=marker)
         # A closed trade too: `/trades/history` and `/journal` describe finished
         # business, and an OPEN-only fixture would make their controls vacuous.
+        # exit_time is relative to now: `/api/journal` returns only trades
+        # closed in the last 30 days (analytics.queries.closed_in_window), so a
+        # fixed date silently aged out of the window and failed this positive
+        # control from 2026-10-04 onward.
+        exit_time = (datetime.now(timezone.utc) - timedelta(days=1)).replace(microsecond=0)
         _seed_trade(fake_db, test_user, symbol=marker, status="TARGET_HIT",
                     quantity_open=0, pnl=250.0, exit_price=125.0,
-                    exit_time="2026-09-04T06:00:00+00:00")
+                    exit_time=exit_time.isoformat())
         fake_db.holdings.docs.append({
             "_id": ObjectId(), "user_id": str(test_user["_id"]), "symbol": marker,
             "quantity": 5, "average_price": 100.0, "broker": "zerodha"})

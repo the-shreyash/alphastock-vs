@@ -74,6 +74,10 @@ jobs:
         # exempts, where a reviewer reading that line cannot miss it — never as
         # a broad path exclusion, which would also hide a real leak added to the
         # same file later.
+        #
+        # The one exception is fakes already in HISTORY, where no inline marker
+        # can be added: those are exempted in /.gitleaksignore by exact
+        # commit-scoped fingerprint, each value checked by hand (see its header).
         uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

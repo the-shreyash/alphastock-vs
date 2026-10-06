@@ -1,0 +1,50 @@
+# ==============================================================================
+# gitleaks — historical synthetic test credentials (2026-10-06, beta release)
+#
+# Each line is a gitleaks fingerprint, <commit>:<file>:<rule>:<line>, so it
+# exempts ONE finding in ONE historical commit and nothing else. Any new commit
+# that adds a secret — including to these same files, or the same value again —
+# produces a new fingerprint and is still reported. Detection stays fully on;
+# no rule, path or value pattern is disabled.
+#
+# Why fingerprints and not inline  (the policy in
+# security-audit.yml): the inline marker exempts a line in NEW commits. These 24
+# findings live in commits that are already in history, whose contents cannot
+# change without rewriting history. They surfaced only in the weekly full-history
+# scan (push/PR scans check just the new commit range), which has failed every
+# week since at least 2026-09-14 on them.
+#
+# Every value below was decoded and checked by hand before being listed; all
+# are synthetic: Fernet-format keys whose base64 decodes to a descriptive
+# stockassist test phrase, JWT-shaped strings whose payload is the literal word
+# SECRET, and self-describing test strings (chaos, nova, live-looking and
+# placeholder OAuth values). Example values are deliberately NOT quoted here:
+# quoting them in this file would itself trip the scanner on the commit that
+# adds it. Regenerate with gitleaks v8.24.3
+# (the version gitleaks-action pins) and never add a fingerprint without
+# checking the value it hides.
+# ==============================================================================
+d93b28eeb83497fcc267967d1e950d3ee1bf1dc4:backend/tests/_chaos.py:generic-api-key:245
+d93b28eeb83497fcc267967d1e950d3ee1bf1dc4:backend/tests/_chaos.py:generic-api-key:246
+d93b28eeb83497fcc267967d1e950d3ee1bf1dc4:backend/tests/_chaos.py:generic-api-key:248
+d93b28eeb83497fcc267967d1e950d3ee1bf1dc4:backend/tests/_chaos.py:generic-api-key:250
+1bebfb9c265d4f2d23a5a02b22f46c01ffb4ddc4:backend/tests/_testenv.py:generic-api-key:62
+ed9807ed5e95c06863da8c8a1c1d3e16d058e7f0:backend/tests/test_d519_surface_disclosure.py:generic-api-key:78
+1ba58242e4b66d1a11a2e021b17f971abf657c61:backend/tests/test_d68_data_quality.py:generic-api-key:495
+1ba58242e4b66d1a11a2e021b17f971abf657c61:backend/tests/test_d68_data_quality.py:generic-api-key:1494
+eca34618738a180d40bec13bf6b237e30c22ff91:backend/tests/test_instrument_sharding.py:generic-api-key:1188
+eca34618738a180d40bec13bf6b237e30c22ff91:backend/tests/test_instrument_sharding.py:generic-api-key:1189
+59ce6ed4626bcfcf1a325eff1194e2a1b22db241:backend/tests/test_log_infrastructure.py:generic-api-key:615
+59ce6ed4626bcfcf1a325eff1194e2a1b22db241:backend/tests/test_observability.py:generic-api-key:825
+6816bdeea3408fbb95afe907769e76c3a68470c3:backend/tests/test_secret_loading.py:generic-api-key:625
+6816bdeea3408fbb95afe907769e76c3a68470c3:backend/tests/test_secret_loading.py:generic-api-key:636
+42cd6a77f3b33a9c5e86bba370677d07738ff0e0:backend/tests/test_stream_reliability.py:generic-api-key:333
+42cd6a77f3b33a9c5e86bba370677d07738ff0e0:backend/tests/test_stream_reliability.py:generic-api-key:334
+42cd6a77f3b33a9c5e86bba370677d07738ff0e0:backend/tests/test_stream_reliability.py:generic-api-key:341
+dc19514473953354aff21a91b72dbce594f9b2b2:frontend/src/__tests__/feedStateSecurity.test.jsx:generic-api-key:44
+dc19514473953354aff21a91b72dbce594f9b2b2:frontend/src/__tests__/feedStateSecurity.test.jsx:generic-api-key:45
+dc19514473953354aff21a91b72dbce594f9b2b2:frontend/src/__tests__/feedStateSecurity.test.jsx:generic-api-key:49
+dc19514473953354aff21a91b72dbce594f9b2b2:frontend/src/components/__tests__/MarketFeedStatus.test.jsx:generic-api-key:173
+80cd203528be8b72022621c920eaeb88b5819e5e:frontend/src/services/__tests__/telemetry.test.js:generic-api-key:221
+dc19514473953354aff21a91b72dbce594f9b2b2:frontend/src/store/__tests__/feedState.store.test.js:generic-api-key:185
+ecd12782ed3d1de0de995132c2f200ef8c1100e5:scripts/load/env/loadtest.env:generic-api-key:72
