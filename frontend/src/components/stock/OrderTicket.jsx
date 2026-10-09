@@ -45,9 +45,11 @@
  *     deliberately does not reimplement product codes, margin or exchange
  *     rules — those are the broker's answer to give.
  */
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, useMemo, useRef } from "react";
 import { AlertTriangle, Check, Loader2, ShieldAlert } from "lucide-react";
 import brokerService, { brokerErrorMessage } from "../../services/brokerService";
+import { currentAuthEpoch } from "../../services/api";
+import { useAuth } from "../../context/AuthContext";
 
 const SIDES = ["BUY", "SELL"];
 const ORDER_TYPES = ["MARKET", "LIMIT"];
@@ -66,6 +68,25 @@ export default function OrderTicket({ symbol, exchange = "NSE", price }) {
   const [placing, setPlacing] = useState(false);
   const [result, setResult] = useState(null);
   const [error, setError] = useState(null);
+  const { user } = useAuth();
+  const userId = user?._id || user?.id || null;
+  /**
+   * Who this review panel was raised for, and which broker it names (D6.3).
+   *
+   * The review step is the one place in the product where a human has already
+   * decided to spend real money and is one click from the irreversible half of
+   * the order path. Everything else about an identity change is recoverable by
+   * refetching; this is not — a confirmation that outlives the account it was
+   * composed under would place a live order at the exchange, and the *server*
+   * cannot catch it, because by then the request carries the new account's
+   * cookie and is a perfectly valid order from that account.
+   *
+   * So the intent carries its own identity: the account, the broker, and the
+   * auth epoch in force when the user pressed Review. `placeOrder` re-checks
+   * all three at the instant of confirmation. A ref rather than state because
+   * it must be read synchronously inside the click handler, before any await.
+   */
+  const intentRef = useRef(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -116,6 +137,21 @@ export default function OrderTicket({ symbol, exchange = "NSE", price }) {
     // Guarded rather than merely disabled: a second click on an in-flight
     // confirmation must not produce a second order at the exchange.
     if (placing || !valid) return;
+    // D6.3. The intent must still belong to the account, the broker and the
+    // identity generation it was composed under. Any of the three moving means
+    // this panel is describing an order nobody currently signed in asked for;
+    // it is torn down rather than sent.
+    const intent = intentRef.current;
+    if (!intent
+        || intent.userId !== userId
+        || intent.broker !== broker
+        || intent.epoch !== currentAuthEpoch()) {
+      intentRef.current = null;
+      setReviewing(false);
+      setError("The session or the broker changed while this order was under "
+               + "review. Nothing was sent — please re-enter it.");
+      return;
+    }
     setPlacing(true);
     setError(null);
     try {
@@ -132,7 +168,7 @@ export default function OrderTicket({ symbol, exchange = "NSE", price }) {
   if (statuses === null) {
     return (
       <div data-testid="order-ticket" className="glass-card p-4">
-        <div className="h-24 animate-pulse rounded-lg bg-[var(--bg-tertiary)]" />
+        <div className="h-24 animate-pulse rounded-lg bg-[var(--bg-elevated)]" />
       </div>
     );
   }
@@ -250,7 +286,7 @@ export default function OrderTicket({ symbol, exchange = "NSE", price }) {
               data-testid="order-broker"
               value={broker}
               onChange={(e) => setBroker(e.target.value)}
-              className="w-full rounded-lg border border-[var(--border)] bg-[var(--bg-tertiary)] px-2 py-2 text-[11px] text-[var(--text-primary)]"
+              className="w-full rounded-lg border border-[var(--border)] bg-[var(--bg-elevated)] px-2 py-2 text-[11px] text-[var(--text-primary)]"
             >
               {/* Deliberately unselected. Choosing the account that will spend
                   the money is the user's decision, not a default. */}
@@ -273,7 +309,7 @@ export default function OrderTicket({ symbol, exchange = "NSE", price }) {
                 min="1"
                 value={quantity}
                 onChange={(e) => setQuantity(e.target.value)}
-                className="w-full rounded-lg border border-[var(--border)] bg-[var(--bg-tertiary)] px-2 py-2 text-[11px] font-mono text-[var(--text-primary)]"
+                className="w-full rounded-lg border border-[var(--border)] bg-[var(--bg-elevated)] px-2 py-2 text-[11px] font-mono text-[var(--text-primary)]"
               />
             </label>
             <label className="block">
@@ -282,7 +318,7 @@ export default function OrderTicket({ symbol, exchange = "NSE", price }) {
                 data-testid="order-type"
                 value={orderType}
                 onChange={(e) => setOrderType(e.target.value)}
-                className="w-full rounded-lg border border-[var(--border)] bg-[var(--bg-tertiary)] px-2 py-2 text-[11px] text-[var(--text-primary)]"
+                className="w-full rounded-lg border border-[var(--border)] bg-[var(--bg-elevated)] px-2 py-2 text-[11px] text-[var(--text-primary)]"
               >
                 {ORDER_TYPES.map((t) => <option key={t} value={t}>{t}</option>)}
               </select>
@@ -301,7 +337,7 @@ export default function OrderTicket({ symbol, exchange = "NSE", price }) {
                 min="0"
                 value={limitPrice}
                 onChange={(e) => setLimitPrice(e.target.value)}
-                className="w-full rounded-lg border border-[var(--border)] bg-[var(--bg-tertiary)] px-2 py-2 text-[11px] font-mono text-[var(--text-primary)]"
+                className="w-full rounded-lg border border-[var(--border)] bg-[var(--bg-elevated)] px-2 py-2 text-[11px] font-mono text-[var(--text-primary)]"
               />
             </label>
           )}
@@ -310,9 +346,15 @@ export default function OrderTicket({ symbol, exchange = "NSE", price }) {
             data-testid="order-review"
             type="button"
             disabled={!valid}
-            onClick={() => { setResult(null); setError(null); setReviewing(true); }}
+            onClick={() => {
+              setResult(null);
+              setError(null);
+              // Stamp the intent with the identity it is being composed under.
+              intentRef.current = { userId, broker, epoch: currentAuthEpoch() };
+              setReviewing(true);
+            }}
             className="w-full rounded-lg px-3 py-2 text-[11px] font-semibold text-[var(--text-primary)] border border-[var(--border)] disabled:opacity-40 disabled:cursor-not-allowed"
-            style={{ background: "var(--bg-tertiary)" }}
+            style={{ background: "var(--bg-elevated)" }}
           >
             Review order
           </button>

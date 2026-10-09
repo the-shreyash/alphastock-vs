@@ -48,6 +48,7 @@ from services.brokers.feed_universe import (
     index_instruments,
 )
 from tests.test_broker_streaming import run
+from _accounts import account_ref  # noqa: E402
 
 
 # ==================================================================
@@ -477,7 +478,7 @@ def test_an_accounts_planned_subscription_covers_the_index_strip(broker, monkeyp
     monkeypatch.setattr(engine, "_feed_watchlist_symbols", _no_watchlist)
 
     tokens, symbols = run(engine._plan_tick_subscription(
-        "u1", broker, {}, holdings=[], positions=[]))
+        account_ref("u1", broker), {}, holdings=[], positions=[]))
 
     for canonical, identifier in expected.items():
         assert identifier in tokens, (

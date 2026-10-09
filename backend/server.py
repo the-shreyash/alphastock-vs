@@ -64,6 +64,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
 from bson.errors import InvalidId
 import os
+import hashlib
 import logging
 import secrets
 import httpx
@@ -78,6 +79,12 @@ from services.alpha_vantage import get_global_quote as av_get_quote, get_intrada
 # Legacy single-session Zerodha shim (data-sources status + startup log only).
 # All broker routes go through services.broker_engine (Sprint 7).
 from services.broker_engine import broker_engine
+from services.brokers.accounts import (
+    AmbiguousBrokerAccount,
+    UnknownBrokerAccount,
+    broker_accounts,
+    is_broker_account_id,
+)
 from services.brokers.base import BrokerAuthError, BrokerError
 from services.brokers.stream import stream_manager
 from services.scheduler import setup_scheduler
@@ -88,6 +95,9 @@ from services.scheduler import setup_scheduler
 # whole body is the gateway call, and a function-local import in each would be
 # more import machinery than route.
 from services.market_engine import Capability, SourceTier, market_gateway
+# D6.8-A — every market field this module narrates or hands to a model is
+# read through this contract, never straight off the quote dict.
+from services.market_engine import field_quality
 
 # Centralized authentication-cookie policy (PH1.3). Every auth cookie is set or
 # cleared through this module so the Secure/HttpOnly/SameSite/Path/Max-Age
@@ -102,10 +112,11 @@ from security.cookies import (
     clear_oauth_state_cookie,
     set_broker_oauth_state_cookie,
     clear_broker_oauth_state_cookie,
+    cookie_policy_warnings,
 )
 from security import oauth_state as oauth_state_store
 from security import api_docs
-from security.cors import apply_cors
+from security.cors import apply_cors, is_allowed_websocket_origin
 from security.headers import apply_security_headers
 
 # Centralized CSRF protection (PH1.7). Signed double-submit token bound to the
@@ -135,7 +146,7 @@ from security.passwords import hash_password, verify_password
 # allowlist and least privilege on elevation (only super_admin grants admin-tier
 # roles). See SECURITY_ARCHITECTURE.md and backend/security/{identifiers,roles}.py.
 from security.identifiers import parse_object_id
-from security.roles import validate_role_assignment
+from security.roles import PLAN_ROLES, authorize_admin_target, validate_role_assignment
 
 # Supervised background tasks (PH3.6). Every perpetual loop this process starts
 # is registered here so it (a) keeps a strong reference for its whole life — the
@@ -190,6 +201,7 @@ from models import (
     AdvisorRequest, AdvisorRecommendation, AdvisorEntryZone,
     AIMemoryUpdate, LearnRequest, TradeReviewRequest, PortfolioReviewRequest,
     BrokerOrderCreate, BrokerOrderModify,
+    ZerodhaOrderCreate, ZerodhaQuickTradeCreate,
 )
 from market_data import get_stock_meta, search_stocks, STOCK_UNIVERSE
 # NOTE: market_data contains ONLY factual reference metadata (symbols, company
@@ -470,7 +482,7 @@ async def malformed_json_handler(request, exc: _json.JSONDecodeError):
 from security import jwt as jwt_service
 from security.sessions import (
     SessionStore,
-    ROTATED, REUSE_DETECTED, REVOKED, EXPIRED, NOT_FOUND,
+    ROTATED, GRACE_REPLAY, REUSE_DETECTED, REVOKED, EXPIRED, NOT_FOUND,
     REASON_LOGOUT,
 )
 
@@ -859,11 +871,31 @@ def _advisor_score(quote: dict, patterns: list, horizon: str) -> tuple:
     """Technical score (0-100 conviction) + human-readable reasons for a stock,
     computed entirely from REAL indicators. Weighting is nudged per horizon:
     shorter horizons lean on momentum/volume, longer ones on trend (MACD)."""
-    rsi = quote.get("rsi", 50.0) or 50.0
-    volume_ratio = quote.get("volume_ratio", 1.0) or 1.0
-    macd = quote.get("macd", 0.0) or 0.0
-    macd_signal = quote.get("macd_signal", 0.0) or 0.0
-    change_pct = quote.get("change_pct", 0.0) or 0.0
+    # D6.8-A — THE SECOND OF THE THREE SURFACES D5.19 DID NOT REACH (§G-6).
+    #
+    # These `reasons` are published as `technical_reasons` on every advisor
+    # recommendation and are quoted verbatim into the deterministic narrative
+    # ("Reasoning is driven by live technicals: …"). Before this phase every one
+    # of them was emitted unconditionally from a coalesced value, so a stock
+    # whose RSI the platform never had was told, under a buy recommendation,
+    # that its "RSI at 50 sits in a healthy bullish zone with room before
+    # overbought" — a complete, confident, fabricated sentence.
+    #
+    # The arithmetic is untouched: `scoring_input` is `or <default>` by
+    # construction, so every confidence, risk level, entry band, stop and target
+    # is numerically identical for identical input. Only the sentences are gated.
+    rsi = field_quality.scoring_input(quote, "rsi", 50.0)
+    volume_ratio = field_quality.scoring_input(quote, "volume_ratio", 1.0)
+    macd = field_quality.scoring_input(quote, "macd", 0.0)
+    macd_signal = field_quality.scoring_input(quote, "macd_signal", 0.0)
+    change_pct = field_quality.scoring_input(quote, "change_pct", 0.0)
+    rsi_known = field_quality.is_available(quote, "rsi")
+    volume_known = field_quality.is_available(quote, "volume_ratio")
+    macd_known = (
+        field_quality.is_available(quote, "macd")
+        and field_quality.is_available(quote, "macd_signal")
+    )
+    change_known = field_quality.is_available(quote, "change_pct")
 
     short_horizon = horizon in ("intraday", "swing")
     score = 50.0
@@ -872,39 +904,43 @@ def _advisor_score(quote: dict, patterns: list, horizon: str) -> tuple:
     # RSI — momentum vs mean-reversion
     if 50 <= rsi <= 68:
         score += 15
-        reasons.append(f"RSI at {rsi:.0f} sits in a healthy bullish zone with room before overbought.")
+        field_quality.claim(reasons, rsi_known, f"RSI at {rsi:.0f} sits in a healthy bullish zone with room before overbought.")
     elif 40 <= rsi < 50:
         score += 8
-        reasons.append(f"RSI at {rsi:.0f} is neutral-to-constructive, basing before a potential move up.")
+        field_quality.claim(reasons, rsi_known, f"RSI at {rsi:.0f} is neutral-to-constructive, basing before a potential move up.")
     elif rsi < 35:
         score += 10
-        reasons.append(f"RSI at {rsi:.0f} is oversold, hinting at a mean-reversion bounce.")
+        field_quality.claim(reasons, rsi_known, f"RSI at {rsi:.0f} is oversold, hinting at a mean-reversion bounce.")
     elif rsi > 72:
         score -= 6
-        reasons.append(f"RSI at {rsi:.0f} is overbought — momentum is strong but entries need discipline.")
+        field_quality.claim(reasons, rsi_known, f"RSI at {rsi:.0f} is overbought — momentum is strong but entries need discipline.")
 
     # Volume — conviction behind the move (weighted more for short horizons)
     vol_weight = 20 if short_horizon else 12
     if volume_ratio >= 1.5:
         score += vol_weight
-        reasons.append(f"Volume is {volume_ratio:.1f}x the 20-day average — strong participation.")
+        field_quality.claim(reasons, volume_known, f"Volume is {volume_ratio:.1f}x the 20-day average — strong participation.")
     elif volume_ratio >= 1.1:
         score += vol_weight * 0.5
-        reasons.append(f"Volume is elevated at {volume_ratio:.1f}x the 20-day average.")
+        field_quality.claim(reasons, volume_known, f"Volume is elevated at {volume_ratio:.1f}x the 20-day average.")
 
     # MACD — trend (weighted more for longer horizons)
     macd_weight = 18 if not short_horizon else 12
     if macd > macd_signal:
         score += macd_weight
-        reasons.append("MACD is in a bullish crossover, confirming upward trend momentum.")
+        field_quality.claim(reasons, macd_known, "MACD is in a bullish crossover, confirming upward trend momentum.")
     else:
         score -= 4
-        reasons.append("MACD has yet to cross bullish — wait for confirmation on strength.")
+        # "MACD has yet to cross bullish" is a claim about the indicator, and
+        # this is the branch the substituted `0.0 > 0.0` always took — so before
+        # this phase it was the single most-published fabricated sentence in the
+        # advisor.
+        field_quality.claim(reasons, macd_known, "MACD has yet to cross bullish — wait for confirmation on strength.")
 
     # Live day change
     if change_pct >= 1.0:
         score += 6
-        reasons.append(f"Trading up {change_pct:+.1f}% today with positive intraday momentum.")
+        field_quality.claim(reasons, change_known, f"Trading up {change_pct:+.1f}% today with positive intraday momentum.")
     elif change_pct <= -1.5:
         score -= 4
 
@@ -940,13 +976,34 @@ def _advisor_deterministic_narrative(rec: dict, horizon_label: str) -> dict:
     name = rec["name"]
     entry = rec["entry_zone"]
     t = rec["targets"]
+    # D6.8-A — the clause used to end "…: positive setup" when there were no
+    # technical reasons, which asserts a setup nothing had assessed. Its first
+    # entry is either a real reading or an explicit statement that there is
+    # none, so the fallback string is gone rather than softened.
+    #
+    # D6.8-A FIX (F-5) — BOUND TO THE CLAUSE, NOT TO THE WHOLE SUMMARY.
+    #
+    # This was one conditional expression spanning every `+` above it, so
+    # Python's precedence made `if rec["technical_reasons"]` govern the entire
+    # concatenation: an empty reasons list did not swap the Reasoning clause,
+    # it replaced the WHOLE narrative — name, confidence, entry zone, stop,
+    # targets and expected move all vanished, leaving `ai_summary` as the bare
+    # sentence "No technical evidence supports this level." That is a worse
+    # failure than the one the conditional was added to fix: the levels a user
+    # is asked to trade on are exactly the part that is still true when the
+    # technicals are absent. The clause is now built separately and appended.
+    reasoning = (
+        f"Reasoning: {rec['technical_reasons'][0]}"
+        if rec["technical_reasons"]
+        else "No technical evidence supports this level."
+    )
     summary = (
         f"{name} scores {rec['confidence']}/100 as a {horizon_label.lower()} idea "
         f"({rec['risk'].lower()} risk). Accumulate in the ₹{entry['low']}–₹{entry['high']} zone "
         f"with a stop at ₹{rec['stop_loss']}, targeting ₹{t[0]}"
         + (f" and ₹{t[1]}" if len(t) > 1 else "")
         + f" — an expected move of about {rec['expected_return_pct']:+.1f}%. "
-        f"Reasoning is driven by live technicals: {rec['technical_reasons'][0] if rec['technical_reasons'] else 'positive setup'}"
+        + reasoning
     )
     news = (
         f"No stock-specific news feed is modeled for this recommendation. "
@@ -966,9 +1023,24 @@ async def _advisor_ai_enrich(recs: list, horizon_label: str, risk_appetite, capi
     engine = get_debate_engine()
     lines = []
     for r in recs:
+        # D6.8-A — A MODEL MAY NOT BE HANDED A NUMBER THE PLATFORM DOES NOT HAVE.
+        #
+        # `RSI {r.get('rsi')}` printed `RSI None` when the reading was absent —
+        # under a system prompt asserting these are REAL pre-computed technicals
+        # — and printed a substituted `RSI 50.0` before this phase removed the
+        # substitution. Either way the model was asked to explain a number
+        # nobody measured, and its whole job here is to be persuasive about it.
+        #
+        # An absent field is LABELLED rather than dropped, because a silently
+        # missing line reads to a model as an omission it may fill in, while
+        # "not enough price history to compute" is a fact it can state.
+        # `describe_field` is the one formatter for this, shared with every
+        # other surface, and its vocabulary is provider-free by construction.
         lines.append(
             f"- {r['symbol']} ({r['name']}, {r['sector']}): live price ₹{r['price']}, "
-            f"RSI {r.get('rsi')}, volume {r.get('volume_ratio')}x avg, pattern "
+            f"RSI {field_quality.describe_field(r, 'rsi')}, "
+            f"volume {field_quality.describe_field(r, 'volume_ratio')}"
+            f"{'x avg' if field_quality.is_available(r, 'volume_ratio') else ''}, pattern "
             f"'{r.get('pattern') or 'none'}', confidence {r['confidence']}/100, {r['risk']} risk, "
             f"entry ₹{r['entry_zone']['low']}-₹{r['entry_zone']['high']}, SL ₹{r['stop_loss']}, "
             f"targets {r['targets']}, sector today: {r['sector_strength']}"
@@ -977,7 +1049,11 @@ async def _advisor_ai_enrich(recs: list, horizon_label: str, risk_appetite, capi
     system_msg = (
         "You are AlphaPartner's senior equity strategist for Indian markets (NSE/BSE). "
         "You are given REAL, pre-computed price levels and technicals — never change or invent "
-        "any number, only explain them. For EACH stock write a crisp 2-3 sentence 'summary' "
+        "any number, only explain them. Some technical readings may be given as a short "
+        "phrase instead of a number (for example 'not enough price history to compute'); "
+        "that field is genuinely unavailable — say so plainly if it matters, and never "
+        "estimate, assume or substitute a value for it. "
+        "For EACH stock write a crisp 2-3 sentence 'summary' "
         "(why it fits this horizon, referencing the given levels) and a 1-2 sentence 'news_impact' "
         "(likely news/earnings catalysts and risks for that sector — be honest, no fabricated headlines). "
         "Return ONLY a JSON object mapping each SYMBOL to {\"summary\": str, \"news_impact\": str}."
@@ -1162,15 +1238,29 @@ async def build_advisor_recommendations(
             "entry_zone": {"low": entry_low, "high": entry_high},
             "stop_loss": stop_loss,
             "targets": targets,
-            "technical_reasons": tech_reasons[:4] or ["Constructive technical setup on the daily timeframe."],
+            # D6.8-A — the fallback used to read "Constructive technical setup
+            # on the daily timeframe", which is a claim about the chart made
+            # precisely when the scorer had nothing to say about it. It fired
+            # rarely before, because every branch above emitted a sentence from
+            # a coalesced value; now that the sentences are gated on real
+            # readings it is the honest answer for a stock with no technicals,
+            # and it has to BE honest. It states the absence instead.
+            "technical_reasons": tech_reasons[:4] or [
+                "No technical indicator readings are available for this stock, "
+                "so this recommendation is not supported by technical evidence."
+            ],
             "fundamental_reasons": fundamental_reasons,
             "news_impact": "",
             "sector_strength": sector_strength,
             "ai_summary": "",
             "price": round(price, 2),
             "horizon": horizon,
-            "rsi": quote.get("rsi"),
-            "volume_ratio": quote.get("volume_ratio"),
+            # D6.8-A — readings, not whatever the quote dict happened to carry.
+            # Both keys are rendered on the advisor card AND fed to the model in
+            # `_advisor_ai_enrich`, so a substitute here becomes a number the AI
+            # is asked to explain.
+            "rsi": field_quality.reading(quote, "rsi"),
+            "volume_ratio": field_quality.reading(quote, "volume_ratio"),
             "pattern": pattern_name,
         }
         scored.append(rec)
@@ -1351,6 +1441,12 @@ async def logout(request: Request, response: Response):
         try:
             payload = jwt_service.decode_token(token, expected_type="refresh")
             await SessionStore(db).revoke(payload["sid"], reason=REASON_LOGOUT)
+            # D6.2 / E. Revoking the family kills the refresh token; it does
+            # nothing to a WebSocket that authenticated at its handshake and has
+            # been open ever since. That socket is a live private event stream
+            # for a session that no longer exists, so close it here — scoped to
+            # this session, because the user's other devices did not log out.
+            await ws_manager.close_session(payload["sid"])
             await log_auth_event(audit.SESSION_REVOKED, request,
                                  user_id=payload.get("sub"), session_id=payload.get("sid"),
                                  reason=REASON_LOGOUT)
@@ -1369,6 +1465,8 @@ async def logout_all(request: Request, response: Response, user: dict = Depends(
     (≤15 min) drain on their own; the service-layer primitive
     (``SessionStore.revoke_all_for_user``) is what PH1.10's UI will call."""
     revoked = await SessionStore(db).revoke_all_for_user(user["_id"], reason="logout_all")
+    # Every device, so every socket (D6.2 / E).
+    await ws_manager.close_user(str(user["_id"]))
     clear_auth_cookies(response)
     clear_csrf_cookie(response)
     await log_auth_event(audit.LOGOUT_ALL, request, email=user.get("email"),
@@ -1410,7 +1508,11 @@ async def refresh_token(request: Request, response: Response):
         raise HTTPException(status_code=401, detail="Invalid refresh token")
 
     # Rotate: the presented token is single-use. Replaying an already-rotated
-    # token (reuse) revokes the whole family — see security.sessions.
+    # token (reuse) revokes the whole family — see security.sessions. The one
+    # exception is a replay of the immediately-previous token inside the
+    # rotation grace window (D6.2 / F): two tabs sharing one cookie jar refresh
+    # at the same instant, and that is not theft. It is answered with the pair
+    # that is already current rather than a new rotation.
     new_jti = jwt_service.new_jti()
     result = await SessionStore(db).rotate(payload["sid"], payload["jti"], new_jti)
     if not result.ok:
@@ -1430,14 +1532,25 @@ async def refresh_token(request: Request, response: Response):
 
     user_id = str(user["_id"])
     access = jwt_service.create_access_token(user_id, user["email"], payload["sid"])
-    refresh = jwt_service.create_refresh_token(user_id, payload["sid"], new_jti)
+    # `issued_jti` is the new generation for a clean rotation and the ALREADY
+    # current one for a grace replay — minting `new_jti` unconditionally would
+    # hand the second tab a refresh token the store does not consider current,
+    # so its next refresh would trip reuse detection and revoke the family. The
+    # store, not the route, decides which generation is live.
+    refresh = jwt_service.create_refresh_token(user_id, payload["sid"], result.issued_jti)
     # Re-issue BOTH cookies through the central hardened policy: rotation means
     # the refresh token changes on every use, not just the access token.
     set_auth_cookies(response, access, refresh)
     # Refresh the session-bound CSRF token alongside (same sid → same binding).
     set_csrf_cookie(response, payload["sid"])
+    # A grace replay is audited under its own reason so the security log never
+    # shows it as a rotation that did not happen — and so an operator can see
+    # whether the window is being used at the rate two-tab usage predicts, or
+    # at a rate that warrants a closer look.
     await log_auth_event(audit.REFRESH_ROTATION, request, user_id=user_id,
-                         session_id=payload["sid"])
+                         session_id=payload["sid"],
+                         reason=("concurrent_refresh_grace"
+                                 if result.outcome == GRACE_REPLAY else None))
     return {"message": "Token refreshed"}
 
 
@@ -1685,6 +1798,10 @@ async def _apply_password_change(user: dict, new_password: str) -> None:
     # Sign out everywhere: revoke refresh families; password_changed_at handles
     # the still-live access tokens on their next use.
     await SessionStore(db).revoke_all_for_user(user_id, reason="password_changed")
+    # A password change is the strongest "this is no longer that person" signal
+    # the platform has. Leaving their sockets open would keep streaming private
+    # data to whoever the change was made to lock out (D6.2 / E).
+    await ws_manager.close_user(user_id)
     await _send_recovery_email("PASSWORD_CHANGED", user.get("email", ""), name=user.get("name", ""))
 
 
@@ -1756,7 +1873,11 @@ async def fii_dii():
     return await market_gateway.get_fii_dii()
 
 @market_router.get("/summary")
-async def market_summary():
+async def market_summary(user: dict = Depends(get_current_user)):
+    # D6.8 / F-5 — authenticated. This handler invokes a paid AI model and was
+    # public: the only thing between an anonymous caller and model spend was the
+    # SPA's `ProtectedRoute`, which is UX, not a control. No signed-out page
+    # calls it. See `_MODEL_INVOKING_ROUTES` in tests/test_d68_entitlements.py.
     summary = await ai_market_summary()
     return {"summary": summary, "generated_at": datetime.now(timezone.utc).isoformat()}
 
@@ -1871,12 +1992,21 @@ async def economic_calendar(
     )
 
 
-@market_router.get("/events")
-async def market_events(event_type: Optional[str] = None, limit: int = 50):
-    """Recent market engine events from the event bus."""
-    from services.market_engine.event_bus import event_bus
-    events = event_bus.recent_events(event_type=event_type, limit=min(limit, 200))
-    return {"events": events, "count": len(events)}
+# `GET /api/market/events` was removed in D6.10-P0. It served
+# `EventBus.recent_events()` — a *process-global* 500-entry log that carries
+# `trade.updated`, `portfolio.updated`, `notification.created`,
+# `broker.order.updated` and `trade.review.ready` payloads, each stamped with
+# its owner's `user_id` — to any anonymous caller. Authentication alone would
+# not have fixed it: the log itself is cross-tenant, so every signed-in user
+# would still have read every other user's positions, P&L, notifications and
+# broker orders. It had no frontend or service consumer, so the endpoint was
+# deleted rather than rescoped.
+#
+# Do not reintroduce a route that returns the event log. The per-user delivery
+# path is the WebSocket bridge (`services/realtime/event_bridge.py`), which
+# addresses private domains to their owner; the readable activity surfaces are
+# `/api/market/activity-feed` and `/api/ai/activity`, both scoped by
+# `get_optional_user_id` (D6.1 / S4).
 
 
 @market_router.get("/engine/status")
@@ -2059,15 +2189,38 @@ async def stock_chart(symbol: str, period: str = "1D"):
 
 
 @stocks_router.get("/{symbol}/patterns")
-async def stock_patterns(symbol: str):
-    """Detect classic chart patterns for a given symbol using 3 months of OHLCV data."""
+async def stock_patterns(symbol: str, user_id: Optional[str] = Depends(get_optional_user_id)):
+    """Detect classic chart patterns for a given symbol using 3 months of OHLCV data.
+
+    D6.3 (closure) — THE ENTRY DESCRIBES A CALLER, NOT THE MARKET.
+    -------------------------------------------------------------
+    D6.1 classified this scan line as platform scope on the grounds that the
+    route took no identity and the symbol it names is public reference data.
+    The first half was true and the conclusion did not follow: the entry exists
+    only because *somebody opened this symbol's detail page*, so publishing it
+    to the shared stream told every other signed-in user which symbols their
+    neighbours were researching.
+
+    Reproduced in two simultaneous real-Chrome profiles (LIM-D6.3-1 closure):
+    B's feed did not mention `PIDILITIND`; A opened `/stock/PIDILITIND`; B's
+    feed and B's rendered dashboard both named it seconds later, while a control
+    symbol nobody opened stayed absent throughout. The symbol is public; the
+    fact that this account just looked at it is not.
+
+    The route now takes the optional caller identity D6.1's own comment said it
+    would need, and follows the shape D6.1 already chose for the backtest route
+    (`run_backtest_route`) when it hit this same problem: an identified caller's
+    entry is theirs alone, while a genuinely anonymous visitor — who is not a
+    tenant and whose page view discloses no account's business — keeps the
+    public behaviour unchanged. Same defect, same remedy, one pattern.
+    """
+    from services.activity_logger import log_activity, log_platform_activity
     from services.real_market import detect_chart_patterns
-    # PLATFORM scope (D6.1 / S4): this route takes no identity at all and the
-    # symbol it names is public reference data the same endpoint returns. There
-    # is no user to own the entry. If this endpoint ever gains a caller
-    # identity, this must become the private logger and take their id.
-    from services.activity_logger import log_platform_activity
-    log_platform_activity(f"Scanning chart patterns for {symbol.upper()}", "scan", "done")
+    message = f"Scanning chart patterns for {symbol.upper()}"
+    if user_id:
+        log_activity(message, "scan", "done", user_id=user_id)
+    else:
+        log_platform_activity(message, "scan", "done")
     result = await detect_chart_patterns(symbol)
     return result
 
@@ -2153,7 +2306,11 @@ async def top_picks():
     return {"picks": picks, "date": today, "available": True}
 
 @analysis_router.post("/explain")
-async def explain_stock(data: StockAnalysisRequest):
+async def explain_stock(data: StockAnalysisRequest, user: dict = Depends(get_current_user)):
+    # D6.8 / F-5 — authenticated. This handler invokes a paid AI model and was
+    # public: the only thing between an anonymous caller and model spend was the
+    # SPA's `ProtectedRoute`, which is UX, not a control. No signed-out page
+    # calls it. See `_MODEL_INVOKING_ROUTES` in tests/test_d68_entitlements.py.
     # AI debates are expensive — cache per symbol per day (4h TTL);
     # `force: true` bypasses for an explicit re-run.
     from services.cache import cache_get, cache_set
@@ -2170,14 +2327,29 @@ async def explain_stock(data: StockAnalysisRequest):
             raise HTTPException(status_code=404, detail="Stock not found")
         raise HTTPException(status_code=503, detail="Live market data temporarily unavailable for this stock")
     name = data.name or quote.get("name", data.symbol)
+    # D6.8-A — this prompt used to index `quote['rsi']`, `quote['volume_ratio']`
+    # and `quote['macd']` directly. Those keys were guaranteed non-null only
+    # because `fetch_real_stock_quote` substituted 50.0 / 1.0 / 0.0 for them, so
+    # the debate that produced the user's "why this could be a good trade" was
+    # reasoning about a fabricated RSI on any stock without 15 bars of history —
+    # and on a stock WITH them, about a reading that might be a day out of date.
+    #
+    # Each line now states the reading or states why there is none, in the
+    # platform's one shared vocabulary. No provider is named and no exception
+    # text is exposed: `describe` maps a closed enum to fixed English.
+    volume_ratio_line = field_quality.describe_field(quote, "volume_ratio")
+    if field_quality.is_available(quote, "volume_ratio"):
+        volume_ratio_line += "x"
     prompt = f"""Analyze this NSE stock for intraday trading:
 Stock: {name} ({data.symbol})
 Price: INR {quote['price']}
-RSI: {quote['rsi']}
-Volume vs Avg: {quote['volume_ratio']}x
+RSI: {field_quality.describe_field(quote, 'rsi')}
+Volume vs Avg: {volume_ratio_line}
 Sector: {quote['sector']}
-MACD: {quote['macd']}
+MACD: {field_quality.describe_field(quote, 'macd')}
 VWAP: {quote['vwap']}
+
+{_UNAVAILABLE_FIELD_INSTRUCTION}
 
 Explain: WHY this stock could be a good trade, momentum factors, entry reasoning, risks, and what to watch after entering. Simple language, bullet points, under 200 words."""
 
@@ -2189,7 +2361,11 @@ Explain: WHY this stock could be a good trade, momentum factors, entry reasoning
     return response
 
 @analysis_router.get("/morning-report")
-async def morning_report():
+async def morning_report(user: dict = Depends(get_current_user)):
+    # D6.8 / F-5 — authenticated. This handler invokes a paid AI model and was
+    # public: the only thing between an anonymous caller and model spend was the
+    # SPA's `ProtectedRoute`, which is UX, not a control. No signed-out page
+    # calls it. See `_MODEL_INVOKING_ROUTES` in tests/test_d68_entitlements.py.
     from services.real_market import fetch_real_top_picks, fetch_real_sectors
     picks_res = await fetch_real_top_picks(3)
     picks = picks_res.get("picks", [])
@@ -2211,6 +2387,12 @@ async def morning_report():
     session_open = overview.get("market_status") == "OPEN"
 
     report = ""
+    # D6.9 — provenance for the compact briefing. `briefing_source` is "ai" only
+    # when a model actually answered; `ai_provider` / `ai_model` are written
+    # only on that branch and are never filled from what was *attempted*.
+    briefing_source = "deterministic"
+    ai_provider_name: Optional[str] = None
+    ai_model_name: Optional[str] = None
     if claude_configured() or gemini_configured():
         try:
             engine = get_debate_engine()
@@ -2235,10 +2417,27 @@ Nifty: {overview['nifty']['value']} | Bank Nifty: {overview['bank_nifty']['value
 Sentiment: {f"{sentiment}/100" if sentiment is not None else "unavailable"} | VIX: {vix if vix is not None else "unavailable"}
 Top Sectors: {', '.join([f"{s['sector']} ({s['change_pct']}%)" for s in sectors[:3]]) or "unavailable"}
 Top Picks: {', '.join([f"{p['name']} (Confidence: {p['confidence']}%)" for p in picks]) or "unavailable"}"""
-            report = await engine.simple_chat(system_msg, prompt, prefer="claude", max_tokens=400)
+            # `simple_chat_result`, not `simple_chat`: the string form cannot
+            # distinguish a model's answer from the SimulatedProvider's outage
+            # text, and this endpoint published whichever it received.
+            resp = await engine.simple_chat_result(system_msg, prompt, prefer="claude", max_tokens=400)
+            if resp.success and (resp.content or "").strip():
+                report = resp.content.strip()
+                briefing_source = "ai"
+                ai_provider_name, ai_model_name = resp.provider, resp.model
+            else:
+                logging.warning("morning-report: no model produced a briefing (provider=%s)", resp.provider)
         except Exception as e:
-            report = f"Morning report generation failed: {str(e)}"
-    else:
+            # D6.9 — this used to assign `f"Morning report generation failed:
+            # {str(e)}"` to `report` and return it with `available: True`. Two
+            # defects in one line: a failure was published as a successful
+            # report, and the raw exception text — which can carry a request id,
+            # an account identifier or an echoed prompt — was served to the
+            # client. The exception is logged; the client gets the grounded
+            # briefing below, correctly labelled as not AI-generated.
+            logging.error(f"morning-report briefing failed: {e}")
+
+    if not report:
         top_pick_line = (f"Top pick: {picks[0]['name']} ({picks[0]['confidence']}% confidence)."
                          if picks else "Live pick data is unavailable right now.")
         report = (f"Good morning! NSE is open — Nifty trading at {overview['nifty']['value']}. "
@@ -2250,6 +2449,14 @@ Top Picks: {', '.join([f"{p['name']} (Confidence: {p['confidence']}%)" for p in 
     return {
         "available": True,
         "report": report,
+        # Whether `report` above is a model's narration or the grounded
+        # restatement of the numbers beside it. Consumers label from this
+        # rather than assuming, and `picks` are a deterministic technical scan
+        # in both cases — see services/morning_report.PICKS_SOURCE_DETERMINISTIC.
+        "briefing_source": briefing_source,
+        "ai_provider": ai_provider_name,
+        "ai_model": ai_model_name,
+        "picks_source": "deterministic_technical_scan",
         "picks": picks,
         "overview": overview,
         "market_open": session_open,
@@ -2316,6 +2523,30 @@ async def validate_trade_route(data: TradeCreate, user: dict = Depends(get_curre
 async def create_trade(data: TradeCreate, user: dict = Depends(get_current_user)):
     from services import trading_engine
 
+    # 0. D6.8 / F-4 — THIS ENDPOINT DOES NOT CREATE PAPER TRADES.
+    #
+    # `is_paper` is a client-supplied boolean, and it decides which domain a
+    # trade row belongs to: the paper service closes, credits and resets any
+    # `is_paper: True` row, and the live auto-exit engine and scheduler skip
+    # every one. Honouring it here let a caller cross that boundary both ways:
+    #
+    # * a paper row created here was never DEBITED (only `execute_paper_trade`
+    #   debits), yet `/api/paper/close` CREDITS it — reproduced as +₹5,000 of
+    #   paper capital per zero-P&L round trip, repeatable;
+    # * with a broker account named, a REAL order was placed and then filed as
+    #   paper, so its stop-loss auto-exit never ran and `/api/paper/reset` could
+    #   mark a live position closed without touching the broker.
+    #
+    # PH3.12R closed the mirror image (`PaperTradeCreate` forbids `is_paper` and
+    # `broker`). Refused before the risk check and before any account is
+    # resolved, so no broker call can precede it. The one paper entry point is
+    # `POST /api/paper/trade`. `/validate` keeps accepting the field: it is a
+    # stateless dry run and writes nothing.
+    if data.is_paper:
+        raise HTTPException(status_code=422, detail=(
+            "Paper trades are placed through POST /api/paper/trade. "
+            "This endpoint records live and manual trades only."))
+
     # 1. Risk Manager gate — violations always block (warnings educate).
     trades_today, realized_today = await _risk_inputs(user["_id"])
     check = trading_engine.validate_trade(user, data.model_dump(), trades_today, realized_today)
@@ -2330,10 +2561,18 @@ async def create_trade(data: TradeCreate, user: dict = Depends(get_current_user)
     # 2. Optional LIVE entry order via the Broker Engine (no simulation — a
     #    failed broker order never creates an OPEN trade).
     broker_order_id = None
-    if data.broker:
-        broker = _require_broker(data.broker)
+    broker_account = None
+    if data.broker_account_id:
+        # D6.4 — the client named an account. Resolved owner-scoped; the broker
+        # comes FROM the account rather than from a second client-supplied field,
+        # so a request cannot name one account and one brand and have them
+        # disagree.
+        broker_account = await _account(user, data.broker_account_id)
+    elif data.broker:
+        broker_account = await _sole_account(user, data.broker)
+    if broker_account is not None:
         try:
-            placed = await broker_engine.place_order(user["_id"], broker, {
+            placed = await broker_engine.place_order(broker_account, {
                 "symbol": data.symbol.upper(), "exchange": data.exchange,
                 "transaction_type": data.type, "quantity": data.quantity,
                 "order_type": data.order_type,
@@ -2366,9 +2605,15 @@ async def create_trade(data: TradeCreate, user: dict = Depends(get_current_user)
         "trailing_stop": trailing,
         "best_price": data.entry_price,
         "targets_hit": [],
+        # The narration names the broker of the RESOLVED account, not the
+        # `broker` the client sent. An account-addressed request (the only kind
+        # the trade form now makes) carries no `broker` field at all, and the
+        # entry event would otherwise lose the brand it was actually placed
+        # through. Same rule as `broker` below: derived from the account.
         "events": [trading_engine.make_event(
             "ENTRY", f"{side_word} {data.quantity} @ ₹{data.entry_price}"
-                     + (f" via {data.broker} (order {broker_order_id})" if data.broker else ""),
+                     + (f" via {broker_account.broker} (order {broker_order_id})"
+                        if broker_account else ""),
             data.entry_price)],
         "status": "OPEN",
         "pnl": None,
@@ -2378,12 +2623,21 @@ async def create_trade(data: TradeCreate, user: dict = Depends(get_current_user)
         "notes": data.notes,
         "setup_type": data.setup_type,
         "is_paper": data.is_paper,
-        "broker": data.broker,
+        # OWNER vs ACCOUNT OWNER (D6.4 / §14). `user_id` is who may read and act
+        # on this trade; `broker_account_id` is the brokerage account the entry
+        # order actually went to and the account a later auto-exit must return
+        # to. `broker` is now derived metadata — kept because history, reports
+        # and the UI read it, but it no longer identifies anything.
+        "broker": broker_account.broker if broker_account else data.broker,
+        "broker_account_id": (broker_account.broker_account_id
+                              if broker_account else None),
         "broker_order_id": broker_order_id,
         "product": data.product,
         "exchange": data.exchange,
-        # Live auto-exit needs explicit per-trade consent AND a broker link.
-        "auto_exit": bool(data.auto_exit and data.broker),
+        # Live auto-exit needs explicit per-trade consent AND a resolved broker
+        # ACCOUNT. Gated on the account rather than on the broker name: an exit
+        # that cannot say which account to sell in must not run.
+        "auto_exit": bool(data.auto_exit and broker_account is not None),
         "risk_check": {"warnings": check["warnings"], "metrics": check["metrics"],
                        "acknowledged": data.override_warnings},
     }
@@ -2684,8 +2938,10 @@ async def update_trade(trade_id: str, request: Request, background_tasks: Backgr
     if "notes" in body:
         update["notes"] = body["notes"]
 
-    await db.trades.update_one({"_id": trade_oid}, {"$set": update})
-    updated = await db.trades.find_one({"_id": trade_oid})
+    # D6.3 — the owner is part of the write, not merely of the read above.
+    owned = {"_id": trade_oid, "user_id": user["_id"]}
+    await db.trades.update_one(owned, {"$set": update})
+    updated = await db.trades.find_one(owned)
     updated["_id"] = str(updated["_id"])
 
     # If this update just closed the trade, announce the close and generate
@@ -2724,12 +2980,18 @@ async def exit_trade(trade_id: str, data: TradeExitRequest, background_tasks: Ba
 
     broker_order_id = None
     if data.at_market:
-        if not trade.get("broker"):
+        # D6.4 — the exit returns to the ACCOUNT the entry was placed in, read
+        # off the trade itself. Routing by `trade["broker"]` would have sold the
+        # position in whichever account the bridge happened to resolve, which
+        # for a user with two accounts at one broker is a market order in the
+        # wrong brokerage account.
+        exit_account = await _trade_broker_account(user, trade)
+        if exit_account is None:
             raise HTTPException(status_code=400,
                                 detail="This trade is not linked to a broker — enter an exit price instead.")
         side = "BUY" if trade.get("type") == "SELL" else "SELL"
         try:
-            placed = await broker_engine.place_order(user["_id"], trade["broker"], {
+            placed = await broker_engine.place_order(exit_account, {
                 "symbol": trade["symbol"], "exchange": trade.get("exchange", "NSE"),
                 "transaction_type": side, "quantity": quantity,
                 "order_type": "MARKET", "product": trade.get("product") or "CNC",
@@ -2758,9 +3020,10 @@ async def exit_trade(trade_id: str, data: TradeExitRequest, background_tasks: Ba
         + (f" via {trade['broker']} (order {broker_order_id})" if broker_order_id else ""),
         exit_price))
     update["events"] = events
-    await db.trades.update_one({"_id": trade_oid}, {"$set": update})
+    owned = {"_id": trade_oid, "user_id": user["_id"]}   # D6.3
+    await db.trades.update_one(owned, {"$set": update})
 
-    updated = await db.trades.find_one({"_id": trade_oid})
+    updated = await db.trades.find_one(owned)
     updated["_id"] = str(updated["_id"])
     if updated.get("status") != "OPEN":
         from services.trade_review import generate_close_intelligence
@@ -2812,7 +3075,8 @@ async def get_trade_coaching(trade_id: str, user: dict = Depends(get_current_use
     coaching = await generate_trade_coaching(trade, ai_func=ai_func)
 
     # Cache in DB
-    await db.trades.update_one({"_id": trade_oid}, {"$set": {"coaching": coaching}})
+    await db.trades.update_one({"_id": trade_oid, "user_id": user["_id"]},   # D6.3
+                               {"$set": {"coaching": coaching}})
     from services.activity_logger import log_activity
     log_activity(f"AI coaching generated for {trade['symbol']} trade", "monitor", "done",
                  user_id=str(user["_id"]))
@@ -3010,29 +3274,37 @@ async def mark_read(notif_id: str, user: dict = Depends(get_current_user)):
 
 @chat_router.post("")
 async def chat_endpoint(data: ChatMessage, user: dict = Depends(get_current_user)):
-    """Send a chat turn. The conversation is the caller's or it is refused.
+    """Send a chat turn into one of the caller's own conversations.
 
-    D6.1 / S5. `session_id` is client-supplied and its default (`chat-<user_id>`)
-    is derivable from any user id, so it is an identifier, never a capability.
-    Two independent guards:
+    A CONVERSATION IS `(user_id, session_id)`, NOT `session_id` (D6.8 / F-1)
+    ------------------------------------------------------------------------
+    `session_id` is a client-chosen label. The frontend mints it as
+    `chat-<epoch ms>` / `quick-<epoch ms>` and the default is `chat-<user_id>`,
+    so the string is neither secret nor unique across users. It names a thread
+    *within* an account; the account is what makes it a conversation.
 
-    1. **Here** — a session id that already has turns belonging to someone else
-       is a 403, an explicit authorization failure rather than a silent
-       reinterpretation. This also stops one user squatting on another's
-       conversation id.
-    2. **In `ai_chat`** — the context load filters on `user_id` as well as
-       `session_id`, so even if this check were removed the model could not be
-       fed another user's turns.
+    D6.1 / S5 treated the label as globally owned: a label that already held
+    another user's turns answered 403 "belongs to another account". That was
+    an authorization decision made on the wrong key, and it failed three ways
+    D6.8 reproduced:
 
-    Two guards because they fail differently: this one gives the caller a
-    truthful answer, and that one is the invariant that holds regardless of
-    which routes exist.
+    * **Existence oracle.** 403 for a label someone else used, 200 for one
+      nobody used — so any account could test whether another user had ever
+      chatted, and when.
+    * **Squatting.** Posting first to `chat-<victim_id>` permanently 403'd the
+      victim's own default conversation. ObjectIds minted by one process
+      differ by a counter step, so a victim's id is derivable from the
+      attacker's own.
+    * **Collision.** Two users opening a chat in the same millisecond got the
+      same label, and the second was refused their own conversation.
+
+    Every read and write of `chat_messages` is already filtered by `user_id`
+    (the context load in `ai_chat`, `/chat/history`, `list_conversations`,
+    `delete_conversation`), so no other account's use of a label can reach this
+    caller. The response therefore depends on nothing but the caller's own
+    data, which is the only way it cannot be an oracle.
     """
     session_id = data.session_id or f"chat-{user['_id']}"
-    foreign = await db.chat_messages.find_one(
-        {"session_id": session_id, "user_id": {"$ne": user["_id"]}})
-    if foreign:
-        raise HTTPException(status_code=403, detail="This conversation belongs to another account")
     response = await ai_chat(data.message, session_id, user, run_id=data.run_id)
 
     # Save to DB
@@ -3221,7 +3493,9 @@ async def ai_trade_review(data: TradeReviewRequest, user: dict = Depends(get_cur
                   "symbol": trade.get("symbol")}
         if data.trade_id:
             async with run.step():
-                await db.trades.update_one({"_id": trade_oid}, {"$set": {"ai_review": review}})
+                await db.trades.update_one(
+                    {"_id": trade_oid, "user_id": user["_id"]},   # D6.3
+                    {"$set": {"ai_review": review}})
         log_activity(f"Trade review ready for {trade.get('symbol')}", "monitor", "done",
                      user_id=str(user["_id"]))
         await run.complete()
@@ -3451,8 +3725,17 @@ class ConnectionManager:
         # each page listen to just the topics it needs (market/sectors/scanner/
         # news/…) instead of every global broadcast.
         self.channels: dict[WebSocket, Set[str]] = {}
+        # Sockets grouped by the refresh-token FAMILY that authorized them
+        # (D6.2 / C). A socket is authenticated exactly once, at the handshake,
+        # and then lives for as long as the tab stays open — so without this,
+        # revoking a session left its private event stream running until the
+        # user closed the browser. Keyed by `sid` rather than by user because
+        # signing out on one device must not tear down another device's socket:
+        # that session was not revoked, and its socket is still legitimate.
+        self.session_connections: dict[str, Set[WebSocket]] = {}
 
-    async def connect(self, ws: WebSocket, user_id: str = None, subprotocol: str = None):
+    async def connect(self, ws: WebSocket, user_id: str = None, subprotocol: str = None,
+                      session_id: str = None):
         # `subprotocol` is echoed back on the handshake. A browser that offered
         # subprotocols CLOSES the connection unless the server selects one of
         # them, so this is load-bearing for the auth path in
@@ -3462,13 +3745,16 @@ class ConnectionManager:
         self.channels.setdefault(ws, set())
         if user_id:
             self.user_connections.setdefault(user_id, set()).add(ws)
+        if session_id:
+            self.session_connections.setdefault(session_id, set()).add(ws)
         # PH3.7. The gauges below say how many sockets exist right now; this
         # counter says how many arrived. A gauge alone cannot distinguish "200
         # stable connections" from "200 clients reconnecting every second",
         # and those are very different incidents.
         obs_instruments.record_ws_connection("accepted")
 
-    def disconnect(self, ws: WebSocket, user_id: str = None, reason: str = "client"):
+    def disconnect(self, ws: WebSocket, user_id: str = None, reason: str = "client",
+                   session_id: str = None):
         # `reason` distinguishes a clean close from a socket that raised. Both
         # empty the same structures, but only one of them is normal: a spike in
         # reason="error" against a flat reason="client" is a network or
@@ -3490,6 +3776,49 @@ class ConnectionManager:
             # only thing that ever emptied it was a process restart.
             if not conns:
                 del self.user_connections[user_id]
+        if session_id and session_id in self.session_connections:
+            session_conns = self.session_connections[session_id]
+            session_conns.discard(ws)
+            if not session_conns:
+                del self.session_connections[session_id]
+
+    async def close_session(self, session_id: str, *, code: int = None) -> int:
+        """Close every socket authorized by one refresh-token family.
+
+        D6.2 / C+E. Called when that family is revoked — a logout, or reuse
+        detection firing. The socket authenticated once at the handshake and has
+        no idea its credential died; nothing else in the system would ever tell
+        it. Returns the number of sockets closed.
+
+        Closing with the same policy-violation code the handshake rejection uses
+        means the client's existing "never opened / closed by policy" recovery
+        path handles it: it diagnoses, finds the credential gone, and stops
+        rather than reconnecting in a loop.
+        """
+        return await self._close_all(self.session_connections.get(session_id, set()), code)
+
+    async def close_user(self, user_id: str, *, code: int = None) -> int:
+        """Close every socket belonging to a user, across all their sessions.
+
+        For the events that invalidate a whole identity rather than one login:
+        sign-out-everywhere, a password change, an administrator block, account
+        deletion. Returns the number of sockets closed."""
+        return await self._close_all(self.user_connections.get(user_id, set()), code)
+
+    async def _close_all(self, sockets, code) -> int:
+        # Snapshot: closing a socket triggers its endpoint's disconnect, which
+        # mutates the very set being iterated.
+        targets = list(sockets)
+        closed = 0
+        for ws in targets:
+            try:
+                await ws.close(code=code or WS_CLOSE_POLICY_VIOLATION)
+                closed += 1
+            except Exception:
+                # Already gone. The endpoint's own teardown reaps the tracking
+                # entry; a failure to close a dead socket is not an error.
+                pass
+        return closed
 
     def subscribe(self, ws: WebSocket, channels):
         """Add channels to a socket's subscription set. Returns (accepted, refused).
@@ -3608,6 +3937,10 @@ class ConnectionManager:
             conns -= dead
             if not conns:
                 emptied.append(user_id)
+        for sid in list(self.session_connections):
+            self.session_connections[sid] -= dead
+        for sid in [s for s, conns in self.session_connections.items() if not conns]:
+            del self.session_connections[sid]
         # Same retention bug as `disconnect` (PH3.6): a socket that dies without
         # a clean close is reaped here, and before this the user's now-empty set
         # stayed keyed forever. This is the path a *dropped* connection takes, so
@@ -3724,26 +4057,53 @@ def _websocket_credential(websocket: WebSocket) -> tuple[Optional[str], Optional
 
     The server must echo one of the offered subprotocols or the browser closes
     the connection, so the marker — never the token — is returned for echoing.
-    """
-    cookie_token = websocket.cookies.get(ACCESS_TOKEN_COOKIE)
-    if cookie_token:
-        return cookie_token, None
 
+    **THE ECHO BELONGS TO THE OFFER, NOT TO THE TRANSPORT THAT WON (D6.3).**
+    This function used to answer ``(cookie_token, None)`` the moment a cookie was
+    present, without looking at what the client had offered. Both halves of that
+    were individually reasonable and together they broke every browser session:
+
+      * the SPA offers ``["stockassist.auth", <token>]`` whenever it still holds
+        the bootstrap credential — which is every session, from sign-in until the
+        first refresh drops it (D6.1);
+      * D6.1's cookie fix then made the ``access_token`` cookie present on that
+        same handshake, so the cookie branch won and no subprotocol was selected;
+      * a browser that offered subprotocols and got none back **fails the
+        connection**, so the socket died at 1006 immediately after the server had
+        accepted it — realtime never connected, and the client, seeing a close
+        with no open, correctly diagnosed a credential problem and re-tried into
+        the same wall.
+
+    The server was reporting success (``[accepted]`` in the access log) for a
+    handshake the browser was tearing down, which is why no hermetic test saw it:
+    Starlette's test transport does not enforce the browser's rule. Verified in a
+    real Chrome against a real server — offering the marker closed at 1006,
+    offering nothing on the identical cookie opened.
+
+    The marker is therefore resolved from the OFFER first and echoed on every
+    path, including the one where the cookie supplied the credential.
+    """
     offered = [p.strip() for p in
                (websocket.headers.get("sec-websocket-protocol") or "").split(",")
                if p.strip()]
-    if WS_AUTH_SUBPROTOCOL in offered:
+    marker = WS_AUTH_SUBPROTOCOL if WS_AUTH_SUBPROTOCOL in offered else None
+
+    cookie_token = websocket.cookies.get(ACCESS_TOKEN_COOKIE)
+    if cookie_token:
+        return cookie_token, marker
+
+    if marker is not None:
         # Any value that is not the marker is the credential. Positional
         # ("the second one") would break the moment a client offered a third
         # subprotocol for an unrelated reason.
         for value in offered:
             if value != WS_AUTH_SUBPROTOCOL:
-                return value, WS_AUTH_SUBPROTOCOL
+                return value, marker
     return None, None
 
 
-async def authenticate_websocket(websocket: WebSocket) -> Optional[tuple[str, Optional[str]]]:
-    """Resolve ``(user_id, subprotocol)`` for a WebSocket handshake, or ``None``.
+async def authenticate_websocket(websocket: WebSocket) -> Optional[tuple[str, Optional[str], Optional[str]]]:
+    """Resolve ``(user_id, session_id, subprotocol)`` for a handshake, or ``None``.
 
     PH3.10 (S-2, carried since PH1.9). The identity this returns is the key
     `ConnectionManager.send_to_user` fans per-user events out on — notifications,
@@ -3781,7 +4141,11 @@ async def authenticate_websocket(websocket: WebSocket) -> Optional[tuple[str, Op
         return None
     if jwt_service.token_issued_before(payload, user.get("password_changed_at")):
         return None
-    return str(user["_id"]), subprotocol
+    # D6.2 / C. The `sid` is carried through so the manager can group sockets by
+    # the refresh-token family that authorized them, and close exactly that
+    # group when the family is revoked. Without it a revoked session's private
+    # event stream stays open for as long as the tab does.
+    return str(user["_id"]), payload.get("sid"), subprotocol
 
 
 @app.websocket("/api/ws")
@@ -3792,14 +4156,33 @@ async def websocket_endpoint(websocket: WebSocket):
     with 1008 *before* `accept()`, so an anonymous caller never occupies a
     connection slot, never appears in the manager's tracking maps, and never
     reaches the subscribe/broadcast surface.
+
+    The ``Origin`` check runs FIRST, before authentication, and closes with the
+    same 1008. Order matters: a cross-site hijack arrives with the victim's
+    genuinely valid cookie, so authentication would succeed — the origin is the
+    only thing that distinguishes it. Checking it first also means a foreign
+    page never triggers the user lookup. See
+    `security.cors.is_allowed_websocket_origin` for the rules.
     """
+    origin = websocket.headers.get("origin")
+    if not is_allowed_websocket_origin(origin):
+        obs_instruments.record_ws_connection("rejected")
+        # Truncated: the header is attacker-controlled, and a log line is not a
+        # place to store an arbitrarily long string.
+        logger.warning(
+            "WebSocket handshake rejected: origin not allowed",
+            extra={"event": "websocket_origin_rejected", "origin": origin[:200]},
+        )
+        await websocket.close(code=WS_CLOSE_POLICY_VIOLATION)
+        return
     identity = await authenticate_websocket(websocket)
     if identity is None:
         obs_instruments.record_ws_connection("rejected")
         await websocket.close(code=WS_CLOSE_POLICY_VIOLATION)
         return
-    user_id, subprotocol = identity
-    await ws_manager.connect(websocket, user_id, subprotocol=subprotocol)
+    user_id, session_id, subprotocol = identity
+    await ws_manager.connect(websocket, user_id, subprotocol=subprotocol,
+                             session_id=session_id)
     try:
         while True:
             # Keep connection alive, listen for client messages
@@ -3839,7 +4222,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 await websocket.send_json({"type": "pong", "timestamp": datetime.now(timezone.utc).isoformat()})
 
     except WebSocketDisconnect:
-        ws_manager.disconnect(websocket, user_id)
+        ws_manager.disconnect(websocket, user_id, session_id=session_id)
     except Exception as exc:
         # PH3.7. This branch was previously indistinguishable from a clean
         # close — same call, no log line — so a socket dying on a malformed
@@ -3853,7 +4236,7 @@ async def websocket_endpoint(websocket: WebSocket):
             exc_info=exc,
             extra={"event": "websocket_abnormal_close", "error_class": error_class},
         )
-        ws_manager.disconnect(websocket, user_id, reason="error")
+        ws_manager.disconnect(websocket, user_id, reason="error", session_id=session_id)
 
 
 # Background task: broadcast market data every 10 seconds
@@ -3952,7 +4335,12 @@ async def ai_monitoring_loop():
                     # 5 min per user). create_notification also publishes
                     # notification.created so the bridge pushes it live.
                     from services.notification_service import create_notification
-                    users = await db.users.find({}, {"_id": 1}).to_list(100)
+                    from services import fanout
+                    # D6.7 — was `.to_list(100)`. A market alert is sent to every
+                    # user, so the cap meant user 101 onward never received one.
+                    users = await fanout.collect(
+                        db.users.find({}, {"_id": 1}),
+                        label="market_alert_loop.users")
                     for u in users:
                         await create_notification(
                             db, str(u["_id"]),
@@ -4379,6 +4767,88 @@ def _require_broker(broker: str) -> str:
     return broker
 
 
+# ---------------------------------------------------------------------------
+# Account resolution (D6.4)
+# ---------------------------------------------------------------------------
+# Two helpers, and the difference between them is the whole of this sprint's
+# routing rule.
+#
+# `_account(user, broker_account_id)` is the ACCOUNT-ADDRESSED path. The client
+# named an account; the directory resolves it filtered by the authenticated
+# user, so an id belonging to somebody else does not resolve. The 404 is
+# identical for "no such account" and "not yours" on purpose — an ownership
+# failure is not a debugging surface (the same rule D6.1 applied to the broker
+# OAuth callback).
+#
+# `_sole_account(user, broker)` is the BROKER-ADDRESSED bridge that keeps the
+# pre-D6.4 routes and the existing frontend working. It resolves the
+# unambiguous case and **409s when the user holds more than one account at that
+# broker**. It never picks. "First connected", "last connected" and "any
+# connected" are the semantics D6.4 exists to remove, and a bridge that quietly
+# chose would reintroduce all three under a different name.
+
+#: Told to a client whose broker-addressed request can no longer be answered by
+#: a broker name alone. Names the account ids so the caller can retry correctly.
+BROKER_ACCOUNT_AMBIGUOUS = (
+    "You have more than one {broker} account connected. "
+    "Address this request to a specific broker_account_id."
+)
+
+
+async def _account(user: dict, broker_account_id: str):
+    """The authenticated user's account with this id, or 404."""
+    if not is_broker_account_id(broker_account_id):
+        raise HTTPException(status_code=404, detail="Broker account not found")
+    try:
+        return await broker_engine.resolve_account(str(user["_id"]), broker_account_id)
+    except UnknownBrokerAccount:
+        raise HTTPException(status_code=404, detail="Broker account not found")
+
+
+async def _sole_account(user: dict, broker: str):
+    """The user's single account at `broker`. 404 if none, 409 if several."""
+    broker = _require_broker(broker)
+    try:
+        account = await broker_engine.account_for_broker(str(user["_id"]), broker)
+    except AmbiguousBrokerAccount:
+        raise HTTPException(
+            status_code=409,
+            detail=BROKER_ACCOUNT_AMBIGUOUS.format(broker=broker))
+    if account is None:
+        # BrokerAuthError, not a bare 404. "You have no account at this broker"
+        # and "your account's token died" are the same thing to a caller — both
+        # mean *connect your broker* — and the app's handler already maps this
+        # exception to 409 with a reconnect message. A 404 here would have been a
+        # new status code on an existing contract, and the frontend interceptor
+        # branches on 409 (see the handler above `app = FastAPI(...)`).
+        from services.brokers import broker_registry
+
+        adapter = broker_registry.get(broker)
+        raise BrokerAuthError(
+            f"{adapter.display_name if adapter else broker} is not connected. "
+            "Connect your account in Settings.")
+    return account
+
+
+async def _trade_broker_account(user: dict, trade: dict):
+    """The brokerage account a stored trade's live orders belong to.
+
+    Prefers the `broker_account_id` recorded on the trade. Falls back to the
+    broker-name bridge only for a legacy row the D6.4 migration could not stamp
+    — and the bridge refuses when it is ambiguous, so the fallback can produce
+    the right account or an error, never a guess.
+
+    Returns None when the trade has no broker link at all, which is the manual
+    and paper case and is not an error.
+    """
+    account_id = trade.get("broker_account_id")
+    if account_id:
+        return await _account(user, account_id)
+    if trade.get("broker"):
+        return await _sole_account(user, trade["broker"])
+    return None
+
+
 def _frontend_base() -> str:
     base = os.environ.get("FRONTEND_URL")
     if not base:
@@ -4388,15 +4858,162 @@ def _frontend_base() -> str:
 
 @brokers_router.get("")
 async def brokers_list(user: dict = Depends(get_current_user)):
-    """Supported brokers + this user's connection status for each."""
+    """Supported brokers + this user's accounts and per-broker status.
+
+    `status` is the pre-D6.4 per-broker view, kept because the frontend and the
+    legacy clients read it. `accounts` is the D6.4 view and is the one that can
+    represent reality: one record per authorized brokerage account, each naming
+    its `broker_account_id`. When a user holds several accounts at one broker the
+    per-broker record reports `ambiguous: true` and a null `broker_account_id`
+    rather than inventing a single answer.
+    """
     return {
         "brokers": broker_engine.list_brokers(),
         "status": await broker_engine.get_status(str(user["_id"])),
+        "accounts": await broker_engine.account_statuses(str(user["_id"])),
     }
 
 @brokers_router.get("/status")
 async def brokers_status(user: dict = Depends(get_current_user)):
     return await broker_engine.get_status(str(user["_id"]))
+
+
+# ---------------------------------------------------------------------------
+# Account-addressed broker routes (D6.4)
+# ---------------------------------------------------------------------------
+# Every one resolves `{broker_account_id}` through `_account`, which filters by
+# the authenticated user. There is no route that takes an account id alone.
+#
+# These are registered BEFORE `/{broker}/...` so `accounts` is never captured as
+# a broker name — `_require_broker` would 404 it, but relying on that would make
+# the routing order load-bearing in the wrong direction.
+
+@brokers_router.get("/accounts")
+async def broker_accounts_list(user: dict = Depends(get_current_user)):
+    """Every brokerage account this user has authorized."""
+    return {"accounts": await broker_engine.account_statuses(str(user["_id"]))}
+
+
+@brokers_router.get("/accounts/{broker_account_id}")
+async def broker_account_detail(broker_account_id: str,
+                                user: dict = Depends(get_current_user)):
+    account = await _account(user, broker_account_id)
+    for entry in await broker_engine.account_statuses(str(user["_id"])):
+        if entry["broker_account_id"] == account.broker_account_id:
+            return entry
+    return account.public_dict()
+
+
+@brokers_router.post("/accounts/{broker_account_id}/disconnect")
+async def broker_account_disconnect(broker_account_id: str,
+                                    user: dict = Depends(get_current_user)):
+    account = await _account(user, broker_account_id)
+    result = await broker_engine.disconnect(account)
+    await _sync_legacy_broker_flag(str(user["_id"]), account.broker)
+    return result
+
+
+@brokers_router.post("/accounts/{broker_account_id}/sync")
+async def broker_account_sync(broker_account_id: str,
+                              user: dict = Depends(get_current_user)):
+    return await broker_engine.sync_portfolio(await _account(user, broker_account_id))
+
+
+@brokers_router.get("/accounts/{broker_account_id}/profile")
+async def broker_account_profile(broker_account_id: str,
+                                 user: dict = Depends(get_current_user)):
+    return await broker_engine.get_profile(await _account(user, broker_account_id))
+
+
+@brokers_router.get("/accounts/{broker_account_id}/holdings")
+async def broker_account_holdings(broker_account_id: str,
+                                  user: dict = Depends(get_current_user)):
+    account = await _account(user, broker_account_id)
+    return {"broker": account.broker, "broker_account_id": account.broker_account_id,
+            "holdings": await broker_engine.get_holdings(account)}
+
+
+@brokers_router.get("/accounts/{broker_account_id}/positions")
+async def broker_account_positions(broker_account_id: str,
+                                   user: dict = Depends(get_current_user)):
+    account = await _account(user, broker_account_id)
+    return {"broker": account.broker, "broker_account_id": account.broker_account_id,
+            "positions": await broker_engine.get_positions(account)}
+
+
+@brokers_router.get("/accounts/{broker_account_id}/funds")
+async def broker_account_funds(broker_account_id: str,
+                               user: dict = Depends(get_current_user)):
+    account = await _account(user, broker_account_id)
+    return {"broker": account.broker, "broker_account_id": account.broker_account_id,
+            "funds": await broker_engine.get_funds(account)}
+
+
+@brokers_router.get("/accounts/{broker_account_id}/margins")
+async def broker_account_margins(broker_account_id: str,
+                                 user: dict = Depends(get_current_user)):
+    account = await _account(user, broker_account_id)
+    return {"broker": account.broker, "broker_account_id": account.broker_account_id,
+            "margins": await broker_engine.get_margins(account)}
+
+
+@brokers_router.get("/accounts/{broker_account_id}/orders")
+async def broker_account_orders(broker_account_id: str,
+                                user: dict = Depends(get_current_user)):
+    account = await _account(user, broker_account_id)
+    return {"broker": account.broker, "broker_account_id": account.broker_account_id,
+            "orders": await broker_engine.get_orders(account)}
+
+
+@brokers_router.get("/accounts/{broker_account_id}/trades")
+async def broker_account_trades(broker_account_id: str,
+                                user: dict = Depends(get_current_user)):
+    account = await _account(user, broker_account_id)
+    return {"broker": account.broker, "broker_account_id": account.broker_account_id,
+            "trades": await broker_engine.get_trades(account)}
+
+
+@brokers_router.post("/accounts/{broker_account_id}/orders")
+async def broker_account_place_order(broker_account_id: str, order: BrokerOrderCreate,
+                                     user: dict = Depends(get_current_user)):
+    """Place a LIVE order in ONE named brokerage account (no simulation)."""
+    account = await _account(user, broker_account_id)
+    return await broker_engine.place_order(account, order.model_dump(exclude_none=True))
+
+
+@brokers_router.patch("/accounts/{broker_account_id}/orders/{order_id}")
+async def broker_account_modify_order(broker_account_id: str, order_id: str,
+                                      changes: BrokerOrderModify,
+                                      user: dict = Depends(get_current_user)):
+    account = await _account(user, broker_account_id)
+    return await broker_engine.modify_order(account, order_id,
+                                            changes.model_dump(exclude_none=True))
+
+
+@brokers_router.delete("/accounts/{broker_account_id}/orders/{order_id}")
+async def broker_account_cancel_order(broker_account_id: str, order_id: str,
+                                      user: dict = Depends(get_current_user)):
+    return await broker_engine.cancel_order(
+        await _account(user, broker_account_id), order_id)
+
+
+async def _sync_legacy_broker_flag(user_id: str, broker: str) -> None:
+    """Keep `users.{broker}_connected` true while ANY account there is live.
+
+    The flag predates D6.4 and is read by older surfaces. It was written as a
+    plain boolean on connect and disconnect, which with two accounts at one
+    broker meant disconnecting either one told the rest of the platform the
+    broker was gone. Recomputed from the directory instead of assigned.
+    """
+    try:
+        accounts = await broker_engine.account_statuses(user_id)
+    except Exception as e:  # pragma: no cover - best effort bookkeeping
+        logger.warning("Could not refresh the %s connected flag for %s: %s",
+                       broker, user_id, e)
+        return
+    connected = any(a["broker"] == broker and a.get("connected") for a in accounts)
+    await db.users.update_one({"_id": ObjectId(user_id)},
+                              {"$set": {f"{broker}_connected": connected}})
 
 # ---------------------------------------------------------------------------
 # Broker OAuth ownership (D6.1 / S1 — was CRITICAL)
@@ -4473,8 +5090,14 @@ async def broker_session(broker: str, request: Request, user: dict = Depends(get
     result = await broker_engine.complete_auth(broker, str(user["_id"]), body)
     await db.users.update_one({"_id": ObjectId(user["_id"])},
                               {"$set": {f"{broker}_connected": True}})
-    # Never return tokens to the browser — profile + sync summary only.
-    return {"success": True, "broker": broker, "profile": result.get("profile", {}),
+    # Never return tokens to the browser — profile + sync summary only. The
+    # `broker_account_id` IS returned: it is an opaque internal handle the client
+    # needs in order to address the account it just linked, and it carries no
+    # credential (D6.4).
+    return {"success": True, "broker": broker,
+            "broker_account_id": result.get("broker_account_id"),
+            "account": result.get("account"),
+            "profile": result.get("profile", {}),
             "sync": (result.get("sync") or {}).get("summary")}
 
 #: The one outcome every S1 rejection reports. Deliberately identical for a
@@ -4570,70 +5193,84 @@ async def broker_oauth_callback(broker: str, request: Request):
         logger.error(f"{broker} OAuth callback failed: {e}")
         return _finish(f"status=failed&error={message}")
 
+# ---------------------------------------------------------------------------
+# Broker-addressed routes — the D6.4 compatibility bridge
+# ---------------------------------------------------------------------------
+# Every one resolves through `_sole_account`, which answers only when the user
+# has exactly one account at that broker and 409s otherwise. They are kept, not
+# deprecated-and-broken, because they are what the shipped frontend and every
+# existing integration call — and because for a user with one account per broker
+# (which is every user today) the answer is unambiguous and identical to what it
+# has always been.
+
 @brokers_router.post("/{broker}/disconnect")
 async def broker_disconnect(broker: str, user: dict = Depends(get_current_user)):
-    broker = _require_broker(broker)
-    result = await broker_engine.disconnect(broker, str(user["_id"]))
-    await db.users.update_one({"_id": ObjectId(user["_id"])},
-                              {"$set": {f"{broker}_connected": False}})
+    account = await _sole_account(user, broker)
+    result = await broker_engine.disconnect(account)
+    await _sync_legacy_broker_flag(str(user["_id"]), account.broker)
     return result
 
 @brokers_router.post("/{broker}/sync")
 async def broker_sync(broker: str, user: dict = Depends(get_current_user)):
     """Full portfolio sync: holdings + positions + funds persisted to Mongo."""
-    return await broker_engine.sync_portfolio(str(user["_id"]), _require_broker(broker))
+    return await broker_engine.sync_portfolio(await _sole_account(user, broker))
 
 @brokers_router.get("/{broker}/profile")
 async def broker_profile(broker: str, user: dict = Depends(get_current_user)):
-    return await broker_engine.get_profile(str(user["_id"]), _require_broker(broker))
+    return await broker_engine.get_profile(await _sole_account(user, broker))
 
 @brokers_router.get("/{broker}/holdings")
 async def broker_holdings(broker: str, user: dict = Depends(get_current_user)):
-    return {"broker": broker, "holdings": await broker_engine.get_holdings(str(user["_id"]), _require_broker(broker))}
+    return {"broker": broker, "holdings": await broker_engine.get_holdings(await _sole_account(user, broker))}
 
 @brokers_router.get("/{broker}/positions")
 async def broker_positions(broker: str, user: dict = Depends(get_current_user)):
-    return {"broker": broker, "positions": await broker_engine.get_positions(str(user["_id"]), _require_broker(broker))}
+    return {"broker": broker, "positions": await broker_engine.get_positions(await _sole_account(user, broker))}
 
 @brokers_router.get("/{broker}/funds")
 async def broker_funds(broker: str, user: dict = Depends(get_current_user)):
-    return {"broker": broker, "funds": await broker_engine.get_funds(str(user["_id"]), _require_broker(broker))}
+    return {"broker": broker, "funds": await broker_engine.get_funds(await _sole_account(user, broker))}
 
 @brokers_router.get("/{broker}/margins")
 async def broker_margins(broker: str, user: dict = Depends(get_current_user)):
-    return {"broker": broker, "margins": await broker_engine.get_margins(str(user["_id"]), _require_broker(broker))}
+    return {"broker": broker, "margins": await broker_engine.get_margins(await _sole_account(user, broker))}
 
 @brokers_router.get("/{broker}/orders")
 async def broker_orders(broker: str, user: dict = Depends(get_current_user)):
-    return {"broker": broker, "orders": await broker_engine.get_orders(str(user["_id"]), _require_broker(broker))}
+    return {"broker": broker, "orders": await broker_engine.get_orders(await _sole_account(user, broker))}
 
 @brokers_router.get("/{broker}/trades")
 async def broker_trades(broker: str, user: dict = Depends(get_current_user)):
     """Executed trade history for the day (official broker trade book)."""
-    return {"broker": broker, "trades": await broker_engine.get_trades(str(user["_id"]), _require_broker(broker))}
+    return {"broker": broker, "trades": await broker_engine.get_trades(await _sole_account(user, broker))}
 
 @brokers_router.post("/{broker}/orders")
 async def broker_place_order(broker: str, order: BrokerOrderCreate, user: dict = Depends(get_current_user)):
-    """Place a LIVE order via the official broker API (no simulation)."""
-    broker = _require_broker(broker)
+    """Place a LIVE order via the official broker API (no simulation).
+
+    Refuses with 409 when the user holds more than one account at this broker
+    rather than choosing one. An order is the request where "we picked for you"
+    is least acceptable, and it is the reason the bridge fails closed everywhere
+    instead of only here.
+    """
+    account = await _sole_account(user, broker)
     payload = order.model_dump(exclude_none=True)
     # The product default comes from the adapter (`BrokerGateway.place_order`),
     # not from a broker name in this route. The expression here used to be
     # `"CNC" if broker == "zerodha" else "D"`, which named a broker in a core
     # route AND silently handed Upstox's product code to every broker added
     # after it.
-    return await broker_engine.place_order(str(user["_id"]), broker, payload)
+    return await broker_engine.place_order(account, payload)
 
 @brokers_router.patch("/{broker}/orders/{order_id}")
 async def broker_modify_order(broker: str, order_id: str, changes: BrokerOrderModify,
                               user: dict = Depends(get_current_user)):
-    broker = _require_broker(broker)
-    return await broker_engine.modify_order(str(user["_id"]), broker, order_id,
+    return await broker_engine.modify_order(await _sole_account(user, broker), order_id,
                                             changes.model_dump(exclude_none=True))
 
 @brokers_router.delete("/{broker}/orders/{order_id}")
 async def broker_cancel_order(broker: str, order_id: str, user: dict = Depends(get_current_user)):
-    return await broker_engine.cancel_order(str(user["_id"]), _require_broker(broker), order_id)
+    return await broker_engine.cancel_order(await _sole_account(user, broker), order_id)
 
 
 # ============ UNIFIED ORDER HISTORY (Sprint 9) ============
@@ -4645,26 +5282,44 @@ orders_router = APIRouter(prefix="/api/orders", tags=["Orders"])
 
 @orders_router.get("")
 async def unified_orders(user: dict = Depends(get_current_user),
-                         broker: Optional[str] = None, refresh: bool = False):
-    """Unified order history. `refresh=true` re-syncs the live order book from
-    every connected broker first (best-effort — a broker outage never hides
-    the locally recorded history)."""
+                         broker: Optional[str] = None,
+                         broker_account_id: Optional[str] = None,
+                         refresh: bool = False):
+    """Unified order history across every account this user owns.
+
+    Always filtered by `user_id` — that is the ownership boundary and it has not
+    moved. `broker_account_id` narrows it to one brokerage account (D6.4);
+    `broker` narrows it to one brand, which may now span several accounts.
+
+    `refresh=true` re-syncs the live order book from every connected *account*
+    first (best-effort — a broker outage never hides the locally recorded
+    history).
+    """
     user_id = str(user["_id"])
     sync_errors = {}
     if refresh:
-        statuses = await broker_engine.get_status(user_id)
-        for name, status in statuses.items():
-            if broker and name != broker:
+        # D6.4 — iterate ACCOUNTS, not brokers. The per-broker loop synced one
+        # order book per brand, so a user with two accounts at one broker had one
+        # of them silently never refreshed.
+        for entry in await broker_engine.account_statuses(user_id):
+            if broker and entry["broker"] != broker:
                 continue
-            if not status.get("connected"):
+            if broker_account_id and entry["broker_account_id"] != broker_account_id:
+                continue
+            if not entry.get("connected"):
                 continue
             try:
-                await broker_engine.sync_orders(user_id, name)
-            except BrokerError as e:
-                sync_errors[name] = e.user_message
+                account = await broker_engine.resolve_account(
+                    user_id, entry["broker_account_id"])
+                await broker_engine.sync_orders(account)
+            except (BrokerError, UnknownBrokerAccount) as e:
+                sync_errors[entry["broker_account_id"]] = getattr(
+                    e, "user_message", "sync failed")
     query = {"user_id": user_id}
     if broker:
         query["broker"] = broker
+    if broker_account_id:
+        query["broker_account_id"] = broker_account_id
     docs = await db.orders.find(query).sort("placed_at", -1).to_list(200)
     for d in docs:
         d["_id"] = str(d["_id"])
@@ -4680,8 +5335,16 @@ async def zerodha_status(user: dict = Depends(get_current_user)):
     return (await broker_engine.get_status(str(user["_id"])))["zerodha"]
 
 @zerodha_router.get("/login-url")
-async def zerodha_login(user: dict = Depends(get_current_user)):
-    return broker_engine.get_login_url("zerodha", str(user["_id"]))
+async def zerodha_login(response: Response, user: dict = Depends(get_current_user)):
+    """Legacy alias. Mints the same bound state the D6.1 route does.
+
+    It used to call `get_login_url("zerodha", str(user["_id"]))` — passing the
+    app's user id into the adapter's `state` parameter, which put it on the wire
+    as `redirect_params=state=<user id>`. That is the very shape D6.1 removed;
+    the parameter had merely been renamed. It now issues a real opaque state and
+    plants the cookie, by delegating to the hardened route.
+    """
+    return await broker_login_url("zerodha", response, user)
 
 @zerodha_router.post("/session")
 async def zerodha_session(request: Request, user: dict = Depends(get_current_user)):
@@ -4700,30 +5363,53 @@ async def zerodha_session(request: Request, user: dict = Depends(get_current_use
 @zerodha_router.get("/holdings")
 async def zerodha_holdings(user: dict = Depends(get_current_user)):
     try:
-        return {"source": "zerodha", "holdings": await broker_engine.get_holdings(str(user["_id"]), "zerodha")}
+        return {"source": "zerodha", "holdings": await broker_engine.get_holdings(await _sole_account(user, "zerodha"))}
     except BrokerAuthError as e:
         return {"source": "zerodha", "holdings": [], "error": e.user_message}
 
 @zerodha_router.get("/positions")
 async def zerodha_positions(user: dict = Depends(get_current_user)):
     try:
-        positions = await broker_engine.get_positions(str(user["_id"]), "zerodha")
+        positions = await broker_engine.get_positions(await _sole_account(user, "zerodha"))
         return {"source": "zerodha", "net": positions, "day": []}
     except BrokerAuthError as e:
         return {"source": "zerodha", "net": [], "day": [], "error": e.user_message}
 
 @zerodha_router.post("/order")
-async def zerodha_order(request: Request, user: dict = Depends(get_current_user)):
-    body = await request.json()
+async def zerodha_order(order: ZerodhaOrderCreate, user: dict = Depends(get_current_user)):
+    """Place a LIVE order in the user's sole Zerodha account (legacy route).
+
+    D6.8 GAP / G-1 — THE BODY IS VALIDATED BEFORE ANY ACCOUNT IS RESOLVED.
+    ---------------------------------------------------------------------
+    This handler took `request: Request` and indexed `await request.json()`
+    directly. Nothing checked the numbers it handed to a live brokerage account:
+    `quantity` of -50, 0, 1_000_000_000, 1.5 and `"abc"`, a `transaction_type`
+    of "STEAL", an `order_type` of "WHATEVER", a negative `price` and a
+    5,000-character symbol were all forwarded to the Kite adapter and answered
+    200 — while `/api/brokers/accounts/{id}/orders`, which performs the same
+    irreversible operation through the same engine, refused every one of them
+    with 422. A missing `symbol` or `quantity` raised `KeyError` and became a
+    500 rather than a 422.
+
+    `ZerodhaOrderCreate` is `BrokerOrderCreate` with this route's own historical
+    defaults, so there is ONE set of order constraints and not two that must
+    agree. The payload built below is byte-identical to the old one for any
+    request that was already valid: the fix removes reachable states, it does
+    not move a valid order.
+
+    The authorization boundary is unchanged and was never the gap: identity
+    (`get_current_user`) → owner-scoped account (`_sole_account`) → live session
+    (`BrokerEngine.get_session`) → capability (`BrokerGateway.require_capability`).
+    """
     try:
-        result = await broker_engine.place_order(str(user["_id"]), "zerodha", {
-            "symbol": body["symbol"],
-            "transaction_type": body.get("transaction_type", "BUY"),
-            "quantity": body["quantity"],
-            "price": body.get("price"),
-            "order_type": body.get("order_type", "LIMIT"),
-            "product": body.get("product", "MIS"),
-            "exchange": body.get("exchange", "NSE"),
+        result = await broker_engine.place_order(await _sole_account(user, "zerodha"), {
+            "symbol": order.symbol,
+            "transaction_type": order.transaction_type,
+            "quantity": order.quantity,
+            "price": order.price,
+            "order_type": order.order_type,
+            "product": order.product,
+            "exchange": order.exchange,
         })
         return {"source": "zerodha", "order_id": result.get("order_id"), "status": "PLACED"}
     except BrokerError as e:
@@ -4732,7 +5418,7 @@ async def zerodha_order(request: Request, user: dict = Depends(get_current_user)
 @zerodha_router.delete("/order/{order_id}")
 async def zerodha_cancel(order_id: str, user: dict = Depends(get_current_user)):
     try:
-        result = await broker_engine.cancel_order(str(user["_id"]), "zerodha", order_id)
+        result = await broker_engine.cancel_order(await _sole_account(user, "zerodha"), order_id)
         return {"source": "zerodha", "status": "success", "order_id": result.get("order_id")}
     except BrokerError as e:
         return {"source": "zerodha", "status": "ERROR", "message": e.user_message}
@@ -4740,7 +5426,7 @@ async def zerodha_cancel(order_id: str, user: dict = Depends(get_current_user)):
 @zerodha_router.get("/funds")
 async def zerodha_funds(user: dict = Depends(get_current_user)):
     try:
-        funds = await broker_engine.get_funds(str(user["_id"]), "zerodha")
+        funds = await broker_engine.get_funds(await _sole_account(user, "zerodha"))
         # Legacy aliases used by the Portfolio page.
         return {"source": "zerodha", **funds,
                 "available": funds.get("available_margin"),
@@ -4753,7 +5439,7 @@ async def zerodha_funds(user: dict = Depends(get_current_user)):
 @zerodha_router.get("/profile")
 async def zerodha_profile(user: dict = Depends(get_current_user)):
     try:
-        profile = await broker_engine.get_profile(str(user["_id"]), "zerodha")
+        profile = await broker_engine.get_profile(await _sole_account(user, "zerodha"))
         return {"source": "zerodha", **profile, "user_id": profile.get("account_id", "")}
     except BrokerAuthError as e:
         return {"source": "zerodha", "user_name": "Not Connected", "user_id": "", "error": e.user_message}
@@ -4761,7 +5447,7 @@ async def zerodha_profile(user: dict = Depends(get_current_user)):
 @zerodha_router.get("/orders")
 async def zerodha_orders(user: dict = Depends(get_current_user)):
     try:
-        return {"source": "zerodha", "orders": await broker_engine.get_orders(str(user["_id"]), "zerodha")}
+        return {"source": "zerodha", "orders": await broker_engine.get_orders(await _sole_account(user, "zerodha"))}
     except BrokerAuthError as e:
         return {"source": "zerodha", "orders": [], "error": e.user_message}
 
@@ -4775,10 +5461,11 @@ async def zerodha_account(user: dict = Depends(get_current_user)):
                 "holdings": {"holdings": []}, "positions": {"net": [], "day": []},
                 "status": status}
     try:
-        profile = await broker_engine.get_profile(user_id, "zerodha")
-        funds = await broker_engine.get_funds(user_id, "zerodha")
-        holdings = await broker_engine.get_holdings(user_id, "zerodha")
-        positions = await broker_engine.get_positions(user_id, "zerodha")
+        account = await _sole_account(user, "zerodha")
+        profile = await broker_engine.get_profile(account)
+        funds = await broker_engine.get_funds(account)
+        holdings = await broker_engine.get_holdings(account)
+        positions = await broker_engine.get_positions(account)
     except BrokerError as e:
         return {"profile": {"error": e.user_message}, "funds": None,
                 "holdings": {"holdings": []}, "positions": {"net": [], "day": []},
@@ -4793,23 +5480,72 @@ async def zerodha_account(user: dict = Depends(get_current_user)):
     }
 
 @zerodha_router.post("/quick-trade")
-async def zerodha_quick_trade(request: Request, user: dict = Depends(get_current_user)):
-    """One-click trade from AI picks — places order on Zerodha + creates trade record."""
-    try:
-        body = await request.json()
-        symbol = body["symbol"]
-        entry = float(body["entry_price"])
-        qty = int(body["quantity"])
-        sl = float(body["stop_loss"])
-        t1 = float(body["target1"])
-        t2 = float(body.get("target2", 0)) or None
-        stock_name = body.get("stock_name", symbol)
-    except (KeyError, ValueError, TypeError) as e:
-        raise HTTPException(status_code=400, detail=f"Invalid payload: missing or malformed {str(e)}")
+async def zerodha_quick_trade(order: ZerodhaQuickTradeCreate,
+                              user: dict = Depends(get_current_user)):
+    """One-click trade from AI picks — places order on Zerodha + creates trade record.
+
+    D6.8 GAP / G-2 — THE THIRD TRADE-ENTRY SURFACE NOW OBEYS THE SAME TWO GATES.
+    ---------------------------------------------------------------------------
+    This route does exactly what `POST /api/trades` does — place a live entry
+    order, then write a `db.trades` row the auto-exit engine will act on — and it
+    did it with neither of that route's gates:
+
+    * **No bounds.** It read the raw body and called `float()`/`int()`, which
+      accept `-5`, `0`, `1e9` and `Infinity`. `quantity: -5` and
+      `entry_price: -100` reached the Kite adapter AND were written to the
+      journal. `ZerodhaQuickTradeCreate` is spelled in the same aliases as
+      `TradeCreate` and `PaperTradeCreate` (PH3.12R / B-1), so the three cannot
+      drift.
+    * **No Risk Manager.** `stop_loss: 150` on a `entry_price: 100` BUY was
+      accepted, which is not merely an unenforced discipline limit: it writes a
+      trade whose stop is ALREADY breached at entry, and the auto-exit engine
+      reads that row. `/api/trades` refuses it with 422.
+
+    THE INVARIANT THE RISK CHECK FOLLOWS (and why it is not on every route)
+    ----------------------------------------------------------------------
+    A route that **creates a `db.trades` row** runs `validate_trade`; a route
+    that only **relays an order to the broker** does not. That is not a
+    convenience — `validate_trade` evaluates entry/stop/target relationships and
+    daily limits, and the relay routes (`/zerodha/order`,
+    `/brokers/{broker}/orders`, `/brokers/accounts/{id}/orders`) carry no stop
+    and no target, so there is nothing for it to evaluate. `/zerodha/emergency-stop`
+    is on the relay side for a stronger reason: it only ever CLOSES positions, and
+    a user who has hit their daily loss limit must still be able to flatten.
+
+    `validate_trade` is a personal risk-discipline function, not an authorization
+    boundary: it resolves no account, proves no ownership, checks no capability
+    and persists nothing. The authorization boundary here is the same one every
+    order route has — identity → `_sole_account` → session → capability — and it
+    ran before this change too.
+    """
+    symbol = order.symbol
+    entry = order.entry_price
+    qty = order.quantity
+    sl = order.stop_loss
+    t1 = order.target1
+    t2 = order.target2 or None
+    stock_name = order.stock_name or symbol
+
+    # Risk Manager gate — the same call, on the same inputs, as POST /api/trades.
+    # Runs BEFORE the account is resolved and before any broker call, so a
+    # refusal cannot have placed an order.
+    from services import trading_engine
+    trades_today, realized_today = await _risk_inputs(user["_id"])
+    check = trading_engine.validate_trade(user, {
+        "symbol": symbol, "type": "BUY", "entry_price": entry, "quantity": qty,
+        "stop_loss": sl, "target1": t1, "target2": t2,
+    }, trades_today, realized_today)
+    if not check["approved"]:
+        raise HTTPException(status_code=422, detail={
+            "message": "Risk check failed — trade was not placed.",
+            "violations": check["violations"],
+            "warnings": check["warnings"],
+            "metrics": check["metrics"],
+        })
 
     # Place LIVE order on Zerodha via the Broker Engine (no simulation)
     try:
-        placed = await broker_engine.place_order(str(user["_id"]), "zerodha", {
+        placed = await broker_engine.place_order(await _sole_account(user, "zerodha"), {
             "symbol": symbol, "transaction_type": "BUY", "quantity": qty,
             "price": entry, "order_type": "LIMIT", "product": "MIS", "exchange": "NSE",
         })
@@ -4834,7 +5570,7 @@ async def zerodha_quick_trade(request: Request, user: dict = Depends(get_current
         "pnl": None,
         "entry_time": datetime.now(timezone.utc).isoformat(),
         "zerodha_order_id": order_result.get("order_id"),
-        "ai_confidence": body.get("confidence"),
+        "ai_confidence": order.confidence,
     }
     result = await db.trades.insert_one(trade_doc)
     trade_doc["_id"] = str(result.inserted_id)
@@ -4871,16 +5607,19 @@ async def zerodha_emergency_stop(user: dict = Depends(get_current_user)):
         from services.email_service import send_notification as send_email_notif, is_configured as email_configured
         from services.telegram_service import send_notification as send_tg_notif, is_configured as tg_configured
 
-        user_id = str(user["_id"])
         now_str = datetime.now(timezone.utc).isoformat()
 
-        # 1. Cancel all open orders (per-user, via the Broker Engine)
+        # 1. Cancel all open orders (per-ACCOUNT, via the Broker Engine).
+        #    Resolved once and reused, so every cancel and every liquidation
+        #    below targets the same account. Re-resolving per iteration would be
+        #    a second chance to land somewhere else.
+        zerodha_account = await _sole_account(user, "zerodha")
         cancelled_count = 0
         try:
-            for o in await broker_engine.get_orders(user_id, "zerodha"):
+            for o in await broker_engine.get_orders(zerodha_account):
                 if o.get("status") in ("OPEN", "PENDING", "PARTIALLY_FILLED"):
                     try:
-                        await broker_engine.cancel_order(user_id, "zerodha", o["order_id"])
+                        await broker_engine.cancel_order(zerodha_account, o["order_id"])
                         cancelled_count += 1
                     except BrokerError as e:
                         logger.error(f"Emergency stop: cancel {o['order_id']} failed: {e}")
@@ -4890,11 +5629,11 @@ async def zerodha_emergency_stop(user: dict = Depends(get_current_user)):
         # 2. Liquidate active open positions at market
         liquidated_count = 0
         try:
-            for pos in await broker_engine.get_positions(user_id, "zerodha"):
+            for pos in await broker_engine.get_positions(zerodha_account):
                 qty = pos.get("quantity", 0)
                 if qty != 0:
                     try:
-                        await broker_engine.place_order(user_id, "zerodha", {
+                        await broker_engine.place_order(zerodha_account, {
                             "symbol": pos["symbol"],
                             "exchange": pos.get("exchange", "NSE"),
                             "transaction_type": "SELL" if qty > 0 else "BUY",
@@ -5181,50 +5920,133 @@ async def configure_email(request: Request, user: dict = Depends(get_current_use
     return {"message": "Email preferences updated", "email_alerts": email_enabled}
 
 
-# ============ ZERODHA CALLBACK ============
+# ============ ZERODHA CALLBACK (legacy path) ============
+#
+# D6.4 / V-1 — THIS ROUTE STILL TRUSTED `uid`.
+# ---------------------------------------------
+# D6.1 / S1 removed `uid = params.get("uid")` from `/api/brokers/{broker}/
+# callback` and replaced it with a server-side, single-use, cookie-bound OAuth
+# state record. It did not touch this route, which is the *older* alias for the
+# same flow — and `KITE_REDIRECT_URL` in this repository's own `.env` and
+# `.env.example` points at THIS path, so the hardened callback was not the one
+# Kite actually redirected to. The D6.1 fix was inert for Zerodha in the shipped
+# configuration.
+#
+# What the vulnerability bought, in both directions:
+#   * an attacker who completed a Kite login themselves, with
+#     `redirect_params=uid=<victim>`, attached THEIR brokerage account to the
+#     victim's platform account — the victim's orders would then be placed in the
+#     attacker's account;
+#   * an attacker who lured a victim through a Kite login carrying
+#     `uid=<attacker>` attached the VICTIM's brokerage account to the attacker's
+#     platform account, handing over the victim's holdings, positions, funds and
+#     live order placement.
+#
+# Neither required any credential of the other party. The fix is not a new
+# mechanism: this route now runs the identical ownership proof the D6.1 route
+# does — the state record plus the `b_oauth_state` cookie — by delegating to it,
+# so there is one implementation and not two that must agree.
 
 @zerodha_router.get("/callback")
 async def zerodha_callback(request: Request):
-    """Handle the Kite Connect browser redirect after login/OTP.
+    """Legacy Kite redirect target. Ownership is proved exactly as D6.1 requires.
 
-    Kite appends ?request_token=...&status=... plus any redirect_params we
-    attached to the login URL (uid identifies the app user, since no JWT is
-    available on a cross-site redirect). Always redirects back to the
-    frontend with an absolute URL — a relative redirect would land on the
-    backend origin and 404.
+    `uid` is not read. A callback that arrives without a valid, cookie-matched,
+    single-use state record is refused with the same constant message every other
+    rejection uses — a caller probing this endpoint learns only that it failed.
     """
-    request_token = request.query_params.get("request_token")
-    status_param = request.query_params.get("status")
-    uid = request.query_params.get("uid")
-    from starlette.responses import RedirectResponse
+    return await broker_oauth_callback("zerodha", request)
 
-    frontend_base = _frontend_base()
+#: Largest Kite postback body this endpoint will read. A real Kite order
+#: postback is well under a kilobyte; 64 KiB leaves three orders of magnitude of
+#: headroom for a field Zerodha adds later. See `zerodha_postback` for why a
+#: bound is the load-bearing control on an endpoint nothing authenticates.
+ZERODHA_POSTBACK_MAX_BYTES = 64 * 1024
 
-    if status_param == "success" and request_token:
-        try:
-            await broker_engine.complete_auth("zerodha", uid, {"request_token": request_token})
-            if uid:
-                try:
-                    await db.users.update_one({"_id": ObjectId(uid)}, {"$set": {"zerodha_connected": True}})
-                except Exception:
-                    pass
-            return RedirectResponse(url=f"{frontend_base}/settings?zerodha=connected")
-        except (BrokerError, Exception) as e:
-            message = getattr(e, "user_message", str(e))
-            logger.error(f"Zerodha session exchange failed: {message}")
-            return RedirectResponse(url=f"{frontend_base}/settings?zerodha=failed&error={message}")
-    return RedirectResponse(url=f"{frontend_base}/settings?zerodha=cancelled")
+#: How long a recorded postback is kept. Nothing reads the collection yet
+#: (LIM-D6.8-4), so the only reason to hold one is forensic — long enough to
+#: investigate a settlement dispute, short enough that the collection has a
+#: ceiling instead of a slope.
+ZERODHA_POSTBACK_RETENTION_DAYS = 30
+
 
 @zerodha_router.post("/postback")
 async def zerodha_postback(request: Request):
-    """Handle Zerodha order postback webhooks."""
+    """Record a Zerodha order postback. Unauthenticated by protocol.
+
+    WHAT THIS ENDPOINT IS, AND WHAT IT IS NOT (D6.8 GAP / G-3..G-5)
+    --------------------------------------------------------------
+    It is a bounded, idempotent, NON-AUTHORITATIVE recorder. It writes to exactly
+    one collection, `db.zerodha_postbacks`, which nothing in the platform reads.
+    It resolves no user, touches no order, trade, session or account, sends no
+    notification and makes no broker call — verified by asserting every other
+    collection is untouched, not by reading this docstring.
+
+    **It is not authenticated, and nothing here pretends otherwise.** Kite
+    Connect does publish a `checksum` on the postback, and verifying it is the
+    prerequisite for the FIRST consumer of this data — not for storing it.
+    Recording an unverified message is safe; acting on one is not. That gate is
+    LIM-D6.8-4 and is deliberately still open: a signature check written from
+    memory rather than from Zerodha's live specification is worse than none,
+    because the first real postback it wrongly rejects gets it relaxed to fail
+    open.
+
+    So the controls that ARE available without authenticating the sender:
+
+    * **A size bound (G-3).** This was the only reachable harm. A 2 MB body was
+      stored verbatim, MongoDB accepts documents up to 16 MB, the collection had
+      no TTL and nothing ever pruned it — so an anonymous caller could grow the
+      platform's database at roughly a gigabyte a minute per source address
+      (the global 60 req/min/IP limiter is the only other brake, and it bounds
+      the COUNT, not the volume). `Content-Length` is checked before the body is
+      read, and the read itself is capped, so a lying header does not help.
+    * **Idempotency by content (G-5).** The dedupe key is a digest of the raw
+      bytes, so Kite's own retries and an attacker's replay both collapse to one
+      row. Keying on `order_id` instead would have let a forged payload OVERWRITE
+      a genuine record — an inert bug today, a landmine for the consumer that
+      verifies checksums tomorrow.
+    * **Retention (G-6).** A TTL index reaps rows after
+      `ZERODHA_POSTBACK_RETENTION_DAYS`, so the collection has a ceiling.
+    * **Faithful storage.** The body is stored as received and is NOT reshaped to
+      a schema. That is deliberate and it is the one place where "validate
+      strictly" would do harm: a future checksum verification must run over what
+      Zerodha actually sent, and a field dropped here is evidence destroyed. The
+      bound, not the shape, is the control.
+    * **A constant response.** Always `200 {"status": ...}`, carrying nothing
+      about whether the order exists, whom it belongs to, or whether it was
+      stored as new. A caller learns nothing it did not already know.
+
+    G-4: a non-object body (a JSON array, a bare number) used to be INSERTED and
+    then answered `{"status": "error"}` — the row was written before
+    `body.get(...)` raised on it. The shape is checked before the write now, so
+    the answer and the effect agree.
+    """
+    declared = request.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > ZERODHA_POSTBACK_MAX_BYTES:
+        return _JSONResponse(status_code=413, content={"status": "too_large"})
     try:
-        body = await request.json()
-        await db.zerodha_postbacks.insert_one({
-            "data": body,
-            "received_at": datetime.now(timezone.utc).isoformat(),
-        })
-        logger.info(f"Zerodha postback received: {body.get('order_id', 'unknown')}")
+        raw = await request.body()
+        if len(raw) > ZERODHA_POSTBACK_MAX_BYTES:
+            return _JSONResponse(status_code=413, content={"status": "too_large"})
+        body = json.loads(raw)
+        if not isinstance(body, dict):
+            # Checked BEFORE the write (G-4). Kite sends a JSON object; anything
+            # else is not a postback and is not recorded.
+            logger.warning("Zerodha postback ignored: body was %s, not an object",
+                           type(body).__name__)
+            return {"status": "error"}
+        digest = hashlib.sha256(raw).hexdigest()
+        await db.zerodha_postbacks.update_one(
+            {"body_sha256": digest},
+            {"$setOnInsert": {
+                "body_sha256": digest,
+                "data": body,
+                "received_at": datetime.now(timezone.utc).isoformat(),
+                "expires_at": datetime.now(timezone.utc) + timedelta(
+                    days=ZERODHA_POSTBACK_RETENTION_DAYS),
+            }},
+            upsert=True)
+        logger.info("Zerodha postback received: %s", body.get("order_id", "unknown"))
         return {"status": "ok"}
     except Exception as e:
         logger.error(f"Postback error: {e}")
@@ -5372,7 +6194,11 @@ async def webhook_weekly_review(_: bool = Depends(verify_webhook_key)):
     """Generate an AI weekly performance review for every user and notify them."""
     from services.trade_journal import generate_weekly_review
     try:
-        users = await db.users.find({}, {"_id": 1, "capital": 1, "risk_level": 1}).to_list(1000)
+        from services import fanout
+        # D6.7 — was `.to_list(1000)`: user 1,001 onward never got a review.
+        users = await fanout.collect(
+            db.users.find({}, {"_id": 1, "capital": 1, "risk_level": 1}),
+            label="weekly_review.users")
         reviewed = 0
         for u in users:
             uid = str(u["_id"])
@@ -5505,9 +6331,31 @@ async def _publish_watchlist_updated(user_id: str, action: str, symbol: str):
 
 # ============ ENHANCED AI EXPLAIN ============
 
+#: What a model must do with a technical field it is given as a phrase rather
+#: than a number (D6.8-A).
+#:
+#: One sentence, defined once and used by every prompt that can carry an
+#: unavailable reading, because the instruction has to say the same thing in
+#: every prompt or the model will treat the phrasing itself as a signal.
+_UNAVAILABLE_FIELD_INSTRUCTION = (
+    "Any field above given as a phrase rather than a number is genuinely "
+    "unavailable: do not estimate it, do not assume a value for it, and do not "
+    "describe it as if you had measured it."
+)
+
+#: Which quote field each `/analysis/full-report` scoring factor reads.
+#: Declared so a factor that could not be assessed can say *why* in the
+#: platform's shared vocabulary rather than with a bespoke string per branch.
+_FACTOR_FIELD = {"RSI": "rsi", "Volume": "volume_ratio", "Price Action": "change_pct"}
+
+
 @analysis_router.post("/full-report")
-async def full_ai_report(data: StockAnalysisRequest):
+async def full_ai_report(data: StockAnalysisRequest, user: dict = Depends(get_current_user)):
     """Generate comprehensive AI analysis report with full transparency."""
+    # D6.8 / F-5 — authenticated. This handler invokes a paid AI model and was
+    # public: the only thing between an anonymous caller and model spend was the
+    # SPA's `ProtectedRoute`, which is UX, not a control. No signed-out page
+    # calls it. See `_MODEL_INVOKING_ROUTES` in tests/test_d68_entitlements.py.
     quote = await real_quote(data.symbol)
     if not quote:
         if not get_stock_meta(data.symbol):
@@ -5517,40 +6365,70 @@ async def full_ai_report(data: StockAnalysisRequest):
     name = data.name or quote["name"]
 
     # Scoring breakdown
+    #
+    # D6.8-A — THIS BLOCK INDEXED `quote["rsi"]` AND COMPARED IT.
+    #
+    # It worked only because `fetch_real_stock_quote` guaranteed a non-null RSI
+    # by substituting 50.0 for one it did not have, so removing that
+    # substitution (STEP 9) would have turned this route into a 500 on every
+    # stock with under 15 bars of history. This is the consumer-safety half of
+    # "make every consumer safe, THEN remove the defaults".
+    #
+    # The `reason` strings are the point, not the arithmetic: they are published
+    # as a scoring breakdown a user reads to decide whether to trade. A factor
+    # scored from a substitute keeps its score (no score moves in this phase)
+    # and loses its claim, exactly as the ranking engine's evidence does.
     score = 0
     breakdown = []
-    rsi = quote["rsi"]
+
+    def _factor(name: str, points: int, maximum: int, reason: Optional[str]) -> None:
+        """One scoring row. `reason=None` means "scored, nothing to say"."""
+        nonlocal score
+        score += points
+        row = {"factor": name, "score": points, "max": maximum}
+        if reason:
+            row["reason"] = reason
+        else:
+            row["reason"] = (
+                f"{name} could not be assessed — "
+                f"{field_quality.describe(field_quality.quality_of(quote, _FACTOR_FIELD[name]))}."
+            )
+            row["available"] = False
+        breakdown.append(row)
+
+    rsi = field_quality.scoring_input(quote, "rsi", 50.0)
+    rsi_known = field_quality.is_available(quote, "rsi")
     if 55 < rsi < 70:
-        score += 20
-        breakdown.append({"factor": "RSI", "score": 20, "max": 20, "reason": f"RSI at {rsi} — bullish momentum without being overbought"})
+        _factor("RSI", 20, 20, rsi_known and f"RSI at {rsi} — bullish momentum without being overbought")
     elif rsi >= 70:
-        score += 5
-        breakdown.append({"factor": "RSI", "score": 5, "max": 20, "reason": f"RSI at {rsi} — overbought territory, may pull back"})
+        _factor("RSI", 5, 20, rsi_known and f"RSI at {rsi} — overbought territory, may pull back")
     else:
-        score += 10
-        breakdown.append({"factor": "RSI", "score": 10, "max": 20, "reason": f"RSI at {rsi} — moderate momentum"})
+        _factor("RSI", 10, 20, rsi_known and f"RSI at {rsi} — moderate momentum")
 
-    vol_ratio = quote["volume_ratio"]
+    vol_ratio = field_quality.scoring_input(quote, "volume_ratio", 1.0)
+    vol_known = field_quality.is_available(quote, "volume_ratio")
     if vol_ratio > 1.5:
-        score += 20
-        breakdown.append({"factor": "Volume", "score": 20, "max": 20, "reason": f"Volume {vol_ratio}x above average — strong institutional interest"})
+        _factor("Volume", 20, 20, vol_known and f"Volume {vol_ratio}x above average — strong institutional interest")
     else:
-        score += 8
-        breakdown.append({"factor": "Volume", "score": 8, "max": 20, "reason": f"Volume {vol_ratio}x — below average activity"})
+        _factor("Volume", 8, 20, vol_known and f"Volume {vol_ratio}x — below average activity")
 
-    change_pct = quote["change_pct"]
+    change_pct = field_quality.scoring_input(quote, "change_pct", 0.0)
+    change_known = field_quality.is_available(quote, "change_pct")
     if change_pct > 0.5:
-        score += 20
-        breakdown.append({"factor": "Price Action", "score": 20, "max": 20, "reason": f"Up {change_pct}% today — positive momentum"})
+        _factor("Price Action", 20, 20, change_known and f"Up {change_pct}% today — positive momentum")
     elif change_pct > -0.5:
-        score += 12
-        breakdown.append({"factor": "Price Action", "score": 12, "max": 20, "reason": f"Flat at {change_pct}% — consolidating"})
+        _factor("Price Action", 12, 20, change_known and f"Flat at {change_pct}% — consolidating")
     else:
-        score += 5
-        breakdown.append({"factor": "Price Action", "score": 5, "max": 20, "reason": f"Down {change_pct}% — bearish pressure"})
+        _factor("Price Action", 5, 20, change_known and f"Down {change_pct}% — bearish pressure")
 
-    vwap = quote["vwap"]
-    if quote["price"] > vwap:
+    vwap = quote.get("vwap")
+    if vwap is None or quote.get("price") is None:
+        score += 8
+        breakdown.append({
+            "factor": "VWAP", "score": 8, "max": 20, "available": False,
+            "reason": "VWAP could not be assessed — the session's range is not available.",
+        })
+    elif quote["price"] > vwap:
         score += 20
         breakdown.append({"factor": "VWAP", "score": 20, "max": 20, "reason": f"Price INR {quote['price']} above VWAP INR {vwap} — buyers in control"})
     else:
@@ -5575,10 +6453,14 @@ async def full_ai_report(data: StockAnalysisRequest):
     def _na(v):
         return v if v is not None else "unavailable"
 
+    change_line = field_quality.describe_field(quote, "change_pct") + ("%" if change_known else "")
+    rsi_line = field_quality.describe_field(quote, "rsi")
+    macd_line = field_quality.describe_field(quote, "macd")
+    vol_line = field_quality.describe_field(quote, "volume_ratio") + ("x avg" if vol_known else "")
     prompt = f"""Deep analysis for {name} ({data.symbol}):
-Price: INR {quote['price']} ({quote['change_pct']}%)
-RSI: {rsi} | MACD: {quote['macd']} | Volume: {vol_ratio}x avg
-VWAP: {vwap} | Sector: {quote['sector']}
+Price: INR {quote['price']} ({change_line})
+RSI: {rsi_line} | MACD: {macd_line} | Volume: {vol_line}
+VWAP: {_na(vwap)} | Sector: {quote['sector']}
 52W Range: {_na(quote['week_52_low'])} - {_na(quote['week_52_high'])}
 P/E: {_na(quote['pe_ratio'])} | Market Cap: {_na(quote['market_cap_cr'])} Cr
 
@@ -5624,8 +6506,12 @@ async def gemini_analyze_stock(data: StockAnalysisRequest, user: dict = Depends(
     return {"symbol": data.symbol, "analysis": analysis, "quote": stock_data}
 
 @gemini_router.get("/market-pulse")
-async def gemini_market_pulse_endpoint():
+async def gemini_market_pulse_endpoint(user: dict = Depends(get_current_user)):
     """Get Gemini market pulse."""
+    # D6.8 / F-5 — authenticated. This handler invokes a paid AI model and was
+    # public: the only thing between an anonymous caller and model spend was the
+    # SPA's `ProtectedRoute`, which is UX, not a control. No signed-out page
+    # calls it. See `_MODEL_INVOKING_ROUTES` in tests/test_d68_entitlements.py.
     from services.gemini_direct import gemini_market_pulse
     pulse = await gemini_market_pulse()
     return {"pulse": pulse or "Gemini key not configured", "source": "gemini-2.5-flash"}
@@ -5782,6 +6668,24 @@ async def require_admin(request: Request) -> dict:
     if user.get("role") not in ("admin", "super_admin"):
         raise HTTPException(status_code=403, detail="Admin access required")
     return user
+
+
+async def _admin_target(user_id: str, actor: dict) -> ObjectId:
+    """Resolve the account an admin action modifies, and authorize the actor on it.
+
+    D6.8 / F-2. `require_admin` answers "may this caller use the admin console";
+    it does not answer "may this caller modify *that* account". Without the
+    second check a plain admin could demote, re-plan or block a super_admin —
+    the accounts that alone may delete users and mint admins. The target's role
+    is read from the database, never from the request, and a missing account is
+    a 404 rather than a silent no-op write reporting success.
+    """
+    oid = parse_object_id(user_id, "user")
+    target = await db.users.find_one({"_id": oid}, {"role": 1})
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    authorize_admin_target(target.get("role", ""), actor.get("role", ""))
+    return oid
 
 
 async def log_admin_action(admin_id: str, action: str, target: str = "", details: dict = None):
@@ -6006,7 +6910,7 @@ async def admin_get_user(user_id: str, user: dict = Depends(require_admin)):
 
 @admin_router.put("/users/{user_id}")
 async def admin_update_user(user_id: str, request: Request, user: dict = Depends(require_admin)):
-    oid = parse_object_id(user_id, "user")
+    oid = await _admin_target(user_id, user)
     body = await request.json()
     allowed = {"name", "role", "capital", "risk_level", "max_daily_loss", "max_trades_per_day"}
     update = {k: v for k, v in body.items() if k in allowed}
@@ -6024,15 +6928,22 @@ async def admin_update_user(user_id: str, request: Request, user: dict = Depends
 
 @admin_router.post("/users/{user_id}/block")
 async def admin_block_user(user_id: str, user: dict = Depends(require_admin)):
-    oid = parse_object_id(user_id, "user")
+    oid = await _admin_target(user_id, user)
     await db.users.update_one({"_id": oid}, {"$set": {"blocked": True}})
+    # PH3.10 made `blocked` take effect within the access token's 15-minute life
+    # on every path that re-resolves an identity. A WebSocket resolves its
+    # identity exactly once, at the handshake, so a blocked user's socket kept
+    # streaming their private events indefinitely — the one place the block did
+    # not reach. Blocking is what an operator reaches for during an active
+    # incident, so it has to reach there too (D6.2 / C).
+    await ws_manager.close_user(user_id)
     await log_admin_action(user["_id"], "user.blocked", user_id)
     return {"success": True}
 
 
 @admin_router.post("/users/{user_id}/unblock")
 async def admin_unblock_user(user_id: str, user: dict = Depends(require_admin)):
-    oid = parse_object_id(user_id, "user")
+    oid = await _admin_target(user_id, user)
     await db.users.update_one({"_id": oid}, {"$set": {"blocked": False}})
     await log_admin_action(user["_id"], "user.unblocked", user_id)
     return {"success": True}
@@ -6076,27 +6987,37 @@ async def admin_delete_user(user_id: str, user: dict = Depends(require_admin)):
 
     revoked_brokers, broker_errors = [], {}
     try:
-        accounts = await db.broker_accounts.find(
-            {"user_id": user_id, "connected": {"$ne": False}}).to_list(50)
+        # D6.4 — every ACCOUNT, through the directory. The old query listed
+        # documents and disconnected by broker name, which with two accounts at
+        # one broker would have revoked one of them twice and the other never.
+        accounts = await broker_accounts.list_for_user(user_id)
     except Exception as e:
         accounts = []
         logger.error(f"Could not list broker accounts for deleted user {user_id}: {e}")
     for account in accounts:
-        broker = account.get("broker")
-        if not broker:
-            continue
         try:
-            await broker_engine.disconnect(broker, user_id)
-            revoked_brokers.append(broker)
+            await broker_engine.disconnect(account)
+            revoked_brokers.append(account.broker)
         except Exception as e:
-            broker_errors[broker] = str(e)
-            logger.error(f"Broker teardown failed for deleted user {user_id} / {broker}: {e}")
+            # Keyed by the account, valued with the broker: a user may hold two
+            # accounts at one broker, so a broker name is no longer a unique key
+            # for "which teardown failed", and dropping the name would leave an
+            # operator with an opaque id and no idea which brokerage to chase.
+            broker_errors[account.broker_account_id] = {
+                "broker": account.broker, "error": str(e)}
+            logger.error(f"Broker teardown failed for deleted user {user_id} / "
+                         f"{account.broker_account_id}: {e}")
 
     try:
         sessions_revoked = await SessionStore(db).revoke_all_for_user(user_id, reason="user_deleted")
     except Exception as e:
         sessions_revoked = 0
         logger.error(f"Session revocation failed for deleted user {user_id}: {e}")
+
+    try:
+        await ws_manager.close_user(user_id)
+    except Exception as e:  # pragma: no cover - defensive; teardown is best-effort
+        logger.error(f"Socket teardown failed for deleted user {user_id}: {e}")
 
     await db.users.delete_one({"_id": oid})
     await log_admin_action(user["_id"], "user.deleted", user_id)
@@ -6106,13 +7027,17 @@ async def admin_delete_user(user_id: str, user: dict = Depends(require_admin)):
 
 @admin_router.post("/users/{user_id}/grant-plan")
 async def admin_grant_plan(user_id: str, request: Request, user: dict = Depends(require_admin)):
-    oid = parse_object_id(user_id, "user")
+    oid = await _admin_target(user_id, user)
     body = await request.json()
     plan = body.get("plan", "pro")
     duration_days = body.get("duration_days", 30)
-    valid_plans = {"free", "pro", "elite", "lifetime", "developer", "investor", "beta_tester"}
-    if plan not in valid_plans:
-        raise HTTPException(status_code=400, detail=f"Invalid plan. Choose from: {', '.join(valid_plans)}")
+    # D6.8 — validated against `security.roles.PLAN_ROLES` itself. This route
+    # kept its own copy, which had drifted (no `premium`), while the module
+    # claimed the two were "kept in sync". A plan grant overwrites `role`, so
+    # this allowlist is the only thing stopping it from writing `admin`.
+    if not isinstance(plan, str) or plan not in PLAN_ROLES:
+        raise HTTPException(status_code=400,
+                            detail=f"Invalid plan. Choose from: {', '.join(sorted(PLAN_ROLES))}")
     # PH3.3 (D-3): `duration_days` went straight from an untyped JSON body into
     # `timedelta(days=...)`, which raises TypeError for a string/null/list and
     # OverflowError for an astronomically large int — both uncaught, both a 500
@@ -7330,7 +8255,87 @@ async def ensure_indexes():
     # busiest collection in the product on every admin page load.
     await db.chat_messages.create_index("created_at")
 
-    await db.broker_accounts.create_index([("user_id", 1), ("broker", 1)], unique=True)
+    # ----------------------------------------------------------------------- #
+    # Broker account identity (D6.4)
+    # ----------------------------------------------------------------------- #
+    # The old index was `{user_id, broker}` UNIQUE. That single line was the
+    # thing that made a second account at one broker impossible: a user's second
+    # Zerodha connect did not fail, it *upserted over* the first.
+    #
+    # What replaces it, and what each one is for:
+    #
+    #   `{broker_account_id}` UNIQUE
+    #       The account's identity. Every owner-scoped lookup, every stream key
+    #       and every stamped row resolves through it.
+    #
+    #   `{user_id, broker, external_account_id}` UNIQUE
+    #       The *external* identity, and the constraint that makes reconnect
+    #       idempotent: relinking the same brokerage account can only ever land
+    #       on the row that is already there. A different client code at the same
+    #       broker is a different tuple and therefore a different account, which
+    #       is what makes two Zerodha accounts possible at all.
+    #
+    #       PARTIAL, on `external_account_id` existing. Mongo treats missing and
+    #       null as one value in a unique index, so without the filter a user
+    #       with two accounts whose brokers never named them would collide — and
+    #       the legacy rows this migration cannot name are exactly that case.
+    #
+    #   `{user_id, broker}` NON-unique
+    #       Kept for the owner-scoped listing and for the compatibility bridge,
+    #       which asks "how many accounts does this user have at this broker" on
+    #       every broker-addressed request. Non-unique is the whole point.
+    #
+    # The old unique index is dropped explicitly. `create_index` does not
+    # redefine an existing index with the same key pattern, so leaving it would
+    # have kept the uniqueness constraint silently in force under a new set of
+    # indexes that all say a second account is allowed — the failure would have
+    # been a duplicate-key error on a user's second connect, after every code
+    # path had already agreed it was legal.
+    try:
+        await db.broker_accounts.drop_index("user_id_1_broker_1")
+        logger.info("Dropped the pre-D6.4 unique broker_accounts index")
+    except Exception:
+        # Already dropped, never existed (fresh database), or the deployment
+        # named it differently. None is an error; the migration below and the
+        # indexes above are what the platform actually depends on.
+        pass
+    await db.broker_accounts.create_index("broker_account_id", unique=True,
+                                          partialFilterExpression={
+                                              "broker_account_id": {"$exists": True}})
+    await db.broker_accounts.create_index(
+        [("user_id", 1), ("broker", 1), ("external_account_id", 1)], unique=True,
+        partialFilterExpression={"external_account_id": {"$exists": True, "$type": "string"}})
+    await db.broker_accounts.create_index([("user_id", 1), ("broker", 1)])
+
+    # Owner-scoped, account-scoped reads of the rows that now name an account.
+    # `{user_id, broker_account_id}` leads with the owner so it also answers the
+    # plain per-user reads as a prefix; `orders` additionally needs the
+    # deduplication key `_record_order` upserts on.
+    # D6.7 — UNIQUE, not merely indexed. `_record_order` upserts on exactly this
+    # pair from three concurrent writers (a broker-book sync, the realtime order
+    # stream, and an order acknowledgement), and `update_one(upsert=True)` is not
+    # atomic against a concurrent insert of the same key WITHOUT a unique index:
+    # both callers find nothing and both insert, leaving two authoritative rows
+    # for one real broker order. The build is defensive and never destructive —
+    # see `services/brokers/order_identity.py` for why a collection that already
+    # violates the constraint is reported rather than repaired.
+    from services.brokers.order_identity import (
+        ensure_holding_identity_index, ensure_order_identity_index,
+    )
+    await ensure_order_identity_index(db)
+    await db.holdings.create_index([("user_id", 1), ("broker_account_id", 1)])
+    # D6.7 — the per-symbol upsert in `BrokerEngine._replace_holdings` needs this
+    # constraint to be atomic against a concurrent sync of the same account.
+    await ensure_holding_identity_index(db)
+    await db.portfolios.create_index([("user_id", 1), ("broker_account_id", 1)])
+
+    # Leader election (D6.7 / A2). One document per named lease, keyed by `_id`,
+    # so the unique constraint that makes the election safe is the one Mongo
+    # already enforces on every collection — there is nothing to declare here.
+    # `expires_at` is deliberately NOT a TTL index: Mongo's TTL reaper runs on a
+    # ~60s cycle, so a document it was responsible for removing can outlive its
+    # expiry by longer than the lease itself. The election compares `expires_at`
+    # in its own filter instead, which is exact.
 
     # Admin Portal collections (Sprint 11)
     await db.admin_audit_logs.create_index("timestamp")
@@ -7369,6 +8374,14 @@ async def ensure_indexes():
     await db.recovery_tokens.create_index("token_id", unique=True)
     await db.recovery_tokens.create_index([("user_id", 1), ("purpose", 1)])
     await db.recovery_tokens.create_index("expires_at", expireAfterSeconds=0)
+    # Zerodha postbacks (D6.8 gap / G-5, G-6) — an unauthenticated endpoint
+    # writes here, so the collection needs a ceiling and not a slope. The unique
+    # index on the body digest is what makes a replayed delivery idempotent (and
+    # is enforced by the database, not only by the upsert filter); the TTL index
+    # reaps rows once past their retention Date. Nothing reads the collection
+    # yet — LIM-D6.8-4.
+    await db.zerodha_postbacks.create_index("body_sha256", unique=True)
+    await db.zerodha_postbacks.create_index("expires_at", expireAfterSeconds=0)
     await db.feature_flags.create_index("key", unique=True)
     await db.announcements.create_index("created_at")
     await db.support_tickets.create_index("status")
@@ -7380,12 +8393,44 @@ async def ensure_indexes():
 
 
 # Startup
+async def _run_broker_account_migration() -> None:
+    """Assign `broker_account_id` to pre-D6.4 accounts, before any session load.
+
+    Never raises: a migration failure must not stop the process starting, and a
+    session restored against an unmigrated document is skipped by
+    `load_sessions` rather than restored under an invented identity. An
+    ambiguous legacy pair is logged at ERROR because it needs a person — those
+    accounts stay unusable until it is resolved by hand (D6.4 / §4).
+    """
+    try:
+        from services.brokers.account_migration import migrate_broker_accounts
+
+        report = await migrate_broker_accounts(db)
+        if report.ambiguous:
+            logger.error(
+                "D6.4 broker account migration found %d ambiguous legacy "
+                "identities; those accounts are UNUSABLE until resolved: %s",
+                len(report.ambiguous), report.ambiguous)
+    except Exception as e:
+        logger.error("D6.4 broker account migration failed: %s", e)
+
+
 @app.on_event("startup")
 async def startup():
     # Indexes first, before anything else in boot and before the readiness gate
     # opens — unchanged from the pre-PH3.4 ordering, now one call instead of
     # forty inline statements. See `ensure_indexes()` for why it was extracted.
     await ensure_indexes()
+
+    # Browser-session topology check (D6.2 / D). The cookie policy, the CORS
+    # allowlist and the CSRF double-submit only work as one coherent system, and
+    # a mismatch between them fails silently: the API answers, CORS matches, and
+    # every cookie-authenticated mutation 403s because the SPA is on a host the
+    # cookies were never filed under. Logged at WARNING, never fatal — a running
+    # deployment must not refuse to boot over a configuration the operator may
+    # be midway through changing.
+    for problem in cookie_policy_warnings():
+        logger.warning("Cookie/CORS topology: %s", problem)
 
     # Outbound HTTP connection pooling (PH3.4). Enabled here, on the application's
     # own event loop, because an httpx client's connections belong to the loop
@@ -7441,6 +8486,11 @@ async def startup():
 
     # Restore same-day broker sessions (Zerodha/Upstox) + realtime streams so
     # a backend restart doesn't force re-login. Encrypts legacy plaintext tokens.
+    # D6.4 — the identity backfill runs BEFORE any session is restored. A
+    # session restored against an unmigrated document would be cached under an
+    # id that does not exist yet, and every stream, provider and order it wrote
+    # would carry it.
+    await _run_broker_account_migration()
     await broker_engine.load_sessions()
 
     # Admin accounts are never seeded by the API server (PH1.1). For local
@@ -7455,12 +8505,44 @@ async def startup():
     except Exception as e:
         logger.error(f"Market Engine init error: {e}")
 
-    # Setup scheduler (cron jobs)
+    # Setup scheduler (cron jobs), behind a single-leader lease (D6.7 / A2).
+    #
+    # Every uvicorn worker is a separate process and runs this handler, so before
+    # D6.7 every worker registered its own copy of the six cron jobs — including
+    # `trade_monitor`, which places real broker exit orders on stop-loss and
+    # target hits. Two schedulers meant two live market orders for one position.
+    # The only thing standing against that was a warning in the Docker
+    # entrypoint, which does not fire when the deployment scales by *replicas*
+    # (the identical defect) and never runs outside Docker at all.
+    #
+    # The election is started before the scheduler and never blocks the boot: a
+    # process that loses simply runs no leader-only jobs, and keeps campaigning
+    # so it takes over within one lease if the holder dies.
+    try:
+        from infrastructure.leader import LeaderLease, SCHEDULER_LEASE
+
+        scheduler_lease = LeaderLease(db, SCHEDULER_LEASE)
+        acquired = await scheduler_lease.acquire()
+        scheduler_lease.start()
+        app.state.scheduler_lease = scheduler_lease
+        logger.info(
+            "Scheduler leader election: this process (%s) %s the lease.",
+            scheduler_lease.identity, "ACQUIRED" if acquired else "did not win")
+    except Exception as e:
+        # An election that cannot run must not take the scheduler down with it.
+        # `setup_scheduler(lease=None)` restores the pre-D6.7 behaviour exactly,
+        # and the per-trade exit claim in `trading_engine.claim_exit` still makes
+        # a duplicate order impossible regardless — see `scheduler.is_leader`.
+        scheduler_lease = None
+        logger.error("Scheduler leader election failed, falling back to "
+                     "ungated scheduling: %s", e)
+
     try:
         setup_scheduler(
             db=db,
             ai_summary_func=ai_market_summary,
             ws_broadcast=ws_manager.broadcast,
+            lease=scheduler_lease,
         )
         logger.info("Cron scheduler initialized")
     except Exception as e:
@@ -7567,6 +8649,19 @@ async def shutdown():
     from services.scheduler import scheduler
     if scheduler.running:
         scheduler.shutdown(wait=False)
+
+    # Release the scheduler lease AFTER the scheduler stops, so no job of ours
+    # can still be running when another process takes over. Releasing is what
+    # makes a rolling deploy hand leadership over in under a second instead of
+    # leaving the platform schedulerless for the length of one lease (D6.7).
+    lease = getattr(app.state, "scheduler_lease", None)
+    if lease is not None:
+        try:
+            await lease.stop()
+            logger.info("Scheduler lease released")
+        except Exception as e:
+            # A lease nobody releases simply expires. Never block a shutdown.
+            logger.warning("Releasing the scheduler lease failed: %s", e)
 
     # Stop the perpetual application loops BEFORE the resources they use (PH3.6).
     #

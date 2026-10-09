@@ -37,6 +37,8 @@ import asyncio
 
 import pytest
 
+from services.ai_provider import AIResponse
+
 from services import morning_report
 
 
@@ -82,10 +84,13 @@ def capture_prompt(monkeypatch):
     monkeypatch.setattr(server, "gemini_configured", lambda: True)
 
     class _Engine:
-        async def simple_chat(self, system, context, **_k):
+        # D6.9 — the report now calls `simple_chat_result`, which returns the
+        # response object rather than a bare string, so the caller can tell a
+        # model's answer from the simulated fallback's.
+        async def simple_chat_result(self, system, context, **_k):
             seen["system"] = system
             seen["context"] = context
-            return "A briefing."
+            return AIResponse(content="A briefing.", provider="claude", model="claude-test")
 
     monkeypatch.setattr(server, "get_debate_engine", lambda: _Engine())
     return seen
@@ -147,26 +152,26 @@ def test_the_model_is_told_not_to_call_a_live_level_a_close(capture_prompt):
 # --------------------------------------------------------------------------- #
 
 def test_the_fallback_does_not_claim_a_close_during_an_open_session(no_ai):
-    briefing = _run(morning_report._generate_briefing(_facts(market_is_open=True)))
+    briefing = _run(morning_report._generate_briefing(_facts(market_is_open=True))).text
 
     assert "closed" not in briefing.lower()
 
 
 def test_the_fallback_labels_an_open_session_as_live(no_ai):
-    briefing = _run(morning_report._generate_briefing(_facts(market_is_open=True)))
+    briefing = _run(morning_report._generate_briefing(_facts(market_is_open=True))).text
 
     assert "trading" in briefing.lower() or "live" in briefing.lower()
 
 
 def test_the_fallback_still_restates_the_real_numbers(no_ai):
     """The label is added; the data is not replaced."""
-    briefing = _run(morning_report._generate_briefing(_facts(market_is_open=True)))
+    briefing = _run(morning_report._generate_briefing(_facts(market_is_open=True))).text
 
     assert "24,058" in briefing
 
 
 def test_the_fallback_is_unchanged_in_shape_when_the_market_is_closed(no_ai):
-    briefing = _run(morning_report._generate_briefing(_facts(market_is_open=False)))
+    briefing = _run(morning_report._generate_briefing(_facts(market_is_open=False))).text
 
     assert "24,058" in briefing
     assert briefing.strip()

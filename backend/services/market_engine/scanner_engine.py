@@ -26,9 +26,70 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+from services.market_engine import field_quality
 from services.market_engine.event_bus import event_bus
 
 logger = logging.getLogger(__name__)
+
+#: Which quote field each numeric filter reads, and the placeholder the old
+#: coalescing substituted when it was absent.
+#:
+#: D6.8-A — the table exists so the eligibility rule below can be stated once
+#: over every bound instead of six times inline, and so a new filter cannot be
+#: added without declaring which reading it claims to test.
+_FILTER_FIELD = {
+    "price_min": "price", "price_max": "price",
+    "volume_min": "volume",
+    "rsi_min": "rsi", "rsi_max": "rsi",
+    "change_pct_min": "change_pct", "change_pct_max": "change_pct",
+    "volume_ratio_min": "volume_ratio",
+    "macd_bullish": "macd",
+}
+
+#: Bounds that are SKIPPED when their field is not a real reading, rather than
+#: refused.
+#:
+#: RSI only, and the reason is in `match_evidence`'s docstring, which predates
+#: this phase: "refusing it would hide a real stock over missing reference
+#: data". A stock with no RSI is still a stock, and an RSI band is a preference
+#: about a stock rather than a definition of one. That reasoning does not extend
+#: to a volume-ratio floor or a MACD crossover, which are the scan's subject:
+#: a "volume spike" scan that returned stocks whose volume nobody measured would
+#: not be a weaker answer to the question, it would be an answer to a different
+#: one. Those refuse — which is also, exactly, what they did before this phase.
+_SKIPPED_WHEN_UNAVAILABLE = frozenset({"rsi_min", "rsi_max"})
+
+
+def _bound_reading(quote: Dict[str, Any], field: str) -> Any:
+    """The value a bound may be tested against, or None if there is none.
+
+    D6.8-A FIX (F-1) — THE FIELDQUALITY CONTRACT COVERS SIX FIELDS, NOT EVERY
+    KEY ON THE PAYLOAD.
+
+    `field_quality.reading()` answers "is this a real reading of a
+    quality-tracked field", and its staleness leg is derived from
+    :data:`field_quality.OBSERVED_AT_KEY` — which, on the baseline path, is the
+    timestamp of the newest **daily bar** the indicators were computed from
+    (`real_market._series_observed_at`). That instant ages the six fields in
+    `QUALITY_TRACKED_FIELDS` and nothing else.
+
+    `price` and `volume` are not among them, and they are not derived from the
+    bar series at all — they are the live quote. Routing them through
+    `reading()` borrowed the daily series' clock: on a Monday morning, when the
+    newest bar is Friday's, `quality_of("price")` returned STALE and a
+    `price_min` bound refused a perfectly current price, silently emptying the
+    scan. Same for `volume_min`.
+
+    So: a tracked field is read under the contract; anything else is read
+    directly, with exactly the None/missing semantics it had before D6.8-A.
+    Making `price` and `volume` quality-tracked is a different (and larger)
+    change — it would need a producer that classifies them and an observation
+    instant that describes the quote rather than the bar series — and it is
+    deliberately not this phase's business.
+    """
+    if field in field_quality.QUALITY_TRACKED_FIELDS:
+        return field_quality.reading(quote, field)
+    return quote.get(field)
 
 
 # ── Strategy presets ─────────────────────────────────
@@ -135,39 +196,96 @@ def get_presets() -> List[Dict[str, Any]]:
     ]
 
 
-def _passes_filters(quote: Dict[str, Any], filters: Dict[str, Any]) -> bool:
-    """Check if a quote passes all specified filters."""
-    price = quote.get("price") or 0
-    rsi = quote.get("rsi")
-    volume = quote.get("volume") or 0
-    volume_ratio = quote.get("volume_ratio") or 0
-    change_pct = quote.get("change_pct") or 0
-    macd = quote.get("macd") or 0
-    macd_signal = quote.get("macd_signal") or 0
-    sector = (quote.get("sector") or "").lower()
+def unverified_filters(quote: Dict[str, Any], filters: Dict[str, Any]) -> List[str]:
+    """The applied bounds this quote could not actually be tested against.
 
-    if "price_min" in filters and price < filters["price_min"]:
-        return False
-    if "price_max" in filters and price > filters["price_max"]:
-        return False
-    if "volume_min" in filters and volume < filters["volume_min"]:
-        return False
+    D6.8-A — the scanner's eligibility decision, made explicit.
+
+    `_passes_filters` skips an RSI bound for a stock with no RSI, so such a
+    stock appears in an RSI-filtered scan having been measured against one
+    criterion fewer than the stock beside it — and the two were indistinguishable
+    in the result. This is the list that tells them apart. It carries filter
+    *names*, which are the scanner's own published vocabulary (`STRATEGY_PRESETS`
+    ships them to the browser), and never a provider, a value or a reason string.
+    """
+    if not filters:
+        return []
+    return [
+        name for name in filters
+        if name in _SKIPPED_WHEN_UNAVAILABLE
+        and filters.get(name) is not None
+        # `_bound_reading`, not `is_available`, so the definition of "this
+        # quote could not be tested against that bound" is the SAME one
+        # `_passes_filters` applies — otherwise a non-tracked field added to
+        # `_SKIPPED_WHEN_UNAVAILABLE` would be skipped by one and reported by
+        # the other. Identical for every tracked field, which is all of them
+        # today.
+        and _bound_reading(quote, _FILTER_FIELD[name]) is None
+    ]
+
+
+def _passes_filters(quote: Dict[str, Any], filters: Dict[str, Any]) -> bool:
+    """Check if a quote passes all specified filters.
+
+    D6.8-A — THE ONE RULE THAT REPLACED SIX COALESCING EXPRESSIONS.
+
+        **A filter may never be satisfied by a value the platform does not
+        have.**
+
+    This function used to read `quote.get("volume_ratio") or 0`,
+    `change_pct or 0`, `macd or 0`, `price or 0` — and then compare the
+    substitute against the bound. Whether that was safe depended entirely on
+    which way the bound pointed, which nobody had checked: a `volume_ratio_min`
+    of 1.3 excluded the substituted 0 (fine, and unchanged below), while a
+    `change_pct_min` of -5 *admitted* it, so a stock whose day change the
+    platform never had was selected by a scan for stocks that had not fallen
+    far, and then told it matched.
+
+    Under the rule, a bound over a field that is not a real reading either
+    refuses the stock or is skipped entirely (`_SKIPPED_WHEN_UNAVAILABLE`);
+    there is no third option in which a placeholder passes. Every preset is
+    byte-identical to its pre-D6.8-A result, because a preset's bounds are all
+    the refusing kind and the substitutes already failed them —
+    `test_every_preset_matches_exactly_what_it_matched_before` pins that.
+    """
+    def _reading(name: str):
+        """The value a bound may be tested against, or None if there is none."""
+        return _bound_reading(quote, _FILTER_FIELD[name])
+
+    sector = (quote.get("sector") or "").lower()
     if "sector" in filters and filters["sector"]:
         if sector != filters["sector"].lower():
             return False
-    if rsi is not None:
-        if "rsi_min" in filters and rsi < filters["rsi_min"]:
+
+    for name, comparison in (
+        ("price_min", lambda v, b: v >= b),
+        ("price_max", lambda v, b: v <= b),
+        ("volume_min", lambda v, b: v >= b),
+        ("rsi_min", lambda v, b: v >= b),
+        ("rsi_max", lambda v, b: v <= b),
+        ("change_pct_min", lambda v, b: v >= b),
+        ("change_pct_max", lambda v, b: v <= b),
+        ("volume_ratio_min", lambda v, b: v >= b),
+    ):
+        if name not in filters or filters[name] is None:
+            continue
+        value = _reading(name)
+        if value is None:
+            if name in _SKIPPED_WHEN_UNAVAILABLE:
+                continue
             return False
-        if "rsi_max" in filters and rsi > filters["rsi_max"]:
+        if not comparison(value, filters[name]):
             return False
-    if "change_pct_min" in filters and change_pct < filters["change_pct_min"]:
-        return False
-    if "change_pct_max" in filters and change_pct > filters["change_pct_max"]:
-        return False
-    if "volume_ratio_min" in filters and volume_ratio < filters["volume_ratio_min"]:
-        return False
-    if filters.get("macd_bullish") and macd <= macd_signal:
-        return False
+
+    if filters.get("macd_bullish"):
+        # Both legs, or refuse. `macd > macd_signal` against an absent signal
+        # line is the comparison D5.16 documented as silently true for every
+        # stock with positive momentum, and `or 0` on both legs made it
+        # silently *false* for every stock with neither.
+        macd = field_quality.reading(quote, "macd")
+        macd_signal = field_quality.reading(quote, "macd_signal")
+        if macd is None or macd_signal is None or macd <= macd_signal:
+            return False
 
     return True
 
@@ -283,6 +401,9 @@ async def scan(
     source_tier = market_gateway.source_tier(
         Capability.UNIVERSE_QUOTES, user_id=user_id
     )
+    # Developer Rule 2: the coverage of a provider fetch is a gateway fact,
+    # and the scanner reads it the same way it reads the tier — by asking.
+    coverage = market_gateway.universe_coverage(len(quotes))
     if not quotes:
         return {
             "strategy": strategy,
@@ -294,6 +415,7 @@ async def scan(
             "available": False,
             "note": "Live market data is temporarily unavailable.",
             "source_tier": source_tier,
+            "coverage": coverage,
             "scanned_at": datetime.now(timezone.utc).isoformat(),
         }
 
@@ -321,16 +443,45 @@ async def scan(
         sort_key = preset.get("sort_key", "change_pct")
         sort_desc = preset.get("sort_desc", True)
 
-    matched.sort(
-        key=lambda q: q.get(sort_key) or 0,
-        reverse=sort_desc,
-    )
+    # D6.8-A — A STOCK THE PLATFORM CANNOT RANK IS RANKED LAST, NOT FIRST.
+    #
+    # `q.get(sort_key) or 0` gave every unmeasured stock a sort value of zero,
+    # and zero is not neutral in an ordering — it is an extreme. The `reversal`
+    # preset sorts RSI ascending to put the most oversold stock at the top, so a
+    # stock with no RSI at all took that slot, under a heading that asserts it is
+    # the most oversold thing on the exchange. `value` sorts the same way.
+    #
+    # The two-element key puts unmeasured rows after measured ones in BOTH
+    # directions (the flag is not negated by `reverse`, because the flag is
+    # compared before the value and `reverse` inverts the whole comparison — so
+    # it is inverted here to compensate). Ordering among measured rows is
+    # untouched, which is what keeps every preset's visible result identical for
+    # a universe whose sort field is present.
+    def _sort_key(quote):
+        # `_bound_reading`, not `field_quality.reading`, for the reason in its
+        # docstring: a preset may sort on a field the quality contract does not
+        # track, and judging such a field by the daily series' clock would rank
+        # a current price as unmeasured. Identical for every tracked sort key,
+        # which is every sort key the shipped presets use.
+        value = _bound_reading(quote, sort_key)
+        unranked = value is None
+        return (unranked != sort_desc, value if value is not None else 0)
+
+    matched.sort(key=_sort_key, reverse=sort_desc)
 
     # Each pick carries the filters it satisfied. Attached to a copy so the
     # gateway's normalized quote — which is shared with other consumers and may
     # be cached — is not mutated by a presentational field.
     results = [
-        {**q, "matched_on": match_evidence(q, effective_filters)}
+        {
+            **q,
+            "matched_on": match_evidence(q, effective_filters),
+            # D6.8-A — which of the applied bounds this stock was never actually
+            # tested against. Empty for a fully measured stock, which is the
+            # normal case; non-empty is the honest caveat that used to be
+            # invisible. See `unverified_filters`.
+            "unverified_filters": unverified_filters(q, effective_filters),
+        }
         for q in matched[:limit]
     ]
 
@@ -355,6 +506,12 @@ async def scan(
         "total_matched": len(matched),
         "filters_applied": effective_filters,
         "available": True,
+        # D6.8-A — `total_scanned` alone says how many stocks were examined and
+        # is silent about how many were meant to be. A vendor that failed on
+        # seven of thirty-one symbols made the scan report 24, which does not
+        # read as an incident; it reads as a smaller, healthy market. See
+        # `_scan_coverage`.
+        "coverage": coverage,
         # The freshness of the data these picks were selected from, read with
         # the same identity that resolved them. Never a provider name.
         "source_tier": source_tier,

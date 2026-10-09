@@ -204,6 +204,11 @@ docs/
 Dockerfile
 .dockerignore
 docker-compose*.yml
+# Railway config-as-code (deployment preparation). Read by Railway from the
+# repository, never by the running app — keeping it out preserves the
+# PH3.12-certified /app tree byte-for-byte.
+railway.toml
+railway.json
 
 # ── DEPTH-INDEPENDENT TWINS FOR EVERY RULE ABOVE (PH3.12 finding C-3) ─────────
 # Everything above this line, apart from the C-1 block, is a BARE pattern, and a
@@ -323,3 +328,5 @@ docker-compose*.yml
 **/Dockerfile
 **/.dockerignore
 **/docker-compose*.yml
+**/railway.toml
+**/railway.json

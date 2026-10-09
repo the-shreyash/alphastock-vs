@@ -329,13 +329,119 @@ async def _publish(event_type: str, data: dict) -> None:
         logger.warning(f"Trading engine event publish failed ({event_type}): {e}")
 
 
-async def _broker_exit(broker_engine, trade: dict, quantity: int, reason: str):
-    """Place the live market exit order for an auto_exit trade. Returns the
-    broker order result or None on failure (failure never blocks bookkeeping —
-    the user is alerted either way)."""
+async def claim_exit(db, trade_id, claim: str) -> bool:
+    """Atomically claim the right to place ONE live exit order, or refuse.
+
+    D6.7. `run_cycle` reads a trade, decides an exit is due, and only then places
+    a real market order in a real brokerage account. Everything between the read
+    and the order is a window in which a second runner — another uvicorn worker,
+    a second container, a cycle that overran its 60-second slot — can read the
+    same OPEN trade, reach the same decision, and place the same order again.
+
+    THE KEY IS THE EXIT, NOT THE TRADE
+    ----------------------------------
+    `claim` names the specific exit being taken: ``"SL"``, or ``"T1"``/``"T2"``
+    for a target level. That is the correct granularity because it is the one
+    the business rule already uses — a stop fires once and each target books
+    once — so the claim key can be derived from the decision instead of being
+    invented alongside it. Claiming the *trade* would be wrong in the other
+    direction: a partial exit at target 1 must not block the stop-loss exit of
+    the remainder.
+
+    WHY THE FILTER IS THE WHOLE MECHANISM
+    -------------------------------------
+    MongoDB applies a single-document update atomically and re-evaluates the
+    filter under the document lock, so of two callers presenting the same claim
+    exactly one can match ``exit_claims: {$ne: claim}``. The loser sees
+    ``modified_count == 0`` and returns False. No transaction is involved, which
+    matters on this deployment: `mongod` runs standalone here, where multi-
+    document transactions are unavailable — and reaching for one would have been
+    the wrong instrument regardless, since the whole race lives inside one
+    document.
+
+    Returns True when this caller may place the order. On any database error it
+    returns **False**: a claim that cannot be recorded is a claim that cannot be
+    shown to be exclusive, and the fail-closed outcome of an un-placed exit
+    (the user is alerted to exit manually, as they are on any order failure) is
+    strictly better than a duplicate live market order.
+    """
+    if db is None or not claim:
+        return False
+    try:
+        result = await db.trades.update_one(
+            {"_id": trade_id, "exit_claims": {"$ne": claim}},
+            {"$push": {"exit_claims": claim},
+             "$set": {"exit_claimed_at": _now_iso()}},
+        )
+    except Exception as e:
+        logger.error("Exit claim %r could not be recorded for trade %s: %s — "
+                     "refusing to place the order.", claim, trade_id, e)
+        return False
+    if not getattr(result, "modified_count", 0):
+        logger.warning(
+            "Exit %r for trade %s is already claimed; not placing a second "
+            "order. (Another runner reached this trade first.)", claim, trade_id)
+        return False
+    return True
+
+
+async def _broker_exit(broker_engine, trade: dict, quantity: int, reason: str,
+                       db=None):
+    """Place the live market exit order for an auto_exit trade.
+
+    Returns the broker order result or None on failure (failure never blocks
+    bookkeeping — the user is alerted either way).
+
+    D6.7 — THE ORDER IS PLACED AT MOST ONCE, PER EXIT, PLATFORM-WIDE.
+    -----------------------------------------------------------------
+    `claim_exit` above is taken before the order and after the account resolves,
+    so a refused claim costs nothing and a successful one is never held against
+    an exit that could not have happened anyway. `db` is optional only so the
+    existing unit callers that drive this function directly keep working; when
+    it is None the claim cannot be taken and no order is placed, which is the
+    same fail-closed answer an unrecordable claim gets.
+
+    D6.4 — THE ACCOUNT COMES FROM THE TRADE, NOT FROM THE BROKER NAME.
+    ------------------------------------------------------------------
+    This runs on a background scheduler with no request and no authenticated
+    user, so it cannot resolve an account by asking "this user's zerodha". It
+    reads the `broker_account_id` the entry order was recorded against and
+    exits there. A trade that carries no account id is **not exited** — it is
+    logged and skipped, because the alternative is a live market order in an
+    account this function chose, which is precisely the failure D6.4 exists to
+    make impossible. The bookkeeping still runs and the user is still alerted.
+
+    `get_unscoped` is correct here and is one of its two sanctioned callers: the
+    task is acting as the account, and the ownership check it would otherwise
+    perform is already discharged — the id came off a trade row that was itself
+    filtered by `user_id` when it was written.
+    """
+    account_id = trade.get("broker_account_id")
+    if not account_id:
+        logger.error(
+            "Auto-exit for %s skipped: the trade names broker %r but no "
+            "broker_account_id, and this path may not choose an account.",
+            trade.get("symbol"), trade.get("broker"))
+        return None
+    from services.brokers.accounts import broker_accounts
+
+    account = await broker_accounts.get_unscoped(account_id)
+    if account is None or not account.owned_by(trade.get("user_id")):
+        # The second half is not redundant with the first: an account that was
+        # deleted and an account whose row no longer belongs to this trade's
+        # owner are different facts, and neither may be exited into.
+        logger.error("Auto-exit for %s skipped: account %s is not resolvable for "
+                     "its owner.", trade.get("symbol"), account_id)
+        return None
+    # D6.7 — the last thing checked before the irreversible action, and the only
+    # one that has to be atomic. Taken AFTER the account resolves so a trade that
+    # could never have been exited does not burn its one claim, and BEFORE the
+    # order so no second runner can reach the broker with the same exit.
+    if not await claim_exit(db, trade.get("_id"), reason):
+        return None
     side = "BUY" if _is_short(trade) else "SELL"
     try:
-        return await broker_engine.place_order(trade["user_id"], trade["broker"], {
+        return await broker_engine.place_order(account, {
             "symbol": trade["symbol"], "exchange": trade.get("exchange", "NSE"),
             "transaction_type": side, "quantity": quantity,
             "order_type": "MARKET", "product": trade.get("product") or "CNC",
@@ -352,7 +458,13 @@ async def run_cycle(db, quotes: dict, broker_engine=None, ws_push=None) -> dict:
     `quotes` maps SYMBOL -> {"price": ...} (prefetched by the scheduler job so
     this cycle never triggers its own market-data fan-out).
     """
-    trades = await db.trades.find({"status": "OPEN", "is_paper": {"$ne": True}}).to_list(200)
+    # D6.7 — streamed, not capped. `.to_list(200)` silently skipped every open
+    # position past the 200th platform-wide, and this is the cycle that trails
+    # stops and fires stop-loss exits: a skipped trade is an unguarded position.
+    from services import fanout
+    trades = await fanout.collect(
+        db.trades.find({"status": "OPEN", "is_paper": {"$ne": True}}),
+        label="trading_engine.run_cycle")
     stats = {"checked": 0, "trailed": 0, "targets_hit": 0, "sl_exits": 0,
              "auto_orders": 0, "closed_trades": []}
 
@@ -389,7 +501,9 @@ async def run_cycle(db, quotes: dict, broker_engine=None, ws_push=None) -> dict:
             trade = {**trade, **trail}
 
         # 2. Target / SL lifecycle.
-        auto = bool(trade.get("auto_exit")) and bool(trade.get("broker"))
+        # D6.4 — gated on the ACCOUNT, so a trade whose account cannot be named
+        # never reaches `_broker_exit` at all.
+        auto = bool(trade.get("auto_exit")) and bool(trade.get("broker_account_id"))
         for action in evaluate_trade(trade, price):
             if action["action"] == "TARGET_HIT":
                 level, qty = action["level"], action["quantity"]
@@ -400,7 +514,8 @@ async def run_cycle(db, quotes: dict, broker_engine=None, ws_push=None) -> dict:
                 message = (f"{trade['symbol']} hit target {level} (₹{action['target_price']}) "
                            f"at ₹{price}.")
                 if auto:
-                    order = await _broker_exit(broker_engine, trade, qty, f"T{level}")
+                    order = await _broker_exit(broker_engine, trade, qty, f"T{level}",
+                                               db=db)
                     if order:
                         stats["auto_orders"] += 1
                         hit["quantity_booked"] = qty
@@ -428,7 +543,8 @@ async def run_cycle(db, quotes: dict, broker_engine=None, ws_push=None) -> dict:
                 message = (f"{trade['symbol']} breached stop loss ₹{trade.get('stop_loss')} "
                            f"at ₹{price}.")
                 if auto:
-                    order = await _broker_exit(broker_engine, trade, action["quantity"], "SL")
+                    order = await _broker_exit(broker_engine, trade, action["quantity"],
+                                               "SL", db=db)
                     if order:
                         stats["auto_orders"] += 1
                         message += (f" Auto-exit: closed {action['quantity']} at market "

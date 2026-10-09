@@ -246,6 +246,119 @@ entries:
     expires: "2026-11-15"
 
   # ---------------------------------------------------------------------------
+  # PYTHON — pymongo 4.6.3 (2026-10-06, beta release preparation)
+  #
+  # All four are fixed only in pymongo 4.18.1/4.18.2, and pymongo is pinned in
+  # place by `motor==3.3.1`. Motor declares `pymongo>=4.5,<5`, so pip resolves
+  # 3.3.1 + 4.18.2 without complaint — and the result does not import:
+  #
+  #     ImportError: cannot import name '_QUERY_OPTIONS' from 'pymongo.cursor'
+  #
+  # (motor/core.py:31). pymongo 4.9 restructured its internals for the native
+  # async API, and only Motor 3.6+ follows it. Taking the fix is therefore a
+  # coordinated Motor + pymongo upgrade with its own regression pass over every
+  # database path, not a pin bump. A bump here would have passed `pip check` and
+  # crashed the server at import.
+  #
+  # Three are structurally unreachable. One (the BSON encoder overflow) is not
+  # provably unreachable and gets the short leash, as the starlette split above
+  # does.
+  # ---------------------------------------------------------------------------
+
+  - id: GHSA-8fvv-fgr5-f8ch
+    ecosystem: python
+    package: pymongo
+    affected: "4.6.3"
+    severity: medium
+    classification: not-reachable
+    reason: GridFS reads/writes by ID did not require an exact ID match.
+    reachability: >-
+      The application never uses GridFS. Motor imports its own motor_gridfs
+      module at load time, but no code in the backend constructs a GridFS bucket
+      or calls a GridFS API.
+    evidence: >-
+      grep -rnE "gridfs|GridFS|motor_gridfs" backend --include='*.py'
+      --exclude-dir=venv → 0 matches
+    mitigation: No GridFS collections exist; file payloads are not stored in MongoDB.
+    fixed_in: "4.18.1"
+    blocked_by: "motor==3.3.1 fails to import with pymongo>=4.9 (see section header)"
+    owner: platform-security
+    expires: "2027-01-15"
+
+  - id: GHSA-qx36-8mw2-4r3x
+    ecosystem: python
+    package: pymongo
+    affected: "4.6.3"
+    severity: medium
+    classification: not-reachable
+    reason: The KMS endpoint of a client-side-encryption data key was passed verbatim to parse_host().
+    reachability: >-
+      Client-side field-level encryption is not used. No ClientEncryption or
+      AutoEncryptionOpts is constructed, and pymongocrypt (required for any KMS
+      call) is not installed.
+    evidence: >-
+      grep -rnE "ClientEncryption|AutoEncryptionOpts|kms_providers" backend
+      --include='*.py' --exclude-dir=venv → 0 matches;
+      grep -ciE "pymongocrypt|pymongo\[encryption\]" backend/requirements.txt → 0
+    mitigation: The vulnerable code path cannot load without the encryption extra.
+    fixed_in: "4.18.2"
+    blocked_by: "motor==3.3.1 fails to import with pymongo>=4.9 (see section header)"
+    owner: platform-security
+    expires: "2027-01-15"
+
+  - id: GHSA-vp6j-j7w5-5xjj
+    ecosystem: python
+    package: pymongo
+    affected: "4.6.3"
+    severity: high
+    classification: not-reachable
+    reason: >-
+      Percent-decoding the whole host section of a connection string let an
+      encoded `,`/`:` inject an extra seed host.
+    reachability: >-
+      Exploitation requires interpolating untrusted input into the host portion
+      of a connection string. Every MongoDB client in the backend takes its URL
+      verbatim from the operator-set MONGO_URL environment variable; no request,
+      user or tenant value is ever placed into a connection string.
+    evidence: >-
+      grep -rnE "AsyncIOMotorClient\(|MongoClient\(" backend --include='*.py'
+      --exclude-dir=venv --exclude-dir=tests → every call site passes a URL read
+      from os.environ["MONGO_URL"] (server.py:263, scripts/* via os.environ.get)
+    mitigation: MONGO_URL is a deployment secret validated at startup (security/secrets.py).
+    fixed_in: "4.18.2"
+    blocked_by: "motor==3.3.1 fails to import with pymongo>=4.9 (see section header)"
+    owner: platform-security
+    expires: "2027-01-15"
+
+  - id: GHSA-v4x9-3549-crwv
+    ecosystem: python
+    package: pymongo
+    affected: "4.6.3"
+    severity: high
+    classification: temporarily-accepted
+    reason: >-
+      Signed 32-bit size arithmetic in the bundled C BSON encoder can overflow
+      when a single document is built from an unusually large amount of
+      caller-supplied data, risking an out-of-bounds write.
+    reachability: >-
+      NOT provably unreachable: the API writes request-derived data into
+      MongoDB documents, and there is no global request-body size cap (only the
+      Zerodha postback route enforces one, ZERODHA_POSTBACK_MAX_BYTES). Triggering
+      the overflow needs one document whose encoded size passes the signed
+      32-bit limit (~2 GiB), which a single request must deliver and the process
+      must hold in memory before encoding begins.
+    mitigation: >-
+      An attacker must deliver, and the process must hold in memory, ~2 GiB of
+      data destined for one document before encoding starts; MongoDB itself
+      rejects documents over 16 MiB, so no legitimate write path needs anything
+      near that size. Not a demonstrated control: adding a global request-body
+      cap, or the Motor 3.6+ / pymongo 4.18 upgrade, is what clears this.
+    fixed_in: "4.18.2"
+    blocked_by: "motor==3.3.1 fails to import with pymongo>=4.9 (see section header)"
+    owner: platform-security
+    expires: "2026-11-15"
+
+  # ---------------------------------------------------------------------------
   # NPM — the react-scripts (Create React App) build chain
   #
   # Every entry below is build-time tooling. None of it is imported by
@@ -311,6 +424,86 @@ entries:
     mitigation: The application accepts no SVG upload of any kind.
     fixed_in: "none within the react-scripts tree"
     blocked_by: "react-scripts@5.0.1"
+    owner: frontend
+    expires: "2026-11-15"
+
+  # ---------------------------------------------------------------------------
+  # svgo removeScripts bypasses (2026-09-28, deployment preparation)
+  #
+  # The locked tree carried svgo at TWO paths:
+  #   A. react-scripts > @svgr/webpack@5.5.0 > @svgr/plugin-svgo@5.5.0 > svgo@1.3.2
+  #   B. react-scripts > css-minimizer-webpack-plugin > cssnano >
+  #      cssnano-preset-default > postcss-svgo@5.1.0 > svgo@2.8.3
+  #
+  # Path B was FIXED, not triaged: postcss-svgo declares svgo ^2.7.0 and 2.8.4
+  # is the patched release, so a scoped override (`"postcss-svgo": {"svgo":
+  # "^2.8.4"}` in frontend/package.json) takes it inside its own semver range.
+  # Path B is the copy that actually runs in this build (cssnano optimises SVG
+  # data URIs in CSS).
+  #
+  # Path A cannot move. The 1.x line has no patched release, and svgo 2 replaced
+  # the 1.x `new SVGO()` class API that @svgr/plugin-svgo@5 calls, so overriding
+  # it would break the build. The only fix is @svgr/webpack 6+, which
+  # react-scripts@5.0.1 does not accept. Path A is also DEAD CODE in this build:
+  # CRA passes `svgo: false` to @svgr/webpack, and @svgr/plugin-svgo returns the
+  # input unchanged when svgo is false, so svgo@1.3.2 is loaded but never runs.
+  # ---------------------------------------------------------------------------
+
+  - id: GHSA-w27v-7q3p-w38r
+    ecosystem: npm
+    package: svgo
+    affected: "1.3.2 (path A only; path B remediated to 2.8.4)"
+    severity: high
+    classification: not-reachable
+    reason: >-
+      The removeScripts plugin lets executable links through via namespace and
+      control-character bypasses.
+    reachability: >-
+      Build-time only, and not executed. The only remaining vulnerable copy is
+      svgo@1.3.2 at react-scripts > @svgr/webpack > @svgr/plugin-svgo > svgo.
+      react-scripts configures @svgr/webpack with `svgo: false`, and
+      @svgr/plugin-svgo returns early (`if (!config.svgo) return code;`), so
+      svgo 1.x never optimises anything. Even if it ran, the only inputs are
+      repository-controlled SVG files: the application imports no SVG through
+      webpack (the one SVG asset, public/logo.svg, is copied verbatim and never
+      passes through the loader), and it accepts no SVG upload of any kind.
+      svgo is absent from the shipped bundle.
+    evidence: >-
+      grep -n "svgo: false" frontend/node_modules/react-scripts/config/webpack.config.js → 1 match;
+      grep -n "if (!config.svgo) return code" frontend/node_modules/@svgr/plugin-svgo/lib/index.js → 1 match;
+      grep -rnE "\.svg['\"]" frontend/src/ → 0 matches;
+      npm ls svgo --all → svgo@1.3.2 under @svgr/plugin-svgo, svgo@2.8.4 under postcss-svgo
+    mitigation: >-
+      Path B (the svgo copy that runs) is on the patched 2.8.4. Path A inputs
+      are the project's own committed SVG assets, never user data.
+    fixed_in: "2.8.4 (2.x only; no patched 1.x release exists)"
+    blocked_by: >-
+      react-scripts@5.0.1 → @svgr/webpack@5 → @svgr/plugin-svgo@5, which requires
+      the svgo 1.x API. Clears with the CRA → Vite migration (see via:build-chain).
+    owner: frontend
+    expires: "2026-11-15"
+
+  - id: GHSA-4vpr-x523-8j87
+    ecosystem: npm
+    package: svgo
+    affected: "1.3.2 (path A only; path B remediated to 2.8.4)"
+    # GitHub rates this advisory itself `moderate`; npm reports the svgo package
+    # at `high` (its worst advisory), which is why the high-severity gate names it.
+    severity: moderate
+    classification: not-reachable
+    reason: >-
+      removeScripts incompletely sanitises executable HTML inside SVG
+      foreignObject elements.
+    reachability: >-
+      Same remaining path and same reasoning as GHSA-w27v-7q3p-w38r: svgo@1.3.2
+      is reached only through react-scripts > @svgr/webpack > @svgr/plugin-svgo,
+      which CRA runs with `svgo: false`, so it never executes. The build only
+      ever sees repository-controlled SVG files. It is build-time only and not
+      in the shipped bundle.
+    evidence: 'Same commands as GHSA-w27v-7q3p-w38r.'
+    mitigation: Same as GHSA-w27v-7q3p-w38r.
+    fixed_in: "2.8.4 (2.x only; no patched 1.x release exists)"
+    blocked_by: "react-scripts@5.0.1 → @svgr/webpack@5 → @svgr/plugin-svgo@5 (svgo 1.x API)"
     owner: frontend
     expires: "2026-11-15"
 
@@ -564,3 +757,950 @@ entries:
       pipeline and needs its own sprint and regression pass.
     owner: frontend
     expires: "2026-11-15"
+
+  # ---------------------------------------------------------------------------
+  # NPM — dev/build/test tooling advisories (2026-10-06, beta release preparation)
+  #
+  # 61 findings published after the 2026-09-29 certification: 15 advisories of
+  # their own plus 46 packages flagged only through a vulnerable dependency.
+  # Every one is in the Create React App / craco toolchain, the Jest test runner,
+  # ESLint, or the Tailwind/PostCSS CSS build. They are TRIAGED here rather than
+  # bulk-upgraded: upgrading build tooling inside the release that is about to
+  # ship changes the build that was certified, for no change to what users
+  # receive.
+  #
+  # That is a deliberate departure from PH3.11's "fix everything in range"
+  # rule above, for this release only. Six of these advisories DO have an
+  # in-range fix (`fixed_in` says so): brace-expansion ×3, compression,
+  # proxy-addr, source-map-js. Taking them via `overrides` after the beta ships
+  # is the follow-up, not a re-dating of these entries.
+  #
+  # Shared reachability evidence (re-runnable):
+  #   1. no application import —
+  #        grep -rE "from ['\"](<pkg>)" frontend/src --exclude-dir=__tests__ → 0
+  #   2. every dependency path roots at build/test tooling — the `roots:` in each
+  #      entry come from `npm ls --all --json` and are only ever react-scripts,
+  #      tailwindcss, tailwindcss-animate, postcss, eslint-config-react-app or
+  #      eslint-plugin-import (tailwindcss-animate: required only by
+  #      tailwind.config.js)
+  #   3. absent from the shipped bundle — no `node_modules/<pkg>/` path appears
+  #      in the `sources` of frontend/build/static/js/*.map, which list every
+  #      module webpack bundled
+  #
+  # Expiry 2027-01-15: past the beta, before any general-availability release.
+  # ---------------------------------------------------------------------------
+
+  - id: "via:jest-message-util"
+    ecosystem: npm
+    package: "@jest/console"
+    affected: "25.4.0 - 30.2.0"
+    severity: high
+    classification: not-reachable
+    reason: Flagged only because it depends on jest-message-util.
+    reachability: "Test runner only. Jest runs repository test files under `craco test` locally and in frontend-ci's test job; it is never imported by application source and is not bundled."
+    evidence: "npm audit --json → via: [jest-message-util], no advisory of its own; npm ls @jest/console --all → roots: react-scripts"
+    mitigation: "Processes only repository-controlled test files and globs; no untrusted input."
+    fixed_in: "clears with jest-message-util"
+    blocked_by: "react-scripts@5.0.1 / craco@5 build chain (see via:build-chain)"
+    owner: frontend
+    expires: "2027-01-15"
+
+  - id: "via:jest-chain"
+    ecosystem: npm
+    package: "@jest/core"
+    affected: "<=30.2.0"
+    severity: high
+    classification: not-reachable
+    reason: Flagged only because it depends on @jest/console, @jest/reporters, @jest/test-result, @jest/transform, jest-config, jest-haste-map, jest-message-util, jest-resolve, jest-resolve-dependencies, jest-runner, jest-runtime, jest-snapshot, jest-watcher, micromatch.
+    reachability: "Test runner only. Jest runs repository test files under `craco test` locally and in frontend-ci's test job; it is never imported by application source and is not bundled."
+    evidence: "npm audit --json → via: [@jest/console, @jest/reporters, @jest/test-result, @jest/transform, jest-config, jest-haste-map, jest-message-util, jest-resolve, jest-resolve-dependencies, jest-runner, jest-runtime, jest-snapshot, jest-watcher, micromatch], no advisory of its own; npm ls @jest/core --all → roots: react-scripts"
+    mitigation: "Processes only repository-controlled test files and globs; no untrusted input."
+    fixed_in: "clears with @jest/console, @jest/reporters, @jest/test-result, @jest/transform, jest-config, jest-haste-map, jest-message-util, jest-resolve, jest-resolve-dependencies, jest-runner, jest-runtime, jest-snapshot, jest-watcher, micromatch"
+    blocked_by: "react-scripts@5.0.1 / craco@5 build chain (see via:build-chain)"
+    owner: frontend
+    expires: "2027-01-15"
+
+  - id: "via:@jest/fake-timers"
+    ecosystem: npm
+    package: "@jest/environment"
+    affected: "<=30.2.0"
+    severity: high
+    classification: not-reachable
+    reason: Flagged only because it depends on @jest/fake-timers.
+    reachability: "Test runner only. Jest runs repository test files under `craco test` locally and in frontend-ci's test job; it is never imported by application source and is not bundled."
+    evidence: "npm audit --json → via: [@jest/fake-timers], no advisory of its own; npm ls @jest/environment --all → roots: react-scripts"
+    mitigation: "Processes only repository-controlled test files and globs; no untrusted input."
+    fixed_in: "clears with @jest/fake-timers"
+    blocked_by: "react-scripts@5.0.1 / craco@5 build chain (see via:build-chain)"
+    owner: frontend
+    expires: "2027-01-15"
+
+  - id: "via:jest-message-util"
+    ecosystem: npm
+    package: "@jest/fake-timers"
+    affected: "<=30.2.0"
+    severity: high
+    classification: not-reachable
+    reason: Flagged only because it depends on jest-message-util.
+    reachability: "Test runner only. Jest runs repository test files under `craco test` locally and in frontend-ci's test job; it is never imported by application source and is not bundled."
+    evidence: "npm audit --json → via: [jest-message-util], no advisory of its own; npm ls @jest/fake-timers --all → roots: react-scripts"
+    mitigation: "Processes only repository-controlled test files and globs; no untrusted input."
+    fixed_in: "clears with jest-message-util"
+    blocked_by: "react-scripts@5.0.1 / craco@5 build chain (see via:build-chain)"
+    owner: frontend
+    expires: "2027-01-15"
+
+  - id: "via:jest-chain"
+    ecosystem: npm
+    package: "@jest/globals"
+    affected: "<=30.2.0"
+    severity: high
+    classification: not-reachable
+    reason: Flagged only because it depends on @jest/environment, expect.
+    reachability: "Test runner only. Jest runs repository test files under `craco test` locally and in frontend-ci's test job; it is never imported by application source and is not bundled."
+    evidence: "npm audit --json → via: [@jest/environment, expect], no advisory of its own; npm ls @jest/globals --all → roots: react-scripts"
+    mitigation: "Processes only repository-controlled test files and globs; no untrusted input."
+    fixed_in: "clears with @jest/environment, expect"
+    blocked_by: "react-scripts@5.0.1 / craco@5 build chain (see via:build-chain)"
+    owner: frontend
+    expires: "2027-01-15"
+
+  - id: "via:jest-chain"
+    ecosystem: npm
+    package: "@jest/reporters"
+    affected: "<=30.2.0"
+    severity: high
+    classification: not-reachable
+    reason: Flagged only because it depends on @jest/console, @jest/test-result, @jest/transform, jest-haste-map, jest-resolve.
+    reachability: "Test runner only. Jest runs repository test files under `craco test` locally and in frontend-ci's test job; it is never imported by application source and is not bundled."
+    evidence: "npm audit --json → via: [@jest/console, @jest/test-result, @jest/transform, jest-haste-map, jest-resolve], no advisory of its own; npm ls @jest/reporters --all → roots: react-scripts"
+    mitigation: "Processes only repository-controlled test files and globs; no untrusted input."
+    fixed_in: "clears with @jest/console, @jest/test-result, @jest/transform, jest-haste-map, jest-resolve"
+    blocked_by: "react-scripts@5.0.1 / craco@5 build chain (see via:build-chain)"
+    owner: frontend
+    expires: "2027-01-15"
+
+  - id: "via:@jest/console"
+    ecosystem: npm
+    package: "@jest/test-result"
+    affected: "25.4.0 - 30.2.0"
+    severity: high
+    classification: not-reachable
+    reason: Flagged only because it depends on @jest/console.
+    reachability: "Test runner only. Jest runs repository test files under `craco test` locally and in frontend-ci's test job; it is never imported by application source and is not bundled."
+    evidence: "npm audit --json → via: [@jest/console], no advisory of its own; npm ls @jest/test-result --all → roots: react-scripts"
+    mitigation: "Processes only repository-controlled test files and globs; no untrusted input."
+    fixed_in: "clears with @jest/console"
+    blocked_by: "react-scripts@5.0.1 / craco@5 build chain (see via:build-chain)"
+    owner: frontend
+    expires: "2027-01-15"
+
+  - id: "via:jest-chain"
+    ecosystem: npm
+    package: "@jest/test-sequencer"
+    affected: "<=30.2.0"
+    severity: high
+    classification: not-reachable
+    reason: Flagged only because it depends on @jest/test-result, jest-haste-map, jest-runtime.
+    reachability: "Test runner only. Jest runs repository test files under `craco test` locally and in frontend-ci's test job; it is never imported by application source and is not bundled."
+    evidence: "npm audit --json → via: [@jest/test-result, jest-haste-map, jest-runtime], no advisory of its own; npm ls @jest/test-sequencer --all → roots: react-scripts"
+    mitigation: "Processes only repository-controlled test files and globs; no untrusted input."
+    fixed_in: "clears with @jest/test-result, jest-haste-map, jest-runtime"
+    blocked_by: "react-scripts@5.0.1 / craco@5 build chain (see via:build-chain)"
+    owner: frontend
+    expires: "2027-01-15"
+
+  - id: "via:jest-chain"
+    ecosystem: npm
+    package: "@jest/transform"
+    affected: "<=30.2.0"
+    severity: high
+    classification: not-reachable
+    reason: Flagged only because it depends on jest-haste-map, micromatch.
+    reachability: "Test runner only. Jest runs repository test files under `craco test` locally and in frontend-ci's test job; it is never imported by application source and is not bundled."
+    evidence: "npm audit --json → via: [jest-haste-map, micromatch], no advisory of its own; npm ls @jest/transform --all → roots: react-scripts"
+    mitigation: "Processes only repository-controlled test files and globs; no untrusted input."
+    fixed_in: "clears with jest-haste-map, micromatch"
+    blocked_by: "react-scripts@5.0.1 / craco@5 build chain (see via:build-chain)"
+    owner: frontend
+    expires: "2027-01-15"
+
+  - id: "via:eslint-chain"
+    ecosystem: npm
+    package: "@typescript-eslint/eslint-plugin"
+    affected: "4.0.1-alpha.0 - 8.2.1-alpha.25"
+    severity: high
+    classification: not-reachable
+    reason: Flagged only because it depends on @typescript-eslint/parser, @typescript-eslint/type-utils, @typescript-eslint/utils.
+    reachability: "Lint-time only. ESLint and its plugins/configs run during `npm run build` (eslint-webpack-plugin) over repository source; they are not imported by application code and are not bundled."
+    evidence: "npm audit --json → via: [@typescript-eslint/parser, @typescript-eslint/type-utils, @typescript-eslint/utils], no advisory of its own; npm ls @typescript-eslint/eslint-plugin --all → roots: eslint-config-react-app"
+    mitigation: "Inputs are the project's own source files."
+    fixed_in: "clears with @typescript-eslint/parser, @typescript-eslint/type-utils, @typescript-eslint/utils"
+    blocked_by: "react-scripts@5.0.1 / craco@5 build chain (see via:build-chain)"
+    owner: frontend
+    expires: "2027-01-15"
+
+  - id: "via:@typescript-eslint/utils"
+    ecosystem: npm
+    package: "@typescript-eslint/experimental-utils"
+    affected: ">=5.9.2-alpha.0"
+    severity: high
+    classification: not-reachable
+    reason: Flagged only because it depends on @typescript-eslint/utils.
+    reachability: "Lint-time only. ESLint and its plugins/configs run during `npm run build` (eslint-webpack-plugin) over repository source; they are not imported by application code and are not bundled."
+    evidence: "npm audit --json → via: [@typescript-eslint/utils], no advisory of its own; npm ls @typescript-eslint/experimental-utils --all → roots: eslint-config-react-app"
+    mitigation: "Inputs are the project's own source files."
+    fixed_in: "clears with @typescript-eslint/utils"
+    blocked_by: "react-scripts@5.0.1 / craco@5 build chain (see via:build-chain)"
+    owner: frontend
+    expires: "2027-01-15"
+
+  - id: "via:@typescript-eslint/typescript-estree"
+    ecosystem: npm
+    package: "@typescript-eslint/parser"
+    affected: "3.10.2-alpha.0 - 8.2.1-alpha.25"
+    severity: high
+    classification: not-reachable
+    reason: Flagged only because it depends on @typescript-eslint/typescript-estree.
+    reachability: "Lint-time only. ESLint and its plugins/configs run during `npm run build` (eslint-webpack-plugin) over repository source; they are not imported by application code and are not bundled."
+    evidence: "npm audit --json → via: [@typescript-eslint/typescript-estree], no advisory of its own; npm ls @typescript-eslint/parser --all → roots: eslint-config-react-app"
+    mitigation: "Inputs are the project's own source files."
+    fixed_in: "clears with @typescript-eslint/typescript-estree"
+    blocked_by: "react-scripts@5.0.1 / craco@5 build chain (see via:build-chain)"
+    owner: frontend
+    expires: "2027-01-15"
+
+  - id: "via:eslint-chain"
+    ecosystem: npm
+    package: "@typescript-eslint/type-utils"
+    affected: "5.9.2-alpha.0 - 8.2.1-alpha.25"
+    severity: high
+    classification: not-reachable
+    reason: Flagged only because it depends on @typescript-eslint/typescript-estree, @typescript-eslint/utils.
+    reachability: "Lint-time only. ESLint and its plugins/configs run during `npm run build` (eslint-webpack-plugin) over repository source; they are not imported by application code and are not bundled."
+    evidence: "npm audit --json → via: [@typescript-eslint/typescript-estree, @typescript-eslint/utils], no advisory of its own; npm ls @typescript-eslint/type-utils --all → roots: eslint-config-react-app"
+    mitigation: "Inputs are the project's own source files."
+    fixed_in: "clears with @typescript-eslint/typescript-estree, @typescript-eslint/utils"
+    blocked_by: "react-scripts@5.0.1 / craco@5 build chain (see via:build-chain)"
+    owner: frontend
+    expires: "2027-01-15"
+
+  - id: "via:globby"
+    ecosystem: npm
+    package: "@typescript-eslint/typescript-estree"
+    affected: "3.10.2-alpha.0 - 8.2.1-alpha.25"
+    severity: high
+    classification: not-reachable
+    reason: Flagged only because it depends on globby.
+    reachability: "Lint-time only. ESLint and its plugins/configs run during `npm run build` (eslint-webpack-plugin) over repository source; they are not imported by application code and are not bundled."
+    evidence: "npm audit --json → via: [globby], no advisory of its own; npm ls @typescript-eslint/typescript-estree --all → roots: eslint-config-react-app"
+    mitigation: "Inputs are the project's own source files."
+    fixed_in: "clears with globby"
+    blocked_by: "react-scripts@5.0.1 / craco@5 build chain (see via:build-chain)"
+    owner: frontend
+    expires: "2027-01-15"
+
+  - id: "via:@typescript-eslint/typescript-estree"
+    ecosystem: npm
+    package: "@typescript-eslint/utils"
+    affected: "<=8.2.1-alpha.25"
+    severity: high
+    classification: not-reachable
+    reason: Flagged only because it depends on @typescript-eslint/typescript-estree.
+    reachability: "Lint-time only. ESLint and its plugins/configs run during `npm run build` (eslint-webpack-plugin) over repository source; they are not imported by application code and are not bundled."
+    evidence: "npm audit --json → via: [@typescript-eslint/typescript-estree], no advisory of its own; npm ls @typescript-eslint/utils --all → roots: eslint-config-react-app"
+    mitigation: "Inputs are the project's own source files."
+    fixed_in: "clears with @typescript-eslint/typescript-estree"
+    blocked_by: "react-scripts@5.0.1 / craco@5 build chain (see via:build-chain)"
+    owner: frontend
+    expires: "2027-01-15"
+
+  - id: "via:@jest/transform"
+    ecosystem: npm
+    package: "babel-jest"
+    affected: "24.2.0-alpha.0 - 30.2.0"
+    severity: high
+    classification: not-reachable
+    reason: Flagged only because it depends on @jest/transform.
+    reachability: "Test runner only. Jest runs repository test files under `craco test` locally and in frontend-ci's test job; it is never imported by application source and is not bundled."
+    evidence: "npm audit --json → via: [@jest/transform], no advisory of its own; npm ls babel-jest --all → roots: react-scripts"
+    mitigation: "Processes only repository-controlled test files and globs; no untrusted input."
+    fixed_in: "clears with @jest/transform"
+    blocked_by: "react-scripts@5.0.1 / craco@5 build chain (see via:build-chain)"
+    owner: frontend
+    expires: "2027-01-15"
+
+  - id: GHSA-q2hr-2g5m-vwhr
+    ecosystem: npm
+    package: "brace-expansion"
+    affected: "<=1.1.20"
+    severity: moderate
+    classification: not-reachable
+    reason: "brace-expansion: Quadratic-time expansion of the `{a},b}` rewrite causes CPU denial of service"
+    reachability: "Build-time only. These are glob, file-watch, source-map and CSS-generation tools that run inside the webpack/PostCSS/Tailwind build over repository-controlled paths and assets (tailwindcss-animate is required only from tailwind.config.js). None is imported by application source and none is bundled."
+    evidence: "npm ls brace-expansion --all → roots: eslint-plugin-import, react-scripts; no import in frontend/src (grep); absent from the bundled module list in frontend/build/static/js/*.map"
+    mitigation: "Patterns, paths and CSS inputs are committed repository content, not user data."
+    fixed_in: "in-range update available (npm audit fix) — deferred, see section header"
+    blocked_by: "react-scripts@5.0.1 build chain; bulk tooling upgrades deferred out of the beta release"
+    owner: frontend
+    expires: "2027-01-15"
+
+  - id: GHSA-qhr7-859c-m2p7
+    ecosystem: npm
+    package: "brace-expansion"
+    affected: "<=1.1.20"
+    severity: high
+    classification: not-reachable
+    reason: "brace-expansion: DoS via uncontrolled recursion on nested brace groups causing stack exhaustion"
+    reachability: "Build-time only. These are glob, file-watch, source-map and CSS-generation tools that run inside the webpack/PostCSS/Tailwind build over repository-controlled paths and assets (tailwindcss-animate is required only from tailwind.config.js). None is imported by application source and none is bundled."
+    evidence: "npm ls brace-expansion --all → roots: eslint-plugin-import, react-scripts; no import in frontend/src (grep); absent from the bundled module list in frontend/build/static/js/*.map"
+    mitigation: "Patterns, paths and CSS inputs are committed repository content, not user data."
+    fixed_in: "in-range update available (npm audit fix) — deferred, see section header"
+    blocked_by: "react-scripts@5.0.1 build chain; bulk tooling upgrades deferred out of the beta release"
+    owner: frontend
+    expires: "2027-01-15"
+
+  - id: GHSA-6j4f-fj2g-mc7p
+    ecosystem: npm
+    package: "brace-expansion"
+    affected: "<=1.1.20"
+    severity: high
+    classification: not-reachable
+    reason: "brace-expansion: DoS via uncontrolled recursion in parseCommaParts causing stack exhaustion"
+    reachability: "Build-time only. These are glob, file-watch, source-map and CSS-generation tools that run inside the webpack/PostCSS/Tailwind build over repository-controlled paths and assets (tailwindcss-animate is required only from tailwind.config.js). None is imported by application source and none is bundled."
+    evidence: "npm ls brace-expansion --all → roots: eslint-plugin-import, react-scripts; no import in frontend/src (grep); absent from the bundled module list in frontend/build/static/js/*.map"
+    mitigation: "Patterns, paths and CSS inputs are committed repository content, not user data."
+    fixed_in: "in-range update available (npm audit fix) — deferred, see section header"
+    blocked_by: "react-scripts@5.0.1 build chain; bulk tooling upgrades deferred out of the beta release"
+    owner: frontend
+    expires: "2027-01-15"
+
+  - id: GHSA-vfj7-8cjw-p6xm
+    ecosystem: npm
+    package: "braces"
+    affected: "*"
+    severity: high
+    classification: not-reachable
+    reason: "braces vulnerable to stack-exhaustion denial of service through deeply nested patterns"
+    reachability: "Build-time only. These are glob, file-watch, source-map and CSS-generation tools that run inside the webpack/PostCSS/Tailwind build over repository-controlled paths and assets (tailwindcss-animate is required only from tailwind.config.js). None is imported by application source and none is bundled."
+    evidence: "npm ls braces --all → roots: tailwindcss; no import in frontend/src (grep); absent from the bundled module list in frontend/build/static/js/*.map"
+    mitigation: "Patterns, paths and CSS inputs are committed repository content, not user data."
+    fixed_in: "breaking only (react-scripts major)"
+    blocked_by: "react-scripts@5.0.1 build chain; bulk tooling upgrades deferred out of the beta release"
+    owner: frontend
+    expires: "2027-01-15"
+
+  - id: "via:braces"
+    ecosystem: npm
+    package: "chokidar"
+    affected: "2.0.0 - 3.6.0"
+    severity: high
+    classification: not-reachable
+    reason: Flagged only because it depends on braces.
+    reachability: "Build-time only. These are glob, file-watch, source-map and CSS-generation tools that run inside the webpack/PostCSS/Tailwind build over repository-controlled paths and assets (tailwindcss-animate is required only from tailwind.config.js). None is imported by application source and none is bundled."
+    evidence: "npm audit --json → via: [braces], no advisory of its own; npm ls chokidar --all → roots: react-scripts, tailwindcss"
+    mitigation: "Patterns, paths and CSS inputs are committed repository content, not user data."
+    fixed_in: "clears with braces"
+    blocked_by: "react-scripts@5.0.1 / craco@5 build chain (see via:build-chain)"
+    owner: frontend
+    expires: "2027-01-15"
+
+  - id: GHSA-vc2v-76pw-4v95
+    ecosystem: npm
+    package: "compression"
+    affected: "<1.8.2"
+    severity: high
+    classification: not-reachable
+    reason: "compression vulnerable to Denial of Service via memory leak on premature response close"
+    reachability: "Development server only. Reached through react-scripts > webpack-dev-server, which runs for `npm start` / `craco start` on a developer machine. Production is the static frontend/build/ directory served by Vercel's CDN; no Node server, dev middleware, proxy or self-signed certificate exists in production."
+    evidence: "npm ls compression --all → roots: react-scripts; no import in frontend/src (grep); absent from the bundled module list in frontend/build/static/js/*.map"
+    mitigation: "Never started in CI or production: vercel.json and frontend-ci.yml run `npm run build` only. Developers should run `npm start` on localhost only, and not browse untrusted sites in the same browser while it is running (that matters for the webpack-dev-server source-exposure advisories)."
+    fixed_in: "in-range update available (npm audit fix) — deferred, see section header"
+    blocked_by: "react-scripts@5.0.1 build chain; bulk tooling upgrades deferred out of the beta release"
+    owner: frontend
+    expires: "2027-01-15"
+
+  - id: "via:@typescript-eslint/parser"
+    ecosystem: npm
+    package: "eslint-config-react-app"
+    affected: ">=6.0.0-next.64"
+    severity: high
+    classification: not-reachable
+    reason: Flagged only because it depends on @typescript-eslint/parser.
+    reachability: "Lint-time only. ESLint and its plugins/configs run during `npm run build` (eslint-webpack-plugin) over repository source; they are not imported by application code and are not bundled."
+    evidence: "npm audit --json → via: [@typescript-eslint/parser], no advisory of its own; npm ls eslint-config-react-app --all → roots: eslint-config-react-app, react-scripts"
+    mitigation: "Inputs are the project's own source files."
+    fixed_in: "clears with @typescript-eslint/parser"
+    blocked_by: "react-scripts@5.0.1 / craco@5 build chain (see via:build-chain)"
+    owner: frontend
+    expires: "2027-01-15"
+
+  - id: "via:@typescript-eslint/utils"
+    ecosystem: npm
+    package: "eslint-plugin-testing-library"
+    affected: "5.0.5 - 7.0.0-beta.6"
+    severity: high
+    classification: not-reachable
+    reason: Flagged only because it depends on @typescript-eslint/utils.
+    reachability: "Lint-time only. ESLint and its plugins/configs run during `npm run build` (eslint-webpack-plugin) over repository source; they are not imported by application code and are not bundled."
+    evidence: "npm audit --json → via: [@typescript-eslint/utils], no advisory of its own; npm ls eslint-plugin-testing-library --all → roots: eslint-config-react-app"
+    mitigation: "Inputs are the project's own source files."
+    fixed_in: "clears with @typescript-eslint/utils"
+    blocked_by: "react-scripts@5.0.1 / craco@5 build chain (see via:build-chain)"
+    owner: frontend
+    expires: "2027-01-15"
+
+  - id: "via:micromatch"
+    ecosystem: npm
+    package: "eslint-webpack-plugin"
+    affected: "*"
+    severity: high
+    classification: not-reachable
+    reason: Flagged only because it depends on micromatch.
+    reachability: "Lint-time only. ESLint and its plugins/configs run during `npm run build` (eslint-webpack-plugin) over repository source; they are not imported by application code and are not bundled."
+    evidence: "npm audit --json → via: [micromatch], no advisory of its own; npm ls eslint-webpack-plugin --all → roots: react-scripts"
+    mitigation: "Inputs are the project's own source files."
+    fixed_in: "clears with micromatch"
+    blocked_by: "react-scripts@5.0.1 / craco@5 build chain (see via:build-chain)"
+    owner: frontend
+    expires: "2027-01-15"
+
+  - id: "via:jest-message-util"
+    ecosystem: npm
+    package: "expect"
+    affected: "21.0.0-beta.1 - 30.2.0"
+    severity: high
+    classification: not-reachable
+    reason: Flagged only because it depends on jest-message-util.
+    reachability: "Test runner only. Jest runs repository test files under `craco test` locally and in frontend-ci's test job; it is never imported by application source and is not bundled."
+    evidence: "npm audit --json → via: [jest-message-util], no advisory of its own; npm ls expect --all → roots: react-scripts"
+    mitigation: "Processes only repository-controlled test files and globs; no untrusted input."
+    fixed_in: "clears with jest-message-util"
+    blocked_by: "react-scripts@5.0.1 / craco@5 build chain (see via:build-chain)"
+    owner: frontend
+    expires: "2027-01-15"
+
+  - id: "via:micromatch"
+    ecosystem: npm
+    package: "fast-glob"
+    affected: "*"
+    severity: high
+    classification: not-reachable
+    reason: Flagged only because it depends on micromatch.
+    reachability: "Build-time only. These are glob, file-watch, source-map and CSS-generation tools that run inside the webpack/PostCSS/Tailwind build over repository-controlled paths and assets (tailwindcss-animate is required only from tailwind.config.js). None is imported by application source and none is bundled."
+    evidence: "npm audit --json → via: [micromatch], no advisory of its own; npm ls fast-glob --all → roots: react-scripts, tailwindcss"
+    mitigation: "Patterns, paths and CSS inputs are committed repository content, not user data."
+    fixed_in: "clears with micromatch"
+    blocked_by: "react-scripts@5.0.1 / craco@5 build chain (see via:build-chain)"
+    owner: frontend
+    expires: "2027-01-15"
+
+  - id: "via:chokidar"
+    ecosystem: npm
+    package: "fork-ts-checker-webpack-plugin"
+    affected: "0.4.7 - 4.0.0-beta.5 || 6.0.0-alpha.1 - 9.0.3"
+    severity: high
+    classification: not-reachable
+    reason: Flagged only because it depends on chokidar.
+    reachability: "Build-time only. These are glob, file-watch, source-map and CSS-generation tools that run inside the webpack/PostCSS/Tailwind build over repository-controlled paths and assets (tailwindcss-animate is required only from tailwind.config.js). None is imported by application source and none is bundled."
+    evidence: "npm audit --json → via: [chokidar], no advisory of its own; npm ls fork-ts-checker-webpack-plugin --all → roots: react-scripts"
+    mitigation: "Patterns, paths and CSS inputs are committed repository content, not user data."
+    fixed_in: "clears with chokidar"
+    blocked_by: "react-scripts@5.0.1 / craco@5 build chain (see via:build-chain)"
+    owner: frontend
+    expires: "2027-01-15"
+
+  - id: "via:fast-glob"
+    ecosystem: npm
+    package: "globby"
+    affected: ">=8.0.0"
+    severity: high
+    classification: not-reachable
+    reason: Flagged only because it depends on fast-glob.
+    reachability: "Build-time only. These are glob, file-watch, source-map and CSS-generation tools that run inside the webpack/PostCSS/Tailwind build over repository-controlled paths and assets (tailwindcss-animate is required only from tailwind.config.js). None is imported by application source and none is bundled."
+    evidence: "npm audit --json → via: [fast-glob], no advisory of its own; npm ls globby --all → roots: eslint-config-react-app, react-scripts"
+    mitigation: "Patterns, paths and CSS inputs are committed repository content, not user data."
+    fixed_in: "clears with fast-glob"
+    blocked_by: "react-scripts@5.0.1 / craco@5 build chain (see via:build-chain)"
+    owner: frontend
+    expires: "2027-01-15"
+
+  - id: "via:micromatch"
+    ecosystem: npm
+    package: "http-proxy-middleware"
+    affected: ">=0.3.0"
+    severity: high
+    classification: not-reachable
+    reason: Flagged only because it depends on micromatch.
+    reachability: "Development server only. Reached through react-scripts > webpack-dev-server, which runs for `npm start` / `craco start` on a developer machine. Production is the static frontend/build/ directory served by Vercel's CDN; no Node server, dev middleware, proxy or self-signed certificate exists in production."
+    evidence: "npm audit --json → via: [micromatch], no advisory of its own; npm ls http-proxy-middleware --all → roots: react-scripts"
+    mitigation: "Never started in CI or production: vercel.json and frontend-ci.yml run `npm run build` only. Developers should run `npm start` on localhost only, and not browse untrusted sites in the same browser while it is running (that matters for the webpack-dev-server source-exposure advisories)."
+    fixed_in: "clears with micromatch"
+    blocked_by: "react-scripts@5.0.1 / craco@5 build chain (see via:build-chain)"
+    owner: frontend
+    expires: "2027-01-15"
+
+  - id: "via:jest-chain"
+    ecosystem: npm
+    package: "jest"
+    affected: "23.5.0 - 30.2.0"
+    severity: high
+    classification: not-reachable
+    reason: Flagged only because it depends on @jest/core, jest-cli.
+    reachability: "Test runner only. Jest runs repository test files under `craco test` locally and in frontend-ci's test job; it is never imported by application source and is not bundled."
+    evidence: "npm audit --json → via: [@jest/core, jest-cli], no advisory of its own; npm ls jest --all → roots: react-scripts"
+    mitigation: "Processes only repository-controlled test files and globs; no untrusted input."
+    fixed_in: "clears with @jest/core, jest-cli"
+    blocked_by: "react-scripts@5.0.1 / craco@5 build chain (see via:build-chain)"
+    owner: frontend
+    expires: "2027-01-15"
+
+  - id: "via:jest-chain"
+    ecosystem: npm
+    package: "jest-circus"
+    affected: "20.1.0-alpha.1 - 30.2.0"
+    severity: high
+    classification: not-reachable
+    reason: Flagged only because it depends on @jest/environment, @jest/test-result, expect, jest-message-util, jest-runtime, jest-snapshot.
+    reachability: "Test runner only. Jest runs repository test files under `craco test` locally and in frontend-ci's test job; it is never imported by application source and is not bundled."
+    evidence: "npm audit --json → via: [@jest/environment, @jest/test-result, expect, jest-message-util, jest-runtime, jest-snapshot], no advisory of its own; npm ls jest-circus --all → roots: react-scripts"
+    mitigation: "Processes only repository-controlled test files and globs; no untrusted input."
+    fixed_in: "clears with @jest/environment, @jest/test-result, expect, jest-message-util, jest-runtime, jest-snapshot"
+    blocked_by: "react-scripts@5.0.1 / craco@5 build chain (see via:build-chain)"
+    owner: frontend
+    expires: "2027-01-15"
+
+  - id: "via:jest-chain"
+    ecosystem: npm
+    package: "jest-cli"
+    affected: "23.5.0 - 30.2.0"
+    severity: high
+    classification: not-reachable
+    reason: Flagged only because it depends on @jest/core, @jest/test-result, jest-config.
+    reachability: "Test runner only. Jest runs repository test files under `craco test` locally and in frontend-ci's test job; it is never imported by application source and is not bundled."
+    evidence: "npm audit --json → via: [@jest/core, @jest/test-result, jest-config], no advisory of its own; npm ls jest-cli --all → roots: react-scripts"
+    mitigation: "Processes only repository-controlled test files and globs; no untrusted input."
+    fixed_in: "clears with @jest/core, @jest/test-result, jest-config"
+    blocked_by: "react-scripts@5.0.1 / craco@5 build chain (see via:build-chain)"
+    owner: frontend
+    expires: "2027-01-15"
+
+  - id: "via:jest-chain"
+    ecosystem: npm
+    package: "jest-config"
+    affected: "18.1.0 - 30.2.0"
+    severity: high
+    classification: not-reachable
+    reason: Flagged only because it depends on @jest/test-sequencer, babel-jest, jest-circus, jest-environment-jsdom, jest-environment-node, jest-jasmine2, jest-resolve, jest-runner, micromatch.
+    reachability: "Test runner only. Jest runs repository test files under `craco test` locally and in frontend-ci's test job; it is never imported by application source and is not bundled."
+    evidence: "npm audit --json → via: [@jest/test-sequencer, babel-jest, jest-circus, jest-environment-jsdom, jest-environment-node, jest-jasmine2, jest-resolve, jest-runner, micromatch], no advisory of its own; npm ls jest-config --all → roots: react-scripts"
+    mitigation: "Processes only repository-controlled test files and globs; no untrusted input."
+    fixed_in: "clears with @jest/test-sequencer, babel-jest, jest-circus, jest-environment-jsdom, jest-environment-node, jest-jasmine2, jest-resolve, jest-runner, micromatch"
+    blocked_by: "react-scripts@5.0.1 / craco@5 build chain (see via:build-chain)"
+    owner: frontend
+    expires: "2027-01-15"
+
+  - id: "via:jest-chain"
+    ecosystem: npm
+    package: "jest-environment-jsdom"
+    affected: "24.2.0-alpha.0 - 30.2.0"
+    severity: high
+    classification: not-reachable
+    reason: Flagged only because it depends on @jest/environment, @jest/fake-timers, jsdom.
+    reachability: "Test runner only. Jest runs repository test files under `craco test` locally and in frontend-ci's test job; it is never imported by application source and is not bundled."
+    evidence: "npm audit --json → via: [@jest/environment, @jest/fake-timers, jsdom], no advisory of its own; npm ls jest-environment-jsdom --all → roots: react-scripts"
+    mitigation: "Processes only repository-controlled test files and globs; no untrusted input."
+    fixed_in: "clears with @jest/environment, @jest/fake-timers, jsdom"
+    blocked_by: "react-scripts@5.0.1 / craco@5 build chain (see via:build-chain)"
+    owner: frontend
+    expires: "2027-01-15"
+
+  - id: "via:jest-chain"
+    ecosystem: npm
+    package: "jest-environment-node"
+    affected: "24.2.0-alpha.0 - 30.2.0"
+    severity: high
+    classification: not-reachable
+    reason: Flagged only because it depends on @jest/environment, @jest/fake-timers.
+    reachability: "Test runner only. Jest runs repository test files under `craco test` locally and in frontend-ci's test job; it is never imported by application source and is not bundled."
+    evidence: "npm audit --json → via: [@jest/environment, @jest/fake-timers], no advisory of its own; npm ls jest-environment-node --all → roots: react-scripts"
+    mitigation: "Processes only repository-controlled test files and globs; no untrusted input."
+    fixed_in: "clears with @jest/environment, @jest/fake-timers"
+    blocked_by: "react-scripts@5.0.1 / craco@5 build chain (see via:build-chain)"
+    owner: frontend
+    expires: "2027-01-15"
+
+  - id: "via:micromatch"
+    ecosystem: npm
+    package: "jest-haste-map"
+    affected: "18.1.0 - 30.2.0"
+    severity: high
+    classification: not-reachable
+    reason: Flagged only because it depends on micromatch.
+    reachability: "Test runner only. Jest runs repository test files under `craco test` locally and in frontend-ci's test job; it is never imported by application source and is not bundled."
+    evidence: "npm audit --json → via: [micromatch], no advisory of its own; npm ls jest-haste-map --all → roots: react-scripts"
+    mitigation: "Processes only repository-controlled test files and globs; no untrusted input."
+    fixed_in: "clears with micromatch"
+    blocked_by: "react-scripts@5.0.1 / craco@5 build chain (see via:build-chain)"
+    owner: frontend
+    expires: "2027-01-15"
+
+  - id: "via:jest-chain"
+    ecosystem: npm
+    package: "jest-jasmine2"
+    affected: "18.5.0-alpha.7da3df39 - 30.2.0"
+    severity: high
+    classification: not-reachable
+    reason: Flagged only because it depends on @jest/environment, @jest/test-result, expect, jest-message-util, jest-runtime, jest-snapshot.
+    reachability: "Test runner only. Jest runs repository test files under `craco test` locally and in frontend-ci's test job; it is never imported by application source and is not bundled."
+    evidence: "npm audit --json → via: [@jest/environment, @jest/test-result, expect, jest-message-util, jest-runtime, jest-snapshot], no advisory of its own; npm ls jest-jasmine2 --all → roots: react-scripts"
+    mitigation: "Processes only repository-controlled test files and globs; no untrusted input."
+    fixed_in: "clears with @jest/environment, @jest/test-result, expect, jest-message-util, jest-runtime, jest-snapshot"
+    blocked_by: "react-scripts@5.0.1 / craco@5 build chain (see via:build-chain)"
+    owner: frontend
+    expires: "2027-01-15"
+
+  - id: "via:micromatch"
+    ecosystem: npm
+    package: "jest-message-util"
+    affected: "18.5.0-alpha.7da3df39 - 30.2.0"
+    severity: high
+    classification: not-reachable
+    reason: Flagged only because it depends on micromatch.
+    reachability: "Test runner only. Jest runs repository test files under `craco test` locally and in frontend-ci's test job; it is never imported by application source and is not bundled."
+    evidence: "npm audit --json → via: [micromatch], no advisory of its own; npm ls jest-message-util --all → roots: react-scripts"
+    mitigation: "Processes only repository-controlled test files and globs; no untrusted input."
+    fixed_in: "clears with micromatch"
+    blocked_by: "react-scripts@5.0.1 / craco@5 build chain (see via:build-chain)"
+    owner: frontend
+    expires: "2027-01-15"
+
+  - id: "via:jest-haste-map"
+    ecosystem: npm
+    package: "jest-resolve"
+    affected: "18.1.0 - 19.0.2 || 24.2.0-alpha.0 - 24.5.0 || 27.1.0 - 30.2.0"
+    severity: high
+    classification: not-reachable
+    reason: Flagged only because it depends on jest-haste-map.
+    reachability: "Test runner only. Jest runs repository test files under `craco test` locally and in frontend-ci's test job; it is never imported by application source and is not bundled."
+    evidence: "npm audit --json → via: [jest-haste-map], no advisory of its own; npm ls jest-resolve --all → roots: react-scripts"
+    mitigation: "Processes only repository-controlled test files and globs; no untrusted input."
+    fixed_in: "clears with jest-haste-map"
+    blocked_by: "react-scripts@5.0.1 / craco@5 build chain (see via:build-chain)"
+    owner: frontend
+    expires: "2027-01-15"
+
+  - id: "via:jest-snapshot"
+    ecosystem: npm
+    package: "jest-resolve-dependencies"
+    affected: "26.1.0 - 28.1.3"
+    severity: high
+    classification: not-reachable
+    reason: Flagged only because it depends on jest-snapshot.
+    reachability: "Test runner only. Jest runs repository test files under `craco test` locally and in frontend-ci's test job; it is never imported by application source and is not bundled."
+    evidence: "npm audit --json → via: [jest-snapshot], no advisory of its own; npm ls jest-resolve-dependencies --all → roots: react-scripts"
+    mitigation: "Processes only repository-controlled test files and globs; no untrusted input."
+    fixed_in: "clears with jest-snapshot"
+    blocked_by: "react-scripts@5.0.1 / craco@5 build chain (see via:build-chain)"
+    owner: frontend
+    expires: "2027-01-15"
+
+  - id: "via:jest-chain"
+    ecosystem: npm
+    package: "jest-runner"
+    affected: "21.0.0-alpha.1 - 30.2.0"
+    severity: high
+    classification: not-reachable
+    reason: Flagged only because it depends on @jest/console, @jest/environment, @jest/test-result, @jest/transform, jest-environment-jsdom, jest-environment-node, jest-haste-map, jest-message-util, jest-resolve, jest-runtime.
+    reachability: "Test runner only. Jest runs repository test files under `craco test` locally and in frontend-ci's test job; it is never imported by application source and is not bundled."
+    evidence: "npm audit --json → via: [@jest/console, @jest/environment, @jest/test-result, @jest/transform, jest-environment-jsdom, jest-environment-node, jest-haste-map, jest-message-util, jest-resolve, jest-runtime], no advisory of its own; npm ls jest-runner --all → roots: react-scripts"
+    mitigation: "Processes only repository-controlled test files and globs; no untrusted input."
+    fixed_in: "clears with @jest/console, @jest/environment, @jest/test-result, @jest/transform, jest-environment-jsdom, jest-environment-node, jest-haste-map, jest-message-util, jest-resolve, jest-runtime"
+    blocked_by: "react-scripts@5.0.1 / craco@5 build chain (see via:build-chain)"
+    owner: frontend
+    expires: "2027-01-15"
+
+  - id: "via:jest-chain"
+    ecosystem: npm
+    package: "jest-runtime"
+    affected: "18.1.0 - 30.2.0"
+    severity: high
+    classification: not-reachable
+    reason: Flagged only because it depends on @jest/environment, @jest/fake-timers, @jest/globals, @jest/test-result, @jest/transform, jest-haste-map, jest-message-util, jest-resolve, jest-snapshot.
+    reachability: "Test runner only. Jest runs repository test files under `craco test` locally and in frontend-ci's test job; it is never imported by application source and is not bundled."
+    evidence: "npm audit --json → via: [@jest/environment, @jest/fake-timers, @jest/globals, @jest/test-result, @jest/transform, jest-haste-map, jest-message-util, jest-resolve, jest-snapshot], no advisory of its own; npm ls jest-runtime --all → roots: react-scripts"
+    mitigation: "Processes only repository-controlled test files and globs; no untrusted input."
+    fixed_in: "clears with @jest/environment, @jest/fake-timers, @jest/globals, @jest/test-result, @jest/transform, jest-haste-map, jest-message-util, jest-resolve, jest-snapshot"
+    blocked_by: "react-scripts@5.0.1 / craco@5 build chain (see via:build-chain)"
+    owner: frontend
+    expires: "2027-01-15"
+
+  - id: "via:jest-chain"
+    ecosystem: npm
+    package: "jest-snapshot"
+    affected: "23.3.0 - 30.2.0"
+    severity: high
+    classification: not-reachable
+    reason: Flagged only because it depends on @jest/transform, expect, jest-haste-map, jest-message-util.
+    reachability: "Test runner only. Jest runs repository test files under `craco test` locally and in frontend-ci's test job; it is never imported by application source and is not bundled."
+    evidence: "npm audit --json → via: [@jest/transform, expect, jest-haste-map, jest-message-util], no advisory of its own; npm ls jest-snapshot --all → roots: react-scripts"
+    mitigation: "Processes only repository-controlled test files and globs; no untrusted input."
+    fixed_in: "clears with @jest/transform, expect, jest-haste-map, jest-message-util"
+    blocked_by: "react-scripts@5.0.1 / craco@5 build chain (see via:build-chain)"
+    owner: frontend
+    expires: "2027-01-15"
+
+  - id: "via:jest-chain"
+    ecosystem: npm
+    package: "jest-watch-typeahead"
+    affected: "0.6.0 - 2.2.2"
+    severity: high
+    classification: not-reachable
+    reason: Flagged only because it depends on jest, jest-watcher.
+    reachability: "Test runner only. Jest runs repository test files under `craco test` locally and in frontend-ci's test job; it is never imported by application source and is not bundled."
+    evidence: "npm audit --json → via: [jest, jest-watcher], no advisory of its own; npm ls jest-watch-typeahead --all → roots: react-scripts"
+    mitigation: "Processes only repository-controlled test files and globs; no untrusted input."
+    fixed_in: "clears with jest, jest-watcher"
+    blocked_by: "react-scripts@5.0.1 / craco@5 build chain (see via:build-chain)"
+    owner: frontend
+    expires: "2027-01-15"
+
+  - id: "via:@jest/test-result"
+    ecosystem: npm
+    package: "jest-watcher"
+    affected: "25.4.0 - 30.2.0"
+    severity: high
+    classification: not-reachable
+    reason: Flagged only because it depends on @jest/test-result.
+    reachability: "Test runner only. Jest runs repository test files under `craco test` locally and in frontend-ci's test job; it is never imported by application source and is not bundled."
+    evidence: "npm audit --json → via: [@jest/test-result], no advisory of its own; npm ls jest-watcher --all → roots: react-scripts"
+    mitigation: "Processes only repository-controlled test files and globs; no untrusted input."
+    fixed_in: "clears with @jest/test-result"
+    blocked_by: "react-scripts@5.0.1 / craco@5 build chain (see via:build-chain)"
+    owner: frontend
+    expires: "2027-01-15"
+
+  - id: "via:braces"
+    ecosystem: npm
+    package: "micromatch"
+    affected: ">=0.2.0"
+    severity: high
+    classification: not-reachable
+    reason: Flagged only because it depends on braces.
+    reachability: "Build-time only. These are glob, file-watch, source-map and CSS-generation tools that run inside the webpack/PostCSS/Tailwind build over repository-controlled paths and assets (tailwindcss-animate is required only from tailwind.config.js). None is imported by application source and none is bundled."
+    evidence: "npm audit --json → via: [braces], no advisory of its own; npm ls micromatch --all → roots: react-scripts, tailwindcss"
+    mitigation: "Patterns, paths and CSS inputs are committed repository content, not user data."
+    fixed_in: "clears with braces"
+    blocked_by: "react-scripts@5.0.1 / craco@5 build chain (see via:build-chain)"
+    owner: frontend
+    expires: "2027-01-15"
+
+  - id: GHSA-86w9-cpqp-85rv
+    ecosystem: npm
+    package: "node-forge"
+    affected: "*"
+    severity: high
+    classification: not-reachable
+    reason: "node-forge RSA PKCS#1 v1.5 signature verification accepts extra nested DigestAlgorithm elements"
+    reachability: "Development server only. Reached through react-scripts > webpack-dev-server, which runs for `npm start` / `craco start` on a developer machine. Production is the static frontend/build/ directory served by Vercel's CDN; no Node server, dev middleware, proxy or self-signed certificate exists in production."
+    evidence: "npm ls node-forge --all → roots: react-scripts; no import in frontend/src (grep); absent from the bundled module list in frontend/build/static/js/*.map"
+    mitigation: "Never started in CI or production: vercel.json and frontend-ci.yml run `npm run build` only. Developers should run `npm start` on localhost only, and not browse untrusted sites in the same browser while it is running (that matters for the webpack-dev-server source-exposure advisories)."
+    fixed_in: "breaking only (react-scripts major)"
+    blocked_by: "react-scripts@5.0.1 build chain; bulk tooling upgrades deferred out of the beta release"
+    owner: frontend
+    expires: "2027-01-15"
+
+  - id: GHSA-jqcg-44mw-7w3h
+    ecosystem: npm
+    package: "proxy-addr"
+    affected: "1.1.0 - 2.0.7"
+    severity: critical
+    classification: not-reachable
+    reason: "proxy-addr vulnerable to IP spoofing via IPv4-mapped IPv6 trust subnet"
+    reachability: "Development server only. Reached through react-scripts > webpack-dev-server, which runs for `npm start` / `craco start` on a developer machine. Production is the static frontend/build/ directory served by Vercel's CDN; no Node server, dev middleware, proxy or self-signed certificate exists in production."
+    evidence: "npm ls proxy-addr --all → roots: react-scripts; no import in frontend/src (grep); absent from the bundled module list in frontend/build/static/js/*.map"
+    mitigation: "Never started in CI or production: vercel.json and frontend-ci.yml run `npm run build` only. Developers should run `npm start` on localhost only, and not browse untrusted sites in the same browser while it is running (that matters for the webpack-dev-server source-exposure advisories)."
+    fixed_in: "in-range update available (npm audit fix) — deferred, see section header"
+    blocked_by: "react-scripts@5.0.1 build chain; bulk tooling upgrades deferred out of the beta release"
+    owner: frontend
+    expires: "2027-01-15"
+
+  - id: "via:glob-chain"
+    ecosystem: npm
+    package: "react-dev-utils"
+    affected: "6.0.0-next.03604a46 - 6.0.0-next.a671462c || >=6.0.6-next.9b4009d7"
+    severity: high
+    classification: not-reachable
+    reason: Flagged only because it depends on fork-ts-checker-webpack-plugin, globby.
+    reachability: "Build-time only. These are glob, file-watch, source-map and CSS-generation tools that run inside the webpack/PostCSS/Tailwind build over repository-controlled paths and assets (tailwindcss-animate is required only from tailwind.config.js). None is imported by application source and none is bundled."
+    evidence: "npm audit --json → via: [fork-ts-checker-webpack-plugin, globby], no advisory of its own; npm ls react-dev-utils --all → roots: react-scripts"
+    mitigation: "Patterns, paths and CSS inputs are committed repository content, not user data."
+    fixed_in: "clears with fork-ts-checker-webpack-plugin, globby"
+    blocked_by: "react-scripts@5.0.1 / craco@5 build chain (see via:build-chain)"
+    owner: frontend
+    expires: "2027-01-15"
+
+  - id: "via:node-forge"
+    ecosystem: npm
+    package: "selfsigned"
+    affected: "1.1.1 - 4.0.1"
+    severity: high
+    classification: not-reachable
+    reason: Flagged only because it depends on node-forge.
+    reachability: "Development server only. Reached through react-scripts > webpack-dev-server, which runs for `npm start` / `craco start` on a developer machine. Production is the static frontend/build/ directory served by Vercel's CDN; no Node server, dev middleware, proxy or self-signed certificate exists in production."
+    evidence: "npm audit --json → via: [node-forge], no advisory of its own; npm ls selfsigned --all → roots: react-scripts"
+    mitigation: "Never started in CI or production: vercel.json and frontend-ci.yml run `npm run build` only. Developers should run `npm start` on localhost only, and not browse untrusted sites in the same browser while it is running (that matters for the webpack-dev-server source-exposure advisories)."
+    fixed_in: "clears with node-forge"
+    blocked_by: "react-scripts@5.0.1 / craco@5 build chain (see via:build-chain)"
+    owner: frontend
+    expires: "2027-01-15"
+
+  - id: GHSA-68fv-2mgg-jv7q
+    ecosystem: npm
+    package: "source-map-js"
+    affected: "1.0.0 - 1.2.1"
+    severity: high
+    classification: not-reachable
+    reason: "source-map-js allows event-loop denial of service through indexed source-map section offsets"
+    reachability: "Build-time only. These are glob, file-watch, source-map and CSS-generation tools that run inside the webpack/PostCSS/Tailwind build over repository-controlled paths and assets (tailwindcss-animate is required only from tailwind.config.js). None is imported by application source and none is bundled."
+    evidence: "npm ls source-map-js --all → roots: postcss, react-scripts; no import in frontend/src (grep); absent from the bundled module list in frontend/build/static/js/*.map"
+    mitigation: "Patterns, paths and CSS inputs are committed repository content, not user data."
+    fixed_in: "in-range update available (npm audit fix) — deferred, see section header"
+    blocked_by: "react-scripts@5.0.1 build chain; bulk tooling upgrades deferred out of the beta release"
+    owner: frontend
+    expires: "2027-01-15"
+
+  - id: "via:glob-chain"
+    ecosystem: npm
+    package: "tailwindcss"
+    affected: "<=0.0.0-oxide-insiders.ff2c25f || 2.1.0-canary.1 - 3.4.19"
+    severity: high
+    classification: not-reachable
+    reason: Flagged only because it depends on chokidar, fast-glob, micromatch.
+    reachability: "Build-time only. These are glob, file-watch, source-map and CSS-generation tools that run inside the webpack/PostCSS/Tailwind build over repository-controlled paths and assets (tailwindcss-animate is required only from tailwind.config.js). None is imported by application source and none is bundled."
+    evidence: "npm audit --json → via: [chokidar, fast-glob, micromatch], no advisory of its own; npm ls tailwindcss --all → roots: react-scripts, tailwindcss, tailwindcss-animate"
+    mitigation: "Patterns, paths and CSS inputs are committed repository content, not user data."
+    fixed_in: "clears with chokidar, fast-glob, micromatch"
+    blocked_by: "react-scripts@5.0.1 / craco@5 build chain (see via:build-chain)"
+    owner: frontend
+    expires: "2027-01-15"
+
+  - id: "via:tailwindcss"
+    ecosystem: npm
+    package: "tailwindcss-animate"
+    affected: "*"
+    severity: high
+    classification: not-reachable
+    reason: Flagged only because it depends on tailwindcss.
+    reachability: "Build-time only. These are glob, file-watch, source-map and CSS-generation tools that run inside the webpack/PostCSS/Tailwind build over repository-controlled paths and assets (tailwindcss-animate is required only from tailwind.config.js). None is imported by application source and none is bundled."
+    evidence: "npm audit --json → via: [tailwindcss], no advisory of its own; npm ls tailwindcss-animate --all → roots: tailwindcss-animate"
+    mitigation: "Patterns, paths and CSS inputs are committed repository content, not user data."
+    fixed_in: "clears with tailwindcss"
+    blocked_by: "react-scripts@5.0.1 / craco@5 build chain (see via:build-chain)"
+    owner: frontend
+    expires: "2027-01-15"
+
+  - id: GHSA-g84c-rxfj-3j2c
+    ecosystem: npm
+    package: "webpack-dev-middleware"
+    affected: "<7.4.5"
+    severity: high
+    classification: not-reachable
+    reason: "webpack-dev-middleware vulnerable to Path Traversal via non-slash-terminated publicPath"
+    reachability: "Development server only. Reached through react-scripts > webpack-dev-server, which runs for `npm start` / `craco start` on a developer machine. Production is the static frontend/build/ directory served by Vercel's CDN; no Node server, dev middleware, proxy or self-signed certificate exists in production."
+    evidence: "npm ls webpack-dev-middleware --all → roots: react-scripts; no import in frontend/src (grep); absent from the bundled module list in frontend/build/static/js/*.map"
+    mitigation: "Never started in CI or production: vercel.json and frontend-ci.yml run `npm run build` only. Developers should run `npm start` on localhost only, and not browse untrusted sites in the same browser while it is running (that matters for the webpack-dev-server source-exposure advisories)."
+    fixed_in: "breaking only (react-scripts major)"
+    blocked_by: "react-scripts@5.0.1 build chain; bulk tooling upgrades deferred out of the beta release"
+    owner: frontend
+    expires: "2027-01-15"
+
+  - id: GHSA-9jgg-88mc-972h
+    ecosystem: npm
+    package: "webpack-dev-server"
+    affected: "*"
+    severity: moderate
+    classification: not-reachable
+    reason: "webpack-dev-server users' source code may be stolen when they access a malicious web site with non-Chromium based browser"
+    reachability: "Development server only. Reached through react-scripts > webpack-dev-server, which runs for `npm start` / `craco start` on a developer machine. Production is the static frontend/build/ directory served by Vercel's CDN; no Node server, dev middleware, proxy or self-signed certificate exists in production."
+    evidence: "npm ls webpack-dev-server --all → roots: react-scripts; no import in frontend/src (grep); absent from the bundled module list in frontend/build/static/js/*.map"
+    mitigation: "Never started in CI or production: vercel.json and frontend-ci.yml run `npm run build` only. Developers should run `npm start` on localhost only, and not browse untrusted sites in the same browser while it is running (that matters for the webpack-dev-server source-exposure advisories)."
+    fixed_in: "breaking only (react-scripts major)"
+    blocked_by: "react-scripts@5.0.1 build chain; bulk tooling upgrades deferred out of the beta release"
+    owner: frontend
+    expires: "2027-01-15"
+
+  - id: GHSA-4v9v-hfq4-rm2v
+    ecosystem: npm
+    package: "webpack-dev-server"
+    affected: "*"
+    severity: moderate
+    classification: not-reachable
+    reason: "webpack-dev-server users' source code may be stolen when they access a malicious web site"
+    reachability: "Development server only. Reached through react-scripts > webpack-dev-server, which runs for `npm start` / `craco start` on a developer machine. Production is the static frontend/build/ directory served by Vercel's CDN; no Node server, dev middleware, proxy or self-signed certificate exists in production."
+    evidence: "npm ls webpack-dev-server --all → roots: react-scripts; no import in frontend/src (grep); absent from the bundled module list in frontend/build/static/js/*.map"
+    mitigation: "Never started in CI or production: vercel.json and frontend-ci.yml run `npm run build` only. Developers should run `npm start` on localhost only, and not browse untrusted sites in the same browser while it is running (that matters for the webpack-dev-server source-exposure advisories)."
+    fixed_in: "breaking only (react-scripts major)"
+    blocked_by: "react-scripts@5.0.1 build chain; bulk tooling upgrades deferred out of the beta release"
+    owner: frontend
+    expires: "2027-01-15"
+
+  - id: GHSA-79cf-xcqc-c78w
+    ecosystem: npm
+    package: "webpack-dev-server"
+    affected: "*"
+    severity: moderate
+    classification: not-reachable
+    reason: "webpack-dev-server vulnerable to cross-origin source code exposure on non-HTTPS origins"
+    reachability: "Development server only. Reached through react-scripts > webpack-dev-server, which runs for `npm start` / `craco start` on a developer machine. Production is the static frontend/build/ directory served by Vercel's CDN; no Node server, dev middleware, proxy or self-signed certificate exists in production."
+    evidence: "npm ls webpack-dev-server --all → roots: react-scripts; no import in frontend/src (grep); absent from the bundled module list in frontend/build/static/js/*.map"
+    mitigation: "Never started in CI or production: vercel.json and frontend-ci.yml run `npm run build` only. Developers should run `npm start` on localhost only, and not browse untrusted sites in the same browser while it is running (that matters for the webpack-dev-server source-exposure advisories)."
+    fixed_in: "breaking only (react-scripts major)"
+    blocked_by: "react-scripts@5.0.1 build chain; bulk tooling upgrades deferred out of the beta release"
+    owner: frontend
+    expires: "2027-01-15"
+
+  - id: GHSA-mx8g-39q3-5c79
+    ecosystem: npm
+    package: "webpack-dev-server"
+    affected: "*"
+    severity: moderate
+    classification: not-reachable
+    reason: "webpack-dev-server vulnerable to HMR WebSocket interception via permissive user proxies"
+    reachability: "Development server only. Reached through react-scripts > webpack-dev-server, which runs for `npm start` / `craco start` on a developer machine. Production is the static frontend/build/ directory served by Vercel's CDN; no Node server, dev middleware, proxy or self-signed certificate exists in production."
+    evidence: "npm ls webpack-dev-server --all → roots: react-scripts; no import in frontend/src (grep); absent from the bundled module list in frontend/build/static/js/*.map"
+    mitigation: "Never started in CI or production: vercel.json and frontend-ci.yml run `npm run build` only. Developers should run `npm start` on localhost only, and not browse untrusted sites in the same browser while it is running (that matters for the webpack-dev-server source-exposure advisories)."
+    fixed_in: "breaking only (react-scripts major)"
+    blocked_by: "react-scripts@5.0.1 build chain; bulk tooling upgrades deferred out of the beta release"
+    owner: frontend
+    expires: "2027-01-15"
+
+  - id: GHSA-f5vj-f2hx-8m93
+    ecosystem: npm
+    package: "webpack-dev-server"
+    affected: "*"
+    severity: moderate
+    classification: not-reachable
+    reason: "webpack-dev-server vulnerable to cross-site request forgery via internal developer endpoints"
+    reachability: "Development server only. Reached through react-scripts > webpack-dev-server, which runs for `npm start` / `craco start` on a developer machine. Production is the static frontend/build/ directory served by Vercel's CDN; no Node server, dev middleware, proxy or self-signed certificate exists in production."
+    evidence: "npm ls webpack-dev-server --all → roots: react-scripts; no import in frontend/src (grep); absent from the bundled module list in frontend/build/static/js/*.map"
+    mitigation: "Never started in CI or production: vercel.json and frontend-ci.yml run `npm run build` only. Developers should run `npm start` on localhost only, and not browse untrusted sites in the same browser while it is running (that matters for the webpack-dev-server source-exposure advisories)."
+    fixed_in: "breaking only (react-scripts major)"
+    blocked_by: "react-scripts@5.0.1 build chain; bulk tooling upgrades deferred out of the beta release"
+    owner: frontend
+    expires: "2027-01-15"
+
+  - id: GHSA-m28w-2pqf-7qgj
+    ecosystem: npm
+    package: "webpack-dev-server"
+    affected: "*"
+    severity: moderate
+    classification: not-reachable
+    reason: "webpack-dev-server vulnerable to denial of service via a malformed Host or Origin header"
+    reachability: "Development server only. Reached through react-scripts > webpack-dev-server, which runs for `npm start` / `craco start` on a developer machine. Production is the static frontend/build/ directory served by Vercel's CDN; no Node server, dev middleware, proxy or self-signed certificate exists in production."
+    evidence: "npm ls webpack-dev-server --all → roots: react-scripts; no import in frontend/src (grep); absent from the bundled module list in frontend/build/static/js/*.map"
+    mitigation: "Never started in CI or production: vercel.json and frontend-ci.yml run `npm run build` only. Developers should run `npm start` on localhost only, and not browse untrusted sites in the same browser while it is running (that matters for the webpack-dev-server source-exposure advisories)."
+    fixed_in: "breaking only (react-scripts major)"
+    blocked_by: "react-scripts@5.0.1 build chain; bulk tooling upgrades deferred out of the beta release"
+    owner: frontend
+    expires: "2027-01-15"

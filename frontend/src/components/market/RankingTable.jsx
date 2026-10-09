@@ -183,10 +183,10 @@ export default function RankingTable({ compact = false }) {
 
   if (loading) {
     return (
-      <div className="rounded-xl bg-[var(--bg-secondary)] border border-[var(--border)] p-4">
+      <div className="rounded-xl bg-[var(--bg-card-glass)] border border-[var(--border)] p-4">
         <div className="animate-pulse space-y-3">
           {[...Array(compact ? 3 : 5)].map((_, i) => (
-            <div key={i} className="h-10 bg-[var(--bg-tertiary)] rounded-lg" />
+            <div key={i} className="h-10 bg-[var(--bg-elevated)] rounded-lg" />
           ))}
         </div>
       </div>
@@ -194,11 +194,11 @@ export default function RankingTable({ compact = false }) {
   }
 
   return (
-    <div className="rounded-xl bg-[var(--bg-secondary)] border border-[var(--border)] overflow-hidden">
+    <div className="rounded-xl bg-[var(--bg-card-glass)] border border-[var(--border)] overflow-hidden">
       {/* Header */}
       <div className="px-4 py-3 border-b border-[var(--border)] flex items-center justify-between">
         <div className="flex items-center gap-2">
-          <Trophy size={14} className="text-[var(--accent)]" />
+          <Trophy size={14} className="text-[var(--brand-accent)]" />
           <span className="text-sm font-semibold text-[var(--text-primary)]">
             {compact ? "Top Opportunities" : "Stock Rankings"}
           </span>
@@ -211,7 +211,7 @@ export default function RankingTable({ compact = false }) {
               value={sector}
               onChange={(e) => setSector(e.target.value)}
               aria-label="Filter by sector"
-              className="text-[10px] px-2 py-1 rounded-lg bg-[var(--bg-tertiary)] text-[var(--text-secondary)] border border-[var(--border)]"
+              className="text-[10px] px-2 py-1 rounded-lg bg-[var(--bg-elevated)] text-[var(--text-secondary)] border border-[var(--border)]"
             >
               <option value="">All Sectors</option>
               {["Banking", "IT", "Pharma", "Auto", "FMCG", "Oil & Gas", "Metals", "Power"].map((s) => (
@@ -219,7 +219,7 @@ export default function RankingTable({ compact = false }) {
               ))}
             </select>
           )}
-          <button onClick={fetchRankings} aria-label="Refresh rankings" className="text-[var(--text-muted)] hover:text-[var(--accent)]">
+          <button onClick={fetchRankings} aria-label="Refresh rankings" className="text-[var(--text-muted)] hover:text-[var(--text-primary)]">
             <RefreshCw size={13} className={loading ? "animate-spin" : ""} />
           </button>
         </div>
@@ -246,10 +246,10 @@ export default function RankingTable({ compact = false }) {
               transition={{ delay: i * 0.04 }}
               onClick={() => navigate(`/stock/${stock.symbol}`)}
               aria-label={`${stock.symbol} details`}
-              className="w-full px-4 py-2.5 border-b border-[var(--border)] last:border-0 flex items-start gap-3 hover:bg-[var(--bg-hover)] transition-colors text-left"
+              className="w-full px-4 py-2.5 border-b border-[var(--border)] last:border-0 flex items-start gap-3 hover:bg-[var(--hover)] transition-colors text-left"
             >
               {/* Rank badge */}
-              <div className="w-5 h-5 mt-0.5 rounded-full bg-[var(--bg-tertiary)] flex items-center justify-center text-[10px] font-bold text-[var(--text-muted)] shrink-0">
+              <div className="w-5 h-5 mt-0.5 rounded-full bg-[var(--bg-elevated)] flex items-center justify-center text-[10px] font-bold text-[var(--text-muted)] shrink-0">
                 {i + 1}
               </div>
 

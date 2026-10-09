@@ -130,13 +130,26 @@
   -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
   border: 1px solid var(--border);
   border-radius: var(--card-radius);
-  box-shadow: var(--card-shadow);
-  transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+  box-shadow: var(--shadow-sm);
+  transition: border-color 0.2s ease, box-shadow 0.2s ease, background-color 0.2s ease, transform 0.2s ease;
 }
+/* Resting cards do not react to the pointer — only cards that are themselves a
+   click target do (`.sa-card-interactive`). A page where every panel lifts on
+   hover reads as though everything is clickable. */
 .glass-card:hover {
+  border-color: var(--border);
+}
+.sa-card-interactive:hover {
   background: var(--bg-card-glass-hover);
-  box-shadow: var(--card-shadow-hover);
-  border-color: var(--ai-accent-glow);
+  box-shadow: var(--shadow-md);
+  transform: translateY(-1px);
+}
+.sa-card-interactive:active {
+  transform: translateY(0);
+}
+.sa-card-interactive:focus-visible {
+  outline: 2px solid var(--brand-accent);
+  outline-offset: 2px;
 }
 
 /* card-premium — backward compat alias */
@@ -165,12 +178,12 @@
   border: 1px solid var(--border);
   border-radius: var(--card-radius);
   padding: 1.25rem 1.5rem;
-  box-shadow: var(--card-shadow);
-  transition: all 0.25s ease;
+  box-shadow: var(--shadow-sm);
+  transition: box-shadow 0.2s ease, transform 0.2s ease;
 }
 .stat-card:hover {
   transform: translateY(-1px);
-  box-shadow: var(--card-shadow-hover);
+  box-shadow: var(--shadow-md);
 }
 
 /* =============================================
@@ -254,7 +267,8 @@
    ============================================= */
 .btn-primary,
 .btn-secondary,
-.btn-ghost {
+.btn-ghost,
+.btn-confirm {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -272,32 +286,56 @@
 }
 .btn-primary:focus-visible,
 .btn-secondary:focus-visible,
-.btn-ghost:focus-visible {
-  outline: 2px solid var(--ai-accent);
+.btn-ghost:focus-visible,
+.btn-confirm:focus-visible {
+  outline: 2px solid var(--brand-accent);
   outline-offset: 2px;
 }
 .btn-primary:disabled,
 .btn-secondary:disabled,
-.btn-ghost:disabled {
+.btn-ghost:disabled,
+.btn-confirm:disabled {
   opacity: 0.5;
   cursor: not-allowed;
   transform: none;
   filter: none;
 }
 
-/* Primary — filled accent */
+/* Primary — the highest-contrast neutral, matching the landing page's
+   "Get Started". It inverts between themes (near-black on light, near-white on
+   dark) so "primary" always reads as the strongest element on the surface
+   rather than as one particular hue. */
 .btn-primary {
-  background: var(--ai-accent);
-  color: #FFFFFF;
+  background: var(--brand-accent);
+  color: var(--brand-accent-fg);
   border: 1px solid transparent;
-  box-shadow: 0 1px 3px rgba(99, 102, 241, 0.3);
+  box-shadow: var(--shadow-sm);
 }
 .btn-primary:hover {
+  background: var(--brand-accent-hover);
   transform: translateY(-1px);
-  box-shadow: 0 6px 18px rgba(99, 102, 241, 0.35);
-  filter: brightness(1.08);
+  box-shadow: var(--shadow-md);
 }
 .btn-primary:active {
+  transform: translateY(0) scale(0.985);
+}
+
+/* Confirm — reserved for actions that COMMIT something: place order, connect
+   broker, confirm exit. Distinct from --gain, which is a market-state colour
+   and must never become a button fill; a green that means "price went up" and
+   a green that means "this will execute a trade" cannot be the same green. */
+.btn-confirm {
+  background: var(--confirm);
+  color: var(--confirm-fg);
+  border: 1px solid transparent;
+  box-shadow: var(--shadow-sm);
+}
+.btn-confirm:hover {
+  background: var(--confirm-hover);
+  transform: translateY(-1px);
+  box-shadow: var(--shadow-md);
+}
+.btn-confirm:active {
   transform: translateY(0) scale(0.985);
 }
 
@@ -310,9 +348,9 @@
 }
 .btn-secondary:hover {
   background: var(--bg-card-glass-hover);
-  border-color: var(--ai-accent-glow);
+  border-color: var(--text-muted);
   transform: translateY(-1px);
-  box-shadow: var(--card-shadow-hover);
+  box-shadow: var(--shadow-md);
 }
 .btn-secondary:active {
   transform: translateY(0) scale(0.985);
@@ -512,9 +550,9 @@
   letter-spacing: 0.01em;
 }
 .segment-btn.active {
-  background: var(--ai-accent);
-  color: #FFFFFF;
-  box-shadow: 0 2px 8px rgba(99, 102, 241, 0.25);
+  background: var(--bg-card-glass);
+  color: var(--text-primary);
+  box-shadow: var(--shadow-sm);
 }
 
 /* =============================================
@@ -632,8 +670,8 @@
   color: var(--text-muted);
 }
 .search-input:focus {
-  border-color: var(--ai-accent);
-  box-shadow: 0 0 0 3px var(--ai-accent-soft);
+  border-color: var(--brand-accent);
+  box-shadow: 0 0 0 3px var(--brand-accent-soft);
 }
 
 /* Small keycap hint used inside the global search dropdown footer */
@@ -679,4 +717,22 @@
 }
 .score-gauge-circle {
   transition: stroke-dashoffset 1s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+/* =============================================
+   FLOATING ACTION DOCK
+   Where the AI companion sits. Below `lg` the bottom tab bar occupies the
+   thumb zone, so the dock lifts clear of it (plus the iOS home indicator);
+   from `lg` up the tab bar is hidden and the dock returns to the corner.
+   Keeping this in CSS rather than JS means it responds to a resize without a
+   re-render, and there is one number to change if the bar's height changes.
+   ============================================= */
+.floating-action-dock {
+  position: fixed;
+  right: 1.5rem;
+  bottom: calc(60px + env(safe-area-inset-bottom, 0px) + 1rem);
+  z-index: 45;
+}
+@media (min-width: 1024px) {
+  .floating-action-dock { bottom: 1.5rem; }
 }

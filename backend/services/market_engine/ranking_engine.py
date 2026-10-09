@@ -21,9 +21,40 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
+from services.market_engine import field_quality
 from services.market_engine.event_bus import event_bus
 
 logger = logging.getLogger(__name__)
+
+#: The value each scorer's arithmetic uses when a field is not a real reading.
+#:
+#: D6.8-A — these are the six `or 50.0` / `or 1.0` / `or 0.0` literals that used
+#: to sit inline in the scorers, lifted out and named. The NUMBERS ARE
+#: UNCHANGED, deliberately: D6-Q1 is explicit that scores stay identical and
+#: only what the platform claims changes, so moving one of these would be
+#: outside this phase entirely.
+#:
+#: What changes is that they are no longer written as `quote.get(f) or default`.
+#: That expression is indistinguishable at a glance from a reading, it is the
+#: line ADR-058 called "one bug written eight times", and it is the line a
+#: future author copies into a seventh site. Read through
+#: `field_quality.scoring_input` they are visibly substitutes, and the question
+#: "may the engine say anything about this field" is answered somewhere else
+#: entirely — by `dimension_is_supported`, which asks FieldQuality.
+SCORING_PLACEHOLDERS = {
+    "rsi": 50.0,
+    "change_pct": 0.0,
+    "macd": 0.0,
+    "macd_signal": 0.0,
+    "volume_ratio": 1.0,
+    "avg_volume": 0,
+}
+
+
+def _input(quote: Dict[str, Any], field: str) -> Any:
+    """`field`'s value for the arithmetic, substituted when it is not a reading."""
+    return field_quality.scoring_input(quote, field, SCORING_PLACEHOLDERS[field])
+
 
 # Dimension weights (sum to 1.0)
 DIMENSION_WEIGHTS = {
@@ -45,8 +76,8 @@ def _clamp(value: float, lo: float = 0.0, hi: float = 100.0) -> float:
 
 def score_momentum(quote: Dict[str, Any]) -> Tuple[float, str]:
     """Score momentum from RSI and day change. Returns (0-100, reason)."""
-    rsi = quote.get("rsi") or 50.0
-    change_pct = quote.get("change_pct") or 0.0
+    rsi = _input(quote, "rsi")
+    change_pct = _input(quote, "change_pct")
 
     score = 50.0
     reasons = []
@@ -87,8 +118,8 @@ def score_momentum(quote: Dict[str, Any]) -> Tuple[float, str]:
 
 def score_trend(quote: Dict[str, Any]) -> Tuple[float, str]:
     """Score trend from MACD position. Returns (0-100, reason)."""
-    macd = quote.get("macd") or 0.0
-    macd_signal = quote.get("macd_signal") or 0.0
+    macd = _input(quote, "macd")
+    macd_signal = _input(quote, "macd_signal")
 
     score = 50.0
     reasons = []
@@ -110,7 +141,7 @@ def score_trend(quote: Dict[str, Any]) -> Tuple[float, str]:
 
 def score_volume(quote: Dict[str, Any]) -> Tuple[float, str]:
     """Score volume participation. Returns (0-100, reason)."""
-    volume_ratio = quote.get("volume_ratio") or 1.0
+    volume_ratio = _input(quote, "volume_ratio")
 
     score = 50.0
     reasons = []
@@ -133,8 +164,8 @@ def score_volume(quote: Dict[str, Any]) -> Tuple[float, str]:
 
 def score_risk(quote: Dict[str, Any]) -> Tuple[float, str]:
     """Score risk (higher = lower risk = better). Returns (0-100, reason)."""
-    change_pct = abs(quote.get("change_pct") or 0.0)
-    rsi = quote.get("rsi") or 50.0
+    change_pct = abs(_input(quote, "change_pct"))
+    rsi = _input(quote, "rsi")
 
     # Start high (low risk), deduct for risk factors
     score = 80.0
@@ -205,7 +236,7 @@ def score_sector(
 
 def score_liquidity(quote: Dict[str, Any]) -> Tuple[float, str]:
     """Score liquidity from avg volume. Returns (0-100, reason)."""
-    avg_vol = quote.get("avg_volume") or 0
+    avg_vol = _input(quote, "avg_volume")
 
     if avg_vol >= 5_000_000:
         return 90.0, "Very high liquidity"
@@ -228,10 +259,10 @@ def score_ai_confidence(
     reasons = []
 
     # Technical composite
-    rsi = quote.get("rsi") or 50
-    vol_ratio = quote.get("volume_ratio") or 1.0
-    macd = quote.get("macd") or 0
-    macd_signal = quote.get("macd_signal") or 0
+    rsi = _input(quote, "rsi")
+    vol_ratio = _input(quote, "volume_ratio")
+    macd = _input(quote, "macd")
+    macd_signal = _input(quote, "macd_signal")
 
     if 45 <= rsi <= 65 and vol_ratio >= 1.2 and macd > macd_signal:
         score += 30
@@ -327,7 +358,21 @@ def dimension_is_supported(dimension: str, quote: Dict[str, Any]) -> bool:
     # scored on a real +2.6% day move and an absent RSI still reads
     # "RSI 50 in bullish zone; Strong +2.6% day move", and the half that is
     # invented is the half a reader would weigh most.
-    return all(quote.get(field) is not None for field in required)
+    #
+    # D6.8-A — THE PREDICATE MOVED FROM `is not None` TO FieldQuality.
+    #
+    # `is not None` is a two-state model and it certifies the single most
+    # dangerous of the six: a STALE reading is a real number, so it passed, and
+    # a dimension scored from this morning's dead feed was published as evidence
+    # with nothing to distinguish it from a live one. It also could not tell a
+    # newly listed stock (INSUFFICIENT_HISTORY) from a vendor that failed
+    # (PROVIDER_ERROR) — the user was told "insufficient history" and "data
+    # unavailable" interchangeably, which was D6-Q1's opening complaint.
+    #
+    # AVAILABLE and nothing else. The score is unaffected either way: `_record`
+    # stores it regardless, because withholding it would change what the engine
+    # recommends, and this phase changes only what it claims.
+    return all(field_quality.is_available(quote, field) for field in required)
 
 
 def build_evidence(dimensions: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:

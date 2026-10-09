@@ -143,7 +143,7 @@ export default class ErrorBoundary extends React.Component {
         <div
           className="max-w-md w-full rounded-2xl p-8 flex flex-col gap-4"
           style={{
-            background: "var(--surface)",
+            background: "var(--bg-surface)",
             border: "1px solid var(--border)",
             boxShadow: "var(--shadow-lg, 0 20px 40px rgba(0,0,0,0.08))",
           }}
@@ -155,7 +155,7 @@ export default class ErrorBoundary extends React.Component {
             {isChunkError ? "Update required" : "Error"}
           </span>
 
-          <h2 className="text-xl font-semibold" style={{ color: "var(--text)" }}>
+          <h2 className="text-xl font-semibold" style={{ color: "var(--text-primary)" }}>
             {title}
           </h2>
 
@@ -180,7 +180,7 @@ export default class ErrorBoundary extends React.Component {
                 type="button"
                 onClick={this.handleRetry}
                 className="px-4 py-2 rounded-lg text-sm font-medium transition-opacity hover:opacity-80"
-                style={{ background: "var(--surface-2, var(--bg))", color: "var(--text)", border: "1px solid var(--border)" }}
+                style={{ background: "var(--bg-elevated)", color: "var(--text-primary)", border: "1px solid var(--border)" }}
               >
                 Try again
               </button>

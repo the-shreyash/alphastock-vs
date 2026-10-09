@@ -80,7 +80,7 @@ export default function FinancialStatements({ symbol, enabled = true }) {
             <table className="w-full text-sm">
               <thead>
                 <tr style={{ color: "var(--text-muted)" }}>
-                  <th className="font-medium text-[11px] uppercase tracking-wider py-2 px-1 text-left sticky left-0" style={{ background: "var(--bg-card)" }}>
+                  <th className="font-medium text-[11px] uppercase tracking-wider py-2 px-1 text-left sticky left-0" style={{ background: "var(--bg-card-glass)" }}>
                     Line Item
                   </th>
                   {columns.map((c) => (
@@ -93,7 +93,7 @@ export default function FinancialStatements({ symbol, enabled = true }) {
               <tbody>
                 {rows.map((row) => (
                   <tr key={row.key} className="border-t" style={{ borderColor: "var(--border)" }}>
-                    <td className="py-2.5 px-1 sticky left-0" style={{ color: "var(--text-secondary)", background: "var(--bg-card)" }}>
+                    <td className="py-2.5 px-1 sticky left-0" style={{ color: "var(--text-secondary)", background: "var(--bg-card-glass)" }}>
                       {row.label}
                     </td>
                     {columns.map((c, i) => {

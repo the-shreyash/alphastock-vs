@@ -46,11 +46,11 @@ export default function EconomicCalendar({ compact = false }) {
 
   if (loading) {
     return (
-      <div className="rounded-xl bg-[var(--bg-secondary)] border border-[var(--border)] p-4">
+      <div className="rounded-xl bg-[var(--bg-card-glass)] border border-[var(--border)] p-4">
         <div className="animate-pulse space-y-3">
-          <div className="h-4 bg-[var(--bg-tertiary)] rounded w-1/3" />
-          <div className="h-3 bg-[var(--bg-tertiary)] rounded w-2/3" />
-          <div className="h-3 bg-[var(--bg-tertiary)] rounded w-1/2" />
+          <div className="h-4 bg-[var(--bg-elevated)] rounded w-1/3" />
+          <div className="h-3 bg-[var(--bg-elevated)] rounded w-2/3" />
+          <div className="h-3 bg-[var(--bg-elevated)] rounded w-1/2" />
         </div>
       </div>
     );
@@ -63,11 +63,11 @@ export default function EconomicCalendar({ compact = false }) {
     : (calendar.events || []).filter((e) => e.importance !== "low").slice(0, 20);
 
   return (
-    <div className="rounded-xl bg-[var(--bg-secondary)] border border-[var(--border)] overflow-hidden">
+    <div className="rounded-xl bg-[var(--bg-card-glass)] border border-[var(--border)] overflow-hidden">
       {/* Header */}
       <div className="px-4 py-3 border-b border-[var(--border)] flex items-center justify-between">
         <div className="flex items-center gap-2">
-          <Calendar size={14} className="text-[var(--accent)]" />
+          <Calendar size={14} className="text-[var(--brand-accent)]" />
           <span className="text-sm font-semibold text-[var(--text-primary)]">
             Economic Calendar
           </span>
@@ -86,8 +86,8 @@ export default function EconomicCalendar({ compact = false }) {
             onClick={() => setActiveCategory(null)}
             className={`px-2 py-1 rounded-md text-[10px] font-medium transition-all ${
               !activeCategory
-                ? "bg-[var(--accent)] text-white"
-                : "bg-[var(--bg-tertiary)] text-[var(--text-muted)] hover:bg-[var(--bg-hover)]"
+                ? "bg-[var(--brand-accent)] text-[var(--brand-accent-fg)]"
+                : "bg-[var(--bg-elevated)] text-[var(--text-muted)] hover:bg-[var(--hover)]"
             }`}
           >
             All
@@ -100,8 +100,8 @@ export default function EconomicCalendar({ compact = false }) {
                 onClick={() => setActiveCategory(cat === activeCategory ? null : cat)}
                 className={`px-2 py-1 rounded-md text-[10px] font-medium transition-all ${
                   activeCategory === cat
-                    ? "bg-[var(--accent)] text-white"
-                    : "bg-[var(--bg-tertiary)] text-[var(--text-muted)] hover:bg-[var(--bg-hover)]"
+                    ? "bg-[var(--brand-accent)] text-[var(--brand-accent-fg)]"
+                    : "bg-[var(--bg-elevated)] text-[var(--text-muted)] hover:bg-[var(--hover)]"
                 }`}
               >
                 {config.label || cat}
@@ -130,9 +130,9 @@ export default function EconomicCalendar({ compact = false }) {
                 initial={{ opacity: 0, y: 5 }}
                 animate={{ opacity: 1, y: 0 }}
                 transition={{ delay: i * 0.03 }}
-                className={`px-4 py-2.5 border-b border-[var(--border)] last:border-0 flex items-start gap-3 hover:bg-[var(--bg-hover)] transition-colors ${
+                className={`px-4 py-2.5 border-b border-[var(--border)] last:border-0 flex items-start gap-3 hover:bg-[var(--hover)] transition-colors ${
                   isPast ? "opacity-50" : ""
-                } ${isToday ? "bg-[var(--accent)]/5" : ""}`}
+                } ${isToday ? "bg-[var(--brand-accent-soft)]" : ""}`}
               >
                 {/* Category icon */}
                 <div
@@ -149,7 +149,7 @@ export default function EconomicCalendar({ compact = false }) {
                       {event.title}
                     </span>
                     {isToday && (
-                      <span className="text-[9px] bg-[var(--accent)] text-white px-1.5 py-0.5 rounded font-medium shrink-0">
+                      <span className="text-[9px] bg-[var(--brand-accent)] text-[var(--brand-accent-fg)] px-1.5 py-0.5 rounded font-medium shrink-0">
                         TODAY
                       </span>
                     )}

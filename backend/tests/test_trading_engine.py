@@ -406,12 +406,25 @@ def test_quick_trade_places_order_on_chosen_platform(client, fake_db, test_user,
     test_user["preferred_broker"] = "upstox"
     placed = {}
 
+    from _accounts import account_ref
+
+    account = account_ref(str(test_user["_id"]), "upstox")
+
     class _StubEngine:
         async def get_status(self, user_id):
             return {"upstox": {"connected": True, "display_name": "Upstox"}}
 
-        async def place_order(self, user_id, broker, order):
-            placed.update({"broker": broker, **order})
+        async def account_for_broker(self, user_id, broker):
+            # D6.4 — the route resolves a broker name to an ACCOUNT before it
+            # can place anything. A stub that answered `None` here would make
+            # the route report "not connected", which is the correct behaviour
+            # for a user with no account and not what this test is about.
+            assert user_id == str(test_user["_id"])
+            return account if broker == "upstox" else None
+
+        async def place_order(self, account, order):
+            placed.update({"broker": account.broker,
+                           "broker_account_id": account.broker_account_id, **order})
             return {"order_id": "UPX-1", "status": "PENDING"}
 
     monkeypatch.setattr(server, "broker_engine", _StubEngine())

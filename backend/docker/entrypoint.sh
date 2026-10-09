@@ -135,15 +135,37 @@ esac
 # ORDERS on stop-loss and target hits. Two schedulers means two exit orders for
 # one position, in a live brokerage account, with real money.
 #
-# Until a single-leader scheduler exists, the deployment is ONE backend process:
-# one worker, one replica. Warn loudly instead of silently capping — the
-# operator stays in control, but cannot claim they were not told.
+# D6.7 UPDATE — THE SCHEDULER HALF IS NOW SOLVED; THE SOCKET HALF IS NOT.
+#
+# `infrastructure/leader.py` elects one process to run the six cron jobs, via a
+# compare-and-swap lease in MongoDB, and `trading_engine.claim_exit` makes a
+# duplicate exit order impossible even if two processes both believe they lead
+# (a TTL lease is not a fencing token). So the duplicate-real-order hazard this
+# block was written for is closed at two independent layers.
+#
+# What remains is `broker_engine.load_sessions`, which still runs on EVERY
+# process: N workers open N broker WebSockets per connected account, multiplied
+# again by `sharding.plan_shards`. Brokers cap concurrent connections per
+# account, so `WEB_CONCURRENCY > 1` will break broker streaming — reconnect
+# loops, refused handshakes, a dead live feed — before it breaks anything else.
+# Recorded as LIM-D6.7-3; socket ownership needs its own lease.
+#
+# THIS WARNING IS DELIBERATELY NOT THE ONLY CONTROL, AND THAT IS THE LESSON D6.7
+# TOOK FROM IT. It fires only on `WEB_CONCURRENCY > 1`, so scaling by *replicas*
+# — two containers, each correctly running one worker — produced the identical
+# scheduler defect and printed nothing at all; and it lives in the Docker
+# entrypoint, so `uvicorn server:app --workers 4` on a host or in CI never
+# reached it. A log line is not an enforcement mechanism for a financial
+# invariant. The lease and the exit claim are; this is now advice about feed
+# quality, which is what a warning is actually good for.
 if [ "${WEB_CONCURRENCY}" -gt 1 ]; then
-    log "WARNING: WEB_CONCURRENCY=${WEB_CONCURRENCY}. The in-process scheduler is NOT"
-    log "WARNING: multi-process safe: each process runs the trade monitor, which"
-    log "WARNING: places real broker exit orders. Duplicate orders are possible."
-    log "WARNING: Run exactly ONE backend process (1 worker, 1 replica) until a"
-    log "WARNING: single-leader scheduler ships. Do NOT scale with replicas either."
+    log "WARNING: WEB_CONCURRENCY=${WEB_CONCURRENCY}. The scheduler is now single-leader"
+    log "WARNING: (D6.7), so duplicate broker exit orders are prevented. BUT broker"
+    log "WARNING: session restore still runs per process, so each worker opens its own"
+    log "WARNING: WebSocket per connected account. Brokers cap concurrent connections"
+    log "WARNING: per account — expect refused handshakes and a degraded live feed."
+    log "WARNING: Run ONE backend process until broker socket ownership is leased"
+    log "WARNING: (LIM-D6.7-3). The same applies to scaling with replicas."
 fi
 
 # 2b. Full secret resolution + configuration validation, delegated to the

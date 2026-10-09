@@ -14,6 +14,7 @@ import EconomicCalendar from "../components/market/EconomicCalendar";
 import SectorAnalysis from "../components/market/SectorAnalysis";
 import RankingTable from "../components/market/RankingTable";
 import MarketEngineStatus from "../components/market/MarketEngineStatus";
+import { PageHeader, SegmentedTabs, TabPanel, StatusBadge } from "../components/ds";
 
 /* Scroll-reveal wrapper — fades/slides content in as it enters the viewport */
 function Reveal({ children, delay = 0, className }) {
@@ -255,20 +256,15 @@ export default function Markets() {
     <div data-testid="markets-page" className="space-y-5">
       {/* Header */}
       <Reveal>
-        <div className="flex items-center justify-between">
-          <div>
-            <h1 className="page-title">Markets</h1>
-            <p className="page-subtitle mt-1">Real-time market overview and insights</p>
-          </div>
-          <div className="flex items-center gap-2">
+        <PageHeader
+          title="Markets"
+          subtitle="Live market data, indices, and sector performance."
+          actions={<>
             <MarketEngineStatus compact />
             {overview?.market_status && (
-              <span className="badge-status" style={{
-                background: overview.market_status === "OPEN" ? "var(--gain-bg)" : "var(--loss-bg)",
-                color: overview.market_status === "OPEN" ? "var(--gain)" : "var(--loss)",
-              }}>
+              <StatusBadge tone={overview.market_status === "OPEN" ? "positive" : "negative"} dot>
                 Market {overview.market_status === "OPEN" ? "Open" : "Closed"}
-              </span>
+              </StatusBadge>
             )}
             {/* Feed freshness, never the provider. `source_tier` is the only
                 provenance the backend sends (MARKET_DATA_ARCHITECTURE.md,
@@ -276,15 +272,12 @@ export default function Markets() {
                 `source === "yahoo_finance"`, which would have gone dark the day
                 a broker feed served the overview. */}
             {overview?.source_tier && (
-              <span className="badge-status" style={{
-                background: overview.source_tier === "streaming" ? "var(--gain-bg)" : "var(--hover)",
-                color: overview.source_tier === "streaming" ? "var(--gain)" : "var(--text-muted)",
-              }}>
+              <StatusBadge tone={overview.source_tier === "streaming" ? "positive" : "neutral"}>
                 {overview.source_tier === "streaming" ? "Live" : "Delayed"}
-              </span>
+              </StatusBadge>
             )}
-          </div>
-        </div>
+          </>}
+        />
       </Reveal>
 
       {/* Index Strip */}
@@ -292,30 +285,16 @@ export default function Markets() {
 
       {/* Tab Navigation */}
       <Reveal>
-        <div className="flex gap-1 p-1 rounded-xl bg-[var(--bg-secondary)] border border-[var(--border)] overflow-x-auto">
-          {MARKET_TABS.map((tab) => {
-            const Icon = tab.icon;
-            return (
-              <button
-                key={tab.key}
-                onClick={() => setActiveTab(tab.key)}
-                className={`flex items-center gap-1.5 px-4 py-2 rounded-lg text-xs font-medium transition-all whitespace-nowrap ${
-                  activeTab === tab.key
-                    ? "bg-[var(--accent)] text-white shadow-sm"
-                    : "text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]"
-                }`}
-              >
-                <Icon size={13} />
-                {tab.label}
-              </button>
-            );
-          })}
-        </div>
+        <SegmentedTabs
+          label="Market views"
+          tabs={MARKET_TABS}
+          value={activeTab}
+          onChange={setActiveTab}
+        />
       </Reveal>
 
       {/* Tab Content */}
-      {activeTab === "overview" && (
-        <>
+      <TabPanel tabKey="overview" value={activeTab} className="space-y-5">
           {/* Heatmap */}
           <Reveal><MarketHeatmap gainers={gainers} losers={losers} /></Reveal>
 
@@ -377,35 +356,34 @@ export default function Markets() {
 
           {/* Global Markets */}
           <Reveal><GlobalMarkets markets={globalMkts} /></Reveal>
-        </>
-      )}
+      </TabPanel>
 
-      {activeTab === "scanner" && (
+      <TabPanel tabKey="scanner" value={activeTab}>
         <Reveal>
           <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_320px] gap-4 items-start">
             <MarketScanner />
             <ScannerLiveFeed />
           </div>
         </Reveal>
-      )}
+      </TabPanel>
 
-      {activeTab === "rankings" && (
+      <TabPanel tabKey="rankings" value={activeTab}>
         <Reveal>
           <RankingTable />
         </Reveal>
-      )}
+      </TabPanel>
 
-      {activeTab === "sectors" && (
+      <TabPanel tabKey="sectors" value={activeTab}>
         <Reveal>
           <SectorAnalysis />
         </Reveal>
-      )}
+      </TabPanel>
 
-      {activeTab === "calendar" && (
+      <TabPanel tabKey="calendar" value={activeTab}>
         <Reveal>
           <EconomicCalendar />
         </Reveal>
-      )}
+      </TabPanel>
     </div>
   );
 }

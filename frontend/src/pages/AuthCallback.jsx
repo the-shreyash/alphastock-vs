@@ -8,7 +8,7 @@ import { useAuth } from "../context/AuthContext";
 export default function AuthCallback() {
   const hasProcessed = useRef(false);
   const navigate = useNavigate();
-  const { checkAuth } = useAuth();
+  const { adoptSession } = useAuth();
 
   useEffect(() => {
     if (hasProcessed.current) return;
@@ -30,10 +30,14 @@ export default function AuthCallback() {
           state: state,
           redirect_uri: window.location.origin + "/auth/google/callback"
         }, { withCredentials: true });
-        if (data.token) {
-          localStorage.setItem("token", data.token);
-        }
-        await checkAuth();
+        // D6.2 / E. `adoptSession` is the single sign-in convergence point:
+        // it re-arms the refresh queue, starts a new identity generation and
+        // resets the realtime store before resolving the user. Storing the
+        // token and calling `checkAuth()` directly (what this did) skipped all
+        // three, so a Google sign-in after another account's session had
+        // expired inherited that account's dead refresh latch and its live
+        // dashboard state.
+        await adoptSession(data.token);
         navigate("/", { replace: true });
       } catch (err) {
         console.error("Google auth error:", err);
@@ -42,7 +46,7 @@ export default function AuthCallback() {
     };
 
     processSession();
-  }, [navigate, checkAuth]);
+  }, [navigate, adoptSession]);
 
   return (
     <div className="min-h-screen bg-[#080808] flex items-center justify-center">

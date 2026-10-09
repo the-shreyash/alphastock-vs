@@ -80,7 +80,7 @@ describe("client-side password policy", () => {
     await user.click(screen.getByTestId("register-submit-btn"));
 
     expect(await screen.findByTestId("register-error")).toHaveTextContent(/at least 12 characters/i);
-    expect(mock.history.post).toHaveLength(0);
+    expect(mock.history.post.filter((r) => r.url === "/auth/register")).toHaveLength(0);
   });
 
   it("accepts a password at exactly the minimum length", async () => {
@@ -91,7 +91,8 @@ describe("client-side password policy", () => {
 
     await user.click(screen.getByTestId("register-submit-btn"));
 
-    await waitFor(() => expect(mock.history.post).toHaveLength(1));
+    await waitFor(() => expect(
+      mock.history.post.filter((r) => r.url === "/auth/register")).toHaveLength(1));
   });
 
   it("does not block a password one character over the minimum", async () => {
@@ -102,7 +103,8 @@ describe("client-side password policy", () => {
 
     await user.click(screen.getByTestId("register-submit-btn"));
 
-    await waitFor(() => expect(mock.history.post).toHaveLength(1));
+    await waitFor(() => expect(
+      mock.history.post.filter((r) => r.url === "/auth/register")).toHaveLength(1));
     expect(screen.queryByTestId("register-error")).not.toBeInTheDocument();
   });
 });
@@ -115,8 +117,10 @@ describe("submission", () => {
     await fillForm(user);
     await user.click(screen.getByTestId("register-submit-btn"));
 
-    await waitFor(() => expect(mock.history.post).toHaveLength(1));
-    expect(JSON.parse(mock.history.post[0].data)).toEqual({
+    await waitFor(() => expect(
+      mock.history.post.filter((r) => r.url === "/auth/register")).toHaveLength(1));
+    expect(JSON.parse(
+      mock.history.post.filter((r) => r.url === "/auth/register")[0].data)).toEqual({
       name: "Test Trader",
       email: "trader@test.invalid",
       password: "correct-horse-battery",
@@ -135,7 +139,7 @@ describe("submission", () => {
     expect(submit).toHaveTextContent(/creating/i);
 
     await user.click(submit);
-    expect(mock.history.post).toHaveLength(1);
+    expect(mock.history.post.filter((r) => r.url === "/auth/register")).toHaveLength(1);
   });
 });
 

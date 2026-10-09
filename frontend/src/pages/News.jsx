@@ -3,6 +3,7 @@ import { motion } from "framer-motion";
 import api from "../services/api";
 import { Newspaper, ExternalLink, RefreshCw, Search, TrendingUp, TrendingDown, Globe, AlertCircle, Tag, Building2 } from "lucide-react";
 import { useRealtimeStore, selectNews, selectConnected } from "../store/realtimeStore";
+import { PageHeader, StatusBadge } from "../components/ds";
 
 const NEWS_TABS = ["All", "Market", "Economy", "FOSS", "Global"];
 const IMPORTANCE_COLORS = {
@@ -141,25 +142,21 @@ export default function News() {
   return (
     <div data-testid="news-page" className="space-y-6">
       {/* Header */}
-      <motion.div className="flex items-center justify-between"
+      <motion.div
         initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.4 }}>
-        <div>
-          <div className="flex items-center gap-2.5">
-            <h1 className="page-title">Market Intelligence</h1>
+        <PageHeader
+          title="Market News"
+          subtitle="Stay updated with the latest market news and insights"
+          actions={<>
             {connected && (
-              <span className="flex items-center gap-1.5 text-[10px] font-semibold px-2 py-1 rounded-full"
-                style={{ background: "var(--gain-bg)", color: "var(--gain)" }} data-testid="news-live-badge">
-                <span className="w-1.5 h-1.5 rounded-full animate-pulse" style={{ background: "var(--gain)" }} />
-                LIVE
-              </span>
+              <StatusBadge tone="positive" dot pulse data-testid="news-live-badge">LIVE</StatusBadge>
             )}
-          </div>
-          <p className="page-subtitle mt-1">Breaking headlines stream in as they happen</p>
-        </div>
-        <button data-testid="refresh-news-btn" onClick={() => fetchNews(true)}
-          className="btn-ghost btn-sm" style={{ color: "var(--text-muted)" }}>
-          <RefreshCw size={15} className={loading ? "animate-spin" : ""} /> Refresh
-        </button>
+            <button data-testid="refresh-news-btn" onClick={() => fetchNews(true)}
+              className="btn-ghost btn-sm" style={{ color: "var(--text-muted)" }}>
+              <RefreshCw size={15} className={loading ? "animate-spin" : ""} /> Refresh
+            </button>
+          </>}
+        />
       </motion.div>
 
       {/* Tab Bar */}

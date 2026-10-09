@@ -24,6 +24,7 @@ from datetime import datetime, timezone
 import httpx
 
 from services.cache import cache_get, cache_set
+from services.market_engine import field_quality
 from services.real_market import (
     resolve_yahoo_ticker,
     fetch_yahoo_quote,
@@ -819,10 +820,16 @@ async def get_trade_setup(symbol: str):
         return _unavailable(sym, "Not enough price history to compute ATR — no trade setup available.")
 
     price = quote["price"]
-    rsi = quote.get("rsi")
-    macd, macd_signal = quote.get("macd"), quote.get("macd_signal")
+    # D6.8-A — every one of these becomes a sentence in the trade setup below
+    # ("RSI at 62 shows buyers in control"), so each is read as a *reading*.
+    # `is not None` — what this function used — admits the one state that is a
+    # real number and still not a fact about now: a value from a feed that
+    # stopped advancing. `field_quality.reading` returns None for it.
+    rsi = field_quality.reading(quote, "rsi")
+    macd = field_quality.reading(quote, "macd")
+    macd_signal = field_quality.reading(quote, "macd_signal")
     vwap = quote.get("vwap")
-    volume_ratio = quote.get("volume_ratio")
+    volume_ratio = field_quality.reading(quote, "volume_ratio")
 
     bull, bear = [], []
     if macd is not None and macd_signal is not None:

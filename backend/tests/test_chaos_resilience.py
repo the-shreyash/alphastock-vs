@@ -59,6 +59,7 @@ import os
 import pathlib
 
 import pytest
+from _accounts import fixture_account_id  # noqa: E402
 
 from services.brokers.capabilities import BrokerCapability
 from services.brokers.recovery import (
@@ -1145,7 +1146,7 @@ def test_a_reprobe_ladder_is_orders_of_magnitude_slower_than_the_reconnect_ladde
     """
     clock = _ProbeClock()
     register = _register(clock)
-    candidate = register.record_withdrawal("u1", "chaos", "market", RecoveryClass.REPROBE)
+    candidate = register.record_withdrawal(fixture_account_id("u1", "chaos"), "market", RecoveryClass.REPROBE)
 
     assert candidate is not None
     first_rung = candidate.next_attempt_at - clock()
@@ -1166,12 +1167,12 @@ def test_repeated_failed_probes_climb_and_a_success_does_not_buy_a_fresh_ladder(
     register = _register(clock)
     rungs = []
     for _ in range(5):
-        candidate = register.record_withdrawal("u1", "chaos", "market", RecoveryClass.REPROBE)
+        candidate = register.record_withdrawal(fixture_account_id("u1", "chaos"), "market", RecoveryClass.REPROBE)
         clock.now = candidate.next_attempt_at
         register.note_attempt(candidate)
         rungs.append(candidate.next_attempt_at - clock())
         # The broker accepted, then refused again: discharge, then re-record.
-        register.discharge("u1", "chaos", "market")
+        register.discharge(fixture_account_id("u1", "chaos"), "market")
 
     assert rungs == sorted(rungs), "the re-probe ladder did not climb"
     assert rungs[-1] > rungs[0] * 2, "an apparent success bought a fresh ladder"
@@ -1181,12 +1182,12 @@ def test_an_expired_session_is_reclassified_out_of_reprobe_entirely():
     """Retrying a dead credential on a schedule is a login attempt on a timer."""
     clock = _ProbeClock()
     register = _register(clock)
-    register.record_withdrawal("u1", "chaos", "market", RecoveryClass.REPROBE)
-    assert register.get("u1", "chaos", "market").is_reprobeable
+    register.record_withdrawal(fixture_account_id("u1", "chaos"), "market", RecoveryClass.REPROBE)
+    assert register.get(fixture_account_id("u1", "chaos"), "market").is_reprobeable
 
-    register.reclassify("u1", "chaos", RecoveryClass.SESSION)
+    register.reclassify(fixture_account_id("u1", "chaos"), RecoveryClass.SESSION)
 
-    candidate = register.get("u1", "chaos", "market")
+    candidate = register.get(fixture_account_id("u1", "chaos"), "market")
     assert candidate is not None, "the exclusion must be visible, not merely absent"
     assert not candidate.is_reprobeable
     assert register.due() == []
@@ -1200,23 +1201,23 @@ def test_a_probe_never_replaces_a_live_connection():
 
     from services.brokers.recovery import RecoveryService
 
-    async def attach(user_id, broker, channel):
-        attached.append((user_id, broker, channel))
+    async def attach(broker_account_id, channel):
+        attached.append((broker_account_id, channel))
 
     service = RecoveryService(
         register,
         attach=attach,
-        has_session=lambda u, b: True,
-        is_attached=lambda u, b, c: True,   # a user reconnect got there first
+        has_session=lambda a: True,
+        is_attached=lambda a, c: True,   # a user reconnect got there first
     )
-    candidate = register.record_withdrawal("u1", "chaos", "market", RecoveryClass.REPROBE)
+    candidate = register.record_withdrawal(fixture_account_id("u1", "chaos"), "market", RecoveryClass.REPROBE)
     clock.now = candidate.next_attempt_at
 
-    outcome = run(service.reprobe("u1", "chaos", "market"))
+    outcome = run(service.reprobe(fixture_account_id("u1", "chaos"), "market"))
 
     assert outcome.value == "already_attached"
     assert attached == [], "a re-probe tore down a connection that was already live"
-    assert register.get("u1", "chaos", "market") is None, "the candidate was not discharged"
+    assert register.get(fixture_account_id("u1", "chaos"), "market") is None, "the candidate was not discharged"
 
 
 def test_a_probe_for_an_account_with_no_session_costs_no_attempt():
@@ -1228,17 +1229,17 @@ def test_a_probe_for_an_account_with_no_session_costs_no_attempt():
     service = RecoveryService(
         register,
         attach=lambda *a: None,
-        has_session=lambda u, b: False,
-        is_attached=lambda u, b, c: False,
+        has_session=lambda a: False,
+        is_attached=lambda a, c: False,
     )
-    candidate = register.record_withdrawal("u1", "chaos", "market", RecoveryClass.REPROBE)
+    candidate = register.record_withdrawal(fixture_account_id("u1", "chaos"), "market", RecoveryClass.REPROBE)
     clock.now = candidate.next_attempt_at
     before = candidate.attempts
 
-    outcome = run(service.reprobe("u1", "chaos", "market"))
+    outcome = run(service.reprobe(fixture_account_id("u1", "chaos"), "market"))
 
     assert outcome.value == "session_unavailable"
-    assert register.get("u1", "chaos", "market").attempts == before
+    assert register.get(fixture_account_id("u1", "chaos"), "market").attempts == before
 
 
 def test_an_attach_that_raises_still_climbs_the_ladder():
@@ -1252,22 +1253,22 @@ def test_an_attach_that_raises_still_climbs_the_ladder():
     register = _register(clock)
     from services.brokers.recovery import RecoveryService
 
-    async def attach(user_id, broker, channel):
+    async def attach(broker_account_id, channel):
         raise RuntimeError("adapter blew up")
 
     service = RecoveryService(
         register,
         attach=attach,
-        has_session=lambda u, b: True,
-        is_attached=lambda u, b, c: False,
+        has_session=lambda a: True,
+        is_attached=lambda a, c: False,
     )
     rungs = []
     for _ in range(4):
-        candidate = register.get("u1", "chaos", "market") or register.record_withdrawal(
-            "u1", "chaos", "market", RecoveryClass.REPROBE
-        )
+        candidate = register.get(fixture_account_id("u1", "chaos"), "market") \
+            or register.record_withdrawal(
+                fixture_account_id("u1", "chaos"), "market", RecoveryClass.REPROBE)
         clock.now = candidate.next_attempt_at
-        outcome = run(service.reprobe("u1", "chaos", "market"))
+        outcome = run(service.reprobe(fixture_account_id("u1", "chaos"), "market"))
         assert outcome.value == "attempt_failed"
         rungs.append(candidate.next_attempt_at - clock())
 
@@ -1287,7 +1288,7 @@ def test_a_sweep_with_nothing_due_performs_no_work_at_all():
         has_session=lambda u, b: calls.append(("session",)) or True,
         is_attached=lambda u, b, c: calls.append(("attached",)) or False,
     )
-    register.record_withdrawal("u1", "chaos", "market", RecoveryClass.REPROBE)
+    register.record_withdrawal(fixture_account_id("u1", "chaos"), "market", RecoveryClass.REPROBE)
 
     assert run(service.sweep_once()) == {}
     assert calls == [], "a sweep with nothing due reached a guard"
@@ -1297,16 +1298,19 @@ def test_a_reprobe_is_scoped_to_one_user_and_one_broker_and_one_channel():
     """Invariant A at the recovery layer: three keys, three ladders."""
     clock = _ProbeClock()
     register = _register(clock)
-    register.record_withdrawal("u1", "chaos", "market", RecoveryClass.REPROBE)
-    register.record_withdrawal("u2", "chaos", "market", RecoveryClass.REPROBE)
-    register.record_withdrawal("u1", "other", "market", RecoveryClass.REPROBE)
-    register.record_withdrawal("u1", "chaos", "orders", RecoveryClass.REPROBE)
+    register.record_withdrawal(fixture_account_id("u1", "chaos"), "market", RecoveryClass.REPROBE)
+    register.record_withdrawal(fixture_account_id("u2", "chaos"), "market", RecoveryClass.REPROBE)
+    register.record_withdrawal(fixture_account_id("u1", "other"), "market", RecoveryClass.REPROBE)
+    register.record_withdrawal(fixture_account_id("u1", "chaos"), "orders", RecoveryClass.REPROBE)
 
-    register.forget("u1", "chaos", "market")
+    register.forget(fixture_account_id("u1", "chaos"), "market")
 
-    remaining = {(c.user_id, c.broker, c.channel) for c in register.candidates()}
-    assert remaining == {("u2", "chaos", "market"), ("u1", "other", "market"),
-                         ("u1", "chaos", "orders")}
+    remaining = {(c.broker_account_id, c.channel) for c in register.candidates()}
+    assert remaining == {
+        (fixture_account_id("u2", "chaos"), "market"),
+        (fixture_account_id("u1", "other"), "market"),
+        (fixture_account_id("u1", "chaos"), "orders"),
+    }
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -2255,7 +2259,7 @@ def test_a_restart_leaves_no_recovery_candidate_behind_in_a_fresh_register():
     """
     clock = _ProbeClock()
     before = _register(clock)
-    before.record_withdrawal("u1", "chaos", "market", RecoveryClass.REPROBE)
+    before.record_withdrawal(fixture_account_id("u1", "chaos"), "market", RecoveryClass.REPROBE)
     assert before.candidates()
 
     after = _register(clock)

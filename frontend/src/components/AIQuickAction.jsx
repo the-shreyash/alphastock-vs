@@ -145,7 +145,7 @@ export default function AIQuickAction() {
   const panelWidth = "min(360px, calc(100vw - 32px))";
 
   return (
-    <div className="fixed bottom-6 right-6 z-[45] flex flex-col items-end gap-3 print:hidden">
+    <div className="floating-action-dock flex flex-col items-end gap-3 print:hidden">
       <AnimatePresence>
         {open && (
           <motion.div

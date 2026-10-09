@@ -70,6 +70,7 @@ from services.market_engine.ticks import MarketTick
 # The D4 suite's seam helpers, reused rather than re-implemented: a second copy
 # of "attach a feed the way the engine attaches one" would be a second thing to
 # keep true.
+from _accounts import account_ref  # noqa: E402
 from tests.test_broker_streaming import (
     _attach,
     _clean_provider_registry,
@@ -617,16 +618,16 @@ def test_probation_behaves_identically_for_every_broker_including_a_fictional_on
         name = run(_attach("u1", broker, ["RELIANCE"]))
         assert name, f"{broker} did not attach a market feed"
         feed = provider_registry.get(name)
-        run(set_market_feed_link("u1", broker, up=True))
+        run(set_market_feed_link(account_ref("u1", broker), up=True))
 
-        assert run(publish_market_ticks("u1", broker, [_tick()])) == 1
+        assert run(publish_market_ticks(account_ref("u1", broker), [_tick()])) == 1
         assert feed.is_ready and feed.is_on_probation, broker
         assert _quote_provider(manager) is baseline, broker
 
         # Real elapsed time against the real constant — small, but the same
         # arithmetic the published window runs through.
         time.sleep(window * 1.5)
-        assert run(publish_market_ticks("u1", broker, [_tick()])) == 1
+        assert run(publish_market_ticks(account_ref("u1", broker), [_tick()])) == 1
         assert feed.is_stable, broker
         assert _quote_provider(manager) is feed, broker
 
@@ -821,14 +822,14 @@ def test_probation_logging_at_debug_leaks_no_credential(caplog):
         registry.register(YahooPollingAdapter())
         name = run(_attach("u1", "nova", ["RELIANCE"]))
         feed = provider_registry.get(name)
-        run(set_market_feed_link("u1", "nova", up=True))
+        run(set_market_feed_link(account_ref("u1", "nova"), up=True))
 
         # The credentials travel where a broker session would carry them; the
         # provider layer is downstream of that and must never see them.
         tick = _tick()
-        run(publish_market_ticks("u1", "nova", [tick]))
+        run(publish_market_ticks(account_ref("u1", "nova"), [tick]))
         time.sleep(window * 1.5)
-        run(publish_market_ticks("u1", "nova", [tick]))
+        run(publish_market_ticks(account_ref("u1", "nova"), [tick]))
         assert feed.is_stable
 
     captured = caplog.text.lower()

@@ -35,6 +35,28 @@ Transparency
 ────────────
 Generation streams a truthful AIRun step timeline (REALTIME_SYSTEM.md → "AI
 Thinking Process"); each step wraps the real work it names.
+
+Provenance (D6.9)
+─────────────────
+Every generation — successful, failed, or blocked on unreachable inputs —
+persists an `services.ai_provenance` record alongside the report. It answers,
+without inference: when generation began and when it *succeeded*, whether a
+model wrote the briefing and which one, which market-data tier the numbers came
+from and when they were observed, and what went wrong if anything did.
+
+Two distinctions this module refuses to collapse:
+
+  * `ai_briefing` is not necessarily AI. It is a model's narration when
+    `briefing_source == "ai"` and the grounded restatement of collected numbers
+    otherwise. Only the first may be labelled AI-generated.
+  * `top_picks` are never AI. They are a deterministic technical scan
+    (`services.real_market.fetch_real_top_picks`), generated as part of this
+    report and carrying its timestamp — which is what `top_picks_source`
+    records, so no surface has to guess.
+
+Freshness is derived at read time from `provenance.completed_at` and from
+nothing else. Reports written before D6.9 carry no record and are described as
+`status: "unknown"`; no timestamp, provider or model is invented for them.
 """
 from __future__ import annotations
 
@@ -43,12 +65,37 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
+from services import ai_provenance
 from services.ai_activity import AIRun
+from services.ai_provenance import AIOutcome, GenerationStatus
 from services.market_engine import market_gateway
 
 logger = logging.getLogger(__name__)
 
 REPORT_TYPE = "morning"
+
+#: Version of the report's own composition logic — which sections exist, how
+#: mood is weighted, how risk warnings are derived. Bumped when a reader of an
+#: older stored report would misread it. Distinct from the *prompt* version,
+#: which versions only the narration, and from the provenance-shape version.
+ANALYSIS_VERSION = "1.0.0"
+
+#: The prompt this report's briefing is generated from. Named once so the
+#: provenance record and the actual call can never cite different prompts.
+BRIEFING_PROMPT_KEY = "morning_report"
+
+#: Where `ai_briefing` came from. The heading "AI Market Briefing" is only
+#: truthful for `BRIEFING_SOURCE_AI`; the deterministic value restates collected
+#: numbers and is never a model's work.
+BRIEFING_SOURCE_AI = "ai"
+BRIEFING_SOURCE_DETERMINISTIC = "deterministic"
+
+#: How `top_picks` were selected. They come from a deterministic RSI / volume /
+#: MACD / pattern scan and have never involved a model, so the surfaces that
+#: rendered them under an "AI" heading were mislabelling, not misconfigured.
+#: Stamped on the document so no consumer has to know that by reading the
+#: scanner's source.
+PICKS_SOURCE_DETERMINISTIC = "deterministic_technical_scan"
 
 # Step labels for the shared market layer, in execution order. One label per
 # real phase of _build_market_layer() — never a label for work that isn't done.
@@ -357,11 +404,54 @@ def _session_instruction(market_is_open: bool, observed_at_str: str) -> str:
     )
 
 
-async def _generate_briefing(facts: Dict[str, Any]) -> str:
+class _BriefingResult:
+    """The briefing text plus the provenance of whatever produced it.
+
+    D6.9 — WHY A STRING WAS NOT ENOUGH. This function has always had two very
+    different success paths: a model writes the narration, or the grounded
+    fallback restates the collected numbers. Both are honest; only one is
+    AI-generated. Returning a bare `str` erased the difference at the only
+    point in the process where it was still known, and every consumer
+    downstream — the persisted document, the API, the "AI Market Briefing"
+    heading — then had no choice but to guess, and guessed "AI".
+    """
+
+    __slots__ = ("text", "source", "outcome", "provider", "model", "prompt_version")
+
+    def __init__(self, *, text: str, source: str, outcome: AIOutcome,
+                 provider: Optional[str] = None, model: Optional[str] = None,
+                 prompt_version: Optional[str] = None) -> None:
+        self.text = text
+        self.source = source
+        self.outcome = outcome
+        self.provider = provider
+        self.model = model
+        self.prompt_version = prompt_version
+
+
+def _deterministic(text: str, outcome: AIOutcome,
+                   prompt_version: Optional[str] = None) -> _BriefingResult:
+    """The grounded fallback, carrying why no model wrote it.
+
+    `provider` and `model` stay None by construction. Naming the provider that
+    was *attempted* would read to every consumer as the provider that answered
+    — which is the fabrication this module exists to prevent.
+    """
+    return _BriefingResult(
+        text=text,
+        source=BRIEFING_SOURCE_DETERMINISTIC,
+        outcome=outcome,
+        prompt_version=prompt_version,
+    )
+
+
+async def _generate_briefing(facts: Dict[str, Any]) -> _BriefingResult:
     """AI briefing from the centralized prompt library, with a grounded fallback.
 
     The fallback is not a degraded experience — it restates real collected
-    numbers. The AI adds narrative, never data.
+    numbers. The AI adds narrative, never data. Which of the two produced this
+    particular briefing is carried in the returned :class:`_BriefingResult` and
+    is never inferred downstream.
 
     D5.19 — THE SESSION IS PART OF THE FACTS.
     This used to ask for a "pre-market briefing" and hand the model a list of
@@ -401,16 +491,18 @@ async def _generate_briefing(facts: Dict[str, Any]) -> str:
 
     try:
         from server import claude_configured, gemini_configured, get_debate_engine
-        from services.prompt_library import get_prefer, get_prompt
+        from services.prompt_library import PROMPTS, get_prefer, get_prompt
     except Exception as exc:
         logger.debug("Morning report: AI briefing unavailable (%s)", exc)
-        return fallback
+        return _deterministic(fallback, AIOutcome.NOT_CONFIGURED)
+
+    prompt_version = PROMPTS[BRIEFING_PROMPT_KEY].version
 
     if not (claude_configured() or gemini_configured()):
-        return fallback
+        return _deterministic(fallback, AIOutcome.NOT_CONFIGURED, prompt_version)
 
     try:
-        system_prompt = get_prompt("morning_report")
+        system_prompt = get_prompt(BRIEFING_PROMPT_KEY)
         context = (
             f"Nifty: {facts['nifty_str']} ({_pct(facts['nifty_chg'])})\n"
             f"Bank Nifty: {_pct(facts['banknifty_chg'])}\n"
@@ -429,17 +521,56 @@ async def _generate_briefing(facts: Dict[str, Any]) -> str:
             "omitted, never guessed."
         )
         engine = get_debate_engine()
-        briefing = await engine.simple_chat(
-            system_prompt, context, prefer=get_prefer("morning_report"), max_tokens=260
+        # `simple_chat_result`, not `simple_chat`: the string form returns the
+        # SimulatedProvider's outage text on total provider failure, and a
+        # caller holding only a string cannot tell that from a model's answer.
+        # That is how "AI services are currently offline or unavailable. Please
+        # check that ANTHROPIC_API_KEY …" came to be persisted as the day's
+        # `ai_briefing` and published under the heading "AI Market Briefing".
+        resp = await engine.simple_chat_result(
+            system_prompt, context, prefer=get_prefer(BRIEFING_PROMPT_KEY), max_tokens=260
         )
-        return briefing.strip() or fallback
     except Exception as exc:
         logger.warning("Morning report: AI briefing failed, using grounded fallback: %s", exc)
-        return fallback
+        return _deterministic(fallback, AIOutcome.PROVIDER_ERROR, prompt_version)
+
+    text = (resp.content or "").strip()
+    if not resp.success or not text:
+        # A real provider was configured and did not deliver. The user still
+        # gets a briefing — the grounded one, built from numbers this module
+        # actually collected — but nothing downstream may call it AI-generated.
+        logger.warning(
+            "Morning report: no model produced a briefing (provider=%s); using grounded fallback",
+            resp.provider,
+        )
+        return _deterministic(fallback, AIOutcome.PROVIDER_ERROR, prompt_version)
+
+    return _BriefingResult(
+        text=text,
+        source=BRIEFING_SOURCE_AI,
+        outcome=AIOutcome.SUCCEEDED,
+        provider=resp.provider,
+        model=resp.model,
+        prompt_version=prompt_version,
+    )
 
 
 async def _build_market_layer(db, run: AIRun) -> Dict[str, Any]:
-    """Generate the shared market report. Returns the persisted document shape."""
+    """Generate the shared market report. Returns the persisted document shape.
+
+    D6.9 — every exit from this function persists a provenance record, including
+    the failure exits. "Today's report did not generate" and "nobody has asked
+    for today's report yet" used to be the same observation (an absent document)
+    and they are different facts: only the first one is a problem, and only the
+    first one should stop the UI implying a report exists.
+    """
+    date = _today()
+    prov = ai_provenance.begin(
+        ai_provenance.ARTIFACT_MORNING_REPORT,
+        f"{REPORT_TYPE}:{date}",
+        analysis_version=ANALYSIS_VERSION,
+    )
+
     # Step 1 — Collecting Market Data
     async with run.step() as step:
         overview = await _safe(market_gateway.get_indices(), "indices", {}, step)
@@ -447,13 +578,24 @@ async def _build_market_layer(db, run: AIRun) -> Dict[str, Any]:
             step.warn()
 
     if not overview:
-        return {
-            "date": _today(),
+        note = ("Live market data is temporarily unavailable — the morning report "
+                "cannot be generated right now.")
+        # UNAVAILABLE, not FAILED: nothing broke, the inputs were unreachable,
+        # and the two call for different operator responses.
+        ai_provenance.failed(
+            prov, code="market_data_unavailable", message=note,
+            status=GenerationStatus.UNAVAILABLE,
+        )
+        unavailable = {
+            "date": date,
             "type": REPORT_TYPE,
             "available": False,
-            "note": "Live market data is temporarily unavailable — the morning report cannot be generated right now.",
-            "generated_at": _now_iso(),
+            "note": note,
+            "generated_at": prov["generated_at"],
+            "provenance": prov,
         }
+        await _persist(db, unavailable)
+        return unavailable
 
     # Step 2 — Reading Global Markets (+ Gift Nifty: both are the overnight read)
     async with run.step() as step:
@@ -528,7 +670,7 @@ async def _build_market_layer(db, run: AIRun) -> Dict[str, Any]:
             if gift_nifty.get("available") else "unavailable"
         )
         session = build_session_context()
-        briefing = await _generate_briefing({
+        briefing_result = await _generate_briefing({
             # D5.19 — the session is a fact the briefing is given, so the
             # narration matches what the market was actually doing. See
             # `_session_instruction`.
@@ -552,8 +694,40 @@ async def _build_market_layer(db, run: AIRun) -> Dict[str, Any]:
             "picks_count": len(picks),
         })
 
+        # The AI layer's provenance, recorded from what actually happened.
+        # `ai_succeeded` is the only writer of a provider/model name anywhere in
+        # this module, so an attribution cannot appear without a model call.
+        if briefing_result.outcome == AIOutcome.SUCCEEDED:
+            ai_provenance.ai_succeeded(
+                prov,
+                provider=briefing_result.provider,
+                model=briefing_result.model,
+                prompt_key=BRIEFING_PROMPT_KEY,
+                prompt_version=briefing_result.prompt_version,
+            )
+        else:
+            ai_provenance.ai_did_not_run(
+                prov,
+                outcome=briefing_result.outcome,
+                prompt_key=BRIEFING_PROMPT_KEY,
+                prompt_version=briefing_result.prompt_version,
+            )
+
+        # Which market snapshot these numbers came from. `source_tier` and never
+        # a provider name — MARKET_DATA_ARCHITECTURE.md Developer Rule 4 applies
+        # to an artifact exactly as it applies to a quote. Resolved without a
+        # user_id because the market layer is shared platform-wide: a per-user
+        # resolution cached into a shared document would serve one account's
+        # broker tier to everybody.
+        ai_provenance.market_data(
+            prov,
+            source_tier=_source_tier(),
+            observed_at=session["observed_at"],
+        )
+        ai_provenance.completed(prov)
+
         report = {
-            "date": _today(),
+            "date": date,
             "type": REPORT_TYPE,
             "available": True,
             # D5.19 — when these numbers were observed and what the market was
@@ -576,21 +750,70 @@ async def _build_market_layer(db, run: AIRun) -> Dict[str, Any]:
             "economic_calendar": calendar_section,
             "sectors": sectors[:6],
             "top_picks": picks,
+            # Deterministic, and generated as part of this report — so a pick's
+            # age is this report's `completed_at`, not "now".
+            "top_picks_source": PICKS_SOURCE_DETERMINISTIC,
             "key_risks": risk_warnings,
-            "ai_briefing": briefing,
+            "ai_briefing": briefing_result.text,
+            # "ai" or "deterministic". The heading "AI Market Briefing" is only
+            # truthful for the first; consumers read this rather than assuming.
+            "briefing_source": briefing_result.source,
             "fii_dii": {"fii_net": fii_net, "dii_net": (fii_dii.get("dii") or {}).get("net")},
-            "generated_at": _now_iso(),
+            # Preserved for existing consumers. `provenance.generated_at` is the
+            # instant generation *began* and `provenance.completed_at` the
+            # instant it *succeeded* — the latter is the only clock freshness is
+            # ever measured from.
+            "generated_at": prov["generated_at"],
+            "provenance": prov,
         }
 
     # Step 8 — Saving Report
     async with run.step():
-        await db.reports.update_one(
-            {"date": report["date"], "type": REPORT_TYPE},
-            {"$set": {**report}},
-            upsert=True,
-        )
+        await _persist(db, report)
 
     return report
+
+
+def _source_tier() -> Optional[str]:
+    """Freshness tier currently serving the report's index quotes, or None.
+
+    Read through the gateway so the label tracks whichever provider is actually
+    serving, rather than a literal that is wrong the day a broker feed takes
+    over (MARKET_DATA_ARCHITECTURE.md, DD-1). An unanswerable gateway yields
+    None — "not known", which `describe()` renders as absent provenance rather
+    than as a claim.
+    """
+    try:
+        from services.market_engine.gateway import market_gateway as gw
+        from services.market_engine.providers.base import Capability
+
+        return gw.source_tier(Capability.QUOTES)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("Morning report: source tier unavailable (%s)", exc)
+        return None
+
+
+async def _persist(db, report: Dict[str, Any]) -> None:
+    """Write the shared market document for its date.
+
+    One writer for every outcome — success, unavailable and failure — so a
+    failure can never be persisted through a path that forgot to carry
+    provenance.
+
+    REPLACE, NOT `$set`. This was `update_one({"$set": {...}})`, which MERGES.
+    When a *successful* report for today was already stored and a forced
+    regeneration then failed, the merge left every section of the old run —
+    and its `available: true` — standing beside the new `status: "failed"`
+    provenance. The document read as a complete report whose provenance said it
+    had not been produced, and `_is_servable` would happily serve it. A
+    regeneration replaces the day's document outright, so the stored artifact is
+    always exactly one run's output.
+    """
+    await db.reports.replace_one(
+        {"date": report["date"], "type": REPORT_TYPE},
+        {**report},
+        upsert=True,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -730,7 +953,8 @@ async def get_morning_report(
     which must not serve yesterday's cached document).
     """
     today = _today()
-    cached = None if force else await db.reports.find_one({"date": today, "type": REPORT_TYPE})
+    stored = None if force else await db.reports.find_one({"date": today, "type": REPORT_TYPE})
+    cached = stored if _is_servable(stored) else None
 
     steps: List[str] = []
     if not cached:
@@ -750,26 +974,112 @@ async def get_morning_report(
 
         if not market.get("available"):
             await run.complete("warning")
-            return market
+            return _with_provenance(market)
 
         if user:
             async with run.step():
                 market = {**market, "portfolio": await _build_personal_layer(db, user, market)}
 
         await run.complete()
-        return market
-    except Exception:
+        return _with_provenance(market)
+    except Exception as exc:
         await run.complete("warning")
+        # A crash mid-generation must not leave today looking like a day nobody
+        # asked about. Persist the failure so "AI online but today's report did
+        # not generate" is answerable, then re-raise — the caller's error
+        # handling is unchanged.
+        await _persist_generation_failure(db, today, exc)
         raise
+
+
+def _is_servable(stored: Optional[Dict[str, Any]]) -> bool:
+    """Whether a stored document may be served instead of regenerating.
+
+    Only a report that carries sections. A persisted *failure* or *unavailable*
+    record is evidence about the last attempt, not a report — serving one would
+    pin a transient 08:30 market-data outage for the rest of the day, and the
+    on-demand path would never retry. Retrying is also exactly what happened
+    before D6.9, when a failed generation was not persisted at all, so this
+    keeps request behaviour identical while adding the record.
+
+    A legacy document with no `provenance` key IS servable: it is a real report
+    whose provenance simply was never recorded, and regenerating it on that
+    basis would be a cost and behaviour change justified by nothing.
+    """
+    return bool(stored and stored.get("available"))
+
+
+def _with_provenance(report: Dict[str, Any]) -> Dict[str, Any]:
+    """Attach the derived, client-facing provenance view.
+
+    Derived at read time, never stored: freshness is a function of *now*, so a
+    persisted freshness value would be wrong the moment after it was written.
+
+    A report with no stored record — every document written before D6.9 — is
+    described as `status: "unknown"`, `known: false`. No timestamp, provider or
+    model is inferred for it. In particular `generated_at` is NOT promoted into
+    provenance: nothing proves that field marked a successful AI completion
+    rather than the moment a document happened to be written, and a provenance
+    module that guesses is worse than one that says it does not know.
+    """
+    return {**report, "provenance": ai_provenance.describe(report.get("provenance"))}
+
+
+async def _persist_generation_failure(db, date: str, exc: BaseException) -> None:
+    """Record that today's generation was attempted and raised.
+
+    The stored message is written for a user. The exception's own text is
+    logged, never persisted and never served: provider and driver errors carry
+    request ids, connection strings and echoed prompts, and this record leaves
+    the process through the API.
+    """
+    logger.error("Morning report generation failed for %s: %s", date, exc)
+    prov = ai_provenance.begin(
+        ai_provenance.ARTIFACT_MORNING_REPORT,
+        f"{REPORT_TYPE}:{date}",
+        analysis_version=ANALYSIS_VERSION,
+    )
+    ai_provenance.failed(
+        prov,
+        code="generation_error",
+        message="Report generation failed. No analysis was produced for this date.",
+    )
+    try:
+        await _persist(db, {
+            "date": date,
+            "type": REPORT_TYPE,
+            "available": False,
+            "note": prov["error"]["message"],
+            "generated_at": prov["generated_at"],
+            "provenance": prov,
+        })
+    except Exception as persist_exc:  # pragma: no cover - defensive
+        logger.error("Morning report: could not persist failure record: %s", persist_exc)
 
 
 async def generate_and_notify(db) -> Dict[str, Any]:
     """Scheduled 8:30 AM entry point: regenerate the report and notify users.
 
-    Returns the generated market report.
+    Returns the generated market report. A generation that fails still returns
+    a document and still publishes — an unannounced failure is the state in
+    which an open dashboard keeps showing yesterday's briefing with nothing
+    saying the morning's run did not happen.
     """
-    report = await get_morning_report(db, user=None, force=True)
+    try:
+        report = await get_morning_report(db, user=None, force=True)
+    except Exception as exc:
+        # `get_morning_report` has already persisted the failure record; read it
+        # back rather than re-deriving, so the notified state and the stored
+        # state are the same object.
+        logger.error("Morning report: scheduled generation failed: %s", exc)
+        stored = await db.reports.find_one({"date": _today(), "type": REPORT_TYPE}) or {}
+        stored.pop("_id", None)
+        report = _with_provenance(stored) if stored else _with_provenance({
+            "date": _today(), "type": REPORT_TYPE, "available": False,
+            "note": "Report generation failed. No analysis was produced for this date.",
+        })
 
+    prov = report.get("provenance") or {}
     try:
         from services.market_engine.event_bus import event_bus
 
@@ -777,6 +1087,14 @@ async def generate_and_notify(db) -> Dict[str, Any]:
             "date": report.get("date"),
             "picks": len(report.get("top_picks") or []),
             "available": report.get("available", False),
+            # D6.9 — the ready-signal carries the generation's outcome, so a
+            # listening dashboard refetches into the right state instead of
+            # assuming the arrival of the event means a report was produced.
+            # Metadata only: the report body still comes from the API, which is
+            # where per-user layering and authorization live.
+            "status": prov.get("status"),
+            "completed_at": prov.get("completed_at"),
+            "is_ai_generated": bool(prov.get("is_ai_generated")),
         })
     except Exception as exc:
         logger.warning("morningreport.generated publish failed: %s", exc)

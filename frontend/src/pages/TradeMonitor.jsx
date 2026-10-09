@@ -10,6 +10,8 @@ import { useRealtimeStore, selectTradeReviews } from "../store/realtimeStore";
 import { usePriceFlash } from "../hooks/usePriceFlash";
 import AnimatedNumber from "../components/ui/AnimatedNumber";
 import { useAuth } from "../context/AuthContext";
+import { accountLabel, isBrokerAccountId } from "../lib/brokerAccounts";
+import { PageHeader } from "../components/ds";
 import {
   Plus, X, Sparkles, Sliders, BarChart3, Newspaper, ChevronDown, Loader2,
   Target, ShieldAlert, ShieldCheck, TrendingUp, RefreshCw, AlertTriangle,
@@ -63,7 +65,9 @@ const EMPTY_FORM = {
   symbol: "", stock_name: "", type: "BUY", entry_price: "", quantity: "",
   stop_loss: "", target1: "", target2: "", target3: "", notes: "",
   trail_enabled: false, trail_type: "percent", trail_value: "",
-  broker: "", order_type: "MARKET", auto_exit: false,
+  // D6.4/D6.5 — the execution target is a brokerage ACCOUNT, addressed by its
+  // opaque `broker_account_id`. Empty means "track only": no live order.
+  broker_account_id: "", order_type: "MARKET", auto_exit: false,
 };
 
 const targetLevels = (t) =>
@@ -296,7 +300,10 @@ export default function TradeMonitor() {
   const [history, setHistory] = useState([]);
   const [pnl, setPnl] = useState(null);
   const [riskSummary, setRiskSummary] = useState(null);
-  const [connectedBrokers, setConnectedBrokers] = useState([]);
+  // One record per authorized brokerage ACCOUNT the user can execute through
+  // (D6.4) — not one per broker brand, which cannot address either of two
+  // accounts held at the same broker.
+  const [executionAccounts, setExecutionAccounts] = useState([]);
   const [showNew, setShowNew] = useState(false);
   const [loading, setLoading] = useState(true);
   const [tab, setTab] = useState("active");
@@ -465,11 +472,15 @@ export default function TradeMonitor() {
     } finally {
       setLoading(false);
     }
-    // Which brokers can execute? Non-blocking — the form works without any.
-    brokerService.status()
-      .then((statuses) => setConnectedBrokers(
-        Object.values(statuses || {}).filter((s) => s.connected)))
-      .catch(() => setConnectedBrokers([]));
+    // Which ACCOUNTS can execute? Non-blocking — the form works without any.
+    // `/brokers/accounts` is the only list that can represent a user holding two
+    // accounts at one broker; `/brokers/status` collapses them into one brand
+    // record and so cannot address either (LIM-D6.5-6). Rows without a minted
+    // id are dropped rather than rendered as an unaddressable option.
+    brokerService.accounts()
+      .then((accounts) => setExecutionAccounts((accounts || []).filter(
+        (a) => a && a.connected && isBrokerAccountId(a.broker_account_id))))
+      .catch(() => setExecutionAccounts([]));
   };
 
   const fetchActive = async () => {
@@ -478,16 +489,23 @@ export default function TradeMonitor() {
     } catch {}
   };
 
-  // Default the execution broker to the platform the user chose in Settings
-  // (Trading Platform). No choice there → the form starts on "Track only".
-  useEffect(() => {
-    if (!showNew) return;
-    const preferred = user?.preferred_broker;
-    if (preferred && connectedBrokers.some((b) => b.broker === preferred)) {
-      setForm((f) => (f.broker ? f : { ...f, broker: preferred }));
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [showNew, connectedBrokers]);
+  // THERE IS NO DEFAULT EXECUTION ACCOUNT, DELIBERATELY (D6.5 / LIM-D6.5-6).
+  //
+  // An effect here used to pre-select `user.preferred_broker`. That is the same
+  // inference D6.4 removed everywhere else: a brand does not name an account,
+  // and it cannot serve a user holding two accounts at one broker. Nothing
+  // replaces it — not the first account, not the most recently connected one,
+  // not the id Settings remembers, which answers "which account am I looking
+  // at" and is not consent to place an order. The form opens on "Track only"
+  // and the account an order goes to is something the user says, per trade.
+  // Failing closed costs one click; guessing costs a live order in the wrong
+  // account.
+  //
+  // An account that is disconnected while the form is open is NOT policed here
+  // either. The server owns that question: it resolves the id owner-scoped and
+  // answers 404, no order placed. A client-side re-check would be a second
+  // authority on ownership that could never be exercised from the picker, and
+  // therefore never proved.
 
   // ─── Live risk check (debounced against /trades/validate) ────────────────
   const validateTimer = useRef(null);
@@ -514,25 +532,38 @@ export default function TradeMonitor() {
   }, [showNew, form.symbol, form.type, form.entry_price, form.quantity,
       form.stop_loss, form.target1, form.target2, form.target3]);
 
-  const buildTradePayload = () => ({
-    symbol: form.symbol.toUpperCase(),
-    stock_name: form.stock_name || form.symbol.toUpperCase(),
-    type: form.type,
-    entry_price: parseFloat(form.entry_price),
-    quantity: parseInt(form.quantity),
-    stop_loss: parseFloat(form.stop_loss),
-    target1: parseFloat(form.target1),
-    target2: form.target2 ? parseFloat(form.target2) : null,
-    target3: form.target3 ? parseFloat(form.target3) : null,
-    trailing_stop: form.trail_enabled && parseFloat(form.trail_value) > 0
-      ? { enabled: true, type: form.trail_type, value: parseFloat(form.trail_value) }
-      : null,
-    notes: form.notes,
-    broker: form.broker || null,
-    order_type: form.order_type,
-    auto_exit: form.broker ? form.auto_exit : false,
-    override_warnings: Boolean(riskCheck?.warnings?.length),
-  });
+  const buildTradePayload = () => {
+    // THE ORDER IS ADDRESSED TO AN ACCOUNT, NEVER TO A BROKER NAME (D6.4).
+    //
+    // `form.broker_account_id` is either the empty "Track only" option or one
+    // of the ids the server just listed for this user — the picker is its only
+    // writer, and a row arriving without a minted id never becomes an option.
+    // Empty means "record the trade, place no order". There is deliberately no
+    // fallback to `broker`: that field is what makes the server pick an
+    // account, and picking is precisely what D6.4 exists to prevent.
+    const brokerAccountId = form.broker_account_id || null;
+    return {
+      symbol: form.symbol.toUpperCase(),
+      stock_name: form.stock_name || form.symbol.toUpperCase(),
+      type: form.type,
+      entry_price: parseFloat(form.entry_price),
+      quantity: parseInt(form.quantity),
+      stop_loss: parseFloat(form.stop_loss),
+      target1: parseFloat(form.target1),
+      target2: form.target2 ? parseFloat(form.target2) : null,
+      target3: form.target3 ? parseFloat(form.target3) : null,
+      trailing_stop: form.trail_enabled && parseFloat(form.trail_value) > 0
+        ? { enabled: true, type: form.trail_type, value: parseFloat(form.trail_value) }
+        : null,
+      notes: form.notes,
+      broker_account_id: brokerAccountId,
+      order_type: form.order_type,
+      // Live auto-exit is meaningless without an account to sell in, and the
+      // server gates it on the resolved account too.
+      auto_exit: brokerAccountId ? form.auto_exit : false,
+      override_warnings: Boolean(riskCheck?.warnings?.length),
+    };
+  };
 
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -700,15 +731,15 @@ export default function TradeMonitor() {
 
   return (
     <div data-testid="trades-page" className="space-y-4">
-      <div className="flex items-center justify-between">
-        <div>
-          <h1 className="page-title">Trade Monitor</h1>
-          <p className="page-subtitle mt-0.5">Track your active positions, orders and trade history</p>
-        </div>
-        <button data-testid="new-trade-btn" onClick={() => { setSubmitError(null); setShowNew(true); }} className="btn-primary btn-lg">
-          <Plus size={18} /> New Trade
-        </button>
-      </div>
+      <PageHeader
+        title="Trading"
+        subtitle="Track your active positions, orders and trade history"
+        actions={
+          <button data-testid="new-trade-btn" onClick={() => { setSubmitError(null); setShowNew(true); }} className="btn-primary btn-lg">
+            <Plus size={18} /> New Trade
+          </button>
+        }
+      />
 
       {/* PnL Summary */}
       {pnl && (
@@ -1219,30 +1250,33 @@ export default function TradeMonitor() {
                 )}
               </div>
 
-              {/* Broker execution */}
-              {connectedBrokers.length > 0 && (
+              {/* Broker execution — addressed to ONE account (D6.4) */}
+              {executionAccounts.length > 0 && (
                 <div className="p-3 rounded-xl space-y-2" style={{ background: "var(--bg-surface)", border: "1px solid var(--border)" }}>
                   <div className="flex items-center gap-2">
                     <Zap size={12} style={{ color: "var(--ai-accent)" }} />
                     <span className="text-xs font-semibold" style={{ color: "var(--text-primary)" }}>Execution</span>
                   </div>
                   <div className="flex items-center gap-2">
-                    <select data-testid="trade-broker-select" value={form.broker} onChange={(e) => setForm({ ...form, broker: e.target.value })} className={inputCls} style={{ ...inputStyle, width: 180 }}>
+                    <select data-testid="trade-broker-account-select" value={form.broker_account_id} onChange={(e) => setForm({ ...form, broker_account_id: e.target.value })} className={inputCls} style={{ ...inputStyle, width: 240 }}>
                       <option value="">Track only (no order)</option>
-                      {connectedBrokers.map((b) => (
-                        <option key={b.broker} value={b.broker}>
-                          Live order — {b.display_name}{user?.preferred_broker === b.broker ? " (your platform)" : ""}
+                      {/* The broker's own account number is what tells two
+                          accounts at one broker apart; the internal routing
+                          handle is the option's value and is never rendered. */}
+                      {executionAccounts.map((a) => (
+                        <option key={a.broker_account_id} value={a.broker_account_id}>
+                          Live order — {accountLabel(a)}
                         </option>
                       ))}
                     </select>
-                    {form.broker && (
+                    {form.broker_account_id && (
                       <select data-testid="trade-ordertype-select" value={form.order_type} onChange={(e) => setForm({ ...form, order_type: e.target.value })} className={inputCls} style={{ ...inputStyle, width: 110 }}>
                         <option value="MARKET">Market</option>
                         <option value="LIMIT">Limit</option>
                       </select>
                     )}
                   </div>
-                  {form.broker && (
+                  {form.broker_account_id && (
                     <label className="flex items-start gap-2 cursor-pointer">
                       <input data-testid="auto-exit-toggle" type="checkbox" checked={form.auto_exit} onChange={(e) => setForm({ ...form, auto_exit: e.target.checked })} className="mt-0.5" />
                       <span className="text-[11px] leading-snug" style={{ color: "var(--text-secondary)" }}>
@@ -1289,7 +1323,7 @@ export default function TradeMonitor() {
               </div>
               <button data-testid="submit-trade-btn" type="submit" disabled={submitting || (riskCheck && !riskCheck.approved)} className="btn-primary btn-lg btn-block">
                 {submitting ? <Loader2 size={16} className="animate-spin" /> : null}
-                {submitting ? "Placing…" : form.broker ? `Place Live ${form.type} Order` : "Execute Trade"}
+                {submitting ? "Placing…" : form.broker_account_id ? `Place Live ${form.type} Order` : "Execute Trade"}
               </button>
             </form>
           </div>

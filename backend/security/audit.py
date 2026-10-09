@@ -381,10 +381,10 @@ def _context_request_id() -> Optional[str]:
 def request_context(request) -> tuple[Optional[str], Optional[str], Optional[str]]:
     """Best-effort (ip, user_agent, request_id) from a Starlette/FastAPI request.
 
-    IP honors the first hop of ``X-Forwarded-For`` when present (behind a trusted
-    proxy) and falls back to the socket peer — matching ``rate_limit.client_ip``
-    so the audit log and the rate limiter attribute the same request to the same
-    identity.
+    IP comes from ``rate_limit.resolve_client_ip`` — the one resolver, so the
+    audit log and the rate limiter always attribute the same request to the same
+    identity (including under ``TRUSTED_CLIENT_IP_HEADER``). This used to be a
+    hand-copied twin of that logic, which is exactly how the two would drift.
 
     ``request_id`` is the correlation key an investigation joins on. It comes
     from the active request context (PH2.5) — the ID
@@ -403,13 +403,10 @@ def request_context(request) -> tuple[Optional[str], Optional[str], Optional[str
         # inherits its correlation ID even though it holds no request object.
         return None, None, _context_request_id()
     try:
-        ip: Optional[str] = None
-        xff = request.headers.get("x-forwarded-for")
-        if xff:
-            first = xff.split(",")[0].strip()
-            ip = first or None
-        if not ip:
-            ip = request.client.host if request.client else None
+        # Lazy: security.rate_limit imports this module (lazily) to audit
+        # lockouts; a top-level import here would be the other half of a cycle.
+        from security.rate_limit import resolve_client_ip
+        ip: Optional[str] = resolve_client_ip(request)
         ua = request.headers.get("user-agent")
         rid = _context_request_id() or request.headers.get("x-request-id")
         return ip, ua, rid

@@ -1,0 +1,48 @@
+# ==============================================================================
+# StockAssist AI — Railway service configuration (backend)
+#
+# Config-as-code for the Railway "backend" service. It describes the EXISTING
+# PH2.1/PH3.12 container (backend/Dockerfile + docker/entrypoint.sh); it adds no
+# build step, start command or runtime behaviour of its own.
+#
+# IMPORTANT — Railway does NOT look for this file relative to the service's Root
+# Directory. In the service settings set:
+#     Root Directory        backend
+#     Config file path      /backend/railway.toml
+# Full walkthrough and the reasoning behind every value: docs/deployment/RAILWAY.md
+#
+# Deliberately NOT set here:
+#   * startCommand — the image's ENTRYPOINT validates configuration (fail-fast,
+#     security/secrets.py) and then execs uvicorn. A start command would replace
+#     that and skip the validation.
+#   * PORT / HOST — Railway injects PORT and the entrypoint already honours it
+#     and binds 0.0.0.0.
+#   * replicas — must stay at ONE (LIM-D6.7-3: broker WebSocket sessions are
+#     opened per process). Leave the dashboard's replica count at 1.
+# ==============================================================================
+
+[build]
+builder = "DOCKERFILE"
+# Only backend changes redeploy the backend. Paths are repository-root relative.
+watchPatterns = ["/backend/**"]
+
+[deploy]
+# Deploy-time gate: Railway calls this ONLY while bringing a new deployment up
+# (it is not a continuous liveness probe). /api/health/ready returns 200 only
+# after startup completed AND every critical dependency (MongoDB; Redis when
+# REDIS_URL is set) answers, so a deployment that cannot reach its database
+# never receives traffic and the previous one keeps serving.
+healthcheckPath = "/api/health/ready"
+# Cold start builds ~20 indexes and restores broker sessions; 300 s is Railway's
+# default ceiling and is kept explicit so nobody "tightens" it below a real boot.
+healthcheckTimeout = 300
+
+# Railway's default is 0 s: SIGKILL immediately after SIGTERM. That would skip
+# the FastAPI shutdown handler entirely (scheduler lease release, heartbeat and
+# broker-stream shutdown) and sever in-flight requests on every deploy. 30 s is
+# above the entrypoint's TIMEOUT_GRACEFUL_SHUTDOWN (20 s) so uvicorn finishes
+# draining before the kill.
+drainingSeconds = 30
+
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10

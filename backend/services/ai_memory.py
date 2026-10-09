@@ -167,8 +167,15 @@ async def list_conversations(db, user_id: str, limit: int = 30) -> list[dict]:
 
 
 async def delete_conversation(db, user_id: str, session_id: str) -> int:
-    """Delete every message in a session owned by the user. Returns count."""
+    """Delete every message in a session owned by the user. Returns count.
+
+    `deleted_count`, not `modified_count`: pymongo's `DeleteResult` has no
+    `modified_count`, so the old `getattr(..., 0)` reported 0 for every real
+    deletion. The test double exposed both, which is why it went unnoticed
+    (D6.8). The count covers only the caller's own rows, so another account's
+    use of the same `session_id` label never changes it.
+    """
     res = await db.chat_messages.delete_many(
         {"user_id": user_id, "session_id": session_id}
     )
-    return getattr(res, "modified_count", 0)
+    return res.deleted_count

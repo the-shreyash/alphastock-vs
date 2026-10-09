@@ -93,6 +93,7 @@ from tests.test_broker_streaming import (
     run,
 )
 from tests.test_provider_probation import FakeClock, _tick
+from _accounts import account_ref  # noqa: E402
 
 BACKEND = pathlib.Path(__file__).resolve().parent.parent
 
@@ -732,13 +733,13 @@ def test_an_entitlement_refused_feed_is_not_a_health_recovery_candidate():
     engine.configure(FakeDB())
     with nova_registered(), _clean_provider_registry() as registry, clean_register():
         run(_attach("u1", "nova", ["RELIANCE"]))
-        feed = registry.get(feed_provider_name("u1", "nova"))
+        feed = registry.get(feed_provider_name(account_ref("u1", "nova")))
         assert feed is not None
         manager = SourceManager(registry, health_recovery=ProviderHealthRecovery())
 
-        run(engine._on_stream_not_entitled("u1", "nova", DEFAULT_STREAM_CHANNEL))
+        run(engine._on_stream_not_entitled(account_ref("u1", "nova"), DEFAULT_STREAM_CHANNEL))
 
-        assert registry.get(feed_provider_name("u1", "nova")) is None
+        assert registry.get(feed_provider_name(account_ref("u1", "nova"))) is None
         assert registry.down_candidates_for(
             Capability.QUOTES, ResolutionContext(user_id="u1", symbol="RELIANCE")) == []
         assert manager.health_recovery.probe_for(feed) is None
@@ -756,12 +757,12 @@ def test_an_expired_session_is_not_treated_as_ordinary_health_recovery():
     engine.configure(FakeDB())
     with nova_registered(), _clean_provider_registry() as registry, clean_register():
         run(_attach("u1", "nova", ["RELIANCE"]))
-        feed = registry.get(feed_provider_name("u1", "nova"))
+        feed = registry.get(feed_provider_name(account_ref("u1", "nova")))
         manager = SourceManager(registry, health_recovery=ProviderHealthRecovery())
 
-        run(engine._on_stream_expired("u1", "nova", DEFAULT_STREAM_CHANNEL))
+        run(engine._on_stream_expired(account_ref("u1", "nova"), DEFAULT_STREAM_CHANNEL))
 
-        assert registry.get(feed_provider_name("u1", "nova")) is None
+        assert registry.get(feed_provider_name(account_ref("u1", "nova"))) is None
         assert manager.health_recovery.probe_for(feed) is None
 
 
@@ -829,8 +830,8 @@ def test_health_recovery_behaves_identically_for_every_broker(broker):
         name = run(_attach("u1", broker, ["RELIANCE"]))
         assert name, f"{broker} did not attach a market feed"
         feed = provider_registry.get(name)
-        run(set_market_feed_link("u1", broker, up=True))
-        assert run(publish_market_ticks("u1", broker, [_tick()])) == 1
+        run(set_market_feed_link(account_ref("u1", broker), up=True))
+        assert run(publish_market_ticks(account_ref("u1", broker), [_tick()])) == 1
 
         for _ in range(DOWN_AFTER_FAILURES):
             manager.record_failure(feed, RuntimeError("ws closed"))
@@ -1005,8 +1006,8 @@ def test_no_credentials_or_broker_vocabulary_reach_the_logs_at_debug():
             feed = provider_registry.get(name)
             feed._credentials = {"access_token": secrets[0], "api_key": secrets[1],
                                  "refresh_token": secrets[2]}
-            run(set_market_feed_link("u1", "nova", up=True))
-            run(publish_market_ticks("u1", "nova", [_tick()]))
+            run(set_market_feed_link(account_ref("u1", "nova"), up=True))
+            run(publish_market_ticks(account_ref("u1", "nova"), [_tick()]))
 
             for _ in range(DOWN_AFTER_FAILURES):
                 manager.record_failure(feed, RuntimeError(f"handshake failed: {secrets[0]}"))

@@ -87,6 +87,19 @@ def test_morning_report_cached_on_second_call(client, fake_db, auth_headers, no_
         assert m_picks.call_count == 1, "top picks should not be regenerated on cache hit"
         assert m_sectors.call_count == 1, "sectors should not be refetched on cache hit"
 
-    # ASSERT — identical payload returned both times
+    # ASSERT — the same report, and the same generation, returned both times
     assert first.json()["generated_at"] == second.json()["generated_at"]
-    assert first.json() == second.json()
+    assert first.json()["provenance"]["completed_at"] == second.json()["provenance"]["completed_at"]
+
+    # D6.9 — everything except the derived freshness view is byte-identical.
+    # `age_seconds` is DELIBERATELY excluded: freshness is a function of *now*,
+    # derived on every read, so two reads of one cached report must differ here
+    # and must not differ anywhere else. A stored age would be wrong the instant
+    # after it was written, which is the defect this asymmetry prevents.
+    def _without_derived_age(payload):
+        body = dict(payload)
+        body["provenance"] = {k: v for k, v in body["provenance"].items() if k != "age_seconds"}
+        return body
+
+    assert _without_derived_age(first.json()) == _without_derived_age(second.json())
+    assert second.json()["provenance"]["age_seconds"] >= first.json()["provenance"]["age_seconds"]

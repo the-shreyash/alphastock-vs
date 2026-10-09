@@ -70,7 +70,7 @@ markers = [
     "e2e: exercises a complete user journey across the running stack. No test carries this yet — PH3.9 owns the journeys.",
     "security: a PH1 security-control regression test (auth, cookies, CORS, JWT, sessions, password policy, rate limiting, CSRF, headers, RBAC, audit). Hermetic; included in the default run. Applied automatically by tests/conftest.py from the file list in `_SECURITY_SUITES`.",
     "slow: takes more than ~5 seconds. Included in the default run; `-m 'not slow'` gives a fast inner-loop selection.",
-    "requires_db: needs a real MongoDB. No hermetic test carries this — the `fake_db` fixture exists so none has to. Reserved for the PH2.6 integration job.",
+    "requires_db: needs a real MongoDB. Carried by `test_d63_real_db_races.py` (D6.3 closure of LIM-D6.3-2), which reproduces concurrency interleavings `fake_db` structurally cannot express — it is single-threaded with no await point inside an operation. That file SKIPS itself at import when no `mongod` answers at $MONGO_URL, so it stays safe in the default selection; the marker is what lets a future job select it deliberately. Every other suite uses `fake_db` and needs no database.",
     "requires_redis: needs a real Redis. No hermetic test carries this — the Redis suites drive `RedisSettings`/client construction without connecting. Reserved for the PH2.6 integration job.",
     "allow_network: this test is deliberately exempt from the hermetic outbound-network guard. Requires a comment at the test explaining why.",
 ]

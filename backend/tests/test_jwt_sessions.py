@@ -205,6 +205,15 @@ class TestSessionStore:
         store = SessionStore(db)
         sid = _run(store.create("u", "jti-0"))
         _run(store.rotate(sid, "jti-0", "jti-1"))          # legit rotation
+        # D6.2 / F. Age the rotation past the concurrency grace window, so this
+        # is a replay and not the two-tab race the window exists to forgive.
+        # Without this the test would be asserting theft detection against an
+        # input the store deliberately treats as benign.
+        _run(db.sessions.update_one(
+            {"session_id": sid},
+            {"$set": {"previous_jti_at":
+                      (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()}},
+        ))
         res = _run(store.rotate(sid, "jti-0", "jti-2"))    # replay the dead token
         assert res.outcome == REUSE_DETECTED
         # The whole family is now revoked — even the currently-valid token dies.
@@ -283,7 +292,14 @@ class TestAuthEndpoints:
         new_refresh = client.cookies.get("refresh_token")
         assert new_refresh and new_refresh != old_refresh
 
-    def test_replayed_refresh_token_rejected_and_family_revoked(self, client, fake_db):
+    def test_replayed_refresh_token_rejected_and_family_revoked(self, client, fake_db,
+                                                                monkeypatch):
+        # D6.2 / F. Strict single-use, with the concurrency grace disabled. The
+        # grace forgives exactly one case — the immediately-previous token
+        # replayed within seconds — and this test is about the other case, so it
+        # configures the window away rather than racing it. The grace path has
+        # its own tests in test_d62_session_lifecycle.py.
+        monkeypatch.setenv("JWT_REFRESH_GRACE_SECONDS", "0")
         _register(client, email="replay@example.com")
         old_refresh = client.cookies.get("refresh_token")
         # Legit rotation → jar now holds a new refresh token.

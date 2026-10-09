@@ -20,6 +20,7 @@ import pathlib
 import re
 
 import pytest
+from _accounts import account_ref  # noqa: E402
 
 from tests.test_broker_framework import _strip_comments_and_strings as _strip_source
 from tests.test_broker_streaming import _executable_strings
@@ -195,7 +196,7 @@ def test_planning_an_index_subscription_logs_no_credential(caplog):
             adapter_cls._instrument_catalogue = _catalogue
             try:
                 run(engine._plan_tick_subscription(
-                    "u1", broker, session, holdings=[], positions=[]))
+                    account_ref("u1", broker), session, holdings=[], positions=[]))
             finally:
                 adapter_cls._instrument_catalogue = original
 

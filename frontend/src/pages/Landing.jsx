@@ -831,6 +831,22 @@ export default function Landing() {
   const sensexPct = fmtPct(liveData?.sensex?.change_pct, "+0.51%");
   const bankPct = fmtPct(liveData?.bank_nifty?.change_pct, "+0.82%");
 
+  /*
+   * WHETHER THE SNAPSHOT IS LIVE IS NOT THE SAME QUESTION AS WHETHER THE
+   * REQUEST RESOLVED.
+   *
+   * `/market/overview` is public but fallible: when the gateway cannot serve
+   * indices it answers `200 {available: false, note: ...}` — with no index
+   * payload at all. That is a truthy object, so labelling the card from
+   * `liveData` alone printed the hard-coded sample figures below under a "LIVE
+   * DATA" badge. To a first-time visitor, who has no way to tell, that is the
+   * product misrepresenting itself on its own front door.
+   *
+   * The label has to follow the *payload*: live only when the gateway both
+   * says it is available and actually sent a figure to show.
+   */
+  const isLive = liveData?.available !== false && liveData?.nifty?.value != null;
+
   return (
     <div
       className="sa-landing"
@@ -926,7 +942,7 @@ export default function Landing() {
           variants={containerVariants}
         >
           {/* LEFT TILE — Market Snapshot */}
-          <motion.div className="sa-tile sa-tile-market" variants={itemVariants}>
+          <motion.div className="sa-tile sa-tile-market" variants={itemVariants} data-testid="mi-index-card">
             <div>
               <div className="sa-eyebrow sa-eyebrow-dim" style={{ marginBottom: 20 }}>
                 MARKET SNAPSHOT
@@ -969,8 +985,8 @@ export default function Landing() {
                 ))}
               </div>
             </div>
-            <div className="sa-eyebrow" style={{ fontSize: 9 }}>
-              {liveData ? "LIVE DATA" : "ILLUSTRATIVE VALUES"}
+            <div className="sa-eyebrow" style={{ fontSize: 9 }} data-testid="mi-live-badge">
+              {isLive ? "LIVE DATA" : "SAMPLE — ILLUSTRATIVE VALUES"}
             </div>
           </motion.div>
 
@@ -1648,9 +1664,17 @@ export default function Landing() {
 
             <div>
               <div className="sa-footer-col-title">Legal</div>
-              <a href="#" className="sa-footer-link">Privacy</a>
-              <a href="#" className="sa-footer-link">Terms</a>
-              <a href="#" className="sa-footer-link">Risk Disclosure</a>
+              {/*
+                Rendered as plain text, not as anchors, until these pages exist.
+                `href="#"` looks like a destination to a sighted visitor and is
+                announced as a link by assistive technology, but it only scrolls
+                the page to the top — on a financial product's legal column that
+                is worse than showing nothing, because a visitor looking for the
+                risk disclosure concludes it is broken rather than absent.
+              */}
+              <span className="sa-footer-link" style={{ cursor: "default", opacity: 0.55 }}>Privacy</span>
+              <span className="sa-footer-link" style={{ cursor: "default", opacity: 0.55 }}>Terms</span>
+              <span className="sa-footer-link" style={{ cursor: "default", opacity: 0.55 }}>Risk Disclosure</span>
             </div>
           </div>
 

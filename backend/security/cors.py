@@ -51,6 +51,13 @@ Design decisions:
   client never needs to read a custom response header; nothing extra is
   exposed.
 
+WebSocket handshakes (deployment preparation, 2026-09): ``CORSMiddleware``
+does not see WebSocket upgrades, and browsers do not apply CORS to them — any
+page can open ``new WebSocket("wss://api…")`` and the browser attaches this
+site's cookies. ``is_allowed_websocket_origin`` applies THIS allowlist to the
+handshake's ``Origin`` header so the realtime socket answers exactly the
+origins the REST API answers, from the same configuration. See its docstring.
+
 Note on OAuth: the Google OAuth *redirect-URI* allowlist
 (``_allowed_google_redirect_uris`` in ``server.py``) is PH1.2 scope and derives
 its origins from ``FRONTEND_URL`` / ``CORS_ORIGINS`` independently. Deployments
@@ -61,7 +68,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import List
+from typing import List, Optional
 
 from starlette.middleware.cors import CORSMiddleware
 
@@ -215,3 +222,55 @@ def apply_cors(app) -> None:
     else:
         logger.info("CORS allowlist: %s", ", ".join(origins))
     app.add_middleware(CORSMiddleware, **kwargs)
+
+
+# --------------------------------------------------------------------------- #
+# WebSocket handshake origin check                                              #
+# --------------------------------------------------------------------------- #
+# The serialized origin a browser sends from an opaque context (sandboxed
+# iframe, data: URL, some file:// pages). It names no site, so it can never be
+# an origin we trust — and those contexts are exactly what an attacker controls.
+OPAQUE_ORIGIN = "null"
+
+
+def is_allowed_websocket_origin(origin: Optional[str]) -> bool:
+    """Whether a WebSocket handshake carrying ``origin`` may proceed.
+
+    WHY THIS EXISTS. CORS does not protect WebSockets: the browser performs the
+    upgrade from any page, attaches this site's cookies, and never asks the
+    server's permission to read the replies. Authentication alone therefore
+    cannot stop cross-site WebSocket hijacking (CSWSH) — the hijacked handshake
+    carries a *valid* ``access_token`` cookie. Before this check the only
+    barrier was ``SameSite=Lax``, which blocks a genuinely cross-site page but
+    not a same-site one (a sibling subdomain), and which a deployment switches
+    off entirely with ``COOKIE_SAMESITE=none`` for a cross-site frontend.
+
+    WHAT IT DECIDES, and why each rule:
+
+    * **An allowed origin** is one ``allowed_origins()`` returns — the same
+      environment-driven, exact-match, wildcard-free list the CORS middleware
+      uses, compared the same way (verbatim). One configuration, so the socket
+      can never accept an origin the REST API refuses or vice versa. A
+      same-origin deployment is covered because it must list its own origin in
+      ``FRONTEND_URL`` for OAuth anyway.
+    * **No ``Origin`` header** is allowed. Every browser sends ``Origin`` on a
+      WebSocket handshake, so its absence means a non-browser client — which is
+      not a CSWSH vector (it holds no victim's cookies, and could send any
+      ``Origin`` it liked). Such a client still has to authenticate with a valid
+      token, exactly as before. Rejecting it would break server-side and CLI
+      clients while buying no protection.
+    * **``Origin: null``** is always refused, even if someone configured it: it
+      is the one browser-sent value that identifies no site.
+    * **Anything else** is refused. In production an unconfigured allowlist is
+      empty, so every browser handshake is refused (fail closed, like CORS);
+      outside production the local dev defaults apply, like CORS.
+
+    Resolved per call rather than cached so it always reflects the same
+    environment ``allowed_origins()`` reads; the cost is a few environment reads
+    on a once-per-connection path.
+    """
+    if origin is None or origin == "":
+        return True
+    if origin == OPAQUE_ORIGIN:
+        return False
+    return origin in allowed_origins()

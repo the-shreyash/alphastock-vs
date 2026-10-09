@@ -124,12 +124,49 @@ class ModelRouter:
         """Report router + provider health and the task→model routing table.
 
         Powers the `/api/ai/status` endpoint and the frontend model-status pill.
+
+        D6.9 — `online` NO LONGER MEANS "A KEY IS PRESENT".
+        It used to be `debate_ready`, i.e. `bool(os.environ["ANTHROPIC_API_KEY"])`,
+        and the workspace header rendered that as **"AI ready"**. A revoked key,
+        a key with no credit and a healthy key are identical under that test, so
+        a deployment on which every model call was failing advertised *AI ready*
+        directly above a Morning Report carrying the provider's own outage text.
+
+        `online` now additionally requires that no configured provider is in an
+        observed-failure state (`services.ai_health`). The change is strictly
+        one-directional:
+
+          * no key            → offline, exactly as before
+          * key, no call yet  → online, exactly as before (nothing is known to
+                                be wrong, and a fresh process must behave as it
+                                did)
+          * key, last call OK → online, exactly as before
+          * key, last call    → **offline** — the only changed case, and the
+            FAILED             one the field was wrong about
+
+        `debate_ready` and `full_debate` keep their old capability meaning so
+        existing consumers are unaffected; `health` is additive.
         """
+        from services import ai_health
+
         engine_status = self._engine.get_status()
         routing = {
             key: {"role": p.role, "prefer": p.prefer, "version": p.version}
             for key, p in PROMPTS.items()
         }
+
+        health = {
+            name: ai_health.provider_status(
+                name, configured=engine_status[name]["configured"]
+            )
+            for name in ("claude", "gemini")
+        }
+        # A provider counts toward "online" when it is configured and is not
+        # currently failing. `verified` is not required: a process that has not
+        # yet made a call knows nothing, and refusing to serve AI on that basis
+        # would make every cold start read as an outage.
+        usable = [n for n, h in health.items() if h["configured"] and not h["degraded"]]
+
         return {
             "providers": {
                 "claude": engine_status["claude"],
@@ -137,7 +174,12 @@ class ModelRouter:
             },
             "debate_ready": engine_status["debate_ready"],
             "full_debate": engine_status["full_debate"],
-            "online": engine_status["debate_ready"],
+            "online": bool(usable),
+            # Observed outcomes, per provider. `last_error_class` is a label
+            # from the closed `observability.errors` vocabulary — never the
+            # provider's error string, which can carry a request id, an account
+            # identifier or an echoed prompt.
+            "health": health,
             "routing": routing,
             "policy": {
                 "claude": "deep reasoning, portfolio, risk, reports, coaching",

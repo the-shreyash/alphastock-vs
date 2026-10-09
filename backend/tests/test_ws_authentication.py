@@ -49,10 +49,12 @@ def _clean_manager():
     ws_manager.active.clear()
     ws_manager.user_connections.clear()
     ws_manager.channels.clear()
+    ws_manager.session_connections.clear()
     yield
     ws_manager.active.clear()
     ws_manager.user_connections.clear()
     ws_manager.channels.clear()
+    ws_manager.session_connections.clear()
 
 
 def _token(user_doc):

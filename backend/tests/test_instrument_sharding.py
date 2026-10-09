@@ -104,6 +104,7 @@ from tests.test_broker_streaming import (
     run,
 )
 from tests.test_provider_probation import FakeClock, _tick
+from _accounts import account_ref, fixture_account_id  # noqa: E402
 
 BACKEND = pathlib.Path(__file__).resolve().parent.parent
 
@@ -463,9 +464,9 @@ def test_a_sharded_account_registers_exactly_one_provider():
     from services.brokers.market_feed import attach_market_feed, feed_provider_name
 
     with _clean_provider_registry() as registry, nova_registered(_ShardingNova()):
-        name = run(attach_market_feed("u1", "nova", ("A", "B", "C", "D", "E"),
+        name = run(attach_market_feed(account_ref("u1", "nova"), ("A", "B", "C", "D", "E"),
                                       ("0", "1", "2")))
-        assert name == feed_provider_name("u1", "nova")
+        assert name == feed_provider_name(account_ref("u1", "nova"))
         mine = [n for n in registry._providers if n.startswith("brokerfeed:nova:")]
         assert mine == [name], "a shard was registered as a provider of its own"
         assert registry.get(name).shard_count == 3
@@ -926,11 +927,11 @@ def test_a_fictional_broker_shards_through_the_real_attach_seam():
         with patch.object(engine, "get_session", new=AsyncMock(return_value={"access_token": "t"})), \
                 patch.object(stream_manager, "start_stream", new=record), \
                 patch.object(stream_manager, "status", return_value=[]):
-            run(engine.start_stream("u1", "nova", holdings=holdings, positions=[]))
+            run(engine.start_stream(account_ref("u1", "nova"), holdings=holdings, positions=[]))
 
         assert [k["shard"] for k in started] == ["0", "1", "2"]
         assert [list(k["instrument_tokens"]) for k in started] == [["A", "B"], ["C", "D"], ["E"]]
-        provider = registry.get(feed_provider_name("u1", "nova"))
+        provider = registry.get(feed_provider_name(account_ref("u1", "nova")))
         assert provider is not None and provider.shard_count == 3
 
 
@@ -962,9 +963,9 @@ def test_a_tick_is_attributed_to_the_connection_it_arrived_on():
         with patch.object(engine, "get_session", new=AsyncMock(return_value={"access_token": "t"})), \
                 patch.object(stream_manager, "start_stream", new=record), \
                 patch.object(stream_manager, "status", return_value=[]):
-            run(engine.start_stream("u1", "nova", holdings=holdings, positions=[]))
+            run(engine.start_stream(account_ref("u1", "nova"), holdings=holdings, positions=[]))
 
-        provider = registry.get(feed_provider_name("u1", "nova"))
+        provider = registry.get(feed_provider_name(account_ref("u1", "nova")))
         assert set(opened) == {"0", "1"} and provider.shard_count == 2
 
         # Both connections report up through their own bound callback.
@@ -1031,14 +1032,14 @@ def _engine_with_manager():
 
 def _plan_of(manager, broker="nova", channel="market"):
     return {
-        row["shard"]: tuple(manager.get(row["user_id"], broker, channel, row["shard"]).instrument_tokens)
+        row["shard"]: tuple(manager.get(row["broker_account_id"], channel, row["shard"]).instrument_tokens)
         for row in manager.status() if row["channel"] == channel
     }
 
 
 def _sync(engine, symbols):
     holdings = [{"symbol": s, "quantity": 1} for s in symbols]
-    run(engine.start_stream("u1", "nova", holdings=holdings, positions=[]))
+    run(engine.start_stream(account_ref("u1", "nova"), holdings=holdings, positions=[]))
 
 
 def test_the_initial_subscription_opens_one_connection_per_shard():
@@ -1059,10 +1060,10 @@ def test_adding_instruments_leaves_the_unchanged_connections_alone():
     with _engine_with_manager() as (engine, manager), _clean_provider_registry(), \
             nova_registered(_ShardingNova()):
         _sync(engine, ["A", "B", "C"])
-        kept = manager.get("u1", "nova", "market", "0")
+        kept = manager.get(fixture_account_id("u1", "nova"), "market", "0")
         _sync(engine, ["A", "B", "C", "D"])
         assert _plan_of(manager) == {"0": ("A", "B"), "1": ("C", "D")}
-        assert manager.get("u1", "nova", "market", "0") is kept, (
+        assert manager.get(fixture_account_id("u1", "nova"), "market", "0") is kept, (
             "an unchanged connection was torn down and rebuilt")
 
 
@@ -1071,10 +1072,10 @@ def test_adding_enough_instruments_opens_another_connection():
             nova_registered(_ShardingNova()):
         _sync(engine, ["A", "B"])
         assert set(_plan_of(manager)) == {"0"}
-        kept = manager.get("u1", "nova", "market", "0")
+        kept = manager.get(fixture_account_id("u1", "nova"), "market", "0")
         _sync(engine, ["A", "B", "C"])
         assert set(_plan_of(manager)) == {"0", "1"}
-        assert manager.get("u1", "nova", "market", "0") is kept
+        assert manager.get(fixture_account_id("u1", "nova"), "market", "0") is kept
 
 
 def test_removing_enough_instruments_collapses_the_extra_connection():
@@ -1085,8 +1086,8 @@ def test_removing_enough_instruments_collapses_the_extra_connection():
         assert set(_plan_of(manager)) == {"0", "1", "2"}
         _sync(engine, ["A", "B"])
         assert _plan_of(manager) == {"0": ("A", "B")}
-        assert manager.get("u1", "nova", "market", "1") is None
-        assert manager.get("u1", "nova", "market", "2") is None
+        assert manager.get(fixture_account_id("u1", "nova"), "market", "1") is None
+        assert manager.get(fixture_account_id("u1", "nova"), "market", "2") is None
 
 
 def test_resharding_never_drops_or_duplicates_an_instrument():
@@ -1112,16 +1113,16 @@ def test_a_reconnect_of_one_connection_does_not_touch_the_others():
     with _engine_with_manager() as (engine, manager), _clean_provider_registry(), \
             nova_registered(_ShardingNova()):
         _sync(engine, ["A", "B", "C", "D"])
-        healthy = manager.get("u1", "nova", "market", "0")
-        broken = manager.get("u1", "nova", "market", "1")
+        healthy = manager.get(fixture_account_id("u1", "nova"), "market", "0")
+        broken = manager.get(fixture_account_id("u1", "nova"), "market", "1")
         run(broken.stop())
 
         _sync(engine, ["A", "B", "C", "D"])
 
-        assert manager.get("u1", "nova", "market", "0") is healthy, (
+        assert manager.get(fixture_account_id("u1", "nova"), "market", "0") is healthy, (
             "a healthy connection was re-probed")
-        assert manager.get("u1", "nova", "market", "1") is not broken
-        assert manager.get("u1", "nova", "market", "1").running
+        assert manager.get(fixture_account_id("u1", "nova"), "market", "1") is not broken
+        assert manager.get(fixture_account_id("u1", "nova"), "market", "1").running
 
 
 def test_a_changed_session_rebuilds_every_connection():
@@ -1129,11 +1130,11 @@ def test_a_changed_session_rebuilds_every_connection():
     with _engine_with_manager() as (engine, manager), _clean_provider_registry(), \
             nova_registered(_ShardingNova()):
         _sync(engine, ["A", "B", "C"])
-        before = {s: manager.get("u1", "nova", "market", s) for s in ("0", "1")}
+        before = {s: manager.get(fixture_account_id("u1", "nova"), "market", s) for s in ("0", "1")}
         with patch.object(engine, "get_session", new=AsyncMock(return_value={"access_token": "new"})):
             _sync(engine, ["A", "B", "C"])
         for shard, stream in before.items():
-            assert manager.get("u1", "nova", "market", shard) is not stream
+            assert manager.get(fixture_account_id("u1", "nova"), "market", shard) is not stream
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1207,7 +1208,7 @@ def test_no_credential_reaches_a_shard_id_a_registry_key_or_a_log(caplog):
                 instrument_tokens=list(shard.instruments),
                 channel="market", shard=shard.id,
             )
-            manager._streams[("u1", "nova", "market", shard.id)] = stream
+            manager._streams[(fixture_account_id("u1", "nova"), "market", shard.id)] = stream
             assert stream.shard == shard.id
 
         feed = StreamingTickProvider("brokerfeed:nova:u1", owner_user_id="u1")
@@ -1374,17 +1375,17 @@ def test_an_entitlement_refusal_does_not_retry_through_the_transport_ladder():
     engine = BrokerEngine()
     stopped = []
 
-    async def record_stop(user_id, broker, channel=None, shard=None):
-        stopped.append((user_id, broker, channel, shard))
+    async def record_stop(broker_account_id, channel=None, shard=None):
+        stopped.append((broker_account_id, channel, shard))
 
     with _clean_provider_registry(), nova_registered(_ShardingNova()), \
             patch.object(stream_manager, "discard", return_value=True) as discarded, \
             patch.object(stream_manager, "stop_stream", new=record_stop), \
             patch.object(engine, "_audit", new=AsyncMock()):
-        run(engine._on_stream_not_entitled("u1", "nova", "market", shard="1"))
+        run(engine._on_stream_not_entitled(account_ref("u1", "nova"), "market", shard="1"))
 
-    discarded.assert_called_once_with("u1", "nova", "market", "1")
-    assert stopped == [("u1", "nova", "market", None)], (
+    discarded.assert_called_once_with(fixture_account_id("u1", "nova"), "market", "1")
+    assert stopped == [(fixture_account_id("u1", "nova"), "market", None)], (
         "the refusal did not end every connection of the refused channel")
 
 
@@ -1403,9 +1404,9 @@ def test_an_expired_token_discards_only_the_reporting_connection():
             patch.object(stream_manager, "discard", return_value=True) as discarded, \
             patch.object(stream_manager, "stop_stream", new=AsyncMock()), \
             patch.object(engine, "_audit", new=AsyncMock()):
-        run(engine._on_stream_expired("u1", "nova", "market", shard="2"))
+        run(engine._on_stream_expired(account_ref("u1", "nova"), "market", shard="2"))
 
-    discarded.assert_called_once_with("u1", "nova", "market", "2")
+    discarded.assert_called_once_with(fixture_account_id("u1", "nova"), "market", "2")
 
 
 def test_the_transport_registry_would_replace_a_sibling_without_the_shard_key():
@@ -1417,7 +1418,7 @@ def test_the_transport_registry_would_replace_a_sibling_without_the_shard_key():
     """
     manager = BrokerStreamManager()
     for shard in ("0", "1", "2"):
-        manager._streams[("u1", "nova", "market", shard)] = object()
+        manager._streams[(fixture_account_id("u1", "nova"), "market", shard)] = object()
     assert len(manager._streams) == 3
     collapsed = {("u1", "nova", "market") for _ in manager._streams}
     assert len(collapsed) == 1, "the mutation did not take"
@@ -1436,12 +1437,12 @@ def test_stopping_a_channel_stops_every_one_of_its_connections():
             stopped.append(self.key)
 
     for shard in ("0", "1", "2"):
-        manager._streams[("u1", "nova", "market", shard)] = _Fake(shard)
-    manager._streams[("u1", "nova", "orders", "0")] = _Fake("orders")
+        manager._streams[(fixture_account_id("u1", "nova"), "market", shard)] = _Fake(shard)
+    manager._streams[(fixture_account_id("u1", "nova"), "orders", "0")] = _Fake("orders")
 
-    run(manager.stop_stream("u1", "nova", "market"))
+    run(manager.stop_stream(fixture_account_id("u1", "nova"), "market"))
     assert sorted(stopped) == ["0", "1", "2"]
-    assert ("u1", "nova", "orders", "0") in manager._streams
+    assert (fixture_account_id("u1", "nova"), "orders", "0") in manager._streams
 
 
 # ══════════════════════════════════════════════════════════════════

@@ -67,6 +67,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Optional, Sequence
 
+from services.brokers.accounts import BrokerAccountRef
 from services.brokers.capabilities import BrokerCapability
 from services.brokers.gateway import broker_gateway
 from services.brokers.sharding import DEFAULT_SHARD_ID
@@ -87,21 +88,26 @@ logger = logging.getLogger(__name__)
 FEED_NAME_PREFIX = "brokerfeed"
 
 
-def feed_provider_name(user_id: Any, broker: str) -> str:
+def feed_provider_name(account: "BrokerAccountRef") -> str:
     """The stable registry name for one account's market feed.
 
-    Carries the broker name and the user id. Both are legitimate *here*: a
-    provider name reaches the registry, the gateway's logs and the admin
-    diagnostics surface and nowhere else — `source_manager.status()`, every
-    normalized event and every API response carry a `source_tier` and no
-    identity at all (Developer Rule 4).
+    Carries the broker name and the `broker_account_id`. Both are legitimate
+    *here*: a provider name reaches the registry, the gateway's logs and the
+    admin diagnostics surface and nowhere else — `source_manager.status()`, every
+    normalized event and every API response carry a `source_tier` and no identity
+    at all (Developer Rule 4).
+
+    D6.4 replaced the user id in the third segment with the account id. The old
+    name made a user's two accounts at one broker share ONE provider: the second
+    account's attach replaced the first's registration and its symbol coverage,
+    and disconnecting either one detached the feed both were using. A feed is a
+    property of the socket, and the socket belongs to an account.
     """
-    return f"{FEED_NAME_PREFIX}:{broker}:{user_id}"
+    return f"{FEED_NAME_PREFIX}:{account.broker}:{account.broker_account_id}"
 
 
 async def attach_market_feed(
-    user_id: Any,
-    broker: str,
+    account: "BrokerAccountRef",
     symbols: Optional[Sequence[str]] = None,
     shards: Optional[Sequence[str]] = None,
 ) -> Optional[str]:
@@ -144,8 +150,9 @@ async def attach_market_feed(
     Idempotent. A reconnecting stream re-registers under the same name and
     replaces the provider bound to the socket that died.
     """
-    if not user_id or not broker:
+    if account is None or not account.user_id or not account.broker:
         return None
+    broker = account.broker
     if not broker_gateway.supports(broker, BrokerCapability.TICK_STREAM):
         logger.debug(
             "Broker %s does not declare %s — not registering it as a market-data provider",
@@ -154,8 +161,13 @@ async def attach_market_feed(
         )
         return None
 
-    name = feed_provider_name(user_id, broker)
-    provider = StreamingTickProvider(name, owner_user_id=str(user_id))
+    name = feed_provider_name(account)
+    # The provider is named per account and OWNED per user. Entitlement is a
+    # property of the person, not of the account: a user with two Zerodha
+    # accounts has two feeds, and both are theirs to consume. Keeping the owner
+    # at user scope is what stops D5's per-user entitlement check from having to
+    # learn about accounts at all.
+    provider = StreamingTickProvider(name, owner_user_id=account.user_id)
     provider.declare_shards(shards or ())
     await market_gateway.register_streaming_provider(provider)
     if symbols:
@@ -163,7 +175,7 @@ async def attach_market_feed(
     return name
 
 
-async def set_market_feed_link(user_id: Any, broker: str, *, up: bool,
+async def set_market_feed_link(account: "BrokerAccountRef", *, up: bool,
                                reason: str = "", shard: str = DEFAULT_SHARD_ID) -> bool:
     """Relay one of this account's transport connect/disconnects to its provider.
 
@@ -191,7 +203,7 @@ async def set_market_feed_link(user_id: Any, broker: str, *, up: bool,
     (freshness, the tier a user is told they are on, latency, stability)
     tightens immediately. See `StreamingTickProvider.mark_link_down`.
     """
-    provider = provider_registry.get(feed_provider_name(user_id, broker))
+    provider = provider_registry.get(feed_provider_name(account))
     if provider is None:
         return False
     if up:
@@ -200,8 +212,7 @@ async def set_market_feed_link(user_id: Any, broker: str, *, up: bool,
 
 
 async def detach_market_feed(
-    user_id: Any,
-    broker: str,
+    account: "BrokerAccountRef",
     *,
     change_reason: Optional[FeedChangeReason] = None,
 ) -> bool:
@@ -223,13 +234,13 @@ async def detach_market_feed(
     D3 — the broker layer names a Market Engine value, and the Market Engine
     imports nothing from here.
     """
-    if not user_id or not broker:
+    if account is None or not account.user_id or not account.broker:
         return False
     return await market_gateway.unregister_streaming_provider(
-        feed_provider_name(user_id, broker), change_reason=change_reason)
+        feed_provider_name(account), change_reason=change_reason)
 
 
-async def publish_market_ticks(user_id: Any, broker: str, ticks: Sequence[Any],
+async def publish_market_ticks(account: "BrokerAccountRef", ticks: Sequence[Any],
                                shard: str = DEFAULT_SHARD_ID) -> int:
     """Push a batch of canonical ticks into this account's provider.
 
@@ -254,7 +265,7 @@ async def publish_market_ticks(user_id: Any, broker: str, ticks: Sequence[Any],
     """
     if not ticks:
         return 0
-    provider = provider_registry.get(feed_provider_name(user_id, broker))
+    provider = provider_registry.get(feed_provider_name(account))
     if provider is None:
         return 0
     return await provider.on_raw(list(ticks), shard)

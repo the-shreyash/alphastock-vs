@@ -503,7 +503,9 @@ class SourceManager:
         #: user_id -> {broker_name: (capabilities,)}. Populated from Event Bus
         #: broker lifecycle events; never written by anything that imports a
         #: broker module.
-        self._connected_brokers: Dict[str, Dict[str, Tuple[str, ...]]] = {}
+        #: user_id -> {broker_account_id: (broker, capabilities)}. Keyed by the
+        #: account since D6.4 — see `record_broker_connected`.
+        self._connected_brokers: Dict[str, Dict[str, Tuple[str, Tuple[str, ...]]]] = {}
         self._broker_events_subscribed = False
 
     @property
@@ -878,38 +880,59 @@ class SourceManager:
     async def _on_broker_connected(self, event: Dict[str, Any]) -> None:
         data = event.get("data") or {}
         self.record_broker_connected(
-            data.get("user_id"), data.get("broker"), data.get("capabilities") or [])
+            data.get("user_id"), data.get("broker"), data.get("capabilities") or [],
+            broker_account_id=data.get("broker_account_id"))
 
     async def _on_broker_disconnected(self, event: Dict[str, Any]) -> None:
         data = event.get("data") or {}
-        self.record_broker_disconnected(data.get("user_id"), data.get("broker"))
+        self.record_broker_disconnected(
+            data.get("user_id"), data.get("broker"),
+            broker_account_id=data.get("broker_account_id"))
 
     def record_broker_connected(self, user_id: Optional[str], broker: Optional[str],
-                                capabilities: Any = ()) -> None:
-        """Record that `user_id` has `broker` connected, with `capabilities`.
+                                capabilities: Any = (),
+                                *, broker_account_id: Optional[str] = None) -> None:
+        """Record that `user_id` has this brokerage account connected.
 
         Separate from the event handler so the state transition is callable and
         assertable without constructing an event envelope — and so a future
         caller with the information in hand does not have to publish an event to
         itself.
+
+        D6.4 — the inner map is keyed by `broker_account_id`, not by the broker
+        name. With the name as the key a user's two accounts at one broker shared
+        one entry, so disconnecting either one removed the broker from the
+        registry while the other was still streaming, and the priority algorithm
+        was told the user had no broker feed. The *public* answers
+        (`connected_brokers`, `streaming_brokers`) are still broker names, because
+        that is the question the priority algorithm asks; the deduplication moved
+        into the reader.
+
+        `broker_account_id=None` falls back to the broker name as the key, which
+        reproduces the pre-D6.4 behaviour exactly. This registry is a diagnostics
+        and priority record — it resolves nothing and authorizes nothing — so the
+        fallback costs no correctness for a caller that does not carry an account.
         """
         if not user_id or not broker:
             logger.warning("Ignoring broker.connected with no user or broker: %r/%r",
                            user_id, broker)
             return
-        self._connected_brokers.setdefault(str(user_id), {})[broker] = tuple(capabilities)
+        key = str(broker_account_id or broker)
+        self._connected_brokers.setdefault(str(user_id), {})[key] = (
+            broker, tuple(capabilities))
         logger.info("Source Manager: broker %s connected for user %s (capabilities=%s)",
                     broker, user_id, ",".join(capabilities) or "none")
 
     def record_broker_disconnected(self, user_id: Optional[str],
-                                   broker: Optional[str]) -> None:
-        """Record that `user_id` no longer has `broker` connected."""
+                                   broker: Optional[str],
+                                   *, broker_account_id: Optional[str] = None) -> None:
+        """Record that `user_id` no longer has this brokerage account connected."""
         if not user_id or not broker:
             return
         brokers = self._connected_brokers.get(str(user_id))
         if not brokers:
             return
-        brokers.pop(broker, None)
+        brokers.pop(str(broker_account_id or broker), None)
         if not brokers:
             # Drop the empty user entry rather than keeping it. This map is
             # per-process and unbounded otherwise: one residual key per user who
@@ -918,10 +941,19 @@ class SourceManager:
         logger.info("Source Manager: broker %s disconnected for user %s", broker, user_id)
 
     def connected_brokers(self, user_id: Optional[str]) -> List[str]:
-        """Brokers this user currently has connected, in connection order."""
+        """Brokers this user currently has connected, in connection order.
+
+        De-duplicated: a user with two accounts at one broker has that broker
+        connected once, not twice. Order is first-connection order, which is what
+        it has always been.
+        """
         if not user_id:
             return []
-        return list(self._connected_brokers.get(str(user_id), {}))
+        names: List[str] = []
+        for broker, _capabilities in self._connected_brokers.get(str(user_id), {}).values():
+            if broker not in names:
+                names.append(broker)
+        return names
 
     def streaming_brokers(self, user_id: Optional[str]) -> List[str]:
         """Connected brokers whose feed could serve streaming market data.
@@ -940,11 +972,11 @@ class SourceManager:
         """
         if not user_id:
             return []
-        return [
-            broker
-            for broker, capabilities in self._connected_brokers.get(str(user_id), {}).items()
-            if TICK_STREAM_CAPABILITY in capabilities
-        ]
+        names: List[str] = []
+        for broker, capabilities in self._connected_brokers.get(str(user_id), {}).values():
+            if TICK_STREAM_CAPABILITY in capabilities and broker not in names:
+                names.append(broker)
+        return names
 
     def has_broker_connected(self, user_id: Optional[str]) -> bool:
         return bool(self.connected_brokers(user_id))

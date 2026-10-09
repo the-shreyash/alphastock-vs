@@ -47,6 +47,7 @@ strict.
 """
 from __future__ import annotations
 
+import ipaddress
 import logging
 import os
 import time
@@ -342,16 +343,72 @@ PUBLIC_API = _policy("api_ip", 60, 60, "ip")
 # --------------------------------------------------------------------------- #
 # Request helpers (shared by inline callers and the middleware)                 #
 # --------------------------------------------------------------------------- #
-def client_ip(request: Request) -> str:
-    """Best-effort client IP. Honors the first hop of ``X-Forwarded-For`` behind a
-    trusted proxy, else the socket peer. ``unknown`` if neither is available (so a
-    key is always well-formed)."""
+#: Name of a request header the deployment's edge proxy sets and the client
+#: cannot forge (e.g. ``X-Real-IP`` on Railway). Unset by default.
+TRUSTED_CLIENT_IP_HEADER_ENV = "TRUSTED_CLIENT_IP_HEADER"
+
+
+def _trusted_client_ip_header() -> str:
+    """Read at call time (not import time) so a deployment and a test can both
+    change it without reloading this module."""
+    return os.environ.get(TRUSTED_CLIENT_IP_HEADER_ENV, "").strip().lower()
+
+
+def resolve_client_ip(request) -> Optional[str]:
+    """The client IP this deployment can actually trust, or ``None``.
+
+    The single resolver shared by the rate limiter (:func:`client_ip`) and the
+    audit log (``security.audit.request_context``), so the two always attribute
+    a request to the same identity.
+
+    WHY THE TRUSTED-HEADER MODE EXISTS (deployment preparation, closes PH3.5 S-1
+    for proxied deployments). The default mode below honors the *leftmost*
+    ``X-Forwarded-For`` hop, and the leftmost hop is whatever the client sent:
+    common edge proxies — Railway's included — APPEND the real peer to a
+    client-supplied ``X-Forwarded-For`` rather than replacing it. Because the
+    login policy is keyed ``ip:account``, rotating a forged header hands an
+    attacker a fresh attempt budget per value, i.e. unbounded online password
+    guessing against any account. uvicorn's ``--forwarded-allow-ips`` does not
+    help: it rewrites ``scope["client"]`` but leaves the raw header this
+    function reads untouched.
+
+    ``TRUSTED_CLIENT_IP_HEADER`` names the header the edge proxy itself
+    overwrites (Railway documents ``X-Real-IP`` for exactly this). When it is
+    set, that header is the ONLY forwarded source consulted: if the value is
+    list-shaped the rightmost element — the one appended by the nearest proxy —
+    is used; a missing or unparseable value falls back to the socket peer, never
+    to ``X-Forwarded-For``, because the operator has declared the client-facing
+    headers untrustworthy.
+
+    Unset, behaviour is byte-for-byte the pre-existing PH1.7 contract, which is
+    correct for a deployment with no proxy in front of it or with a proxy that
+    replaces ``X-Forwarded-For`` outright.
+    """
+    header = _trusted_client_ip_header()
+    peer = request.client.host if request.client else None
+    if header:
+        raw = request.headers.get(header) or ""
+        candidate = raw.split(",")[-1].strip()
+        if candidate:
+            try:
+                return str(ipaddress.ip_address(candidate))
+            except ValueError:
+                logger.warning("Ignoring unparseable %s value in the trusted "
+                               "client-IP header; using the socket peer.", header)
+        return peer
+
     xff = request.headers.get("x-forwarded-for")
     if xff:
         first = xff.split(",")[0].strip()
         if first:
             return first
-    return request.client.host if request.client else "unknown"
+    return peer
+
+
+def client_ip(request: Request) -> str:
+    """Best-effort client IP for rate-limit keys (see :func:`resolve_client_ip`).
+    ``unknown`` if nothing is available, so a key is always well-formed."""
+    return resolve_client_ip(request) or "unknown"
 
 
 def _authenticated_user_id(request: Request) -> Optional[str]:

@@ -180,7 +180,11 @@ async def publish_all(db, quotes: dict, reason: str = "monitor") -> int:
     ``quotes`` is the shared prefetch for the whole pass (one fan-out per
     cycle, never per user). Returns the number of users notified.
     """
-    open_trades = await db.trades.find({"status": "OPEN"}).to_list(500)
+    # D6.7 — streamed. The per-user grouping below is built from this list, so
+    # a cap here did not truncate one user's snapshot; it dropped whole users.
+    from services import fanout
+    open_trades = await fanout.collect(
+        db.trades.find({"status": "OPEN"}), label="trade_stream.publish_all")
     by_user: dict = {}
     for t in open_trades:
         by_user.setdefault(str(t.get("user_id")), []).append(t)

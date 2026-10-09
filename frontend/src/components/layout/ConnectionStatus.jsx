@@ -15,7 +15,7 @@
 import { useRealtimeStore, selectConnectionStatus } from "../../store/realtimeStore";
 
 const STATES = {
-  live: { label: "Live", color: "var(--profit)", pulse: false },
+  live: { label: "Live", color: "var(--gain)", pulse: false },
   connecting: { label: "Connecting", color: "#F59E0B", pulse: true },
   reconnecting: { label: "Reconnecting", color: "#F59E0B", pulse: true },
   offline: { label: "Offline", color: "var(--loss)", pulse: false },

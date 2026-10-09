@@ -1,21 +1,20 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import api from "../services/api";
-import { formatCurrency, formatNumber, formatPercent } from "../utils/formatters";
+import { formatNumber } from "../utils/formatters";
 import { useWebSocket } from "../hooks/useWebSocket";
 import { usePriceFlash } from "../hooks/usePriceFlash";
 import { applyLivePrices, applyLiveIndexPrices } from "../lib/livePrices";
+import { deriveReportStatus, formatAge, formatInstant, Freshness } from "../lib/reportProvenance";
 import AnimatedNumber from "../components/ui/AnimatedNumber";
 import {
-  TrendingUp, TrendingDown, Activity, BarChart3,
-  ArrowUpRight, ArrowDownRight, Zap, Brain, RefreshCw,
+  Activity, BarChart3, Brain,
   Wifi, WifiOff, ChevronRight, Eye, GraduationCap,
-  Briefcase, LineChart, Newspaper, Bell, Star,
-  Clock, Search, Sparkles, Globe, DollarSign,
-  PlusCircle, FileText, BookOpen
+  Briefcase, Newspaper, Bell, Star,
+  Clock, Sparkles, Globe,
+  PlusCircle, FileText
 } from "lucide-react";
 import { useAuth } from "../context/AuthContext";
-import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer } from "recharts";
 import { motion } from "framer-motion";
 import MarketEngineStatus from "../components/market/MarketEngineStatus";
 import RankingTable from "../components/market/RankingTable";
@@ -24,6 +23,7 @@ import {
   selectWatchlistEvent, selectMorningReportReadyAt,
 } from "../store/realtimeStore";
 import EconomicCalendar from "../components/market/EconomicCalendar";
+import { PageHeader, MetricCard, StatusBadge, InsightCard, Card } from "../components/ds";
 
 /* ====== Constants ====== */
 const RECENT_STOCKS_KEY = "sa_recent_stocks";
@@ -99,57 +99,31 @@ function QuickActions() {
  * inert div — so this component is still usable for a number that has no
  * detail page behind it.
  */
+/**
+ * The index-strip card.
+ *
+ * This is now a thin adapter over the shared `MetricCard`: it keeps the two
+ * things that are genuinely dashboard-specific — the price-flash animation on
+ * a changing tick, and navigation to the instrument's detail page — and
+ * delegates presentation to the design system, so the strip cannot drift away
+ * from the metric cards on Markets, Portfolio and Trading.
+ */
 function StatCard({ label, value, numericValue, change, changePct, sparkData, testId, symbol }) {
-  const isPos = (change ?? changePct ?? 0) >= 0;
   const flashRef = usePriceFlash(numericValue);
   const navigate = useNavigate();
 
-  const Card = symbol ? "button" : "div";
-  const interactive = symbol
-    ? {
-        type: "button",
-        onClick: () => navigate(`/stock/${symbol}`),
-        "aria-label": `${label} details`,
-        className: "stat-card relative overflow-hidden w-full text-left cursor-pointer transition-transform hover:scale-[1.01]",
-      }
-    : { className: "stat-card relative overflow-hidden" };
-
   return (
-    <Card data-testid={testId} {...interactive}>
-      <span className="stat-label block mb-1.5">{label}</span>
-      <div ref={flashRef} className="stat-value inline-block rounded-md px-0.5">{value || "—"}</div>
-      {changePct != null && (
-        <div className="flex items-center gap-1 mt-1 text-[11px] font-mono font-semibold" style={{ color: isPos ? "var(--gain)" : "var(--loss)" }}>
-          {isPos ? <ArrowUpRight size={11} /> : <ArrowDownRight size={11} />}
-          <span>{isPos ? "+" : ""}{changePct?.toFixed(2)}%</span>
-          {change != null && <span className="font-normal" style={{ color: "var(--text-muted)" }}>({isPos ? "+" : ""}{formatNumber(change)})</span>}
-        </div>
-      )}
-      {/* Mini sparkline overlay */}
-      {sparkData?.length > 1 && (
-        <div className="absolute bottom-0 right-0 w-24 h-10 opacity-30 pointer-events-none">
-          <ResponsiveContainer width="100%" height="100%">
-            <AreaChart data={sparkData} margin={{ top: 0, right: 0, left: 0, bottom: 0 }}>
-              <defs>
-                <linearGradient id={`spark-${testId}`} x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="0%" stopColor={isPos ? "var(--gain)" : "var(--loss)"} stopOpacity={0.4} />
-                  <stop offset="100%" stopColor={isPos ? "var(--gain)" : "var(--loss)"} stopOpacity={0} />
-                </linearGradient>
-              </defs>
-              <Area
-                type="monotone"
-                dataKey="close"
-                stroke={isPos ? "var(--gain)" : "var(--loss)"}
-                strokeWidth={1.5}
-                fill={`url(#spark-${testId})`}
-                dot={false}
-                isAnimationActive={false}
-              />
-            </AreaChart>
-          </ResponsiveContainer>
-        </div>
-      )}
-    </Card>
+    <MetricCard
+      data-testid={testId}
+      label={label}
+      value={value || "—"}
+      valueRef={flashRef}
+      changePct={changePct}
+      change={changePct != null ? change : null}
+      sparkData={sparkData}
+      onClick={symbol ? () => navigate(`/stock/${symbol}`) : undefined}
+      aria-label={symbol ? `${label} details` : undefined}
+    />
   );
 }
 
@@ -343,64 +317,96 @@ function LatestLessonsCard({ lessons, loading: lLoading }) {
 }
 
 /* ====== Morning Report Summary ====== */
+/**
+ * The dashboard's AI market summary.
+ *
+ * Rendered through the shared `InsightCard`, which is what holds this surface
+ * to the product rule that an AI statement always carries its reasoning: the
+ * briefing is the observation, the global cues are why it matters, and the top
+ * key risk is what to watch. Passing them as named slots rather than
+ * concatenating them into one paragraph is what keeps a missing rationale
+ * visible instead of invisible.
+ */
 function MorningReportCard({ report, loading: rLoading }) {
-  return (
-    <div data-testid="morning-report-card" className="glass-card p-5">
-      <h3 className="eyebrow mb-3">
-        AI Morning Report
-      </h3>
-      {rLoading ? (
+  if (rLoading) {
+    return (
+      <Card data-testid="morning-report-card" padding="md">
+        <h3 className="eyebrow mb-3">Morning Report</h3>
         <div className="space-y-2">
           {[100, 80, 60].map(w => <div key={w} className="h-3 rounded-lg skeleton" style={{ width: `${w}%` }} />)}
         </div>
-      ) : !report || report.available === false ? (
+      </Card>
+    );
+  }
+
+  if (!report || report.available === false) {
+    return (
+      <Card data-testid="morning-report-card" padding="md">
+        <h3 className="eyebrow mb-3">Morning Report</h3>
         <p className="text-[12px] py-4 text-center" style={{ color: "var(--text-muted)" }}>
           {report?.note || "Morning report unavailable — live market data unreachable."}
         </p>
-      ) : (
-        <>
-          <div className="flex items-center gap-2 mb-3">
-            <span className="w-2.5 h-2.5 rounded-full" style={{
-              background: report.market_mood === "Bullish" ? "var(--gain)" : report.market_mood === "Bearish" ? "var(--loss)" : "#F59E0B"
-            }} />
-            <span className="text-lg font-bold font-display" style={{
-              color: report.market_mood === "Bullish" ? "var(--gain)" : report.market_mood === "Bearish" ? "var(--loss)" : "var(--text-primary)"
-            }}>
-              {report.market_mood || "Neutral"}
-            </span>
-          </div>
-          <p className="body-text mb-3">
-            {report.ai_briefing || "Briefing unavailable right now."}
-          </p>
-          {report.global_cues && (
-            <div className="mb-2">
-              <span className="text-[10px] font-bold uppercase tracking-wider" style={{ color: "var(--text-muted)" }}>Global Cues: </span>
-              <span className="text-[12px] font-medium" style={{ color: "var(--text-secondary)" }}>{report.global_cues}</span>
-            </div>
-          )}
-          {report.key_risks?.length > 0 && (
-            <div>
-              <span className="text-[10px] font-bold uppercase tracking-wider" style={{ color: "var(--text-muted)" }}>Key Risk: </span>
-              <span className="text-[12px]" style={{ color: "var(--text-secondary)" }}>{report.key_risks[0]}</span>
-            </div>
-          )}
-          <Link to="/morning-report" className="inline-flex items-center gap-1 mt-3 text-[11px] font-semibold transition-all hover:opacity-80" style={{ color: "var(--ai-accent)" }}>
-            View full report <ChevronRight size={12} />
+      </Card>
+    );
+  }
+
+  const mood = report.market_mood || "Neutral";
+  const moodTone = mood === "Bullish" ? "positive" : mood === "Bearish" ? "negative" : "warning";
+
+  // D6.9 — the same derivation the Morning Report page uses, so the two
+  // surfaces cannot disagree about whether a model wrote this briefing or how
+  // old it is. The card previously hardcoded "AI Morning Report" over whatever
+  // string `ai_briefing` happened to hold, including, on a deployment with a
+  // dead API key, the provider's own outage message.
+  const status = deriveReportStatus(report);
+  const generatedInstant = formatInstant(status.completedAt);
+  const age = formatAge(status.ageSeconds);
+  const isStale = status.freshness === Freshness.STALE || status.freshness === Freshness.VERY_STALE;
+
+  return (
+    <InsightCard
+      data-testid="morning-report-card"
+      category={<StatusBadge tone={moodTone} size="sm">{mood}</StatusBadge>}
+      title={status.isAIGenerated ? "AI Morning Report" : "Morning Report"}
+      summary={report.ai_briefing || "Briefing unavailable right now."}
+      rationale={report.global_cues || undefined}
+      watch={report.key_risks?.[0] || undefined}
+      action={
+        <div className="flex items-center justify-between gap-3 flex-wrap w-full">
+          {/* Generation time, or the explicit absence of it — never the render
+              time, and never omitted in a way that reads as "just now". */}
+          <span className="text-[11px] font-mono" data-testid="morning-report-card-provenance"
+            style={{ color: isStale ? "#f59e0b" : "var(--text-muted)" }}>
+            {generatedInstant
+              ? `${isStale ? "⚠ Stale · " : ""}Generated ${generatedInstant}${age ? ` · ${age} ago` : ""}`
+              : "Generation time not recorded"}
+          </span>
+          <Link to="/morning-report" className="inline-flex items-center gap-1 text-[12px] font-semibold transition-all hover:opacity-80" style={{ color: "var(--brand-accent)" }}>
+            View full report <ChevronRight size={13} />
           </Link>
-        </>
-      )}
-    </div>
+        </div>
+      }
+    />
   );
 }
 
-/* ====== Top AI Picks ====== */
+/* ====== Top Picks ======
+   D6.9 — headed "Top AI Picks". These come from `fetch_real_top_picks`, a
+   deterministic RSI / volume / MACD / pattern scan that has never called a
+   model, so the "AI" in the heading was a claim about how the numbers were
+   produced, and it was false. The scan is a real, defensible product surface;
+   it is labelled for what it is. */
 function TopPicksCard({ picks, loading: pLoading }) {
   return (
     <div data-testid="top-picks-card" className="glass-card p-5">
       <div className="flex items-center justify-between mb-4">
         <h3 className="eyebrow flex items-center gap-2">
-          <Star size={13} /> Top AI Picks
+          <Star size={13} /> Top Picks
         </h3>
+        <span className="text-[10px] font-mono" style={{ color: "var(--text-muted)" }}
+          data-testid="top-picks-attribution">
+          Technical scan
+        </span>
       </div>
       {pLoading ? (
         <div className="space-y-3">
@@ -1126,28 +1132,21 @@ export default function Dashboard() {
     <div data-testid="dashboard-page" className="space-y-5">
       {/* ===== Header ===== */}
       <Reveal>
-        <div className="flex items-center justify-between">
-          <div>
-            <h1 className="page-title">
-              {greeting}, {user?.name?.split(" ")[0]}
-            </h1>
-            <p className="page-subtitle mt-1">Here's what the AI has prepared for you today.</p>
-          </div>
-          <div className="flex items-center gap-2">
+        <PageHeader
+          title={`${greeting}, ${user?.name?.split(" ")[0] ?? ""}`}
+          subtitle="Here's what the AI has prepared for you today."
+          actions={<>
             {marketStatus && (
-              <span className="text-[10px] font-mono font-semibold px-2.5 py-1 rounded-full" style={{
-                background: marketStatus === "OPEN" ? "var(--gain-bg)" : "var(--hover)",
-                color: marketStatus === "OPEN" ? "var(--gain)" : "var(--text-muted)",
-              }}>
-                {marketStatus === "OPEN" ? "MARKET OPEN" : "MARKET CLOSED"}
-              </span>
+              <StatusBadge tone={marketStatus === "OPEN" ? "positive" : "neutral"} dot>
+                {marketStatus === "OPEN" ? "Market open" : "Market closed"}
+              </StatusBadge>
             )}
             <MarketEngineStatus compact />
             <div data-testid="ws-status" className="badge-live text-[9px]">
               {connected ? <><Wifi size={10} /> LIVE</> : <><WifiOff size={10} /> OFFLINE</>}
             </div>
-          </div>
-        </div>
+          </>}
+        />
       </Reveal>
 
       {/* ===== Quick Actions ===== */}

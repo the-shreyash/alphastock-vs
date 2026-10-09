@@ -53,6 +53,7 @@ import time
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from _accounts import account_ref, fixture_account_id  # noqa: E402
 
 from services.broker_engine import BrokerEngine
 from services.brokers.reliability import ConnectionStability
@@ -357,9 +358,10 @@ def test_coming_back_requires_a_deliberate_reattachment_rather_than_the_loops_ow
         async def restart():
             stream = await stream_manager.start_stream(
                 "user-1", adapter.name, {"access_token": "live-token"},
+                broker_account_id=fixture_account_id("user-1", adapter.name),
                 credentials={"api_key": "k"}, instrument_tokens=["RELIANCE"],
             )
-            await stream_manager.stop_stream("user-1", adapter.name)
+            await stream_manager.stop_stream(fixture_account_id("user-1", adapter.name))
             return stream
 
         restarted = run(restart())
@@ -528,8 +530,8 @@ def _market_fixture(users=("u1",), broker="nova", symbols=("RELIANCE",), probati
     with patch.object(streaming_module, "PROBATION_WINDOW_SECONDS", probation):
         for user in users:
             run(_attach(user, broker, list(symbols)))
-            run(set_market_feed_link(user, broker, up=True))
-            feeds[user] = provider_registry.get(feed_provider_name(user, broker))
+            run(set_market_feed_link(account_ref(user, broker), up=True))
+            feeds[user] = provider_registry.get(feed_provider_name(account_ref(user, broker)))
     return SourceManager(provider_registry), baseline, feeds
 
 
@@ -545,10 +547,10 @@ def test_an_entitlement_failure_takes_the_feed_out_of_quote_eligibility():
     with entitlement_nova(), _clean_provider_registry() as registry:
         registry.clear()
         manager, baseline, feeds = _market_fixture()
-        run(publish_market_ticks("u1", "nova", [_tick()]))
+        run(publish_market_ticks(account_ref("u1", "nova"), [_tick()]))
         assert feeds["u1"].is_ready
 
-        run(_engine()._on_stream_not_entitled("u1", "nova", DEFAULT_STREAM_CHANNEL))
+        run(_engine()._on_stream_not_entitled(account_ref("u1", "nova"), DEFAULT_STREAM_CHANNEL))
 
         assert _quote(manager, "u1") is baseline, "the refused feed still served the quote"
         assert manager.status(user_id="u1")["state"] == "available", "the baseline was not resolvable"
@@ -573,16 +575,16 @@ def test_a_feed_that_had_earned_readiness_or_stability_cannot_stay_selected(hold
         manager, baseline, feeds = _market_fixture(probation=window)
         feed = feeds["u1"]
 
-        run(publish_market_ticks("u1", "nova", [_tick()]))
+        run(publish_market_ticks(account_ref("u1", "nova"), [_tick()]))
         if hold_to == "stable":
             time.sleep(window * 1.5)
-            run(publish_market_ticks("u1", "nova", [_tick()]))
+            run(publish_market_ticks(account_ref("u1", "nova"), [_tick()]))
             assert feed.is_stable
             assert _quote(manager, "u1") is feed, "the fixture never promoted the feed"
         else:
             assert feed.is_ready and feed.is_on_probation
 
-        run(_engine()._on_stream_not_entitled("u1", "nova", DEFAULT_STREAM_CHANNEL))
+        run(_engine()._on_stream_not_entitled(account_ref("u1", "nova"), DEFAULT_STREAM_CHANNEL))
 
         assert _quote(manager, "u1") is baseline
         assert feed not in manager.failover_chain(
@@ -597,8 +599,8 @@ def test_the_refused_feed_can_no_longer_deliver_into_the_gateway():
     with entitlement_nova(), _clean_provider_registry() as registry:
         registry.clear()
         _manager, _baseline, _feeds = _market_fixture()
-        run(_engine()._on_stream_not_entitled("u1", "nova", DEFAULT_STREAM_CHANNEL))
-        assert run(publish_market_ticks("u1", "nova", [_tick()])) == 0
+        run(_engine()._on_stream_not_entitled(account_ref("u1", "nova"), DEFAULT_STREAM_CHANNEL))
+        assert run(publish_market_ticks(account_ref("u1", "nova"), [_tick()])) == 0
 
 
 # ==================================================================
@@ -620,9 +622,9 @@ def test_a_second_user_of_the_same_broker_is_unaffected():
         registry.clear()
         manager, baseline, feeds = _market_fixture(users=("u1", "u2"))
         for user in ("u1", "u2"):
-            run(publish_market_ticks(user, "nova", [_tick()]))
+            run(publish_market_ticks(account_ref(user, "nova"), [_tick()]))
 
-        run(_engine()._on_stream_not_entitled("u1", "nova", DEFAULT_STREAM_CHANNEL))
+        run(_engine()._on_stream_not_entitled(account_ref("u1", "nova"), DEFAULT_STREAM_CHANNEL))
 
         assert _quote(manager, "u1") is baseline
         assert _quote(manager, "u2") is feeds["u2"], "one user's refusal demoted another user's feed"
@@ -641,9 +643,9 @@ def test_another_broker_of_the_same_user_is_unaffected():
         registry.clear()
         manager, baseline, nova_feeds = _market_fixture(broker="nova")
         _m2, _b2, orion_feeds = _market_fixture(broker="orion")
-        run(publish_market_ticks("u1", "orion", [_tick()]))
+        run(publish_market_ticks(account_ref("u1", "orion"), [_tick()]))
 
-        run(_engine()._on_stream_not_entitled("u1", "nova", DEFAULT_STREAM_CHANNEL))
+        run(_engine()._on_stream_not_entitled(account_ref("u1", "nova"), DEFAULT_STREAM_CHANNEL))
 
         assert orion_feeds["u1"].is_ready, "an unrelated provider lost its readiness"
         assert _quote(manager, "u1") is orion_feeds["u1"], "the surviving feed did not serve"
@@ -657,7 +659,7 @@ def test_the_guest_and_baseline_contexts_are_unchanged():
         manager, baseline, _feeds = _market_fixture()
 
         before = manager.status()
-        run(_engine()._on_stream_not_entitled("u1", "nova", DEFAULT_STREAM_CHANNEL))
+        run(_engine()._on_stream_not_entitled(account_ref("u1", "nova"), DEFAULT_STREAM_CHANNEL))
 
         assert manager.status() == before
         assert _quote(manager, None) is baseline
@@ -686,9 +688,9 @@ def test_a_refusal_on_a_non_tick_channel_does_not_demote_the_market_feed():
     with nova_registered(TwoChannel()), _clean_provider_registry() as registry:
         registry.clear()
         manager, _baseline, feeds = _market_fixture()
-        run(publish_market_ticks("u1", "nova", [_tick()]))
+        run(publish_market_ticks(account_ref("u1", "nova"), [_tick()]))
 
-        run(_engine()._on_stream_not_entitled("u1", "nova", "orders"))
+        run(_engine()._on_stream_not_entitled(account_ref("u1", "nova"), "orders"))
 
         assert _quote(manager, "u1") is feeds["u1"], "an order channel's refusal demoted the market feed"
 
@@ -708,9 +710,9 @@ def test_a_refusal_on_the_tick_channel_of_a_multi_channel_broker_does_demote_it(
     with nova_registered(TwoChannel()), _clean_provider_registry() as registry:
         registry.clear()
         manager, baseline, _feeds = _market_fixture()
-        run(publish_market_ticks("u1", "nova", [_tick()]))
+        run(publish_market_ticks(account_ref("u1", "nova"), [_tick()]))
 
-        run(_engine()._on_stream_not_entitled("u1", "nova", "ticks"))
+        run(_engine()._on_stream_not_entitled(account_ref("u1", "nova"), "ticks"))
 
         assert _quote(manager, "u1") is baseline
 
@@ -729,15 +731,15 @@ def test_an_entitlement_failure_leaves_the_accounts_session_intact():
     orders and receive order updates.
     """
     engine = _engine()
-    engine._sessions[("u1", "nova")] = {"access_token": "still-good"}
+    engine._sessions[fixture_account_id("u1", "nova")] = {"access_token": "still-good"}
 
     with entitlement_nova(), _clean_provider_registry() as registry:
         registry.clear()
         _market_fixture()
         with patch.object(BrokerEngine, "_push", new=AsyncMock()) as pushed:
-            run(engine._on_stream_not_entitled("u1", "nova", DEFAULT_STREAM_CHANNEL))
+            run(engine._on_stream_not_entitled(account_ref("u1", "nova"), DEFAULT_STREAM_CHANNEL))
 
-    assert engine._sessions.get(("u1", "nova")) == {"access_token": "still-good"}, \
+    assert engine._sessions.get(fixture_account_id("u1", "nova")) == {"access_token": "still-good"}, \
         "an entitlement refusal dropped a valid session"
     assert not any("session_expired" in json.dumps(call.args, default=str)
                    for call in pushed.await_args_list), \
@@ -747,15 +749,15 @@ def test_an_entitlement_failure_leaves_the_accounts_session_intact():
 def test_an_expired_session_still_does_tear_the_account_down():
     """The control: the session path is unchanged by this sprint."""
     engine = _engine()
-    engine._sessions[("u1", "nova")] = {"access_token": "dead"}
+    engine._sessions[fixture_account_id("u1", "nova")] = {"access_token": "dead"}
 
     with entitlement_nova(), _clean_provider_registry() as registry:
         registry.clear()
         _market_fixture()
         with patch.object(BrokerEngine, "_push", new=AsyncMock()):
-            run(engine._on_stream_expired("u1", "nova", DEFAULT_STREAM_CHANNEL))
+            run(engine._on_stream_expired(account_ref("u1", "nova"), DEFAULT_STREAM_CHANNEL))
 
-    assert ("u1", "nova") not in engine._sessions
+    assert fixture_account_id("u1", "nova") not in engine._sessions
 
 
 def test_a_refusal_does_not_stop_the_accounts_other_channels():
@@ -773,7 +775,8 @@ def test_a_refusal_does_not_stop_the_accounts_other_channels():
     async def scenario():
         for channel in ("ticks", "orders"):
             await stream_manager.start_stream(
-                "u1", "nova", {"access_token": "t"}, credentials={},
+                "u1", "nova", {"access_token": "t"},
+                broker_account_id=fixture_account_id("u1", "nova"), credentials={},
                 instrument_tokens=["RELIANCE"], channel=channel)
 
     with nova_registered(TwoChannel()), _clean_provider_registry() as registry:
@@ -781,12 +784,12 @@ def test_a_refusal_does_not_stop_the_accounts_other_channels():
         _market_fixture()
         run(scenario())
         try:
-            run(_engine()._on_stream_not_entitled("u1", "nova", "ticks"))
+            run(_engine()._on_stream_not_entitled(account_ref("u1", "nova"), "ticks"))
             live = {row["channel"] for row in stream_manager.status()
                     if row["user_id"] == "u1" and row["broker"] == "nova"}
             assert live == {"orders"}, f"the surviving channels were {live or 'none'}"
         finally:
-            run(stream_manager.stop_stream("u1", "nova"))
+            run(stream_manager.stop_stream(fixture_account_id("u1", "nova")))
 
 
 # ==================================================================
@@ -809,7 +812,7 @@ def test_the_status_change_is_published_to_the_owner_alone():
         _market_fixture(users=("u1", "u2"))
         event_bus.subscribe("provider.status", spy)
         try:
-            run(_engine()._on_stream_not_entitled("u1", "nova", DEFAULT_STREAM_CHANNEL))
+            run(_engine()._on_stream_not_entitled(account_ref("u1", "nova"), DEFAULT_STREAM_CHANNEL))
         finally:
             event_bus.unsubscribe("provider.status", spy)
 
@@ -824,7 +827,7 @@ def test_no_broker_vocabulary_or_credential_reaches_a_consumer_surface():
     with entitlement_nova(), _clean_provider_registry() as registry:
         registry.clear()
         manager, _baseline, _feeds = _market_fixture()
-        run(_engine()._on_stream_not_entitled("u1", "nova", DEFAULT_STREAM_CHANNEL))
+        run(_engine()._on_stream_not_entitled(account_ref("u1", "nova"), DEFAULT_STREAM_CHANNEL))
 
         status = manager.status(user_id="u1")
 

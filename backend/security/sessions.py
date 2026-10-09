@@ -29,11 +29,42 @@ Rotation + reuse detection (the core of R-06):
   compromise into a visible re-login.
 * A revoked or expired family refreshes to nothing — 401.
 
+The rotation grace window (D6.2 / F)
+------------------------------------
+Strict single-use rotation has one benign failure mode, and for a trading
+dashboard it is not a rare one: **two browser tabs**. Cookies are shared across
+tabs, the access token expires for all of them at the same instant, and each tab
+runs its own independent refresh queue — so both POST the *same* refresh token
+within milliseconds of each other. One rotates; the other presents a token that
+is no longer current against a family that is very much alive, which is
+bit-for-bit the signature of theft. The user is signed out of every tab and a
+CRITICAL "token replay detected" record is written, for doing nothing but
+opening a second tab.
+
+So a presented token that is the **immediately previous** ``jti`` and arrives
+within ``JWT_REFRESH_GRACE_SECONDS`` (default 10) of the rotation that retired
+it is answered with the family's *current* token pair instead of a revocation —
+outcome ``GRACE_REPLAY``. No new rotation happens, so the window cannot be
+walked forward by repeated replay: the grace is anchored to a single rotation
+instant, and only one token generation is ever forgiven.
+
+This does not weaken theft detection in any way that matters. An attacker
+holding a stolen refresh token does not need to race the legitimate client — it
+can simply use the token first and get a full rotation, which is what reuse
+detection catches on the *victim's* next refresh. What the window forgives is
+exactly the case that carries no new information: a replay so close to the
+rotation that it cannot be distinguished from the same browser asking twice.
+Everything outside it — the replay an hour later, the replay from another
+device, the second replay of the same retired token — still revokes the family.
+See RFC 9700 §4.14.2, which explicitly contemplates a short grace for
+concurrency.
+
 Nothing in this module stores or logs a raw token. The ``jti`` it persists is an
 opaque identifier, not the signed credential.
 """
 from __future__ import annotations
 
+import os
 import secrets
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -43,12 +74,33 @@ from security.jwt import refresh_ttl_seconds
 
 COLLECTION = "sessions"
 
-# Rotation outcomes. Callers branch on these; only ROTATED issues new tokens.
+# Rotation outcomes. Callers branch on these; ROTATED and GRACE_REPLAY issue
+# tokens, everything else is a 401.
 ROTATED = "rotated"                 # valid, single-use honored → new tokens minted
+GRACE_REPLAY = "grace_replay"       # benign concurrent refresh → re-issue current pair
 REUSE_DETECTED = "reuse_detected"   # replay of a rotated token → family revoked → 401
 NOT_FOUND = "not_found"             # unknown family (cleaned up / never existed) → 401
 REVOKED = "revoked"                 # family already revoked (logout / prior reuse) → 401
 EXPIRED = "expired"                 # family past its absolute expiry → 401
+
+#: How long the immediately-previous refresh ``jti`` stays acceptable after the
+#: rotation that retired it (D6.2 / F). Deliberately small: it is sized for two
+#: tabs racing on the same machine, not for any kind of retry. ``0`` restores
+#: strict single-use, which is what the theft-detection tests configure so the
+#: strict path is still exercised rather than merely assumed.
+DEFAULT_ROTATION_GRACE_SECONDS = 10
+
+
+def rotation_grace_seconds() -> int:
+    """Configured grace window (``JWT_REFRESH_GRACE_SECONDS``), never negative."""
+    raw = os.environ.get("JWT_REFRESH_GRACE_SECONDS", "").strip()
+    if not raw:
+        return DEFAULT_ROTATION_GRACE_SECONDS
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return DEFAULT_ROTATION_GRACE_SECONDS
+
 
 # Revocation reasons — recorded on the session for audit/PH1.10, never surfaced
 # to the client (the 401 stays generic).
@@ -68,14 +120,28 @@ def new_session_id() -> str:
 
 @dataclass
 class RotationResult:
-    """Outcome of a refresh attempt. ``ok`` is True only for a clean rotation;
-    ``session`` is the (possibly now-revoked) record for context/audit."""
+    """Outcome of a refresh attempt. ``ok`` is True for a clean rotation and for
+    a benign within-grace concurrent replay; ``session`` is the (possibly
+    now-revoked) record for context/audit."""
     outcome: str
     session: Optional[dict] = None
+    #: The refresh ``jti`` the caller must mint its new refresh token with.
+    #:
+    #: For a clean rotation that is the ``new_jti`` the caller supplied, which
+    #: is now current. For a grace replay nothing rotated, so it is the ``jti``
+    #: that was already current — re-issuing it hands the second tab the same
+    #: token the first one just received, which is the correct answer: they
+    #: share one cookie jar and one session. ``None`` for every failure.
+    issued_jti: Optional[str] = None
 
     @property
     def ok(self) -> bool:
-        return self.outcome == ROTATED
+        """True when the caller should issue tokens.
+
+        Both a clean rotation and a within-grace concurrent replay produce a
+        usable session; they differ only in which ``jti`` is minted against
+        (``issued_jti``) and in what gets audited."""
+        return self.outcome in (ROTATED, GRACE_REPLAY)
 
 
 class SessionStore:
@@ -102,6 +168,10 @@ class SessionStore:
             "session_id": session_id,
             "user_id": str(user_id),
             "current_jti": jti,
+            # The generation this one retired, and when (D6.2 / F). A brand-new
+            # family has retired nothing, so there is nothing to forgive yet.
+            "previous_jti": None,
+            "previous_jti_at": None,
             "refresh_count": 0,
             "user_agent": user_agent,
             "ip": ip,
@@ -134,20 +204,78 @@ class SessionStore:
             return RotationResult(EXPIRED, session)
 
         if presented_jti != session.get("current_jti"):
-            # Replay of an already-rotated token against a live family → theft.
+            # Not the current token. Before calling it theft, check whether it
+            # is the generation we retired a moment ago — the two-tab race
+            # (D6.2 / F). Anything else, including a second replay of the same
+            # retired token, is a replay against a live family → theft.
+            if self._within_rotation_grace(session, presented_jti):
+                return RotationResult(
+                    GRACE_REPLAY, session,
+                    issued_jti=session.get("current_jti"),
+                )
             await self._revoke_doc(session_id, REASON_REUSE)
             return RotationResult(REUSE_DETECTED, session)
 
         now = _now()
-        await self._col.update_one(
-            {"session_id": session_id},
+        # D6.7 — THE WRITE RESTATES WHAT THE DECISION WAS MADE AGAINST.
+        #
+        # This closes LIM-D6.2-6. The filter used to be `{"session_id": ...}`
+        # alone, so the four checks above were a decision taken against a value
+        # read a round trip earlier and then written unconditionally. Two
+        # refreshes presenting the same current jti both passed every check and
+        # both wrote: the store issued two live refresh tokens for a family that
+        # can only have one, and `refresh_count` counted one logical rotation
+        # twice. Reproduced against a real `mongod` by
+        # `tests/test_d63_real_db_races.py::TestSessionRotationRaceIsTenant
+        # Contained`, which D6.2 and D6.3 could each only reason about.
+        #
+        # The consequence was not merely untidy. Whichever client lost held a
+        # token that was neither current nor the one retired generation, so its
+        # next refresh was indistinguishable from replay and **revoked the whole
+        # family** — a user signed out of every device because two tabs
+        # refreshed in the same instant.
+        #
+        # `current_jti` and `revoked` in the filter make this a compare-and-swap:
+        # Mongo evaluates it under the document lock, so of N racing rotations
+        # exactly one matches. `revoked` is there for a second reason of its own
+        # — a logout that lands between the read and this write must not have
+        # its revocation overwritten by a rotation that slid `expires_at`
+        # forward on a family the user just killed.
+        result = await self._col.update_one(
+            {"session_id": session_id, "current_jti": presented_jti,
+             "revoked": False},
             {"$set": {
                 "current_jti": new_jti,
+                # Remember exactly one retired generation, and the instant it
+                # was retired. Overwriting rather than appending is what keeps
+                # the grace anchored: only the most recent rotation is ever
+                # forgivable, so the window cannot be walked forward.
+                "previous_jti": presented_jti,
+                "previous_jti_at": now.isoformat(),
                 "last_used_at": now.isoformat(),
                 "expires_at": now + timedelta(seconds=refresh_ttl_seconds()),
             }, "$inc": {"refresh_count": 1}},
         )
-        return RotationResult(ROTATED, session)
+        if not getattr(result, "modified_count", 0):
+            # We lost the swap. Re-read and answer from what is actually there
+            # rather than guessing: the winner of a concurrent rotation has just
+            # set `previous_jti` to the very token we presented, so this lands in
+            # D6.2's existing two-tab grace path and the caller is handed the
+            # winner's live token — which is precisely the outcome that vocabulary
+            # was built for. Any other reason for the miss (revoked mid-flight, or
+            # a jti that moved on past the grace) falls through to the same
+            # fail-closed answers the sequential path gives.
+            current = await self._col.find_one({"session_id": session_id})
+            if current is None:
+                return RotationResult(NOT_FOUND)
+            if current.get("revoked"):
+                return RotationResult(REVOKED, current)
+            if self._within_rotation_grace(current, presented_jti):
+                return RotationResult(GRACE_REPLAY, current,
+                                      issued_jti=current.get("current_jti"))
+            await self._revoke_doc(session_id, REASON_REUSE)
+            return RotationResult(REUSE_DETECTED, current)
+        return RotationResult(ROTATED, session, issued_jti=new_jti)
 
     async def revoke(self, session_id: str, *, reason: str = REASON_LOGOUT) -> bool:
         """Revoke a single session (e.g. logout of the current device). Returns
@@ -206,6 +334,33 @@ class SessionStore:
             {"$set": {"revoked": True, "revoked_at": _now().isoformat(),
                       "revoked_reason": reason}},
         )
+
+    @staticmethod
+    def _within_rotation_grace(session: dict, presented_jti: str) -> bool:
+        """True when ``presented_jti`` is the generation retired by the most
+        recent rotation and that rotation happened within the grace window.
+
+        A grace of ``0`` disables this entirely and restores strict single-use.
+        A malformed or missing timestamp is treated as *outside* the window —
+        the fail-closed direction, since the consequence of getting it wrong is
+        forgiving a replay that should have revoked a family."""
+        grace = rotation_grace_seconds()
+        if grace <= 0:
+            return False
+        previous_jti = session.get("previous_jti")
+        if not previous_jti or presented_jti != previous_jti:
+            return False
+        rotated_at = session.get("previous_jti_at")
+        if isinstance(rotated_at, str):
+            try:
+                rotated_at = datetime.fromisoformat(rotated_at)
+            except ValueError:
+                return False
+        if not isinstance(rotated_at, datetime):
+            return False
+        if rotated_at.tzinfo is None:
+            rotated_at = rotated_at.replace(tzinfo=timezone.utc)
+        return (_now() - rotated_at) <= timedelta(seconds=grace)
 
     @staticmethod
     def _is_expired(session: dict) -> bool:

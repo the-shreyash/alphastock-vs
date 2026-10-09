@@ -120,6 +120,10 @@ describe("session restoration on mount", () => {
 describe("login", () => {
   beforeEach(() => {
     mock.onGet("/auth/me").reply(HTTP.UNAUTHORIZED, {});
+    // D6.2 bootstrap recovery: a 401 from the probe is answered with ONE silent
+    // refresh before the app concludes the visitor is signed out. Stubbed as a
+    // refusal so these tests describe a genuinely signed-out browser.
+    mock.onPost("/auth/refresh").reply(HTTP.UNAUTHORIZED, {});
   });
 
   it("signs the user in and persists the token", async () => {
@@ -142,8 +146,14 @@ describe("login", () => {
 
     await user.click(screen.getByRole("button", { name: "login" }));
 
-    await waitFor(() => expect(mock.history.post).toHaveLength(1));
-    expect(JSON.parse(mock.history.post[0].data)).toEqual({
+    // D6.2. Filtered by endpoint: mounting the provider now also fires the
+    // bootstrap refresh probe (a signed-out visitor's `/auth/me` 401 is
+    // answered with one silent refresh attempt before the app concludes they
+    // are signed out), so a bare count of every POST is no longer the number of
+    // logins.
+    const logins = () => mock.history.post.filter((r) => r.url === "/auth/login");
+    await waitFor(() => expect(logins()).toHaveLength(1));
+    expect(JSON.parse(logins()[0].data)).toEqual({
       email: "trader@test.invalid",
       password: "correct-horse-battery",
     });
@@ -157,7 +167,8 @@ describe("login", () => {
 
     await user.click(screen.getByRole("button", { name: "login" }));
 
-    await waitFor(() => expect(mock.history.post).toHaveLength(1));
+    await waitFor(() => expect(
+      mock.history.post.filter((r) => r.url === "/auth/login")).toHaveLength(1));
     expect(screen.getByTestId("user")).toHaveTextContent("signed-out");
     expect(localStorage.getItem("token")).toBeNull();
   });
@@ -180,6 +191,10 @@ describe("login", () => {
 describe("register", () => {
   beforeEach(() => {
     mock.onGet("/auth/me").reply(HTTP.UNAUTHORIZED, {});
+    // D6.2 bootstrap recovery: a 401 from the probe is answered with ONE silent
+    // refresh before the app concludes the visitor is signed out. Stubbed as a
+    // refusal so these tests describe a genuinely signed-out browser.
+    mock.onPost("/auth/refresh").reply(HTTP.UNAUTHORIZED, {});
   });
 
   it("signs the new user in on success", async () => {
@@ -202,7 +217,8 @@ describe("register", () => {
 
     await user.click(screen.getByRole("button", { name: "register" }));
 
-    await waitFor(() => expect(mock.history.post).toHaveLength(1));
+    await waitFor(() => expect(
+      mock.history.post.filter((r) => r.url === "/auth/register")).toHaveLength(1));
     expect(screen.getByTestId("user")).toHaveTextContent("signed-out");
   });
 });

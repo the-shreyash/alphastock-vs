@@ -237,10 +237,17 @@ describe("L3 — WebSocket handshake rejection", () => {
   let mockUser;
 
   const socket = () => global.WebSocket.instances.at(-1);
-  /** The server closes an unauthenticated handshake with 1008 BEFORE accept(),
-   *  so the client sees a close with no preceding open. */
-  const rejectHandshake = () =>
-    act(() => { socket().onclose?.({ code: 1008 }); });
+  /** The connection never came up. A browser reports this identically whether
+   *  the server refused the credential or was not listening at all — see the
+   *  D6.2-E note in RealtimeProvider — so the client has to ask which it was. */
+  const failHandshake = () =>
+    act(() => { socket().onclose?.({ code: 1006 }); });
+
+  /** Settle the diagnosis probe and any refresh it starts. Explicit microtask
+   *  flushing rather than `waitFor`, which needs real timers. */
+  const settle = () => act(async () => {
+    for (let i = 0; i < 12; i += 1) await Promise.resolve();
+  });
 
   beforeEach(() => {
     jest.useFakeTimers();
@@ -255,12 +262,13 @@ describe("L3 — WebSocket handshake rejection", () => {
   });
 
   it("attempts ONE re-authentication and does not retry the dead token on a timer", async () => {
+    mock.onGet("/auth/me").reply(HTTP.UNAUTHORIZED, {});
     mock.onPost("/auth/refresh").reply(HTTP.UNAUTHORIZED, {});
     render(<RealtimeProvider><div /></RealtimeProvider>);
     const socketsAfterMount = global.WebSocket.instances.length;
 
-    rejectHandshake();
-    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    failHandshake();
+    await settle();
 
     // Before D6.1 the reconnect loop re-offered the same expired token forever,
     // backing off to 30s and retrying until the tab closed. Advancing well past
@@ -271,11 +279,12 @@ describe("L3 — WebSocket handshake rejection", () => {
   });
 
   it("surfaces the expiry as a distinct connection state, not 'reconnecting'", async () => {
+    mock.onGet("/auth/me").reply(HTTP.UNAUTHORIZED, {});
     mock.onPost("/auth/refresh").reply(HTTP.UNAUTHORIZED, {});
     render(<RealtimeProvider><div /></RealtimeProvider>);
 
-    rejectHandshake();
-    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    failHandshake();
+    await settle();
 
     // "Reconnecting" would be a spinner describing a condition no amount of
     // waiting can fix.
@@ -283,12 +292,13 @@ describe("L3 — WebSocket handshake rejection", () => {
   });
 
   it("reconnects immediately when re-authentication succeeds", async () => {
+    mock.onGet("/auth/me").reply(HTTP.UNAUTHORIZED, {});
     mock.onPost("/auth/refresh").reply(HTTP.OK, {});
     render(<RealtimeProvider><div /></RealtimeProvider>);
     const before = global.WebSocket.instances.length;
 
-    rejectHandshake();
-    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    failHandshake();
+    await settle();
 
     expect(global.WebSocket.instances.length).toBe(before + 1);
   });

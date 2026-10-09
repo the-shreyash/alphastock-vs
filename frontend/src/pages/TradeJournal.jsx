@@ -2,6 +2,7 @@ import { useState, useEffect } from "react";
 import { motion } from "framer-motion";
 import api from "../services/api";
 import { formatCurrency, formatPercent } from "../utils/formatters";
+import { PageHeader } from "../components/ds";
 import {
   BookOpen, TrendingUp, TrendingDown, Award, Brain, RefreshCw,
   GraduationCap, X, CheckCircle, XCircle, ArrowRight, Loader2,
@@ -176,20 +177,20 @@ export default function TradeJournal() {
     <div data-testid="trade-journal-page" className="space-y-4">
       {coachingTrade && <CoachingDrawer trade={coachingTrade} onClose={() => setCoachingTrade(null)} />}
 
-      <div className="flex items-center justify-between">
-        <div>
-          <h1 className="page-title">Trade Journal</h1>
-          <p className="page-subtitle mt-0.5">Performance tracking & AI coaching</p>
-        </div>
-        <div className="segment-control">
-          {[7, 30, 90].map((p) => (
-            <button key={p} data-testid={`period-${p}d`} onClick={() => setPeriod(p)}
-              className={`segment-btn text-[11px] ${period === p ? "active" : ""}`}>
-              {p}D
-            </button>
-          ))}
-        </div>
-      </div>
+      <PageHeader
+        title="Trade Journal"
+        subtitle="Performance tracking and AI coaching"
+        actions={
+          <div className="segment-control">
+            {[7, 30, 90].map((p) => (
+              <button key={p} data-testid={`period-${p}d`} onClick={() => setPeriod(p)}
+                className={`segment-btn text-[11px] ${period === p ? "active" : ""}`}>
+                {p}D
+              </button>
+            ))}
+          </div>
+        }
+      />
 
       {/* Stats Cards */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">

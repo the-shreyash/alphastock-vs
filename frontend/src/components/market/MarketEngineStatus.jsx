@@ -47,10 +47,10 @@ export default function MarketEngineStatus({ compact = true }) {
     <motion.div
       initial={{ opacity: 0, y: 10 }}
       animate={{ opacity: 1, y: 0 }}
-      className="rounded-xl bg-[var(--bg-secondary)] border border-[var(--border)] p-4"
+      className="rounded-xl bg-[var(--bg-card-glass)] border border-[var(--border)] p-4"
     >
       <div className="flex items-center gap-2 mb-3">
-        <Cpu size={14} className="text-[var(--accent)]" />
+        <Cpu size={14} className="text-[var(--brand-accent)]" />
         <span className="text-sm font-semibold text-[var(--text-primary)]">Market Engine</span>
         <div className={`ml-auto w-2 h-2 rounded-full ${status.initialized ? "bg-[var(--gain)] animate-pulse" : "bg-[var(--loss)]"}`} />
       </div>

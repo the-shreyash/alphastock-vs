@@ -49,6 +49,7 @@ import re
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from _accounts import account_doc, account_ref, fixture_account_id  # noqa: E402
 
 from services.broker_engine import BrokerEngine
 from services.brokers.recovery import (
@@ -112,9 +113,20 @@ def clean_register():
         recovery_register._history.update(saved_history)
 
 
-def _engine():
+def _engine(*accounts):
+    """An engine whose directory can resolve the accounts a test uses.
+
+    `accounts` are `(user_id, broker)` pairs; each is seeded as a
+    `broker_accounts` document carrying the id `fixture_account_id` derives, so
+    the engine's own `_reattach_channel` — which resolves the account from the
+    id the recovery register handed it — finds a real account (D6.4). An engine
+    with no accounts is still valid: it is what a re-probe for a deleted account
+    meets, and it must refuse rather than attach.
+    """
     engine = BrokerEngine()
-    engine.configure(FakeDB())
+    engine.configure(FakeDB(broker_accounts=[
+        account_doc(user_id, broker) for user_id, broker in (accounts or (("u1", "nova"),))
+    ]))
     return engine
 
 
@@ -135,8 +147,8 @@ class _Attacher:
         self.calls = []
         self._raises = raises
 
-    async def __call__(self, user_id, broker, channel):
-        self.calls.append((user_id, broker, channel))
+    async def __call__(self, broker_account_id, channel):
+        self.calls.append((broker_account_id, channel))
         if self._raises is not None:
             raise self._raises
 
@@ -145,8 +157,10 @@ def _service(register, attacher=None, *, session=True, attached=False, **kwargs)
     return RecoveryService(
         register,
         attach=attacher if attacher is not None else _Attacher(),
-        has_session=(session if callable(session) else (lambda u, b: session)),
-        is_attached=(attached if callable(attached) else (lambda u, b, c: attached)),
+        # D6.4 — both predicates are addressed by `broker_account_id` alone,
+        # which already implies the user and the broker.
+        has_session=(session if callable(session) else (lambda a: session)),
+        is_attached=(attached if callable(attached) else (lambda a, c: attached)),
         **kwargs,
     )
 
@@ -169,8 +183,8 @@ def _market_fixture(users=("u1",), broker="nova", symbols=("RELIANCE",), probati
     with patch.object(streaming_module, "PROBATION_WINDOW_SECONDS", probation):
         for user in users:
             run(_attach(user, broker, list(symbols)))
-            run(set_market_feed_link(user, broker, up=True))
-            feeds[user] = provider_registry.get(feed_provider_name(user, broker))
+            run(set_market_feed_link(account_ref(user, broker), up=True))
+            feeds[user] = provider_registry.get(feed_provider_name(account_ref(user, broker)))
     return SourceManager(provider_registry), baseline, feeds
 
 
@@ -194,11 +208,11 @@ def test_a_refusal_still_stops_the_feed_and_now_records_a_recovery_candidate():
     with entitlement_nova(), clean_register() as register, _clean_provider_registry() as registry:
         registry.clear()
         manager, baseline, _feeds = _market_fixture()
-        run(_engine()._on_stream_not_entitled("u1", "nova", TICKS))
+        run(_engine()._on_stream_not_entitled(account_ref("u1", "nova"), TICKS))
 
         assert _quote(manager, "u1") is baseline, "the refused feed still served the quote"
 
-        candidate = register.get("u1", "nova", TICKS)
+        candidate = register.get(fixture_account_id("u1", "nova"), TICKS)
         assert candidate is not None, "the withdrawal was not recorded — nothing can recover it"
         assert candidate.recovery_class is RecoveryClass.REPROBE
         assert candidate.is_reprobeable
@@ -211,11 +225,11 @@ def test_a_refusal_does_not_itself_attach_anything():
         _market_fixture()
         attacher = _Attacher()
         service = _service(register, attacher)
-        run(_engine()._on_stream_not_entitled("u1", "nova", TICKS))
+        run(_engine()._on_stream_not_entitled(account_ref("u1", "nova"), TICKS))
 
         assert attacher.calls == []
         # ...and it is not due either: the ladder starts at the base delay.
-        assert run(service.reprobe("u1", "nova", TICKS)) is ReprobeOutcome.TOO_SOON
+        assert run(service.reprobe(fixture_account_id("u1", "nova"), TICKS)) is ReprobeOutcome.TOO_SOON
         assert attacher.calls == []
 
 
@@ -238,18 +252,18 @@ def test_a_re_probe_while_still_refused_does_not_recreate_an_active_provider():
         engine = _engine()
         manager, baseline, _feeds = _market_fixture()
 
-        async def attach_that_is_refused(user_id, broker, channel):
+        async def attach_that_is_refused(broker_account_id, channel):
             # What the transport does when the broker refuses the re-probed
             # connection: exactly the D5.5 path, unchanged.
-            await engine._on_stream_not_entitled(user_id, broker, channel)
+            await engine._on_stream_not_entitled(account_ref("u1", "nova"), channel)
 
         service = _service(register, attach_that_is_refused)
-        register.record_withdrawal("u1", "nova", TICKS, RecoveryClass.REPROBE)
+        register.record_withdrawal(fixture_account_id("u1", "nova"), TICKS, RecoveryClass.REPROBE)
         clock.advance(STILL_UNAVAILABLE_BASE_DELAY + 1)
 
-        assert run(service.reprobe("u1", "nova", TICKS)) is ReprobeOutcome.ATTEMPTED
+        assert run(service.reprobe(fixture_account_id("u1", "nova"), TICKS)) is ReprobeOutcome.ATTEMPTED
         assert _quote(manager, "u1") is baseline, "a refused re-probe produced a serving feed"
-        assert register.get("u1", "nova", TICKS).is_reprobeable, "the candidate was lost"
+        assert register.get(fixture_account_id("u1", "nova"), TICKS).is_reprobeable, "the candidate was lost"
 
 
 def test_the_re_probe_ladder_climbs_and_is_capped():
@@ -262,15 +276,15 @@ def test_the_re_probe_ladder_climbs_and_is_capped():
     clock = FakeClock()
     register = _register(clock)
     service = _service(register)
-    register.record_withdrawal("u1", "nova", TICKS, RecoveryClass.REPROBE)
+    register.record_withdrawal(fixture_account_id("u1", "nova"), TICKS, RecoveryClass.REPROBE)
 
     expected = []
     for _ in range(12):
-        candidate = register.get("u1", "nova", TICKS)
+        candidate = register.get(fixture_account_id("u1", "nova"), TICKS)
         wait = candidate.next_attempt_at - clock.now
         expected.append(wait)
         clock.advance(wait)
-        assert run(service.reprobe("u1", "nova", TICKS)) is ReprobeOutcome.ATTEMPTED
+        assert run(service.reprobe(fixture_account_id("u1", "nova"), TICKS)) is ReprobeOutcome.ATTEMPTED
 
     assert expected[0] == STILL_UNAVAILABLE_BASE_DELAY
     assert expected[1] == STILL_UNAVAILABLE_BASE_DELAY * 2
@@ -287,10 +301,10 @@ def test_an_undue_candidate_is_never_attempted_however_often_it_is_asked():
     register = _register(clock)
     attacher = _Attacher()
     service = _service(register, attacher)
-    register.record_withdrawal("u1", "nova", TICKS, RecoveryClass.REPROBE)
+    register.record_withdrawal(fixture_account_id("u1", "nova"), TICKS, RecoveryClass.REPROBE)
 
     for _ in range(100):
-        assert run(service.reprobe("u1", "nova", TICKS)) is ReprobeOutcome.TOO_SOON
+        assert run(service.reprobe(fixture_account_id("u1", "nova"), TICKS)) is ReprobeOutcome.TOO_SOON
     assert attacher.calls == []
 
 
@@ -317,12 +331,12 @@ def test_an_attempt_that_raises_still_costs_a_rung():
     clock = FakeClock()
     register = _register(clock)
     service = _service(register, _Attacher(raises=RuntimeError("socket refused")))
-    register.record_withdrawal("u1", "nova", TICKS, RecoveryClass.REPROBE)
+    register.record_withdrawal(fixture_account_id("u1", "nova"), TICKS, RecoveryClass.REPROBE)
     clock.advance(STILL_UNAVAILABLE_BASE_DELAY)
 
-    assert run(service.reprobe("u1", "nova", TICKS)) is ReprobeOutcome.ATTEMPT_FAILED
-    assert register.get("u1", "nova", TICKS).attempts == 1
-    assert register.get("u1", "nova", TICKS).next_attempt_at - clock.now == \
+    assert run(service.reprobe(fixture_account_id("u1", "nova"), TICKS)) is ReprobeOutcome.ATTEMPT_FAILED
+    assert register.get(fixture_account_id("u1", "nova"), TICKS).attempts == 1
+    assert register.get(fixture_account_id("u1", "nova"), TICKS).next_attempt_at - clock.now == \
         STILL_UNAVAILABLE_BASE_DELAY * 2
 
 
@@ -337,15 +351,15 @@ def test_an_apparent_success_cannot_buy_a_fresh_ladder():
     clock = FakeClock()
     register = _register(clock)
     service = _service(register)
-    register.record_withdrawal("u1", "nova", TICKS, RecoveryClass.REPROBE)
+    register.record_withdrawal(fixture_account_id("u1", "nova"), TICKS, RecoveryClass.REPROBE)
     clock.advance(STILL_UNAVAILABLE_BASE_DELAY)
-    run(service.reprobe("u1", "nova", TICKS))
+    run(service.reprobe(fixture_account_id("u1", "nova"), TICKS))
 
-    register.discharge("u1", "nova")
-    assert register.get("u1", "nova", TICKS) is None
+    register.discharge(fixture_account_id("u1", "nova"))
+    assert register.get(fixture_account_id("u1", "nova"), TICKS) is None
 
-    register.record_withdrawal("u1", "nova", TICKS, RecoveryClass.REPROBE)
-    assert register.get("u1", "nova", TICKS).next_attempt_at - clock.now == \
+    register.record_withdrawal(fixture_account_id("u1", "nova"), TICKS, RecoveryClass.REPROBE)
+    assert register.get(fixture_account_id("u1", "nova"), TICKS).next_attempt_at - clock.now == \
         STILL_UNAVAILABLE_BASE_DELAY * 2, "the ladder reset on an apparent success"
 
 
@@ -365,15 +379,15 @@ def test_entitlement_restoration_lets_the_stream_be_recreated():
         clock = FakeClock()
         register = _register(clock)
         engine = _engine()
-        engine._sessions[("u1", "nova")] = {"access_token": "still-good"}
+        engine._sessions[fixture_account_id("u1", "nova")] = {"access_token": "still-good"}
         service = _service(register, engine._reattach_channel)
-        register.record_withdrawal("u1", "nova", TICKS, RecoveryClass.REPROBE)
+        register.record_withdrawal(fixture_account_id("u1", "nova"), TICKS, RecoveryClass.REPROBE)
         clock.advance(STILL_UNAVAILABLE_BASE_DELAY)
 
         with patch.object(stream_manager, "start_stream", new=AsyncMock()) as started, \
                 patch.object(engine, "get_session",
                              new=AsyncMock(return_value={"access_token": "still-good"})):
-            assert run(service.reprobe("u1", "nova", TICKS)) is ReprobeOutcome.ATTEMPTED
+            assert run(service.reprobe(fixture_account_id("u1", "nova"), TICKS)) is ReprobeOutcome.ATTEMPTED
 
         assert started.await_count == 1, "the re-probe opened no stream"
         assert started.await_args.kwargs["channel"] == TICKS
@@ -397,7 +411,7 @@ def test_a_recovered_feed_must_still_earn_readiness_and_probation():
     with entitlement_nova(), clean_register(), _clean_provider_registry() as registry:
         registry.clear()
         manager, baseline, _feeds = _market_fixture(probation=streaming_module.PROBATION_WINDOW_SECONDS)
-        run(_engine()._on_stream_not_entitled("u1", "nova", TICKS))
+        run(_engine()._on_stream_not_entitled(account_ref("u1", "nova"), TICKS))
         assert _quote(manager, "u1") is baseline
 
         # The re-probe's attach, replayed through the same seam the engine uses.
@@ -405,19 +419,19 @@ def test_a_recovered_feed_must_still_earn_readiness_and_probation():
         with patch.object(streaming_module, "PROBATION_WINDOW_SECONDS",
                           streaming_module.PROBATION_WINDOW_SECONDS):
             run(_attach("u1", "nova", ["RELIANCE"]))
-        feed = provider_registry.get(feed_provider_name("u1", "nova"))
+        feed = provider_registry.get(feed_provider_name(account_ref("u1", "nova")))
         feed._clock = clock
-        run(set_market_feed_link("u1", "nova", up=True))
+        run(set_market_feed_link(account_ref("u1", "nova"), up=True))
 
         assert not feed.is_ready, "attaching made the feed ready"
         assert _quote(manager, "u1") is baseline, "a re-attached feed served before it was ready"
 
-        run(publish_market_ticks("u1", "nova", [_tick()]))
+        run(publish_market_ticks(account_ref("u1", "nova"), [_tick()]))
         assert feed.is_ready, "a valid canonical tick did not earn readiness"
         assert feed.is_on_probation, "a recovered feed skipped probation"
 
         clock.advance(streaming_module.PROBATION_WINDOW_SECONDS + 1)
-        run(publish_market_ticks("u1", "nova", [_tick(price=2651.0)]))
+        run(publish_market_ticks(account_ref("u1", "nova"), [_tick(price=2651.0)]))
         assert feed.is_stable, "the recovered feed never left probation"
         assert _quote(manager, "u1") is feed, "a stable recovered feed was not selected"
 
@@ -448,15 +462,15 @@ def test_a_recovered_feed_inherits_nothing_from_the_refused_one(inherited):
         # Give the refused feed everything it could possibly hand on: readiness,
         # a completed probation window and a full latency sample window.
         for i in range(12):
-            run(publish_market_ticks("u1", "nova", [_tick(price=2650.0 + i)]))
+            run(publish_market_ticks(account_ref("u1", "nova"), [_tick(price=2650.0 + i)]))
             clock.advance(5.0)
         assert refused.is_ready and refused.is_stable
         assert refused.delivery_latency is not None
 
-        run(_engine()._on_stream_not_entitled("u1", "nova", TICKS))
+        run(_engine()._on_stream_not_entitled(account_ref("u1", "nova"), TICKS))
         run(_attach("u1", "nova", ["RELIANCE"]))
-        run(set_market_feed_link("u1", "nova", up=True))
-        recovered = provider_registry.get(feed_provider_name("u1", "nova"))
+        run(set_market_feed_link(account_ref("u1", "nova"), up=True))
+        recovered = provider_registry.get(feed_provider_name(account_ref("u1", "nova")))
 
         assert recovered is not refused, "the refused provider object came back"
         if inherited == "readiness":
@@ -487,13 +501,13 @@ def test_yahoo_remains_available_at_every_step_of_a_recovery():
                              ResolutionContext(user_id="u1", symbol="RELIANCE"))))
 
         observe()
-        run(_engine()._on_stream_not_entitled("u1", "nova", TICKS))
+        run(_engine()._on_stream_not_entitled(account_ref("u1", "nova"), TICKS))
         observe()
         run(_attach("u1", "nova", ["RELIANCE"]))
         observe()
-        run(set_market_feed_link("u1", "nova", up=True))
+        run(set_market_feed_link(account_ref("u1", "nova"), up=True))
         observe()
-        run(publish_market_ticks("u1", "nova", [_tick()]))
+        run(publish_market_ticks(account_ref("u1", "nova"), [_tick()]))
         observe()
 
         assert all(state == "available" for state, _ in seen), \
@@ -517,11 +531,11 @@ def test_an_expired_session_is_recorded_as_unrecoverable_by_re_probe():
         registry.clear()
         _market_fixture()
         engine = _engine()
-        engine._sessions[("u1", "nova")] = {"access_token": "dead"}
+        engine._sessions[fixture_account_id("u1", "nova")] = {"access_token": "dead"}
         with patch.object(BrokerEngine, "_push", new=AsyncMock()):
-            run(engine._on_stream_expired("u1", "nova", TICKS))
+            run(engine._on_stream_expired(account_ref("u1", "nova"), TICKS))
 
-        candidate = register.get("u1", "nova", TICKS)
+        candidate = register.get(fixture_account_id("u1", "nova"), TICKS)
         assert candidate is not None, "the withdrawal was not recorded at all"
         assert candidate.recovery_class is RecoveryClass.SESSION
         assert not candidate.is_reprobeable
@@ -541,13 +555,13 @@ def test_an_expiry_downgrades_an_entitlement_candidate_on_every_channel():
         registry.clear()
         _market_fixture()
         engine = _engine()
-        engine._sessions[("u1", "nova")] = {"access_token": "dead"}
-        register.record_withdrawal("u1", "nova", TICKS, RecoveryClass.REPROBE)
+        engine._sessions[fixture_account_id("u1", "nova")] = {"access_token": "dead"}
+        register.record_withdrawal(fixture_account_id("u1", "nova"), TICKS, RecoveryClass.REPROBE)
 
         with patch.object(BrokerEngine, "_push", new=AsyncMock()):
-            run(engine._on_stream_expired("u1", "nova", "orders"))
+            run(engine._on_stream_expired(account_ref("u1", "nova"), "orders"))
 
-        assert register.get("u1", "nova", TICKS).recovery_class is RecoveryClass.SESSION
+        assert register.get(fixture_account_id("u1", "nova"), TICKS).recovery_class is RecoveryClass.SESSION
         assert register.due() == []
 
 
@@ -563,12 +577,12 @@ def test_a_due_candidate_whose_session_vanished_is_never_attempted():
     register = _register(clock)
     attacher = _Attacher()
     service = _service(register, attacher, session=False)
-    register.record_withdrawal("u1", "nova", TICKS, RecoveryClass.REPROBE)
+    register.record_withdrawal(fixture_account_id("u1", "nova"), TICKS, RecoveryClass.REPROBE)
     clock.advance(STILL_UNAVAILABLE_BASE_DELAY)
 
-    assert run(service.reprobe("u1", "nova", TICKS)) is ReprobeOutcome.SESSION_UNAVAILABLE
+    assert run(service.reprobe(fixture_account_id("u1", "nova"), TICKS)) is ReprobeOutcome.SESSION_UNAVAILABLE
     assert attacher.calls == [], "a re-probe attached with no session"
-    assert register.get("u1", "nova", TICKS).attempts == 0, \
+    assert register.get(fixture_account_id("u1", "nova"), TICKS).attempts == 0, \
         "a blocked probe charged the ladder — a reconnecting user would be paced for nothing"
 
 
@@ -579,27 +593,34 @@ def test_the_engines_session_predicate_follows_the_real_session_cache():
     predicate correct rather than merely present.
     """
     engine = _engine()
-    assert engine._has_live_session("u1", "nova") is False
-    engine._sessions[("u1", "nova")] = {"access_token": "t"}
-    assert engine._has_live_session("u1", "nova") is True
-    engine._sessions.pop(("u1", "nova"))
-    assert engine._has_live_session("u1", "nova") is False
+    assert engine._has_live_session(fixture_account_id("u1", "nova")) is False
+    engine._sessions[fixture_account_id("u1", "nova")] = {"access_token": "t"}
+    assert engine._has_live_session(fixture_account_id("u1", "nova")) is True
+    engine._sessions.pop(fixture_account_id("u1", "nova"))
+    assert engine._has_live_session(fixture_account_id("u1", "nova")) is False
 
 
 def test_a_new_valid_session_clears_the_withdrawal_and_the_ladder():
     """Requirement 12. Re-authentication is the authoritative recovery path, and
     it is the only thing that resets pacing."""
     with clean_register() as register:
-        register.record_withdrawal("u1", "nova", TICKS, RecoveryClass.SESSION)
-        register.record_withdrawal("u1", "nova", "orders", RecoveryClass.REPROBE)
+        register.record_withdrawal(fixture_account_id("u1", "nova"), TICKS, RecoveryClass.SESSION)
+        register.record_withdrawal(fixture_account_id("u1", "nova"), "orders", RecoveryClass.REPROBE)
 
         engine = _engine()
         with nova_registered(NovaAdapter()), \
-                patch.object(engine, "_save_account", new=AsyncMock()), \
+                patch.object(engine, "_save_session", new=AsyncMock()), \
                 patch.object(engine, "sync_portfolio", new=AsyncMock()), \
                 patch.object(engine, "_push", new=AsyncMock()), \
                 patch("services.brokers.gateway.broker_gateway.exchange_token",
-                      new=AsyncMock(return_value={"access_token": "fresh"})):
+                      new=AsyncMock(return_value={"access_token": "fresh",
+                                                  # The broker names the account
+                                                  # it just authorized — which is
+                                                  # what makes the reconnect land
+                                                  # on the SAME broker_account_id
+                                                  # and therefore clear that
+                                                  # account's withdrawal (D6.4).
+                                                  "account_id": "AB1234"})):
             run(engine.complete_auth("nova", "u1", {"request_token": "x"}))
 
         assert register.candidates() == [], "reconnecting the broker left a withdrawal behind"
@@ -609,12 +630,12 @@ def test_a_new_valid_session_clears_the_withdrawal_and_the_ladder():
 def test_disconnecting_the_broker_leaves_no_recovery_state_behind():
     """A user who removed the account must not have it re-probed."""
     with clean_register() as register:
-        register.record_withdrawal("u1", "nova", TICKS, RecoveryClass.REPROBE)
+        register.record_withdrawal(fixture_account_id("u1", "nova"), TICKS, RecoveryClass.REPROBE)
         engine = _engine()
         with nova_registered(NovaAdapter()), \
                 patch.object(stream_manager, "stop_stream", new=AsyncMock()), \
                 patch.object(engine, "_push", new=AsyncMock()):
-            run(engine.disconnect("nova", "u1"))
+            run(engine.disconnect(account_ref("u1", "nova")))
 
         assert register.candidates() == []
         assert register._history == {}
@@ -632,7 +653,7 @@ def test_a_transport_class_withdrawal_is_refused_registration_outright():
     change could accidentally make re-probeable.
     """
     register = _register()
-    assert register.record_withdrawal("u1", "nova", TICKS, RecoveryClass.TRANSPORT) is None
+    assert register.record_withdrawal(fixture_account_id("u1", "nova"), TICKS, RecoveryClass.TRANSPORT) is None
     assert register.candidates() == []
     assert RecoveryClass.TRANSPORT not in REPROBEABLE_CLASSES
     assert RecoveryClass.TRANSPORT in SELF_RECOVERING_CLASSES
@@ -649,7 +670,7 @@ def test_an_ordinary_link_loss_creates_no_recovery_candidate():
     with entitlement_nova(), clean_register() as register, _clean_provider_registry() as registry:
         registry.clear()
         _manager, _baseline, feeds = _market_fixture()
-        run(_engine()._on_stream_link_state("u1", "nova", False, "socket closed", TICKS))
+        run(_engine()._on_stream_link_state(account_ref("u1", "nova"), False, "socket closed", TICKS))
 
         assert not feeds["u1"].is_ready, "the link loss did not demote the feed"
         assert register.candidates() == [], "a transport blip entered the re-probe register"
@@ -692,9 +713,9 @@ def test_a_stale_open_feed_recovers_on_a_fresh_tick_with_no_control_plane_probe(
         feed = feeds["u1"]
         feed._clock = clock
 
-        run(publish_market_ticks("u1", "nova", [_tick()]))
+        run(publish_market_ticks(account_ref("u1", "nova"), [_tick()]))
         clock.advance(1.0)
-        run(publish_market_ticks("u1", "nova", [_tick(price=2651.0)]))
+        run(publish_market_ticks(account_ref("u1", "nova"), [_tick(price=2651.0)]))
         assert feed.is_ready and feed.has_fresh_evidence
 
         clock.advance(DEFAULT_TICK_MAX_AGE_SECONDS + 1)
@@ -702,7 +723,7 @@ def test_a_stale_open_feed_recovers_on_a_fresh_tick_with_no_control_plane_probe(
         assert _quote(manager, "u1") is baseline, "a stale feed still served the quote"
         assert register.candidates() == [], "going stale created a recovery candidate"
 
-        run(publish_market_ticks("u1", "nova", [_tick(price=2652.0)]))
+        run(publish_market_ticks(account_ref("u1", "nova"), [_tick(price=2652.0)]))
         assert feed.has_fresh_evidence, "a fresh tick did not restore the feed"
         assert _quote(manager, "u1") is feed, "the naturally recovered feed was not re-selected"
         assert register.candidates() == [], "natural recovery went through the control plane"
@@ -710,7 +731,7 @@ def test_a_stale_open_feed_recovers_on_a_fresh_tick_with_no_control_plane_probe(
 
 def test_an_evidence_class_withdrawal_is_refused_registration_outright():
     register = _register()
-    assert register.record_withdrawal("u1", "nova", TICKS, RecoveryClass.EVIDENCE) is None
+    assert register.record_withdrawal(fixture_account_id("u1", "nova"), TICKS, RecoveryClass.EVIDENCE) is None
     assert RecoveryClass.EVIDENCE not in REPROBEABLE_CLASSES
 
 
@@ -724,15 +745,15 @@ def test_market_data_arriving_discharges_an_outstanding_candidate():
     with entitlement_nova(), clean_register() as register, _clean_provider_registry() as registry:
         registry.clear()
         _market_fixture()
-        register.record_withdrawal("u1", "nova", TICKS, RecoveryClass.REPROBE)
+        register.record_withdrawal(fixture_account_id("u1", "nova"), TICKS, RecoveryClass.REPROBE)
         engine = _engine()
 
-        run(engine._on_stream_tick("u1", "nova", []))
-        assert register.get("u1", "nova", TICKS) is not None, \
+        run(engine._on_stream_tick(account_ref("u1", "nova"), []))
+        assert register.get(fixture_account_id("u1", "nova"), TICKS) is not None, \
             "an empty batch discharged a withdrawal"
 
-        run(engine._on_stream_tick("u1", "nova", [{"scrip": "RELIANCE", "rate": "2650.0"}]))
-        assert register.get("u1", "nova", TICKS) is None, "market data did not discharge the candidate"
+        run(engine._on_stream_tick(account_ref("u1", "nova"), [{"scrip": "RELIANCE", "rate": "2650.0"}]))
+        assert register.get(fixture_account_id("u1", "nova"), TICKS) is None, "market data did not discharge the candidate"
 
 
 # ==================================================================
@@ -746,12 +767,12 @@ def test_two_users_of_the_same_broker_recover_independently():
         registry.clear()
         manager, _baseline, feeds = _market_fixture(users=("u1", "u2"))
         from services.brokers.market_feed import publish_market_ticks
-        run(publish_market_ticks("u2", "nova", [_tick()]))
+        run(publish_market_ticks(account_ref("u2", "nova"), [_tick()]))
 
-        run(_engine()._on_stream_not_entitled("u1", "nova", TICKS))
+        run(_engine()._on_stream_not_entitled(account_ref("u1", "nova"), TICKS))
 
-        assert register.get("u1", "nova", TICKS) is not None
-        assert register.get("u2", "nova", TICKS) is None, "user B was withdrawn by user A's refusal"
+        assert register.get(fixture_account_id("u1", "nova"), TICKS) is not None
+        assert register.get(fixture_account_id("u2", "nova"), TICKS) is None, "user B was withdrawn by user A's refusal"
         assert feeds["u2"].is_ready, "user B's feed lost readiness"
         assert _quote(manager, "u2") is feeds["u2"], "user B stopped being served"
 
@@ -759,11 +780,11 @@ def test_two_users_of_the_same_broker_recover_independently():
         paced = _register(clock)
         attacher = _Attacher()
         service = _service(paced, attacher)
-        paced.record_withdrawal("u1", "nova", TICKS, RecoveryClass.REPROBE)
+        paced.record_withdrawal(fixture_account_id("u1", "nova"), TICKS, RecoveryClass.REPROBE)
         clock.advance(STILL_UNAVAILABLE_BASE_DELAY)
         run(service.sweep_once())
 
-        assert attacher.calls == [("u1", "nova", TICKS)], \
+        assert attacher.calls == [(fixture_account_id("u1", "nova"), TICKS)], \
             f"a re-probe for user A touched somebody else: {attacher.calls}"
 
 
@@ -774,27 +795,27 @@ def test_different_brokers_of_the_same_user_recover_independently():
     register = _register(clock)
     attacher = _Attacher()
     service = _service(register, attacher)
-    register.record_withdrawal("u1", "nova", TICKS, RecoveryClass.REPROBE)
-    register.record_withdrawal("u1", "orion", TICKS, RecoveryClass.SESSION)
+    register.record_withdrawal(fixture_account_id("u1", "nova"), TICKS, RecoveryClass.REPROBE)
+    register.record_withdrawal(fixture_account_id("u1", "orion"), TICKS, RecoveryClass.SESSION)
 
     clock.advance(STILL_UNAVAILABLE_BASE_DELAY)
     run(service.sweep_once())
 
-    assert attacher.calls == [("u1", "nova", TICKS)], \
+    assert attacher.calls == [(fixture_account_id("u1", "nova"), TICKS)], \
         "recovery crossed a broker boundary"
-    assert register.get("u1", "orion", TICKS).recovery_class is RecoveryClass.SESSION
+    assert register.get(fixture_account_id("u1", "orion"), TICKS).recovery_class is RecoveryClass.SESSION
 
 
 def test_two_channels_of_one_account_recover_independently():
     """A refusal on the market feed says nothing about the order socket."""
     clock = FakeClock()
     register = _register(clock)
-    register.record_withdrawal("u1", "nova", "ticks", RecoveryClass.REPROBE)
+    register.record_withdrawal(fixture_account_id("u1", "nova"), "ticks", RecoveryClass.REPROBE)
     clock.advance(STILL_UNAVAILABLE_BASE_DELAY)
-    run(_service(register).reprobe("u1", "nova", "ticks"))
+    run(_service(register).reprobe(fixture_account_id("u1", "nova"), "ticks"))
 
-    register.record_withdrawal("u1", "nova", "orders", RecoveryClass.REPROBE)
-    assert register.get("u1", "nova", "orders").next_attempt_at - clock.now == \
+    register.record_withdrawal(fixture_account_id("u1", "nova"), "orders", RecoveryClass.REPROBE)
+    assert register.get(fixture_account_id("u1", "nova"), "orders").next_attempt_at - clock.now == \
         STILL_UNAVAILABLE_BASE_DELAY, "one channel's ladder paced another's"
 
 
@@ -809,10 +830,10 @@ def test_the_guest_and_baseline_contexts_are_unchanged_by_a_recovery():
         manager, _baseline, _feeds = _market_fixture()
         before = (manager.status(), manager.status(user_id="guest"))
 
-        run(_engine()._on_stream_not_entitled("u1", "nova", TICKS))
+        run(_engine()._on_stream_not_entitled(account_ref("u1", "nova"), TICKS))
         run(_attach("u1", "nova", ["RELIANCE"]))
-        run(set_market_feed_link("u1", "nova", up=True))
-        run(publish_market_ticks("u1", "nova", [_tick()]))
+        run(set_market_feed_link(account_ref("u1", "nova"), up=True))
+        run(publish_market_ticks(account_ref("u1", "nova"), [_tick()]))
 
         assert (manager.status(), manager.status(user_id="guest")) == before
         assert manager.resolve_feed(Capability.QUOTES, GLOBAL_CONTEXT).available
@@ -829,27 +850,28 @@ def test_a_sweep_starts_no_attach_for_an_account_already_attached():
     register = _register(clock)
     attacher = _Attacher()
     service = _service(register, attacher, attached=True)
-    register.record_withdrawal("u1", "nova", TICKS, RecoveryClass.REPROBE)
+    register.record_withdrawal(fixture_account_id("u1", "nova"), TICKS, RecoveryClass.REPROBE)
     clock.advance(STILL_UNAVAILABLE_BASE_DELAY)
 
-    assert run(service.reprobe("u1", "nova", TICKS)) is ReprobeOutcome.ALREADY_ATTACHED
+    assert run(service.reprobe(fixture_account_id("u1", "nova"), TICKS)) is ReprobeOutcome.ALREADY_ATTACHED
     assert attacher.calls == []
-    assert register.get("u1", "nova", TICKS) is None, \
+    assert register.get(fixture_account_id("u1", "nova"), TICKS) is None, \
         "a channel somebody else restored kept an outstanding withdrawal"
 
 
 def test_the_engines_attachment_predicate_reads_the_real_stream_registry():
     engine = _engine()
-    assert engine._channel_is_attached("u1", "nova", TICKS) is False
+    assert engine._channel_is_attached(fixture_account_id("u1", "nova"), TICKS) is False
 
     async def scenario():
         with nova_registered(NovaAdapter()):
             await stream_manager.start_stream(
-                "u1", "nova", {"access_token": "t"}, credentials={},
+                "u1", "nova", {"access_token": "t"},
+                broker_account_id=fixture_account_id("u1", "nova"), credentials={},
                 instrument_tokens=["RELIANCE"], channel=TICKS)
-            attached = engine._channel_is_attached("u1", "nova", TICKS)
-            other = engine._channel_is_attached("u2", "nova", TICKS)
-            await stream_manager.stop_stream("u1", "nova")
+            attached = engine._channel_is_attached(fixture_account_id("u1", "nova"), TICKS)
+            other = engine._channel_is_attached(fixture_account_id("u2", "nova"), TICKS)
+            await stream_manager.stop_stream(fixture_account_id("u1", "nova"))
             return attached, other
 
     attached, other = run(scenario())
@@ -870,12 +892,12 @@ def test_a_recovery_re_probe_opens_only_the_channel_it_is_recovering():
             )
 
     engine = _engine()
-    engine._sessions[("u1", "nova")] = {"access_token": "t"}
+    engine._sessions[fixture_account_id("u1", "nova")] = {"access_token": "t"}
     with nova_registered(TwoChannel()), _clean_provider_registry() as registry:
         registry.clear()
         with patch.object(stream_manager, "start_stream", new=AsyncMock()) as started, \
                 patch.object(engine, "get_session", new=AsyncMock(return_value={"access_token": "t"})):
-            run(engine._reattach_channel("u1", "nova", "orders"))
+            run(engine._reattach_channel(fixture_account_id("u1", "nova"), "orders"))
 
     assert [call.kwargs["channel"] for call in started.await_args_list] == ["orders"]
 
@@ -899,19 +921,19 @@ def test_a_non_tick_channel_re_probe_does_not_replace_a_live_market_feed():
             )
 
     engine = _engine()
-    engine._sessions[("u1", "nova")] = {"access_token": "t"}
+    engine._sessions[fixture_account_id("u1", "nova")] = {"access_token": "t"}
     with nova_registered(TwoChannel()), clean_register(), _clean_provider_registry() as registry:
         registry.clear()
         _market_fixture()
-        run(publish_market_ticks("u1", "nova", [_tick()]))
-        live = provider_registry.get(feed_provider_name("u1", "nova"))
+        run(publish_market_ticks(account_ref("u1", "nova"), [_tick()]))
+        live = provider_registry.get(feed_provider_name(account_ref("u1", "nova")))
         assert live.is_ready
 
         with patch.object(stream_manager, "start_stream", new=AsyncMock()), \
                 patch.object(engine, "get_session", new=AsyncMock(return_value={"access_token": "t"})):
-            run(engine._reattach_channel("u1", "nova", "orders"))
+            run(engine._reattach_channel(fixture_account_id("u1", "nova"), "orders"))
 
-        assert provider_registry.get(feed_provider_name("u1", "nova")) is live, \
+        assert provider_registry.get(feed_provider_name(account_ref("u1", "nova"))) is live, \
             "an order-channel re-probe replaced the live market feed"
         assert live.is_ready, "an order-channel re-probe discarded the market feed's readiness"
 
@@ -922,7 +944,7 @@ def test_recovery_state_never_reaches_a_consumer_surface():
     with entitlement_nova(), clean_register(), _clean_provider_registry() as registry:
         registry.clear()
         manager, _baseline, _feeds = _market_fixture()
-        run(_engine()._on_stream_not_entitled("u1", "nova", TICKS))
+        run(_engine()._on_stream_not_entitled(account_ref("u1", "nova"), TICKS))
 
         status = manager.status(user_id="u1")
         assert set(status) == {"state", "tier", "reason", "capabilities"}
@@ -1007,9 +1029,9 @@ def test_a_fictional_broker_uses_the_recovery_contract_with_no_core_change():
     with entitlement_nova(), clean_register() as register, _clean_provider_registry() as registry:
         registry.clear()
         _market_fixture()
-        run(_engine()._on_stream_not_entitled("u1", "nova", TICKS))
+        run(_engine()._on_stream_not_entitled(account_ref("u1", "nova"), TICKS))
 
-        candidate = register.get("u1", "nova", TICKS)
+        candidate = register.get(fixture_account_id("u1", "nova"), TICKS)
         assert candidate.recovery_class is RecoveryClass.REPROBE
         assert candidate.describe(now=0.0)["reprobeable"] is True
 
@@ -1085,10 +1107,10 @@ def test_a_non_reprobeable_class_is_never_attempted(recovery_class):
     register = _register(clock)
     attacher = _Attacher()
     service = _service(register, attacher)
-    register.record_withdrawal("u1", "nova", TICKS, recovery_class)
+    register.record_withdrawal(fixture_account_id("u1", "nova"), TICKS, recovery_class)
     clock.advance(STILL_UNAVAILABLE_MAX_DELAY * 10)
 
-    assert run(service.reprobe("u1", "nova", TICKS)) is ReprobeOutcome.NOT_REPROBEABLE
+    assert run(service.reprobe(fixture_account_id("u1", "nova"), TICKS)) is ReprobeOutcome.NOT_REPROBEABLE
     assert run(service.sweep_once()) == {}
     assert attacher.calls == []
 
@@ -1104,7 +1126,7 @@ def test_the_outcome_vocabulary_carries_no_broker_or_credential_vocabulary():
 
 def test_an_unregistered_key_is_never_attached():
     service = _service(_register(), attacher := _Attacher())
-    assert run(service.reprobe("nobody", "nova", TICKS)) is ReprobeOutcome.NOT_REGISTERED
+    assert run(service.reprobe(fixture_account_id("nobody", "nova"), TICKS)) is ReprobeOutcome.NOT_REGISTERED
     assert attacher.calls == []
 
 
@@ -1135,7 +1157,7 @@ def test_the_sweep_is_capped_so_one_wake_up_cannot_burst():
     attacher = _Attacher()
     service = _service(register, attacher, max_per_sweep=2)
     for i in range(5):
-        register.record_withdrawal(f"u{i}", "nova", TICKS, RecoveryClass.REPROBE)
+        register.record_withdrawal(fixture_account_id(f"u{i}", "nova"), TICKS, RecoveryClass.REPROBE)
     clock.advance(STILL_UNAVAILABLE_BASE_DELAY)
 
     run(service.sweep_once())
@@ -1175,15 +1197,15 @@ def test_the_whole_recovery_path_logs_no_credential_at_debug(caplog):
         registry.clear()
         _market_fixture()
         engine = _engine()
-        engine._sessions[("u1", "nova")] = dict(FAKE_CREDENTIALS)
+        engine._sessions[fixture_account_id("u1", "nova")] = dict(FAKE_CREDENTIALS)
 
         with caplog.at_level(logging.DEBUG):
             # The full cycle: refusal → record → paced re-probe → attach →
             # refusal again → session expiry → reclassification.
-            run(engine._on_stream_not_entitled("u1", "nova", TICKS))
+            run(engine._on_stream_not_entitled(account_ref("u1", "nova"), TICKS))
             clock = FakeClock()
             paced = _register(clock)
-            paced.record_withdrawal("u1", "nova", TICKS, RecoveryClass.REPROBE)
+            paced.record_withdrawal(fixture_account_id("u1", "nova"), TICKS, RecoveryClass.REPROBE)
             clock.advance(STILL_UNAVAILABLE_BASE_DELAY)
             service = RecoveryService(
                 paced,
@@ -1196,7 +1218,7 @@ def test_the_whole_recovery_path_logs_no_credential_at_debug(caplog):
                     patch.object(stream_manager, "start_stream", new=AsyncMock()):
                 run(service.sweep_once())
             with patch.object(BrokerEngine, "_push", new=AsyncMock()):
-                run(engine._on_stream_expired("u1", "nova", TICKS))
+                run(engine._on_stream_expired(account_ref("u1", "nova"), TICKS))
 
         blob = caplog.text
         assert "Recovery:" in blob, "the recovery path logged nothing — the check proves nothing"
@@ -1206,19 +1228,22 @@ def test_the_whole_recovery_path_logs_no_credential_at_debug(caplog):
             assert value[:12] not in blob, f"a prefix of {field} reached the logs"
         for forbidden in ("Bearer ", "authorization", "?token=", "access_token"):
             assert forbidden.lower() not in blob.lower(), f"{forbidden!r} reached the logs"
-        assert register.get("u1", "nova", TICKS).recovery_class is RecoveryClass.SESSION
+        assert register.get(fixture_account_id("u1", "nova"), TICKS).recovery_class is RecoveryClass.SESSION
 
 
 def test_a_candidates_diagnostics_row_carries_no_credential_and_no_reason_text():
     """`describe()` is the admin surface. It may name a broker; it may not carry
     anything a session does."""
     register = _register()
-    register.record_withdrawal("u1", "nova", TICKS, RecoveryClass.REPROBE)
+    register.record_withdrawal(fixture_account_id("u1", "nova"), TICKS, RecoveryClass.REPROBE)
     rows = register.describe()
 
     assert len(rows) == 1
     assert set(rows[0]) == {
-        "user_id", "broker", "channel", "recovery_class",
+        # D6.4 — the account id replaced `user_id` + `broker`. It is an opaque
+        # internal handle: it names no user, no brand and no credential, which is
+        # strictly less than the two fields it replaced carried.
+        "broker_account_id", "channel", "recovery_class",
         "reprobeable", "attempts", "due_in_seconds",
     }
     blob = repr(rows).lower()

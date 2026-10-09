@@ -28,6 +28,7 @@ import asyncio
 import warnings
 
 import pytest
+from _accounts import fixture_account_id  # noqa: E402
 
 import server
 from infrastructure import tasks as background_tasks
@@ -421,15 +422,15 @@ class TestBrokerStreamRegistry:
         then await the task doing the calling."""
         mgr = BrokerStreamManager()
         stream = BrokerStream("u1", "zerodha", {"access_token": "expired-token"})
-        mgr._streams[("u1", "zerodha")] = stream
+        mgr._streams[(fixture_account_id("u1", "zerodha"), "default", "0")] = stream
 
-        assert mgr.discard("u1", "zerodha") is True
+        assert mgr.discard(fixture_account_id("u1", "zerodha")) is True
         assert mgr._streams == {}
         assert mgr.status() == []
 
     def test_discarding_an_unknown_stream_is_a_no_op(self):
         mgr = BrokerStreamManager()
-        assert mgr.discard("nobody", "zerodha") is False
+        assert mgr.discard(fixture_account_id("nobody", "zerodha")) is False
 
 
 # --------------------------------------------------------------------------- #

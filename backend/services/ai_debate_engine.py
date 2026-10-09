@@ -204,16 +204,38 @@ class AIDebateEngine:
             "rounds_completed": 2 if claude_review or gemini_review else 1,
         }
 
-    async def simple_chat(
+    async def simple_chat_result(
         self,
         system_prompt: str,
         user_message: str | list[AIMessage],
         prefer: Literal["claude", "gemini", "auto"] = "auto",
         max_tokens: int = 800,
-    ) -> str:
-        """
-        Single-provider call for non-debate use cases (chat, summaries, etc).
-        Falls back to the other provider if the preferred one fails.
+    ) -> AIResponse:
+        """Single-provider call, returning the full response object.
+
+        D6.9 — WHY THE OBJECT FORM HAD TO EXIST.
+        `simple_chat` returns `resp.content`, a bare string, and its last line
+        returns the *SimulatedProvider's* content when every real provider
+        fails. That string reads:
+
+            "AI services are currently offline or unavailable. Please check
+             that ANTHROPIC_API_KEY and GOOGLE_GEMINI_KEY are configured …"
+
+        and it is indistinguishable, to a caller holding only a string, from a
+        real model's answer. The Morning Report persisted it into `db.reports`
+        as `ai_briefing` and every user saw it under the heading **AI Market
+        Briefing** for the rest of the day — a backend configuration message
+        published as market analysis.
+
+        The caller cannot fix that without knowing *which provider answered*
+        and *whether it succeeded*, which is precisely what an `AIResponse`
+        carries and a `str` throws away. `simple_chat` is unchanged and now
+        delegates here, so no existing caller is affected and any caller that
+        needs provenance has one honest call to reach for.
+
+        The returned `AIResponse` is never a lie: on total failure it is the
+        SimulatedProvider's response *with its `error` intact*, so
+        `resp.success` is False and `resp.provider` is `"simulated"`.
         """
         providers_by_pref: list[AIProvider]
         if prefer == "claude":
@@ -236,23 +258,50 @@ class AIDebateEngine:
                 continue
             resp = await provider.complete(messages, max_tokens=max_tokens)
             if resp.success:
-                return resp.content
+                return resp
             logger.warning(f"{provider.name} failed, trying next: {resp.error}")
 
         # All failed — use fallback
-        resp = await self.fallback.complete(messages, max_tokens=max_tokens)
+        return await self.fallback.complete(messages, max_tokens=max_tokens)
+
+    async def simple_chat(
+        self,
+        system_prompt: str,
+        user_message: str | list[AIMessage],
+        prefer: Literal["claude", "gemini", "auto"] = "auto",
+        max_tokens: int = 800,
+    ) -> str:
+        """
+        Single-provider call for non-debate use cases (chat, summaries, etc).
+        Falls back to the other provider if the preferred one fails.
+
+        Returns content only. A caller that will *attribute* the result to a
+        model — label it "AI-generated", persist a provider name, stamp
+        provenance — must use :meth:`simple_chat_result` instead: this form
+        cannot distinguish a model's answer from the simulated fallback's.
+        """
+        resp = await self.simple_chat_result(
+            system_prompt, user_message, prefer=prefer, max_tokens=max_tokens
+        )
         return resp.content
 
     def get_status(self) -> dict:
-        """Return status of all configured providers."""
+        """Return status of all configured providers.
+
+        D6.9 — the model ids are read from the providers rather than written
+        here. They were hardcoded, and had drifted: this method advertised
+        `claude-3-5-sonnet-20241022` on `/api/ai/status` while every call in the
+        process went to `claude-3-haiku-20240307`. A status endpoint whose job
+        is provenance may not name a model the platform does not call.
+        """
         return {
             "claude": {
                 "configured": self.claude.is_configured,
-                "model": "claude-3-5-sonnet-20241022",
+                "model": self.claude.default_model,
             },
             "gemini": {
                 "configured": self.gemini.is_configured,
-                "model": "gemini-2.5-flash",
+                "model": self.gemini.default_model,
             },
             "debate_ready": self.claude.is_configured or self.gemini.is_configured,
             "full_debate": self.claude.is_configured and self.gemini.is_configured,
