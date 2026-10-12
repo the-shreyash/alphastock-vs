@@ -97,7 +97,7 @@ jobs:
       # from scratch every single time), and it honours the
       # `# syntax=docker/dockerfile:1.7` directive the Dockerfile opens with.
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       # --- provenance metadata -------------------------------------------------
       # The Dockerfile accepts APP_VERSION / VCS_REF / BUILD_DATE and stamps them
