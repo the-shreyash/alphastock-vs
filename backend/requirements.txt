@@ -85,7 +85,7 @@ PyJWT==2.15.0                # access/refresh JWT signing & verification
 
 # Market data & content
 feedparser==6.0.14           # services/news_service.py — RSS/Atom financial news
-pytz==2025.2                 # services/market_engine/validator.py — NSE session tz math
+pytz==2026.4                 # services/market_engine/validator.py — NSE session tz math
                               #   (PH2.8: previously imported but PINNED NOWHERE — the Market
                               #    Engine validator failed to initialize. This line is the fix.)
 
