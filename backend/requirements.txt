@@ -64,7 +64,7 @@ motor==3.7.1                 # async MongoDB driver (server.py); provides bson.O
 redis==5.0.8                 # cross-process realtime fan-out & cache (infrastructure/*)
 
 # AI providers (product core)
-anthropic==0.116.0           # services/claude_provider.py — Claude engine
+anthropic==1.11.0           # services/claude_provider.py — Claude engine
 google-genai==2.25.0          # services/gemini_provider.py, gemini_direct.py — Gemini engine
 google-auth==2.58.1          # server.py — Google OAuth id_token verification
 
