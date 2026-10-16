@@ -39,7 +39,7 @@ platformdirs==4.11.13     # black dep
 flake8==7.4.1
 mccabe==0.7.0           # flake8 dep
 pycodestyle==2.15.0     # flake8 dep
-pyflakes==3.4.0         # flake8 dep
+pyflakes==4.0.1         # flake8 dep
 isort==8.0.1
 
 # Type checker
